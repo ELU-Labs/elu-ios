@@ -1,0 +1,21 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    name: Build (iOS)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      # SPM package: Xcode generates the EluAnalytics scheme automatically.
+      - name: Build for iOS
+        run: |
+          xcodebuild build \
+            -scheme EluAnalytics \
+            -destination 'generic/platform=iOS' \
+            -skipMacroValidation \
+            CODE_SIGNING_ALLOWED=NO
