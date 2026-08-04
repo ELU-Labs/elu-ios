@@ -34,6 +34,40 @@ final class EluConfigClient {
         session = URLSession(configuration: cfg)
     }
 
+    /// Builds the baseline v1 config URL with the site key as exactly one path
+    /// component. The response contract remains provisional until the browser
+    /// SDK freezes the shared v1 schema.
+    static func requestURL(configHost: URL, siteKey: String) -> URL? {
+        guard !siteKey.isEmpty,
+              var components = URLComponents(url: configHost, resolvingAgainstBaseURL: false),
+              let scheme = components.scheme?.lowercased(),
+              scheme == "https" || scheme == "http",
+              components.host != nil,
+              components.query == nil,
+              components.fragment == nil
+        else {
+            return nil
+        }
+
+        var allowed = CharacterSet.urlPathAllowed
+        allowed.remove(charactersIn: "/%?#")
+        guard let encodedSiteKey = siteKey.addingPercentEncoding(withAllowedCharacters: allowed) else {
+            return nil
+        }
+
+        let basePath = components.percentEncodedPath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        let segments = [basePath, "v1", encodedSiteKey, "config"].filter { !$0.isEmpty }
+        components.percentEncodedPath = "/" + segments.joined(separator: "/")
+        return components.url
+    }
+
+    static func cacheFileName(siteKey: String) -> String {
+        let safeKey = siteKey.map { ch -> Character in
+            ch.isLetter || ch.isNumber || ch == "-" || ch == "_" ? ch : "_"
+        }
+        return "config-\(String(safeKey)).json"
+    }
+
     // MARK: - Disk cache (Application Support, verbatim bytes)
 
     private var cacheFileURL: URL? {
@@ -42,10 +76,7 @@ final class EluConfigClient {
         }
         let dir = base.appendingPathComponent("EluAnalytics", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let safeKey = siteKey.map { ch -> Character in
-            ch.isLetter || ch.isNumber || ch == "-" || ch == "_" ? ch : "_"
-        }
-        return dir.appendingPathComponent("config-\(String(safeKey)).json")
+        return dir.appendingPathComponent(Self.cacheFileName(siteKey: siteKey))
     }
 
     func loadCached() -> EluRemoteConfig? {
@@ -83,12 +114,8 @@ final class EluConfigClient {
     private func startAttempt() {
         guard !inFlight, attemptsThisForeground < Self.maxAttemptsPerForeground else { return }
         attemptsThisForeground += 1
+        guard let url = Self.requestURL(configHost: configHost, siteKey: siteKey) else { return }
         inFlight = true
-
-        var url = configHost
-        url.appendPathComponent("v1")
-        url.appendPathComponent(siteKey)
-        url.appendPathComponent("config")
 
         let task = session.dataTask(with: url) { [weak self] data, response, error in
             guard let self else { return }

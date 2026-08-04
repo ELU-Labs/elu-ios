@@ -4,24 +4,6 @@ import PostHog
     import UIKit
 #endif
 
-enum EluLifecycleState {
-    case idle
-    /// Setup called, no usable config yet — facade ops buffer in memory.
-    case pending
-    /// PostHog initialized and delegating.
-    case running
-    case disabled
-}
-
-enum EluDisabledReason {
-    /// Config said `enabled:false`. A later `enabled:true` may re-initialize.
-    case remoteDisabled
-    /// EU-blocked from cached config. Loosening applies next launch only.
-    case euBlocked
-    /// Mid-session kill switch — PostHog was live and has been opted out.
-    case killSwitch
-}
-
 /// The internal engine behind the `Elu` facade: owns the lifecycle state
 /// machine, the embedded PostHog instance, the pre-config buffer, config
 /// refresh, and the replay budget. Every mutation runs on one serial queue;
@@ -54,7 +36,7 @@ final class EluCore {
     /// gets a fresh budget and a restart.
     private var budgetStoppedSessionId: String?
     private var budgetTimer: DispatchSourceTimer?
-    private var flagCallbacks: [() -> Void] = []
+    private var flagCallbacks = EluCallbackRegistry()
     private var observersInstalled = false
 
     private init() {}
@@ -80,19 +62,12 @@ final class EluCore {
             client.onConfig = { [weak self] cfg in self?.applyFetched(cfg) }
             configClient = client
 
-            if let cached = client.loadCached() {
-                if !cached.enabled {
-                    state = .disabled
-                    disabledReason = .remoteDisabled
-                } else if deviceInEu, cached.privacy.blockEu {
-                    state = .disabled
-                    disabledReason = .euBlocked
-                } else {
-                    initializePostHog(with: cached)
-                    state = .running
-                }
-            } else {
-                state = .pending
+            let cached = client.loadCached()
+            let decision = EluLifecyclePolicy.initial(cached: cached, deviceInEu: deviceInEu)
+            state = decision.state
+            disabledReason = decision.disabledReason
+            if decision.state == .running, let cached {
+                initializePostHog(with: cached)
             }
 
             client.fetchNow()
@@ -123,8 +98,7 @@ final class EluCore {
         ) { [weak self] _ in
             guard let self else { return }
             self.queue.async {
-                let callbacks = self.flagCallbacks
-                DispatchQueue.main.async { callbacks.forEach { $0() } }
+                self.flagCallbacks.dispatch(on: .main)
             }
         }
     }
@@ -136,17 +110,13 @@ final class EluCore {
         case .idle:
             break
         case .pending:
-            if !cfg.enabled {
-                state = .disabled
-                disabledReason = .remoteDisabled
-                buffer.dropAll()
-            } else if deviceInEu, cfg.privacy.blockEu {
-                state = .disabled
-                disabledReason = .euBlocked
+            let decision = EluLifecyclePolicy.activation(for: cfg, deviceInEu: deviceInEu)
+            state = decision.state
+            disabledReason = decision.disabledReason
+            if decision.state == .disabled {
                 buffer.dropAll()
             } else {
                 initializePostHog(with: cfg)
-                state = .running
                 for op in buffer.drain() {
                     execute(op)
                 }
@@ -154,9 +124,12 @@ final class EluCore {
         case .disabled:
             // Only `enabled:false → true` re-initializes mid-run, and only if
             // PostHog was never live. euBlocked/killSwitch loosens next launch.
-            if disabledReason == .remoteDisabled, posthog == nil, cfg.enabled,
-               !(deviceInEu && cfg.privacy.blockEu)
-            {
+            if EluLifecyclePolicy.shouldReactivate(
+                disabledReason: disabledReason,
+                runtimeWasInitialized: posthog != nil,
+                config: cfg,
+                deviceInEu: deviceInEu
+            ) {
                 initializePostHog(with: cfg)
                 state = .running
                 disabledReason = nil

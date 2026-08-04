@@ -63,6 +63,9 @@ extension EluPrivacyConfig: Decodable {
 /// token/host) throws — the caller treats that as a FETCH FAILURE (keep the
 /// cached config / stay pending), never as `enabled:false`.
 struct EluRemoteConfig: Decodable {
+    static let supportedSchemaVersion = 1
+
+    let schemaVersion: Int
     let enabled: Bool
     let publicToken: String
     let host: String
@@ -74,6 +77,14 @@ struct EluRemoteConfig: Decodable {
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
+        schemaVersion = try c.decode(Int.self, forKey: .v)
+        guard schemaVersion == Self.supportedSchemaVersion else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .v,
+                in: c,
+                debugDescription: "unsupported ELU config schema version \(schemaVersion)"
+            )
+        }
         enabled = try c.decode(Bool.self, forKey: .enabled)
         let token = (try? c.decode(String.self, forKey: .publicToken)) ?? ""
         let host = (try? c.decode(String.self, forKey: .host)) ?? ""
