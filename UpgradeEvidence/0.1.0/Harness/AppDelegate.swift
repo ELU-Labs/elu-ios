@@ -75,19 +75,16 @@ private enum UpgradeProbe {
     }
 
     private static func waitForIdentity(build: UpgradeBuild, expectedIdentity: String, deadline: Date) {
-        if let observed = Elu.distinctId() {
-            let matches = observed == expectedIdentity
-            if matches {
-                Elu.capture(build == .source ? sourceMarker : candidateMarker)
-                Elu.flush()
-            }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
-                write(build: build.rawValue, identityCheck: matches)
-            }
-            return
-        }
         guard Date() < deadline else {
             write(build: build.rawValue, identityCheck: false)
+            return
+        }
+        if Elu.distinctId() == expectedIdentity {
+            Elu.capture(build == .source ? sourceMarker : candidateMarker)
+            Elu.flush()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+                write(build: build.rawValue, identityCheck: true)
+            }
             return
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {

@@ -31,6 +31,19 @@ class UpgradeEvidenceCaptureTests(unittest.TestCase):
         self.assertIn("    var window: UIWindow?", source)
         self.assertNotIn("private var window: UIWindow?", source)
 
+    def test_harness_polls_past_anonymous_identity_until_the_fixed_deadline(self) -> None:
+        source = HARNESS_SOURCE.read_text(encoding="utf-8")
+        wait_body = source.split("private static func waitForIdentity", 1)[1].split(
+            "private static func write", 1
+        )[0]
+        self.assertIn("private static let timeoutSeconds: TimeInterval = 20", source)
+        self.assertIn("deadline: Date().addingTimeInterval(timeoutSeconds)", source)
+        self.assertIn("guard Date() < deadline else", wait_body)
+        self.assertIn("if Elu.distinctId() == expectedIdentity", wait_body)
+        self.assertIn("deadline: deadline", wait_body)
+        self.assertNotIn("identityCheck: matches", wait_body)
+        self.assertNotIn("if let observed = Elu.distinctId()", wait_body)
+
     def test_harness_product_is_bound_to_the_local_package(self) -> None:
         project = PROJECT.read_text(encoding="utf-8")
         self.assertIn(
@@ -197,6 +210,152 @@ class UpgradeEvidenceCaptureTests(unittest.TestCase):
                 self.assertNotIn(sentinel, detail)
                 self.assertNotIn(sentinel, public_output)
 
+    def test_run_result_failure_states_are_fixed_and_sanitized(self) -> None:
+        cases = (
+            (None, "RESULT_MISSING"),
+            (b"{", "RESULT_SCHEMA_INVALID"),
+            (b"[]", "RESULT_SCHEMA_INVALID"),
+            (json.dumps({"build": "source"}).encode(), "RESULT_SCHEMA_INVALID"),
+            (
+                json.dumps(
+                    {"build": "source", "identityCheck": True, "unexpected": "raw"}
+                ).encode(),
+                "RESULT_SCHEMA_INVALID",
+            ),
+            (
+                b'{"build":"source","build":"candidate","identityCheck":true}',
+                "RESULT_SCHEMA_INVALID",
+            ),
+            (
+                json.dumps({"build": "candidate", "identityCheck": True}).encode(),
+                "RESULT_BUILD_MISMATCH",
+            ),
+            (
+                json.dumps({"build": "source", "identityCheck": False}).encode(),
+                "IDENTITY_FALSE",
+            ),
+        )
+        for payload, expected_failure in cases:
+            with self.subTest(expected_failure=expected_failure):
+                result, failure = RUNNER.inspect_run_result("source", payload)
+                self.assertIsNone(result)
+                self.assertEqual(failure, expected_failure)
+        for build, prefix in RUNNER.BUILD_PREFIXES.items():
+            for failure in RUNNER.RUN_RESULT_FAILURES:
+                for observed, observation in RUNNER.CONFIG_GET_OBSERVATIONS.items():
+                    code = RUNNER.run_result_blocker_code(build, failure, observed)
+                    detail = RUNNER.BLOCKER_DETAILS[code]
+                    self.assertEqual(code, f"{prefix}_RUN_{failure}_{observation[0]}")
+                    self.assertRegex(code, r"^[A-Z][A-Z0-9_]+$")
+                    self.assertNotIn("/", code)
+                    self.assertNotIn("PRIVATE_", detail)
+
+        result, failure = RUNNER.inspect_run_result(
+            "candidate", json.dumps({"build": "candidate", "identityCheck": True}).encode()
+        )
+        self.assertEqual(result, {"build": "candidate", "identityCheck": True})
+        self.assertIsNone(failure)
+        self.assertEqual(
+            RUNNER.run_result_blocker_code("invalid/raw", "RESULT_MISSING", True),
+            "UNEXPECTED_RUNNER_FAILURE",
+        )
+
+    def test_changed_result_files_drive_terminal_loop_states(self) -> None:
+        for failure in RUNNER.RUN_RESULT_FAILURES:
+            self.assertEqual(
+                RUNNER.should_retry_run_result(failure), failure == "RESULT_MISSING"
+            )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            documents = pathlib.Path(temporary)
+            before = RUNNER.snapshot_result_files(documents)
+            result, failure = RUNNER.inspect_changed_run_result("source", documents, before)
+            self.assertIsNone(result)
+            self.assertEqual(failure, "RESULT_MISSING")
+            self.assertTrue(RUNNER.should_retry_run_result(failure))
+
+            candidate = documents / RUNNER.RESULT_NAMES["candidate"]
+            candidate.write_text(
+                json.dumps({"build": "candidate", "identityCheck": True}), encoding="utf-8"
+            )
+            _, failure = RUNNER.inspect_changed_run_result("source", documents, before)
+            self.assertEqual(failure, "RESULT_BUILD_MISMATCH")
+            self.assertFalse(RUNNER.should_retry_run_result(failure))
+
+        with tempfile.TemporaryDirectory() as temporary:
+            documents = pathlib.Path(temporary)
+            before = RUNNER.snapshot_result_files(documents)
+            (documents / RUNNER.INVALID_RESULT_NAME).write_text(
+                json.dumps({"build": "invalid", "identityCheck": False}), encoding="utf-8"
+            )
+            _, failure = RUNNER.inspect_changed_run_result("source", documents, before)
+            self.assertEqual(failure, "ENVIRONMENT_INVALID")
+            self.assertFalse(RUNNER.should_retry_run_result(failure))
+
+        expected_cases = (
+            (b"{", None, "RESULT_SCHEMA_INVALID"),
+            (
+                json.dumps({"build": "source", "identityCheck": False}).encode(),
+                None,
+                "IDENTITY_FALSE",
+            ),
+            (
+                json.dumps({"build": "source", "identityCheck": True}).encode(),
+                {"build": "source", "identityCheck": True},
+                None,
+            ),
+        )
+        for payload, expected_result, expected_failure in expected_cases:
+            with (
+                self.subTest(expected_failure=expected_failure),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                documents = pathlib.Path(temporary)
+                before = RUNNER.snapshot_result_files(documents)
+                (documents / RUNNER.RESULT_NAMES["source"]).write_bytes(payload)
+                result, failure = RUNNER.inspect_changed_run_result("source", documents, before)
+                self.assertEqual(result, expected_result)
+                self.assertEqual(failure, expected_failure)
+
+    def test_prior_source_result_does_not_poison_candidate_run(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            documents = pathlib.Path(temporary)
+            source_result = documents / RUNNER.RESULT_NAMES["source"]
+            source_result.write_text(
+                json.dumps({"build": "source", "identityCheck": True}), encoding="utf-8"
+            )
+            before = RUNNER.snapshot_result_files(documents)
+            result, failure = RUNNER.inspect_changed_run_result("candidate", documents, before)
+            self.assertIsNone(result)
+            self.assertEqual(failure, "RESULT_MISSING")
+
+            source_result.write_text(
+                json.dumps({"build": "source", "identityCheck": False}), encoding="utf-8"
+            )
+            _, failure = RUNNER.inspect_changed_run_result("candidate", documents, before)
+            self.assertEqual(failure, "RESULT_BUILD_MISMATCH")
+
+    def test_launch_uses_documented_terminate_running_process_option(self) -> None:
+        source = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn('"launch", "--terminate-running-process"', source)
+        self.assertNotIn('"launch", "--terminate-running",', source)
+
+    def test_run_result_public_values_do_not_include_raw_payload_values(self) -> None:
+        raw_build = "PRIVATE_CUSTOMER_BUILD"
+        raw_value = "PRIVATE_IDENTITY_VALUE"
+        payload = json.dumps(
+            {"build": raw_build, "identityCheck": True, "identity": raw_value}
+        ).encode()
+        _, failure = RUNNER.inspect_run_result("source", payload)
+        code = RUNNER.run_result_blocker_code("source", failure, True)
+        detail = RUNNER.BLOCKER_DETAILS[code]
+        public_output = json.dumps({"blockers": [{"code": code, "detail": detail}]})
+        for sentinel in (raw_build, raw_value):
+            with self.subTest(sentinel=sentinel):
+                self.assertNotIn(sentinel, code)
+                self.assertNotIn(sentinel, detail)
+                self.assertNotIn(sentinel, public_output)
+
     def marker_body(self) -> bytes:
         return json.dumps(
             {
@@ -230,6 +389,12 @@ class UpgradeEvidenceCaptureTests(unittest.TestCase):
             handler._respond = lambda _value, status=200: statuses.append(status)
             handler.do_POST()
             return statuses, dict(ledger.markers)
+
+    def config_get_count(self, method: str, path: str) -> int:
+        with tempfile.TemporaryDirectory() as temporary:
+            ledger = RUNNER.CaptureLedger(pathlib.Path(temporary))
+            ledger.record(method, path, {}, b"")
+            return ledger.exact_config_get_count()
 
     def test_capture_ledger_accepts_exact_post_batch(self) -> None:
         self.assertEqual(
@@ -265,6 +430,26 @@ class UpgradeEvidenceCaptureTests(unittest.TestCase):
             batch_markers,
             {"source": ("opaque-identity", "source-session")},
         )
+
+    def test_config_observation_requires_the_exact_get(self) -> None:
+        cases = (
+            ("GET", "/v1/upgrade-evidence/config", 1),
+            ("POST", "/v1/upgrade-evidence/config", 0),
+            ("GET", "/v1/upgrade-evidence/config?forged=1", 0),
+            ("GET", "/prefix/v1/upgrade-evidence/config", 0),
+        )
+        for method, path, expected in cases:
+            with self.subTest(method=method, path=path):
+                self.assertEqual(self.config_get_count(method, path), expected)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            ledger = RUNNER.CaptureLedger(pathlib.Path(temporary))
+            ledger.record("GET", RUNNER.CONFIG_PATH, {}, b"")
+            before_candidate = ledger.exact_config_get_count()
+            ledger.record("GET", f"{RUNNER.CONFIG_PATH}?stale=1", {}, b"")
+            self.assertEqual(ledger.exact_config_get_count(), before_candidate)
+            ledger.record("GET", RUNNER.CONFIG_PATH, {}, b"")
+            self.assertGreater(ledger.exact_config_get_count(), before_candidate)
 
 
 if __name__ == "__main__":

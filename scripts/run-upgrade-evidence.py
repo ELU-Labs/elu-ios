@@ -33,6 +33,7 @@ RESULT_NAMES = {
     "source": "elu-upgrade-source-result.json",
     "candidate": "elu-upgrade-candidate-result.json",
 }
+INVALID_RESULT_NAME = "elu-upgrade-invalid-result.json"
 EVENT_NAMES = {
     "source": "elu_sdk_upgrade_source",
     "candidate": "elu_sdk_upgrade_candidate",
@@ -40,6 +41,7 @@ EVENT_NAMES = {
 TELEMETRY_METHOD = "POST"
 TELEMETRY_PATH = "/batch"
 FLAGS_PATH = "/flags?v=2"
+CONFIG_PATH = "/v1/upgrade-evidence/config"
 HARNESS_SOURCE = ROOT / HARNESS_RELATIVE / "AppDelegate.swift"
 HARNESS_DIAGNOSTIC_PATH = f"{HARNESS_RELATIVE.as_posix().casefold()}/appdelegate.swift"
 BUILD_PREFIXES = {"source": "SOURCE", "candidate": "CANDIDATE"}
@@ -70,6 +72,17 @@ COMPILER_ORIGIN_PRIORITY = (
     "UNKNOWN",
 )
 COMPILER_CATEGORY_PRIORITY = ("AVAILABILITY", "CONCURRENCY", "API", "OTHER")
+RUN_RESULT_FAILURES = {
+    "RESULT_MISSING": "did not write its result before the runner deadline",
+    "RESULT_SCHEMA_INVALID": "wrote a result that did not match the fixed result schema",
+    "RESULT_BUILD_MISMATCH": "wrote a result for a different build role",
+    "ENVIRONMENT_INVALID": "reported that its fixed launch environment was invalid",
+    "IDENTITY_FALSE": "reported that the expected identity was not observed",
+}
+CONFIG_GET_OBSERVATIONS = {
+    True: ("CONFIG_GET_OBSERVED", "the exact configuration GET was observed"),
+    False: ("CONFIG_GET_NOT_OBSERVED", "the exact configuration GET was not observed"),
+}
 BLOCKER_DETAILS = {
     "FULL_XCODE_REQUIRED": "The selected developer directory does not provide Xcode and the iOS Simulator tools.",
     "CANDIDATE_CHECKOUT_DIRTY": "The candidate checkout must be clean so its revision exactly identifies the tested source.",
@@ -102,6 +115,11 @@ for build_prefix, build_label in (("SOURCE", "source-version"), ("CANDIDATE", "c
         for category_code, category_label in COMPILER_CATEGORIES.items():
             BLOCKER_DETAILS[f"{build_prefix}_BUILD_COMPILE_{origin_code}_{category_code}"] = (
                 f"The {build_label} build reported {category_label} in {origin_label}."
+            )
+    for failure_code, failure_label in RUN_RESULT_FAILURES.items():
+        for observation_code, observation_label in CONFIG_GET_OBSERVATIONS.values():
+            BLOCKER_DETAILS[f"{build_prefix}_RUN_{failure_code}_{observation_code}"] = (
+                f"The {build_label} application {failure_label}; {observation_label}."
             )
 
 
@@ -278,6 +296,98 @@ def classify_build_failure(build: str, stdout: bytes, stderr: bytes) -> str:
     return f"{prefix}_BUILD_FAILED"
 
 
+def inspect_run_result(
+    build: str, payload: bytes | None
+) -> tuple[dict[str, Any] | None, str | None]:
+    if build not in BUILD_PREFIXES:
+        return None, "UNEXPECTED_RUNNER_FAILURE"
+    if payload is None:
+        return None, "RESULT_MISSING"
+
+    def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate result key")
+            result[key] = value
+        return result
+
+    try:
+        loaded = json.loads(payload, object_pairs_hook=reject_duplicate_keys)
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        return None, "RESULT_SCHEMA_INVALID"
+    if not isinstance(loaded, dict) or set(loaded) != {"build", "identityCheck"}:
+        return None, "RESULT_SCHEMA_INVALID"
+    result_build = loaded.get("build")
+    identity_check = loaded.get("identityCheck")
+    if not isinstance(result_build, str) or not isinstance(identity_check, bool):
+        return None, "RESULT_SCHEMA_INVALID"
+    if result_build != build:
+        return None, "RESULT_BUILD_MISMATCH"
+    if identity_check is not True:
+        return None, "IDENTITY_FALSE"
+    return {"build": result_build, "identityCheck": True}, None
+
+
+def result_file_stamp(path: pathlib.Path) -> tuple[int, int, int] | None:
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return stat.st_ino, stat.st_size, stat.st_mtime_ns
+
+
+def snapshot_result_files(documents: pathlib.Path) -> dict[str, tuple[int, int, int] | None]:
+    names = {**RESULT_NAMES, "invalid": INVALID_RESULT_NAME}
+    return {role: result_file_stamp(documents / name) for role, name in names.items()}
+
+
+def inspect_changed_run_result(
+    build: str,
+    documents: pathlib.Path,
+    before: dict[str, tuple[int, int, int] | None],
+) -> tuple[dict[str, Any] | None, str | None]:
+    if build not in BUILD_PREFIXES:
+        return None, "UNEXPECTED_RUNNER_FAILURE"
+    names = {**RESULT_NAMES, "invalid": INVALID_RESULT_NAME}
+    changed = {
+        role: path
+        for role, name in names.items()
+        if (path := documents / name).is_file()
+        and result_file_stamp(path) != before.get(role)
+    }
+    expected = changed.get(build)
+    if expected is not None:
+        try:
+            payload = expected.read_bytes()
+        except OSError:
+            payload = b""
+        return inspect_run_result(build, payload)
+    if "invalid" in changed:
+        return None, "ENVIRONMENT_INVALID"
+    for role in BUILD_PREFIXES:
+        if role == build or role not in changed:
+            continue
+        try:
+            payload = changed[role].read_bytes()
+        except OSError:
+            payload = b""
+        return inspect_run_result(build, payload)
+    return None, "RESULT_MISSING"
+
+
+def should_retry_run_result(failure: str | None) -> bool:
+    return failure == "RESULT_MISSING"
+
+
+def run_result_blocker_code(build: str, failure: str, config_get_observed: bool) -> str:
+    prefix = BUILD_PREFIXES.get(build)
+    observation = CONFIG_GET_OBSERVATIONS.get(config_get_observed)
+    if prefix is None or failure not in RUN_RESULT_FAILURES or observation is None:
+        return "UNEXPECTED_RUNNER_FAILURE"
+    return f"{prefix}_RUN_{failure}_{observation[0]}"
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=pathlib.Path, required=True)
@@ -332,6 +442,7 @@ class CaptureLedger:
         self.capture_directory.mkdir(parents=True, exist_ok=True)
         self.lock = threading.Lock()
         self.request_count = 0
+        self.config_get_count = 0
         self.markers: dict[str, tuple[str, str]] = {}
 
     def record(self, method: str, path: str, headers: dict[str, str], body: bytes) -> None:
@@ -348,6 +459,8 @@ class CaptureLedger:
             self._write_status()
 
     def _inspect(self, method: str, path: str, headers: dict[str, str], body: bytes) -> None:
+        if method == "GET" and path == CONFIG_PATH:
+            self.config_get_count += 1
         if method != TELEMETRY_METHOD or path != TELEMETRY_PATH:
             return
         if headers.get("Content-Encoding", "").casefold() == "gzip":
@@ -385,6 +498,10 @@ class CaptureLedger:
                 "sessionRotated": source is not None and candidate is not None and source[1] != candidate[1],
             },
         )
+
+    def exact_config_get_count(self) -> int:
+        with self.lock:
+            return self.config_get_count
 
     def wait_for(self, build: str, timeout: float = 15) -> bool:
         deadline = time.monotonic() + timeout
@@ -428,7 +545,7 @@ class EvidenceHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802
         self._record()
-        if self.path == "/v1/upgrade-evidence/config":
+        if self.path == CONFIG_PATH:
             self._respond(
                 {
                     "v": 1,
@@ -734,7 +851,10 @@ def install_and_run(
     ledger: CaptureLedger,
     raw_directory: pathlib.Path,
 ) -> tuple[pathlib.Path, bool]:
-    code = "SOURCE_RUN_FAILED" if build == "source" else "CANDIDATE_RUN_FAILED"
+    prefix = BUILD_PREFIXES.get(build)
+    if prefix is None:
+        raise HarnessBlocked("UNEXPECTED_RUNNER_FAILURE")
+    code = f"{prefix}_RUN_FAILED"
     diagnostics = raw_directory / "diagnostics"
     run_command(
         ["xcrun", "simctl", "install", udid, str(app)],
@@ -751,26 +871,31 @@ def install_and_run(
     environment = os.environ.copy()
     environment["SIMCTL_CHILD_ELU_UPGRADE_BUILD"] = build
     environment["SIMCTL_CHILD_ELU_UPGRADE_ORIGIN"] = origin
+    config_gets_before_launch = ledger.exact_config_get_count()
+    result_documents = container / "Documents"
+    result_files_before_launch = snapshot_result_files(result_documents)
     run_command(
-        ["xcrun", "simctl", "launch", "--terminate-running", udid, BUNDLE_ID],
+        ["xcrun", "simctl", "launch", "--terminate-running-process", udid, BUNDLE_ID],
         code=code,
         diagnostics=diagnostics,
         env=environment,
     )
-    result_path = container / "Documents" / RESULT_NAMES[build]
     deadline = time.monotonic() + 30
     result: dict[str, Any] | None = None
+    failure = "RESULT_MISSING"
     while time.monotonic() < deadline:
-        try:
-            loaded = json.loads(result_path.read_text(encoding="utf-8"))
-            if isinstance(loaded, dict) and loaded.get("build") == build:
-                result = loaded
-                break
-        except (OSError, json.JSONDecodeError):
-            pass
+        result, inspected_failure = inspect_changed_run_result(
+            build, result_documents, result_files_before_launch
+        )
+        if inspected_failure is None:
+            break
+        failure = inspected_failure
+        if not should_retry_run_result(failure):
+            break
         time.sleep(0.2)
-    if result is None or result.get("identityCheck") is not True:
-        raise HarnessBlocked(code)
+    if result is None:
+        config_get_observed = ledger.exact_config_get_count() > config_gets_before_launch
+        raise HarnessBlocked(run_result_blocker_code(build, failure, config_get_observed))
     write_json(
         raw_directory / "application-results" / f"{build}.json",
         {"build": build, "identityCheck": True},
