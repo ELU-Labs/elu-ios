@@ -46,6 +46,28 @@ def run_scanner(*arguments: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+def write_allowlist(
+    path: pathlib.Path,
+    *,
+    tracked_paths: list[str] | None = None,
+    artifact_basenames: list[str] | None = None,
+) -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "schemaVersion": 1,
+                "trackedPaths": tracked_paths
+                if tracked_paths is not None
+                else ["LICENSE", "legal/THIRD_PARTY_NOTICES.md"],
+                "artifactBasenames": artifact_basenames
+                if artifact_basenames is not None
+                else ["LICENSE", "THIRD_PARTY_NOTICES.md"],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
 def network_trace() -> dict[str, object]:
     return {
         "schemaVersion": 1,
@@ -70,6 +92,41 @@ class ZeroBrandScanTests(unittest.TestCase):
         self.assertEqual(scenarios["minItems"], len(REQUIRED_NETWORK_SCENARIOS))
         self.assertEqual(scenarios["maxItems"], len(REQUIRED_NETWORK_SCENARIOS))
         self.assertTrue(scenarios["uniqueItems"])
+
+    def test_allowlist_rejects_arbitrary_tracked_source(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            allowlist = pathlib.Path(directory) / "allowlist.json"
+            write_allowlist(
+                allowlist,
+                tracked_paths=["Sources/EluAnalytics/Elu.swift"],
+            )
+
+            result = run_scanner("--mode", "strict", "--allowlist", str(allowlist))
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("invalid zero-brand allowlist", result.stderr)
+        self.assertIn("invalid tracked legal path", result.stderr)
+
+    def test_allowlist_rejects_arbitrary_artifact_basename(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            allowlist = pathlib.Path(directory) / "allowlist.json"
+            write_allowlist(allowlist, artifact_basenames=["Runtime.swift"])
+
+            result = run_scanner("--mode", "strict", "--allowlist", str(allowlist))
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("invalid zero-brand allowlist", result.stderr)
+        self.assertIn("invalid legal artifact basename", result.stderr)
+
+    def test_allowlist_rejects_directories_and_globs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            allowlist = pathlib.Path(directory) / "allowlist.json"
+            write_allowlist(allowlist, tracked_paths=["legal/LICENSE*"])
+
+            result = run_scanner("--mode", "strict", "--allowlist", str(allowlist))
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("invalid tracked legal path", result.stderr)
 
     def test_strict_allows_only_named_legal_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

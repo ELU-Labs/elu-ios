@@ -30,6 +30,10 @@ release waiver.
 
 Archive inspection recurses through four nested archive layers; deeper nesting
 is itself a strict-gate failure rather than an unscanned exception.
+Allowlist JSON cannot legalize an arbitrary path: the scanner accepts only
+tracked, regular, non-symlink files at the repository root or directly under
+`legal/`, and every tracked/artifact basename must match `LICENSE*` or
+`THIRD_PARTY_NOTICES*`. Paths, directories, globs, and duplicates fail closed.
 
 ## Local validation limitation
 

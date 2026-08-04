@@ -21,6 +21,8 @@ ALLOWLIST = ROOT / "legal" / "zero-brand-allowlist.json"
 DEFAULT_BASELINE = ROOT / "Baselines" / "phase-1-wrapper" / "zero-brand-debt.json"
 DEFAULT_HOSTS = ROOT / "release" / "elu-owned-hosts.txt"
 IDENTIFIER_MARKER = "Forbidden-Identifier:"
+LEGAL_BASENAME = re.compile(r"^(?:LICENSE|THIRD_PARTY_NOTICES).*", re.IGNORECASE)
+GLOB_CHARACTER = re.compile(r"[*?\[\]{}]")
 REQUIRED_NETWORK_SCENARIOS = frozenset(
     {
         "config",
@@ -45,9 +47,63 @@ def load_identifier() -> bytes:
     raise RuntimeError(f"missing {IDENTIFIER_MARKER} in {NOTICE}")
 
 
-def load_allowlist() -> tuple[set[str], set[str]]:
-    data = json.loads(ALLOWLIST.read_text(encoding="utf-8"))
-    return set(data["trackedPaths"]), set(data["artifactBasenames"])
+def is_legal_basename(value: str) -> bool:
+    return bool(LEGAL_BASENAME.fullmatch(value))
+
+
+def load_allowlist(path: pathlib.Path) -> tuple[set[str], set[str]]:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict) or data.get("schemaVersion") != 1:
+        raise ValueError("schemaVersion must be 1")
+    tracked = data.get("trackedPaths")
+    artifacts = data.get("artifactBasenames")
+    if not isinstance(tracked, list) or not isinstance(artifacts, list):
+        raise ValueError("trackedPaths and artifactBasenames must be arrays")
+    if not all(isinstance(entry, str) for entry in tracked + artifacts):
+        raise ValueError("allowlist entries must be strings")
+    if len(tracked) != len({entry.casefold() for entry in tracked}) or len(artifacts) != len(
+        {entry.casefold() for entry in artifacts}
+    ):
+        raise ValueError("allowlist entries must be unique")
+
+    repository_paths = set(tracked_paths())
+    for entry in tracked:
+        if not isinstance(entry, str) or not entry:
+            raise ValueError(f"invalid tracked legal path: {entry!r}")
+        pure = pathlib.PurePosixPath(entry)
+        parts = pure.parts
+        in_legal_location = len(parts) == 1 or (len(parts) == 2 and parts[0] == "legal")
+        canonical = (
+            not pure.is_absolute()
+            and pure.as_posix() == entry
+            and ".." not in parts
+            and "\\" not in entry
+            and GLOB_CHARACTER.search(entry) is None
+        )
+        resolved = ROOT / entry
+        if (
+            not canonical
+            or not in_legal_location
+            or not is_legal_basename(pure.name)
+            or entry not in repository_paths
+            or resolved.is_symlink()
+            or not resolved.is_file()
+        ):
+            raise ValueError(f"invalid tracked legal path: {entry!r}")
+
+    for entry in artifacts:
+        if (
+            not isinstance(entry, str)
+            or not entry
+            or pathlib.PurePosixPath(entry).name != entry
+            or "/" in entry
+            or "\\" in entry
+            or GLOB_CHARACTER.search(entry) is not None
+            or not is_legal_basename(entry)
+        ):
+            raise ValueError(f"invalid legal artifact basename: {entry!r}")
+
+    return set(tracked), set(artifacts)
 
 
 def count_identifier(data: bytes, identifier: bytes) -> int:
@@ -282,6 +338,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input", type=pathlib.Path, action="append", default=[])
     parser.add_argument("--network-trace", type=pathlib.Path, action="append", default=[])
     parser.add_argument("--owned-hosts", type=pathlib.Path, default=DEFAULT_HOSTS)
+    parser.add_argument("--allowlist", type=pathlib.Path, default=ALLOWLIST)
     parser.add_argument("--skip-source", action="store_true")
     return parser.parse_args()
 
@@ -289,7 +346,11 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     identifier = load_identifier()
-    tracked_allowlist, artifact_allowlist = load_allowlist()
+    try:
+        tracked_allowlist, artifact_allowlist = load_allowlist(args.allowlist)
+    except (OSError, json.JSONDecodeError, ValueError) as error:
+        print(f"invalid zero-brand allowlist: {redact(str(error), identifier)}", file=sys.stderr)
+        return 1
     source_findings = {} if args.skip_source else scan_source(identifier, tracked_allowlist)
     artifact_findings: dict[str, int] = {}
     for path in args.input:
