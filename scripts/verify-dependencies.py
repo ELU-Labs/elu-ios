@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify the temporary baseline pin or the future owned-runtime dependency gate."""
+"""Verify the recorded dependency graph or require an empty runtime graph."""
 
 from __future__ import annotations
 
@@ -10,12 +10,12 @@ import sys
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-PROVENANCE = ROOT / "legal" / "THIRD_PARTY_NOTICES.provenance.json"
+DEPENDENCIES = ROOT / "legal" / "THIRD_PARTY_NOTICES.dependencies.json"
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=("baseline", "owned-runtime"), default="baseline")
+    parser.add_argument("--mode", choices=("baseline", "strict"), default="baseline")
     parser.add_argument("--resolved", type=pathlib.Path, default=ROOT / "Package.resolved")
     return parser.parse_args()
 
@@ -23,8 +23,8 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     if not args.resolved.is_file():
-        if args.mode == "owned-runtime":
-            print("verified owned runtime has no resolved third-party dependency graph")
+        if args.mode == "strict":
+            print("verified no resolved third-party dependency graph")
             return 0
         print(f"missing resolved dependency graph: {args.resolved}", file=sys.stderr)
         return 1
@@ -34,28 +34,28 @@ def main() -> int:
         print("resolved dependency graph has no pins array", file=sys.stderr)
         return 1
 
-    provenance = json.loads(PROVENANCE.read_text(encoding="utf-8"))
-    historical = provenance["packages"]
-    historical_identities = {package["identity"].casefold() for package in historical}
-    historical_sources = {package["source"].casefold() for package in historical}
+    dependency_inventory = json.loads(DEPENDENCIES.read_text(encoding="utf-8"))
+    inventoried = dependency_inventory["packages"]
+    inventoried_identities = {package["identity"].casefold() for package in inventoried}
+    inventoried_sources = {package["source"].casefold() for package in inventoried}
 
-    if args.mode == "owned-runtime":
+    if args.mode == "strict":
         leaked = [
             pin
             for pin in pins
-            if str(pin.get("identity", "")).casefold() in historical_identities
-            or str(pin.get("location", "")).casefold() in historical_sources
+            if str(pin.get("identity", "")).casefold() in inventoried_identities
+            or str(pin.get("location", "")).casefold() in inventoried_sources
         ]
         if leaked:
-            print("owned-runtime dependency gate failed: historical runtime still resolves", file=sys.stderr)
+            print("strict dependency gate failed: inventoried runtime still resolves", file=sys.stderr)
             return 1
-        print("verified resolved graph has no historical runtime dependency")
+        print("verified resolved graph has no inventoried runtime dependency")
         return 0
 
-    if len(historical) != 1 or len(pins) != 1:
-        print("baseline dependency graph must contain exactly the inventoried parity package", file=sys.stderr)
+    if len(inventoried) != 1 or len(pins) != 1:
+        print("baseline dependency graph must contain exactly the inventoried package", file=sys.stderr)
         return 1
-    expected = historical[0]
+    expected = inventoried[0]
     pin = pins[0]
     state = pin.get("state", {})
     checks = {
@@ -68,7 +68,7 @@ def main() -> int:
     if failed:
         print(f"baseline dependency mismatch: {', '.join(failed)}", file=sys.stderr)
         return 1
-    print("verified exact Phase 1 parity dependency against legal provenance")
+    print("verified exact dependency against legal inventory")
     return 0
 
 

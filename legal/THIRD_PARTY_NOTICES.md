@@ -2,9 +2,8 @@
 
 Forbidden-Identifier: PostHog
 
-This legal artifact records the complete runtime dependency present in the
-historical `0.1.0` wrapper baseline. Retention here does not grant a branding
-exception elsewhere in a future ownership release.
+This file contains required notices for third-party components distributed
+with EluAnalytics `0.1.0`.
 
 ## posthog-ios 3.69.0
 

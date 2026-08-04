@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Scan source, artifacts, symbols, archives, and network traces for release debt."""
+"""Scan source, artifacts, symbols, archives, and network traces for identifiers."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from urllib.parse import urlparse
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 NOTICE = ROOT / "legal" / "THIRD_PARTY_NOTICES.md"
 ALLOWLIST = ROOT / "legal" / "zero-brand-allowlist.json"
-DEFAULT_BASELINE = ROOT / "Baselines" / "phase-1-wrapper" / "zero-brand-debt.json"
+DEFAULT_BASELINE = ROOT / "Baselines" / "package-validation" / "source-scan-baseline.json"
 DEFAULT_HOSTS = ROOT / "release" / "elu-owned-hosts.txt"
 IDENTIFIER_MARKER = "Forbidden-Identifier:"
 LEGAL_BASENAME = re.compile(r"^(?:LICENSE|THIRD_PARTY_NOTICES).*", re.IGNORECASE)
@@ -325,9 +325,9 @@ def baseline_errors(findings: dict[str, int], baseline_path: pathlib.Path) -> li
     errors: list[str] = []
     for path, count in sorted(findings.items()):
         if path not in expected:
-            errors.append(f"new debt path: {path} ({count})")
+            errors.append(f"new finding path: {path} ({count})")
         elif count > expected[path]:
-            errors.append(f"debt increased: {path} ({expected[path]} -> {count})")
+            errors.append(f"findings increased: {path} ({expected[path]} -> {count})")
     return errors
 
 
@@ -377,7 +377,7 @@ def main() -> int:
 
     errors = baseline_errors(source_findings, args.baseline)
     if artifact_findings:
-        errors.append("generated/artifact inputs must be strict-clean even while source debt is active")
+        errors.append("generated/artifact inputs must be strict-clean in baseline mode")
     errors.extend(network_errors)
     for error in errors:
         print(redact(error, identifier), file=sys.stderr)

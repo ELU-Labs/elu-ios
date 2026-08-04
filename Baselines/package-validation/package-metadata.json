@@ -16,8 +16,8 @@
     ]
   },
   "dependency": {
-    "identityAndSource": "legal/THIRD_PARTY_NOTICES.provenance.json",
+    "identityAndSource": "legal/THIRD_PARTY_NOTICES.dependencies.json",
     "requirement": { "kind": "exact", "version": "3.69.0" },
-    "status": "temporary Phase 1 parity pin; removed by owned-runtime gate"
+    "resolutionPolicy": "exact version verified against the legal dependency inventory"
   }
 }

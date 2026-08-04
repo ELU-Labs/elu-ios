@@ -34,9 +34,7 @@ final class EluConfigClient {
         session = URLSession(configuration: cfg)
     }
 
-    /// Builds the baseline v1 config URL with the site key as exactly one path
-    /// component. The response contract remains provisional until the browser
-    /// SDK freezes the shared v1 schema.
+    /// Builds the v1 config URL with the site key as exactly one path component.
     static func requestURL(configHost: URL, siteKey: String) -> URL? {
         guard !siteKey.isEmpty,
               var components = URLComponents(url: configHost, resolvingAgainstBaseURL: false),

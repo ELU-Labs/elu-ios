@@ -12,8 +12,7 @@
       "bundledRuntimeComponents": [
         { "name": "PLCrashReporter", "license": "MIT and Apache-2.0 portions" },
         { "name": "libwebp", "license": "BSD-3-Clause" }
-      ],
-      "status": "temporary wrapper dependency scheduled for Phase 2 removal"
+      ]
     }
   ]
 }

@@ -29,8 +29,8 @@ def validate(path: pathlib.Path) -> list[str]:
     data = json.loads(path.read_text(encoding="utf-8"))
     if data.get("schemaVersion") != 1:
         errors.append("schemaVersion must be 1")
-    if data.get("contractStatus") != "provisional-awaiting-browser-v1":
-        errors.append("contractStatus must remain provisional until the shared contract freezes")
+    if data.get("contractStatus") != "observable-surface-only":
+        errors.append("contractStatus must describe the observable surface scope")
     baseline = data.get("baseline", {})
     for key in ("sdkVersion", "sourceTag", "sourceCommit"):
         if not baseline.get(key):
@@ -63,7 +63,7 @@ def validate(path: pathlib.Path) -> list[str]:
         evidence = case.get("evidence")
         if not isinstance(evidence, dict) or evidence.get("status") not in {
             "verified",
-            "foundation-only",
+            "partial",
             "pending",
         }:
             errors.append(f"{prefix}.evidence has an invalid status")

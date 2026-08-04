@@ -13,8 +13,7 @@ let package = Package(
         ),
     ],
     dependencies: [
-        // Phase 1 baseline pin. The Phase 2 owned-runtime change removes this
-        // dependency entirely; pinning avoids a moving parity reference.
+        // An exact version keeps dependency resolution reproducible.
         .package(url: "https://github.com/PostHog/posthog-ios.git", exact: "3.69.0"),
     ],
     targets: [

@@ -10,7 +10,7 @@ struct EluPrivacyConfig: Equatable {
     var maskAllText: Bool
     var maskImages: Bool
     var replayNewUsersOnly: Bool
-    /// 1–60 per-PostHog-session replay budget in minutes; 0 = unlimited.
+    /// 1–60 minute replay budget per analytics session; 0 = unlimited.
     var replayMaxMinutes: Int
 
     static let replayMaxMinutesCap = 60

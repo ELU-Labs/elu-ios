@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare `swift package dump-package` output with the Phase 1 package snapshot."""
+"""Compare `swift package dump-package` output with the package snapshot."""
 
 from __future__ import annotations
 
@@ -10,13 +10,13 @@ import sys
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-SNAPSHOT = ROOT / "Baselines" / "phase-1-wrapper" / "package-metadata.json"
-PROVENANCE = ROOT / "legal" / "THIRD_PARTY_NOTICES.provenance.json"
+SNAPSHOT = ROOT / "Baselines" / "package-validation" / "package-metadata.json"
+DEPENDENCIES = ROOT / "legal" / "THIRD_PARTY_NOTICES.dependencies.json"
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=("baseline", "owned-runtime"), default="baseline")
+    parser.add_argument("--mode", choices=("baseline", "strict"), default="baseline")
     parser.add_argument("dump", type=pathlib.Path)
     return parser.parse_args()
 
@@ -30,7 +30,7 @@ def main() -> int:
     args = parse_args()
     actual = json.loads(args.dump.read_text(encoding="utf-8"))
     expected = json.loads(SNAPSHOT.read_text(encoding="utf-8"))
-    dependency = json.loads(PROVENANCE.read_text(encoding="utf-8"))["packages"][0]
+    dependency = json.loads(DEPENDENCIES.read_text(encoding="utf-8"))["packages"][0]
     package = expected["package"]
 
     if actual.get("name") != package["name"]:
@@ -58,18 +58,18 @@ def main() -> int:
     ]
     if args.mode == "baseline" and actual_targets != package["targets"]:
         fail(f"targets changed: {actual_targets!r}")
-    if args.mode == "owned-runtime":
+    if args.mode == "strict":
         actual_target_names = {item["name"] for item in actual_targets}
         required_target_names = {item["name"] for item in package["targets"]}
         if not required_target_names.issubset(actual_target_names):
-            fail("owned runtime removed a frozen facade or test target")
+            fail("strict package removed a frozen facade or test target")
 
     dependencies = actual.get("dependencies", [])
-    if args.mode == "owned-runtime":
-        print("verified owned-runtime Package.swift metadata and public product surface")
+    if args.mode == "strict":
+        print("verified strict Package.swift metadata and public product surface")
         return 0
     if len(dependencies) != 1:
-        fail("Phase 1 manifest must have exactly one parity dependency")
+        fail("manifest must have exactly one inventoried dependency")
     source_control = dependencies[0].get("sourceControl", [])
     if len(source_control) != 1:
         fail("dependency is not a single source-control requirement")
@@ -77,13 +77,13 @@ def main() -> int:
     remote = item.get("location", {}).get("remote", [])
     requirement = item.get("requirement", {}).get("exact", [])
     if item.get("identity") != dependency["identity"]:
-        fail("dependency identity differs from legal provenance")
+        fail("dependency identity differs from legal inventory")
     if remote != [{"urlString": dependency["source"]}]:
-        fail("dependency source differs from legal provenance")
+        fail("dependency source differs from legal inventory")
     if requirement != [dependency["version"]]:
         fail("dependency is not pinned to the inventoried exact version")
 
-    print("verified Phase 1 Package.swift metadata and public product surface")
+    print("verified Package.swift metadata and public product surface")
     return 0
 
 

@@ -132,7 +132,7 @@ def main() -> int:
 
     legal_output = args.output / "legal"
     legal_output.mkdir(exist_ok=True)
-    for path in (ROOT / "LICENSE", ROOT / "legal" / "THIRD_PARTY_NOTICES.md", ROOT / "legal" / "THIRD_PARTY_NOTICES.provenance.json"):
+    for path in (ROOT / "LICENSE", ROOT / "legal" / "THIRD_PARTY_NOTICES.md", ROOT / "legal" / "THIRD_PARTY_NOTICES.dependencies.json"):
         shutil.copy2(path, legal_output / path.name)
 
     checksum_targets = sorted(
