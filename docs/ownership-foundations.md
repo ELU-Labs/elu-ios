@@ -64,7 +64,12 @@ simulator and consumer builds, API/symbol parity, an archive, SBOM, checksums,
 provenance, legal payload, captured build logs, and strict
 source/artifact/network scans. The trace must contain the real release
 candidate's observed SDK requests normalized to
-`release/network-trace.schema.json`; an empty trace is rejected. The exact tag
+`release/network-trace.schema.json`. Its scenario ledger must cover config,
+capture, identify, reset, flags, replay, background, foreground, and
+offline-recovery exactly once. Request rows are separate: multiple requests
+per scenario are valid, zero is valid for a scenario such as reset, and at
+least one request is required across the trace. Missing, duplicate, or unknown
+scenario declarations and unknown request labels are rejected. The exact tag
 must carry a valid Git or SSH signature. The preflight never publishes, moves
 a tag, or deploys.
 

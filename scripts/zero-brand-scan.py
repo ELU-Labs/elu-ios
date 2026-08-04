@@ -21,6 +21,19 @@ ALLOWLIST = ROOT / "legal" / "zero-brand-allowlist.json"
 DEFAULT_BASELINE = ROOT / "Baselines" / "phase-1-wrapper" / "zero-brand-debt.json"
 DEFAULT_HOSTS = ROOT / "release" / "elu-owned-hosts.txt"
 IDENTIFIER_MARKER = "Forbidden-Identifier:"
+REQUIRED_NETWORK_SCENARIOS = frozenset(
+    {
+        "config",
+        "capture",
+        "identify",
+        "reset",
+        "flags",
+        "replay",
+        "background",
+        "foreground",
+        "offline-recovery",
+    }
+)
 
 
 def load_identifier() -> bytes:
@@ -179,31 +192,60 @@ def host_is_owned(host: str, owned_hosts: set[str]) -> bool:
 
 
 def validate_network_trace(path: pathlib.Path, owned_hosts: set[str]) -> list[str]:
-    data = json.loads(path.read_text(encoding="utf-8"))
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return [f"{path}: trace must be valid JSON"]
     if not isinstance(data, dict):
         return [f"{path}: trace must be an object"]
     if data.get("schemaVersion") != 1:
         return [f"{path}: schemaVersion must be 1"]
+
+    errors: list[str] = []
+    scenarios = data.get("scenarios")
+    if not isinstance(scenarios, list):
+        errors.append(f"{path}: scenarios must be an array")
+        declared_scenarios: set[str] = set()
+    else:
+        declared_scenarios = set()
+        for index, scenario in enumerate(scenarios):
+            if not isinstance(scenario, str) or scenario not in REQUIRED_NETWORK_SCENARIOS:
+                errors.append(f"{path}: scenarios[{index}] is unknown: {scenario!r}")
+            elif scenario in declared_scenarios:
+                errors.append(f"{path}: scenarios[{index}] duplicates {scenario!r}")
+            else:
+                declared_scenarios.add(scenario)
+    missing_scenarios = REQUIRED_NETWORK_SCENARIOS - declared_scenarios
+    if missing_scenarios:
+        errors.append(f"{path}: missing release scenarios: {', '.join(sorted(missing_scenarios))}")
+
     requests = data.get("requests")
     if not isinstance(requests, list):
-        return [f"{path}: requests must be an array"]
+        return errors + [f"{path}: requests must be an array"]
     if not requests:
-        return [f"{path}: requests must contain at least one observed SDK request"]
-    errors: list[str] = []
+        return errors + [f"{path}: requests must contain at least one observed SDK request"]
     for index, request in enumerate(requests):
+        scenario = request.get("scenario") if isinstance(request, dict) else None
+        if not isinstance(scenario, str) or scenario not in REQUIRED_NETWORK_SCENARIOS:
+            errors.append(f"{path}: requests[{index}] has an unknown or missing scenario: {scenario!r}")
         url = request.get("url") if isinstance(request, dict) else None
-        parsed = urlparse(url) if isinstance(url, str) else None
+        try:
+            parsed = urlparse(url) if isinstance(url, str) else None
+            hostname = parsed.hostname if parsed is not None else None
+        except ValueError:
+            parsed = None
+            hostname = None
         if (
             parsed is None
             or parsed.scheme != "https"
-            or not parsed.hostname
+            or not hostname
             or parsed.username is not None
             or parsed.password is not None
         ):
             errors.append(f"{path}: requests[{index}] is not an absolute HTTPS URL")
             continue
-        if not host_is_owned(parsed.hostname, owned_hosts):
-            errors.append(f"{path}: requests[{index}] uses a non-ELU host: {parsed.hostname}")
+        if not host_is_owned(hostname, owned_hosts):
+            errors.append(f"{path}: requests[{index}] uses a non-ELU host: {hostname}")
     return errors
 
 
