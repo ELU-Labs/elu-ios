@@ -1,0 +1,45 @@
+{
+  "$schema": "https://elu.dev/schemas/sdk/ios/upgrade-evidence-v1.json",
+  "schemaVersion": 1,
+  "sourceVersion": "0.1.0",
+  "sourceRevision": "5825dfb4ca9cd1d104d0a07e33d0394128750391",
+  "candidateRevision": null,
+  "resolvedDependency": {
+    "inventoryReference": "legal/THIRD_PARTY_NOTICES.dependencies.json",
+    "source": null,
+    "candidate": null
+  },
+  "environment": {
+    "xcodeVersion": null,
+    "iOSVersion": null,
+    "bundleId": "dev.elu.sdk-upgrade-evidence"
+  },
+  "operations": [
+    "build-source",
+    "build-candidate",
+    "install-source",
+    "establish-identity-and-session",
+    "install-candidate-without-uninstall",
+    "relaunch-candidate",
+    "verify-identity-and-session-continuity"
+  ],
+  "expectedContinuity": {
+    "identity": "preserved",
+    "sourceSession": "present",
+    "candidateSession": "present",
+    "sessionTransition": "rotated"
+  },
+  "observedContinuity": null,
+  "rawEvidence": {
+    "sha256": null,
+    "custody": "external",
+    "status": "not-captured"
+  },
+  "verificationStatus": "blocked",
+  "blockers": [
+    {
+      "code": "RAW_EVIDENCE_NOT_CAPTURED",
+      "detail": "Run the macOS simulator evidence command to resolve both builds and produce externally custodied evidence."
+    }
+  ]
+}

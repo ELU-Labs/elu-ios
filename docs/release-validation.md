@@ -15,6 +15,10 @@ persistence schema.
 - Golden observable-behavior fixtures cover identity, reset, groups, flags,
   lifecycle, events, replay, privacy, persistence, and network routing.
 - UIKit and SwiftUI consumer targets compile representative customer calls.
+- The executable upgrade harness installs the immutable `0.1.0` build and the
+  candidate under one simulator bundle/container, then verifies preserved
+  identity and the source version's documented network-session rotation. Raw
+  captures remain outside the repository and logs.
 - Swift tests cover schema versions, URL encoding, activation policy, FIFO
   buffering, EU defaults, replay markers, facade concurrency, and callback
   ordering.
@@ -38,6 +42,7 @@ tracked, regular, non-symlink files at the repository root or directly under
 
 ```sh
 python3 scripts/verify-baseline.py
+python3 scripts/validate-upgrade-evidence.py
 python3 scripts/zero-brand-scan.py --mode baseline
 python3 -m unittest discover -s scripts/tests -p 'test_*.py' -v
 ```

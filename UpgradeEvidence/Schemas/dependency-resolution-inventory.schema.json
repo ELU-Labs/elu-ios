@@ -1,0 +1,95 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://elu.dev/schemas/sdk/ios/dependency-resolution-inventory-v1.json",
+  "title": "ELU iOS historical dependency-resolution inventory",
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "source",
+    "manifestRequirement",
+    "lockfile",
+    "dependencyInventory",
+    "observations",
+    "historicalUniversality"
+  ],
+  "properties": {
+    "$schema": { "type": "string" },
+    "schemaVersion": { "const": 1 },
+    "source": {
+      "type": "object",
+      "required": ["version", "revision", "manifestSha256"],
+      "properties": {
+        "version": { "const": "0.1.0" },
+        "revision": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "manifestSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      },
+      "additionalProperties": false
+    },
+    "manifestRequirement": {
+      "type": "object",
+      "required": ["kind", "lowerBound", "exclusiveUpperBound"],
+      "properties": {
+        "kind": { "const": "up-to-next-minor" },
+        "lowerBound": { "type": "string" },
+        "exclusiveUpperBound": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "lockfile": {
+      "type": "object",
+      "required": ["status", "meaning"],
+      "properties": {
+        "status": { "const": "absent-at-source" },
+        "meaning": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
+    "dependencyInventory": {
+      "type": "object",
+      "required": ["reference", "gitBlob", "sha256"],
+      "properties": {
+        "reference": { "const": "legal/THIRD_PARTY_NOTICES.dependencies.json" },
+        "gitBlob": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      },
+      "additionalProperties": false
+    },
+    "observations": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["observedOn", "resolution", "annotatedTag", "scope", "universalHistoricalClaim", "provenance"],
+        "properties": {
+          "observedOn": { "type": "string", "format": "date" },
+          "resolution": { "$ref": "https://elu.dev/schemas/sdk/ios/upgrade-evidence-v1.json#/$defs/resolution" },
+          "annotatedTag": {
+            "type": "object",
+            "required": ["name", "objectRevision", "peeledSourceRevision", "authenticationStatus"],
+            "properties": {
+              "name": { "type": "string" },
+              "objectRevision": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+              "peeledSourceRevision": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+              "authenticationStatus": { "const": "observational-until-executable-run" }
+            },
+            "additionalProperties": false
+          },
+          "scope": { "const": "single-dated-resolution" },
+          "universalHistoricalClaim": { "const": false },
+          "provenance": {
+            "type": "object",
+            "required": ["reference", "sha256"],
+            "properties": {
+              "reference": { "type": "string" },
+              "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+            },
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "historicalUniversality": { "const": "not-established" }
+  },
+  "additionalProperties": false
+}

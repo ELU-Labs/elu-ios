@@ -23,6 +23,8 @@ jobs:
           fetch-depth: 0
       - name: Verify immutable baseline and conformance fixtures
         run: python3 scripts/verify-baseline.py
+      - name: Validate upgrade evidence definitions
+        run: python3 scripts/validate-upgrade-evidence.py
       - name: Enforce source scan baseline
         run: python3 scripts/zero-brand-scan.py --mode baseline
       - name: Test strict scanners, evidence, and release trust
@@ -97,3 +99,36 @@ jobs:
             --input "$PWD/.build/interface-derived-data/Build/Products" \
             --input "$PWD/.build/symbol-graphs" \
             --input "$PWD/.build/release-evidence"
+
+  upgrade-evidence:
+    name: 0.1.0 simulator upgrade evidence
+    needs: validation
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Validate checked evidence definitions
+        run: python3 scripts/validate-upgrade-evidence.py
+      - name: Run same-container simulator upgrade
+        continue-on-error: true
+        run: |
+          python3 scripts/run-upgrade-evidence.py \
+            --output "$RUNNER_TEMP/elu-ios-upgrade-evidence" \
+            --custody runner-transient
+      - name: Validate generated evidence shape
+        if: always()
+        run: |
+          python3 scripts/validate-upgrade-evidence.py \
+            --manifest "$RUNNER_TEMP/elu-ios-upgrade-evidence/manifest.json"
+      - name: Require verified upgrade evidence
+        if: always()
+        run: |
+          python3 scripts/validate-upgrade-evidence.py \
+            --manifest "$RUNNER_TEMP/elu-ios-upgrade-evidence/manifest.json" \
+            --raw-archive "$RUNNER_TEMP/elu-ios-upgrade-evidence/raw-evidence.tar.gz" \
+            --require-verified
+      - name: Discard raw simulator capture
+        if: always()
+        run: rm -f "$RUNNER_TEMP/elu-ios-upgrade-evidence/raw-evidence.tar.gz"

@@ -1,0 +1,45 @@
+{
+  "$schema": "https://elu.dev/schemas/sdk/ios/dependency-resolution-inventory-v1.json",
+  "schemaVersion": 1,
+  "source": {
+    "version": "0.1.0",
+    "revision": "5825dfb4ca9cd1d104d0a07e33d0394128750391",
+    "manifestSha256": "9915a886e36d56accadf30f54471b8ff76b74409819ca626fb9496f311d65559"
+  },
+  "manifestRequirement": {
+    "kind": "up-to-next-minor",
+    "lowerBound": "3.69.0",
+    "exclusiveUpperBound": "3.70.0"
+  },
+  "lockfile": {
+    "status": "absent-at-source",
+    "meaning": "The source tag did not fix one dependency revision for every consumer resolver state."
+  },
+  "dependencyInventory": {
+    "reference": "legal/THIRD_PARTY_NOTICES.dependencies.json",
+    "gitBlob": "b834c59b28f534f9182178d679df81e591886b1f",
+    "sha256": "76c56aa5c4c642e25897079d95d6bc381d86b2aa7e2ac826da27d1eeb291837f"
+  },
+  "observations": [
+    {
+      "observedOn": "2026-08-03",
+      "resolution": {
+        "version": "3.69.0",
+        "revision": "1c9b3178746c8102c854c2569047aedcfdec8a0c"
+      },
+      "annotatedTag": {
+        "name": "3.69.0",
+        "objectRevision": "b0dd466cf92ea658e535d495ba843111135de9a6",
+        "peeledSourceRevision": "1c9b3178746c8102c854c2569047aedcfdec8a0c",
+        "authenticationStatus": "observational-until-executable-run"
+      },
+      "scope": "single-dated-resolution",
+      "universalHistoricalClaim": false,
+      "provenance": {
+        "reference": "Baselines/0.1.0/package-metadata.json",
+        "sha256": "4684acdb7598b016f03aba207d8b6db9e1818786e936a5861e76070ff24966f7"
+      }
+    }
+  ],
+  "historicalUniversality": "not-established"
+}
