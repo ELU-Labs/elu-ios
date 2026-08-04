@@ -12,7 +12,7 @@ the shared v1 contract.
 The historical tag is immutable. Generate its rollback archive with:
 
 ```sh
-git archive --format=tar --prefix=elu-ios-0.1.0/ 0.1.0 > elu-ios-0.1.0.tar
+git archive --format=tar 0.1.0 > git-archive-without-prefix.tar
 ```
 
 Then compare it with `SHA256SUMS`. The archive is intentionally generated on
