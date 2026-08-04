@@ -49,6 +49,16 @@ BLOCKER_DETAILS = {
     "SIMULATOR_UNAVAILABLE": "No available iOS Simulator runtime and phone device type could be prepared.",
     "SOURCE_BUILD_FAILED": "The source-version harness did not compile for the selected simulator.",
     "CANDIDATE_BUILD_FAILED": "The candidate harness did not compile for the selected simulator.",
+    "SOURCE_BUILD_DEPENDENCY_RESOLUTION_FAILED": "The source-version harness dependency graph did not resolve.",
+    "CANDIDATE_BUILD_DEPENDENCY_RESOLUTION_FAILED": "The candidate harness dependency graph did not resolve.",
+    "SOURCE_BUILD_CONFIGURATION_FAILED": "The source-version harness project configuration was invalid.",
+    "CANDIDATE_BUILD_CONFIGURATION_FAILED": "The candidate harness project configuration was invalid.",
+    "SOURCE_BUILD_COMPILATION_FAILED": "The source-version harness or package source did not compile.",
+    "CANDIDATE_BUILD_COMPILATION_FAILED": "The candidate harness or package source did not compile.",
+    "SOURCE_BUILD_LINK_FAILED": "The source-version harness did not link.",
+    "CANDIDATE_BUILD_LINK_FAILED": "The candidate harness did not link.",
+    "SOURCE_BUILD_PRODUCT_MISSING": "The source-version build completed without the expected app product.",
+    "CANDIDATE_BUILD_PRODUCT_MISSING": "The candidate build completed without the expected app product.",
     "DEPENDENCY_RESOLUTION_MISSING": "An exact dependency version and revision were not present in resolved build state.",
     "HISTORICAL_TAG_AUTHENTICATION_FAILED": "The resolved source dependency checkout did not authenticate the dated tag observation.",
     "SOURCE_RUN_FAILED": "The source-version application did not establish observable identity and session evidence.",
@@ -62,6 +72,55 @@ class HarnessBlocked(RuntimeError):
     def __init__(self, code: str):
         super().__init__(code)
         self.code = code
+
+
+def classify_build_failure(build: str, stdout: bytes, stderr: bytes) -> str:
+    prefix = build.upper()
+    diagnostic = (stdout + b"\n" + stderr).decode("utf-8", errors="replace").casefold()
+    categories = (
+        (
+            "DEPENDENCY_RESOLUTION_FAILED",
+            (
+                "could not resolve package dependencies",
+                "failed to resolve dependencies",
+                "failed to clone repository",
+                "couldn't update repository",
+                "package resolution errors must be fixed",
+            ),
+        ),
+        (
+            "CONFIGURATION_FAILED",
+            (
+                "missing package product",
+                "does not contain a scheme named",
+                "is not currently configured for the build action",
+                "unable to find a destination matching",
+                "could not open project",
+            ),
+        ),
+        (
+            "LINK_FAILED",
+            (
+                "linker command failed",
+                "undefined symbols for architecture",
+                "ld: symbol(s) not found",
+            ),
+        ),
+        (
+            "COMPILATION_FAILED",
+            (
+                "swiftcompile normal",
+                "swiftemitmodule normal",
+                "emit-swiftmodule command failed",
+                "compilec ",
+                " error:",
+            ),
+        ),
+    )
+    for category, markers in categories:
+        if any(marker in diagnostic for marker in markers):
+            return f"{prefix}_BUILD_{category}"
+    return f"{prefix}_BUILD_FAILED"
 
 
 def parse_args() -> argparse.Namespace:
@@ -95,6 +154,7 @@ def run_command(
     diagnostics: pathlib.Path,
     cwd: pathlib.Path = ROOT,
     env: dict[str, str] | None = None,
+    build_failure_role: str | None = None,
 ) -> bytes:
     try:
         result = subprocess.run(command, cwd=cwd, env=env, capture_output=True, check=False)
@@ -104,6 +164,8 @@ def run_command(
         diagnostics.mkdir(parents=True, exist_ok=True)
         (diagnostics / f"{code.lower()}-stdout.log").write_bytes(result.stdout)
         (diagnostics / f"{code.lower()}-stderr.log").write_bytes(result.stderr)
+        if build_failure_role is not None:
+            raise HarnessBlocked(classify_build_failure(build_failure_role, result.stdout, result.stderr))
         raise HarnessBlocked(code)
     return result.stdout
 
@@ -365,10 +427,11 @@ def build_app(
         code=code,
         diagnostics=raw_directory / "diagnostics",
         cwd=sdk_root / HARNESS_RELATIVE,
+        build_failure_role=build,
     )
     app = derived_data / "Build" / "Products" / "Debug-iphonesimulator" / APP_NAME
     if not app.is_dir():
-        raise HarnessBlocked(code)
+        raise HarnessBlocked(f"{build.upper()}_BUILD_PRODUCT_MISSING")
     return app, resolved_dependency(
         packages,
         raw_directory,

@@ -240,6 +240,7 @@
 /* Begin XCSwiftPackageProductDependency section */
 		A10000000000000000000004 /* EluAnalytics */ = {
 			isa = XCSwiftPackageProductDependency;
+			package = A10000000000000000000011 /* XCLocalSwiftPackageReference "../../.." */;
 			productName = EluAnalytics;
 		};
 /* End XCSwiftPackageProductDependency section */

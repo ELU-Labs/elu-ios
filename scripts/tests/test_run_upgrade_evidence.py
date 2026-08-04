@@ -11,6 +11,7 @@ import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts" / "run-upgrade-evidence.py"
+PROJECT = ROOT / "UpgradeEvidence" / "0.1.0" / "Harness" / "UpgradeHarness.xcodeproj" / "project.pbxproj"
 SPEC = importlib.util.spec_from_file_location("run_upgrade_evidence", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 RUNNER = importlib.util.module_from_spec(SPEC)
@@ -18,6 +19,28 @@ SPEC.loader.exec_module(RUNNER)
 
 
 class UpgradeEvidenceCaptureTests(unittest.TestCase):
+    def test_harness_product_is_bound_to_the_local_package(self) -> None:
+        project = PROJECT.read_text(encoding="utf-8")
+        self.assertIn(
+            'package = A10000000000000000000011 /* XCLocalSwiftPackageReference "../../.." */;',
+            project,
+        )
+
+    def test_build_failure_classification_is_fixed_enum_only(self) -> None:
+        cases = (
+            ("source", b"", b"Could not resolve package dependencies", "SOURCE_BUILD_DEPENDENCY_RESOLUTION_FAILED"),
+            ("source", b"error: Missing package product 'Example'", b"", "SOURCE_BUILD_CONFIGURATION_FAILED"),
+            ("candidate", b"SwiftCompile normal arm64 /private/path.swift", b"", "CANDIDATE_BUILD_COMPILATION_FAILED"),
+            ("candidate", b"", b"linker command failed with exit code 1", "CANDIDATE_BUILD_LINK_FAILED"),
+            ("source", b"private path with no known marker", b"", "SOURCE_BUILD_FAILED"),
+        )
+        for build, stdout, stderr, expected in cases:
+            with self.subTest(expected=expected):
+                code = RUNNER.classify_build_failure(build, stdout, stderr)
+                self.assertEqual(code, expected)
+                self.assertRegex(code, r"^[A-Z][A-Z0-9_]+$")
+                self.assertNotIn("/", code)
+
     def marker_body(self) -> bytes:
         return json.dumps(
             {
