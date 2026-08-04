@@ -8,10 +8,6 @@ fi
 
 release_tag="$1"
 network_trace="$2"
-if [[ ! "$release_tag" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
-  echo "release tag must be an exact semantic version" >&2
-  exit 2
-fi
 
 repo_root="$(git rev-parse --show-toplevel)"
 cd "$repo_root"
@@ -22,18 +18,7 @@ if [[ ! -f "$network_trace" ]]; then
 fi
 network_trace="$(cd "$(dirname "$network_trace")" && pwd)/$(basename "$network_trace")"
 
-if [[ -n "$(git status --porcelain)" ]]; then
-  echo "release preflight requires a clean checkout" >&2
-  exit 1
-fi
-if [[ "$(git rev-parse HEAD)" != "$(git rev-parse "$release_tag^{commit}")" ]]; then
-  echo "release tag does not resolve to HEAD" >&2
-  exit 1
-fi
-if ! git verify-tag "$release_tag" >/dev/null 2>&1; then
-  echo "release tag must carry a valid Git or SSH signature" >&2
-  exit 1
-fi
+python3 scripts/verify-release-tag.py "$release_tag"
 if ! command -v xcodebuild >/dev/null 2>&1; then
   echo "release preflight requires full Xcode" >&2
   exit 1
@@ -56,7 +41,6 @@ run_logged() {
 
 python3 scripts/verify-baseline.py
 python3 Conformance/validate-baselines.py
-python3 scripts/verify-release-version.py "$release_tag"
 run_logged resolve swift package resolve
 swift package dump-package > "$output/package-metadata.json" 2> "$logs/dump-package.log"
 python3 scripts/verify-package-surface.py --mode owned-runtime "$output/package-metadata.json"

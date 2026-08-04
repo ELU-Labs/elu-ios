@@ -74,8 +74,23 @@ offline-recovery exactly once. Request rows are separate: multiple requests
 per scenario are valid, zero is valid for a scenario such as reset, and at
 least one request is required across the trace. Missing, duplicate, or unknown
 scenario declarations and unknown request labels are rejected. The exact tag
-must carry a valid Git or SSH signature. The preflight never publishes, moves
-a tag, or deploys.
+must match `EluCore.sdkVersion`, point at `HEAD`, contain a `Reviewed-by:`
+trailer, and carry a valid GPG signature whose full fingerprint appears in
+`ELU_TRUSTED_RELEASE_SIGNING_FINGERPRINTS`. The variable accepts comma- or
+whitespace-separated 40- or 64-hex fingerprints; missing values, short key
+IDs, untrusted valid signatures, non-GPG signatures, dirty tracked files, and
+untracked files all fail closed. The signer's public key must already be in
+the verifier's GPG keyring. The preflight never publishes, moves a tag, or
+deploys.
+
+For a future reviewed candidate, configure the full trusted fingerprint set,
+create (but never move) the signed tag, and then run preflight:
+
+```sh
+export ELU_TRUSTED_RELEASE_SIGNING_FINGERPRINTS='<full GPG fingerprint>'
+git -c gpg.format=openpgp tag -s 1.0.0-rc.1 -m $'iOS ownership candidate\n\nReviewed-by: SDK Owner <owner@elu.dev>'
+scripts/release-preflight.sh 1.0.0-rc.1 /absolute/path/to/network-trace.json
+```
 
 Release evidence includes an explicit checksum inventory for every artifact
 input. Files use SHA-256; directories use the documented path-bound
