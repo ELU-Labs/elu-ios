@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import base64
-import gzip
 import hashlib
 import io
 import json
@@ -18,6 +17,7 @@ import sys
 import tarfile
 import threading
 import time
+import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
@@ -43,9 +43,19 @@ TELEMETRY_PATH = "/batch"
 FLAGS_PATH = "/flags?v=2"
 CONFIG_PATH = "/v1/upgrade-evidence/config"
 MARKER_WAIT_SECONDS = 45
+MAX_CAPTURE_BODY_BYTES = 8 * 1024 * 1024
+GZIP_INPUT_CHUNK_BYTES = 64 * 1024
+MAX_DECOMPRESSED_BODY_BYTES = 8 * 1024 * 1024
 HARNESS_SOURCE = ROOT / HARNESS_RELATIVE / "AppDelegate.swift"
 HARNESS_DIAGNOSTIC_PATH = f"{HARNESS_RELATIVE.as_posix().casefold()}/appdelegate.swift"
 BUILD_PREFIXES = {"source": "SOURCE", "candidate": "CANDIDATE"}
+MARKER_STAGE_PRECEDENCE = (
+    "markerObserved",
+    "markerSessionAbsent",
+    "markerIdentityAbsent",
+    "batchUnreadable",
+    "markerEventAbsent",
+)
 COMPILER_ORIGINS = {
     "HARNESS_BOOTSTRAP": "the harness bootstrap",
     "HARNESS_VIEW": "the harness view",
@@ -85,8 +95,20 @@ CONFIG_GET_OBSERVATIONS = {
     False: ("CONFIG_GET_NOT_OBSERVED", "the exact configuration GET was not observed"),
 }
 MARKER_BLOCKER_CODES = {
-    "source": "SOURCE_MARKER_NOT_OBSERVED",
-    "candidate": "CANDIDATE_MARKER_NOT_OBSERVED",
+    "source": {
+        "exactBatchNotObserved": "SOURCE_EXACT_BATCH_NOT_OBSERVED",
+        "batchUnreadable": "SOURCE_BATCH_UNREADABLE",
+        "markerEventAbsent": "SOURCE_MARKER_EVENT_ABSENT",
+        "markerIdentityAbsent": "SOURCE_MARKER_IDENTITY_ABSENT",
+        "markerSessionAbsent": "SOURCE_MARKER_SESSION_ABSENT",
+    },
+    "candidate": {
+        "exactBatchNotObserved": "CANDIDATE_EXACT_BATCH_NOT_OBSERVED",
+        "batchUnreadable": "CANDIDATE_BATCH_UNREADABLE",
+        "markerEventAbsent": "CANDIDATE_MARKER_EVENT_ABSENT",
+        "markerIdentityAbsent": "CANDIDATE_MARKER_IDENTITY_ABSENT",
+        "markerSessionAbsent": "CANDIDATE_MARKER_SESSION_ABSENT",
+    },
 }
 BLOCKER_DETAILS = {
     "FULL_XCODE_REQUIRED": "The selected developer directory does not provide Xcode and the iOS Simulator tools.",
@@ -112,8 +134,16 @@ BLOCKER_DETAILS = {
     "HISTORICAL_TAG_AUTHENTICATION_FAILED": "The resolved source dependency checkout did not authenticate the dated tag observation.",
     "SOURCE_RUN_FAILED": "The source-version application did not establish observable identity and session evidence.",
     "CANDIDATE_RUN_FAILED": "The candidate application did not produce its same-container continuity result.",
-    "SOURCE_MARKER_NOT_OBSERVED": "The source-version application completed its identity check without an observable marker event.",
-    "CANDIDATE_MARKER_NOT_OBSERVED": "The candidate application completed its identity check without an observable marker event.",
+    "SOURCE_EXACT_BATCH_NOT_OBSERVED": "No exact source-version telemetry batch request was observed after launch.",
+    "SOURCE_BATCH_UNREADABLE": "A source-version telemetry batch request was observed, but its fixed envelope could not be read.",
+    "SOURCE_MARKER_EVENT_ABSENT": "Readable source-version telemetry batches did not contain the fixed marker event.",
+    "SOURCE_MARKER_IDENTITY_ABSENT": "The source-version marker event did not contain a non-empty identity.",
+    "SOURCE_MARKER_SESSION_ABSENT": "The source-version marker event did not contain a non-empty session identifier.",
+    "CANDIDATE_EXACT_BATCH_NOT_OBSERVED": "No exact candidate telemetry batch request was observed after launch.",
+    "CANDIDATE_BATCH_UNREADABLE": "A candidate telemetry batch request was observed, but its fixed envelope could not be read.",
+    "CANDIDATE_MARKER_EVENT_ABSENT": "Readable candidate telemetry batches did not contain the fixed marker event.",
+    "CANDIDATE_MARKER_IDENTITY_ABSENT": "The candidate marker event did not contain a non-empty identity.",
+    "CANDIDATE_MARKER_SESSION_ABSENT": "The candidate marker event did not contain a non-empty session identifier.",
     "RAW_CAPTURE_INCOMPLETE": "Observable network evidence did not contain both source and candidate session markers.",
     "UNEXPECTED_RUNNER_FAILURE": "The simulator evidence runner stopped before all required checks completed.",
 }
@@ -442,6 +472,56 @@ def run_command(
     return result.stdout
 
 
+def header_values(headers: Any, name: str) -> list[str]:
+    get_all = getattr(headers, "get_all", None)
+    if callable(get_all):
+        values = get_all(name)
+        if values is not None:
+            return [str(value) for value in values]
+    return [str(value) for key, value in headers.items() if str(key).casefold() == name.casefold()]
+
+
+def decompress_gzip_bounded(
+    body: bytes,
+    *,
+    max_output_bytes: int = MAX_DECOMPRESSED_BODY_BYTES,
+) -> bytes | None:
+    if max_output_bytes < 0:
+        return None
+    inflater = zlib.decompressobj(16 + zlib.MAX_WBITS)
+    output = bytearray()
+    try:
+        for offset in range(0, len(body), GZIP_INPUT_CHUNK_BYTES):
+            input_chunk = body[offset : offset + GZIP_INPUT_CHUNK_BYTES]
+            pending = input_chunk
+            while pending:
+                remaining = max_output_bytes + 1 - len(output)
+                if remaining <= 0:
+                    return None
+                before = len(pending)
+                decoded = inflater.decompress(pending, remaining)
+                output.extend(decoded)
+                if len(output) > max_output_bytes:
+                    return None
+                pending = inflater.unconsumed_tail
+                if pending and len(pending) == before and not decoded:
+                    return None
+            if inflater.eof:
+                consumed_through = offset + len(input_chunk)
+                if inflater.unused_data or consumed_through != len(body):
+                    return None
+                break
+        if not inflater.eof or inflater.unused_data:
+            return None
+        remaining = max_output_bytes + 1 - len(output)
+        output.extend(inflater.flush(remaining))
+    except (ValueError, zlib.error):
+        return None
+    if len(output) > max_output_bytes:
+        return None
+    return bytes(output)
+
+
 class CaptureLedger:
     def __init__(self, raw_directory: pathlib.Path):
         self.raw_directory = raw_directory
@@ -451,48 +531,159 @@ class CaptureLedger:
         self.request_count = 0
         self.config_get_count = 0
         self.markers: dict[str, tuple[str, str]] = {}
+        self.marker_request_numbers: dict[str, int] = {}
+        self.batch_observations: dict[int, dict[str, str]] = {}
 
-    def record(self, method: str, path: str, headers: dict[str, str], body: bytes) -> None:
+    def begin_request(self, method: str, path: str) -> int:
         with self.lock:
             self.request_count += 1
+            if method == TELEMETRY_METHOD and path == TELEMETRY_PATH:
+                self._record_unreadable_batch(self.request_count)
+            return self.request_count
+
+    def record(
+        self,
+        method: str,
+        path: str,
+        headers: dict[str, str],
+        body: bytes,
+        *,
+        body_readable: bool = True,
+        request_number: int | None = None,
+    ) -> None:
+        with self.lock:
+            if request_number is None:
+                self.request_count += 1
+                request_number = self.request_count
             record = {
                 "method": method,
                 "path": path,
                 "headers": dict(sorted(headers.items())),
                 "bodyBase64": base64.b64encode(body).decode("ascii"),
             }
-            write_json(self.capture_directory / f"request-{self.request_count:04d}.json", record)
-            self._inspect(method, path, headers, body)
+            write_json(self.capture_directory / f"request-{request_number:04d}.json", record)
+            self._inspect(
+                request_number,
+                method,
+                path,
+                headers,
+                body,
+                body_readable=body_readable,
+            )
             self._write_status()
 
-    def _inspect(self, method: str, path: str, headers: dict[str, str], body: bytes) -> None:
+    def _record_batch_observation(self, request_number: int, stages: dict[str, str]) -> None:
+        self.batch_observations[request_number] = stages
+
+    def _record_unreadable_batch(self, request_number: int) -> None:
+        self._record_batch_observation(
+            request_number,
+            {build: "batchUnreadable" for build in EVENT_NAMES},
+        )
+
+    def _marker_stage(self, request_number: int, build: str, events: list[Any]) -> str:
+        marker = EVENT_NAMES[build]
+        matching = [event for event in events if isinstance(event, dict) and event.get("event") == marker]
+        if not matching:
+            return "markerEventAbsent"
+
+        identity_present = False
+        for event in matching:
+            identity = event.get("distinct_id")
+            if not isinstance(identity, str) or not identity:
+                continue
+            identity_present = True
+            properties = event.get("properties")
+            session = properties.get("$session_id") if isinstance(properties, dict) else None
+            if isinstance(session, str) and session:
+                previous_request = self.marker_request_numbers.get(build)
+                if previous_request is None or request_number >= previous_request:
+                    self.markers[build] = (identity, session)
+                    self.marker_request_numbers[build] = request_number
+                return "markerObserved"
+        return "markerSessionAbsent" if identity_present else "markerIdentityAbsent"
+
+    def _inspect(
+        self,
+        request_number: int,
+        method: str,
+        path: str,
+        headers: dict[str, str],
+        body: bytes,
+        *,
+        body_readable: bool,
+    ) -> None:
         if method == "GET" and path == CONFIG_PATH:
             self.config_get_count += 1
         if method != TELEMETRY_METHOD or path != TELEMETRY_PATH:
             return
-        content_encoding = next(
-            (value for key, value in headers.items() if key.casefold() == "content-encoding"), ""
-        )
-        if content_encoding.casefold() == "gzip":
-            try:
-                body = gzip.decompress(body)
-            except (OSError, EOFError):
+        if not body_readable:
+            self._record_unreadable_batch(request_number)
+            return
+        encodings = header_values(headers, "Content-Encoding")
+        if len(encodings) > 1:
+            self._record_unreadable_batch(request_number)
+            return
+        content_encoding = encodings[0].strip().casefold() if encodings else ""
+        if content_encoding == "gzip":
+            decompressed = decompress_gzip_bounded(body)
+            if decompressed is None:
+                self._record_unreadable_batch(request_number)
                 return
+            body = decompressed
+        elif content_encoding not in ("", "identity"):
+            self._record_unreadable_batch(request_number)
+            return
         try:
             payload = json.loads(body)
         except (UnicodeDecodeError, json.JSONDecodeError):
+            self._record_unreadable_batch(request_number)
             return
         if not isinstance(payload, dict) or not isinstance(payload.get("batch"), list):
+            self._record_unreadable_batch(request_number)
             return
-        for event in payload["batch"]:
-            if not isinstance(event, dict):
+        events = payload["batch"]
+        self._record_batch_observation(
+            request_number,
+            {
+                build: self._marker_stage(request_number, build, events)
+                for build in EVENT_NAMES
+            },
+        )
+
+    def observation_cursor(self) -> int:
+        with self.lock:
+            return self.request_count
+
+    def _marker_blocker_code_locked(self, build: str, after_request: int) -> str | None:
+        codes = MARKER_BLOCKER_CODES.get(build)
+        if codes is None:
+            return "UNEXPECTED_RUNNER_FAILURE"
+        stages = {
+            observation[build]
+            for request_number, observation in self.batch_observations.items()
+            if request_number > after_request
+        }
+        for stage in MARKER_STAGE_PRECEDENCE:
+            if stage not in stages:
                 continue
-            build = next((name for name, marker in EVENT_NAMES.items() if event.get("event") == marker), None)
-            properties = event.get("properties")
-            identity = event.get("distinct_id")
-            session = properties.get("$session_id") if isinstance(properties, dict) else None
-            if build and isinstance(identity, str) and identity and isinstance(session, str) and session:
-                self.markers[build] = (identity, session)
+            if stage == "markerObserved":
+                return None
+            return codes[stage]
+        return codes["exactBatchNotObserved"]
+
+    def marker_blocker_code(self, build: str, *, after_request: int) -> str | None:
+        with self.lock:
+            return self._marker_blocker_code_locked(build, after_request)
+
+    def raise_marker_timeout(self, build: str, *, after_request: int) -> None:
+        with self.lock:
+            request_number = self.marker_request_numbers.get(build)
+            if request_number is not None and request_number > after_request:
+                return
+            blocker = self._marker_blocker_code_locked(build, after_request)
+            if blocker is not None:
+                raise HarnessBlocked(blocker)
 
     def _write_status(self) -> None:
         source = self.markers.get("source")
@@ -513,14 +704,23 @@ class CaptureLedger:
         with self.lock:
             return self.config_get_count
 
-    def wait_for(self, build: str, timeout: float = MARKER_WAIT_SECONDS) -> bool:
+    def wait_for(
+        self,
+        build: str,
+        timeout: float = MARKER_WAIT_SECONDS,
+        *,
+        after_request: int = 0,
+    ) -> bool:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             with self.lock:
-                if build in self.markers:
+                request_number = self.marker_request_numbers.get(build)
+                if request_number is not None and request_number > after_request:
                     return True
             time.sleep(0.2)
-        return False
+        with self.lock:
+            request_number = self.marker_request_numbers.get(build)
+            return request_number is not None and request_number > after_request
 
 
 class EvidenceServer(ThreadingHTTPServer):
@@ -541,9 +741,49 @@ class EvidenceHandler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: object) -> None:
         return
 
-    def _record(self, body: bytes = b"") -> None:
+    def _record(
+        self,
+        request_number: int,
+        body: bytes = b"",
+        *,
+        body_readable: bool = True,
+    ) -> None:
         headers = {str(key): str(value) for key, value in self.headers.items()}
-        self.server.ledger.record(self.command, self.path, headers, body)
+        content_encodings = header_values(self.headers, "Content-Encoding")
+        self.server.ledger.record(
+            self.command,
+            self.path,
+            headers,
+            body,
+            body_readable=body_readable and len(content_encodings) <= 1,
+            request_number=request_number,
+        )
+
+    def _read_post_body(self) -> tuple[bytes, bool]:
+        transfer_encodings = header_values(self.headers, "Transfer-Encoding")
+        content_lengths = header_values(self.headers, "Content-Length")
+        if transfer_encodings or len(content_lengths) != 1:
+            self.close_connection = True
+            return b"", False
+        content_length = content_lengths[0].strip()
+        if not re.fullmatch(r"[0-9]+", content_length) or len(content_length) > len(
+            str(MAX_CAPTURE_BODY_BYTES)
+        ):
+            self.close_connection = True
+            return b"", False
+        length = int(content_length)
+        if length > MAX_CAPTURE_BODY_BYTES:
+            self.close_connection = True
+            return b"", False
+        try:
+            body = self.rfile.read(length)
+        except OSError:
+            self.close_connection = True
+            return b"", False
+        if len(body) != length:
+            self.close_connection = True
+            return body, False
+        return body, True
 
     def _respond(self, value: object, status: int = 200) -> None:
         data = json.dumps(value, separators=(",", ":")).encode("utf-8")
@@ -554,7 +794,8 @@ class EvidenceHandler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_GET(self) -> None:  # noqa: N802
-        self._record()
+        request_number = self.server.ledger.begin_request(self.command, self.path)
+        self._record(request_number)
         if self.path == CONFIG_PATH:
             self._respond(
                 {
@@ -576,9 +817,9 @@ class EvidenceHandler(BaseHTTPRequestHandler):
             self._respond({"supportedCompression": ["gzip"], "sessionRecording": False})
 
     def do_POST(self) -> None:  # noqa: N802
-        length = int(self.headers.get("Content-Length", "0"))
-        body = self.rfile.read(length)
-        self._record(body)
+        request_number = self.server.ledger.begin_request(self.command, self.path)
+        body, body_readable = self._read_post_body()
+        self._record(request_number, body, body_readable=body_readable)
         if self.path == FLAGS_PATH:
             self._respond({"flags": {}, "featureFlags": {}})
         elif self.path == TELEMETRY_PATH:
@@ -882,6 +1123,7 @@ def install_and_run(
     environment["SIMCTL_CHILD_ELU_UPGRADE_BUILD"] = build
     environment["SIMCTL_CHILD_ELU_UPGRADE_ORIGIN"] = origin
     config_gets_before_launch = ledger.exact_config_get_count()
+    marker_observation_cursor = ledger.observation_cursor()
     result_documents = container / "Documents"
     result_files_before_launch = snapshot_result_files(result_documents)
     run_command(
@@ -910,9 +1152,8 @@ def install_and_run(
         raw_directory / "application-results" / f"{build}.json",
         {"build": build, "identityCheck": True},
     )
-    if not ledger.wait_for(build):
-        marker_blocker = MARKER_BLOCKER_CODES.get(build)
-        raise HarnessBlocked(marker_blocker or "UNEXPECTED_RUNNER_FAILURE")
+    if not ledger.wait_for(build, after_request=marker_observation_cursor):
+        ledger.raise_marker_timeout(build, after_request=marker_observation_cursor)
     run_command(
         ["xcrun", "simctl", "terminate", udid, BUNDLE_ID],
         code=code,

@@ -8,6 +8,7 @@ import pathlib
 import tempfile
 import types
 import unittest
+from email.message import Message
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -67,14 +68,30 @@ class UpgradeEvidenceCaptureTests(unittest.TestCase):
         self.assertEqual(
             RUNNER.MARKER_BLOCKER_CODES,
             {
-                "source": "SOURCE_MARKER_NOT_OBSERVED",
-                "candidate": "CANDIDATE_MARKER_NOT_OBSERVED",
+                "source": {
+                    "exactBatchNotObserved": "SOURCE_EXACT_BATCH_NOT_OBSERVED",
+                    "batchUnreadable": "SOURCE_BATCH_UNREADABLE",
+                    "markerEventAbsent": "SOURCE_MARKER_EVENT_ABSENT",
+                    "markerIdentityAbsent": "SOURCE_MARKER_IDENTITY_ABSENT",
+                    "markerSessionAbsent": "SOURCE_MARKER_SESSION_ABSENT",
+                },
+                "candidate": {
+                    "exactBatchNotObserved": "CANDIDATE_EXACT_BATCH_NOT_OBSERVED",
+                    "batchUnreadable": "CANDIDATE_BATCH_UNREADABLE",
+                    "markerEventAbsent": "CANDIDATE_MARKER_EVENT_ABSENT",
+                    "markerIdentityAbsent": "CANDIDATE_MARKER_IDENTITY_ABSENT",
+                    "markerSessionAbsent": "CANDIDATE_MARKER_SESSION_ABSENT",
+                },
             },
         )
-        for code in RUNNER.MARKER_BLOCKER_CODES.values():
-            self.assertIn(code, RUNNER.BLOCKER_DETAILS)
-            self.assertRegex(code, r"^[A-Z][A-Z0-9_]+$")
-            self.assertNotIn("/", code)
+        self.assertEqual(
+            RUNNER.CaptureLedger.wait_for.__kwdefaults__, {"after_request": 0}
+        )
+        for codes in RUNNER.MARKER_BLOCKER_CODES.values():
+            for code in codes.values():
+                self.assertIn(code, RUNNER.BLOCKER_DETAILS)
+                self.assertRegex(code, r"^[A-Z][A-Z0-9_]+$")
+                self.assertNotIn("/", code)
 
     def test_harness_product_is_bound_to_the_local_package(self) -> None:
         project = PROJECT.read_text(encoding="utf-8")
@@ -388,18 +405,19 @@ class UpgradeEvidenceCaptureTests(unittest.TestCase):
                 self.assertNotIn(sentinel, detail)
                 self.assertNotIn(sentinel, public_output)
 
+    def batch_body(self, events: list[object]) -> bytes:
+        return json.dumps({"batch": events}).encode("utf-8")
+
     def marker_body(self) -> bytes:
-        return json.dumps(
-            {
-                "batch": [
-                    {
-                        "event": "elu_sdk_upgrade_source",
-                        "distinct_id": "opaque-identity",
-                        "properties": {"$session_id": "source-session"},
-                    }
-                ]
-            }
-        ).encode("utf-8")
+        return self.batch_body(
+            [
+                {
+                    "event": "elu_sdk_upgrade_source",
+                    "distinct_id": "opaque-identity",
+                    "properties": {"$session_id": "source-session"},
+                }
+            ]
+        )
 
     def captured_markers(self, method: str, path: str) -> dict[str, tuple[str, str]]:
         with tempfile.TemporaryDirectory() as temporary:
@@ -471,6 +489,360 @@ class UpgradeEvidenceCaptureTests(unittest.TestCase):
             ledger = RUNNER.CaptureLedger(pathlib.Path(temporary))
             ledger.record("POST", "/batch?forged=1", {"content-encoding": "gzip"}, body)
             self.assertEqual(ledger.markers, {})
+
+    def test_marker_blocker_classifies_each_capture_stage(self) -> None:
+        unreadable_cases = (
+            ({}, self.marker_body(), False),
+            ({"Content-Encoding": "gzip"}, b"not-gzip", True),
+            ({"Content-Encoding": "br"}, self.marker_body(), True),
+            ({}, b"{", True),
+            ({}, json.dumps({"events": []}).encode("utf-8"), True),
+        )
+        for headers, body, body_readable in unreadable_cases:
+            with self.subTest(headers=headers, body=body, body_readable=body_readable):
+                with tempfile.TemporaryDirectory() as temporary:
+                    ledger = RUNNER.CaptureLedger(pathlib.Path(temporary))
+                    cursor = ledger.observation_cursor()
+                    ledger.record(
+                        "POST",
+                        "/batch",
+                        headers,
+                        body,
+                        body_readable=body_readable,
+                    )
+                    self.assertEqual(
+                        ledger.marker_blocker_code("source", after_request=cursor),
+                        "SOURCE_BATCH_UNREADABLE",
+                    )
+
+        cases = (
+            (
+                "/batch?not-exact=1",
+                self.marker_body(),
+                "SOURCE_EXACT_BATCH_NOT_OBSERVED",
+            ),
+            (
+                "/batch",
+                self.batch_body([{"event": "Application Opened"}]),
+                "SOURCE_MARKER_EVENT_ABSENT",
+            ),
+            (
+                "/batch",
+                self.batch_body(
+                    [
+                        {
+                            "event": "elu_sdk_upgrade_source",
+                            "properties": {"$session_id": "source-session"},
+                        }
+                    ]
+                ),
+                "SOURCE_MARKER_IDENTITY_ABSENT",
+            ),
+            (
+                "/batch",
+                self.batch_body(
+                    [
+                        {
+                            "event": "elu_sdk_upgrade_source",
+                            "distinct_id": "opaque-identity",
+                            "properties": {},
+                        }
+                    ]
+                ),
+                "SOURCE_MARKER_SESSION_ABSENT",
+            ),
+        )
+        for path, body, expected in cases:
+            with self.subTest(expected=expected):
+                with tempfile.TemporaryDirectory() as temporary:
+                    ledger = RUNNER.CaptureLedger(pathlib.Path(temporary))
+                    cursor = ledger.observation_cursor()
+                    ledger.record("POST", path, {}, body)
+                    self.assertEqual(
+                        ledger.marker_blocker_code("source", after_request=cursor),
+                        expected,
+                    )
+
+    def test_marker_blocker_uses_strongest_conclusive_stage(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            ledger = RUNNER.CaptureLedger(pathlib.Path(temporary))
+            cursor = ledger.observation_cursor()
+            ledger.record(
+                "POST",
+                "/batch",
+                {},
+                self.batch_body([{"event": "Application Opened"}]),
+            )
+            ledger.record("POST", "/batch", {}, b"{", body_readable=True)
+            self.assertEqual(
+                ledger.marker_blocker_code("source", after_request=cursor),
+                "SOURCE_BATCH_UNREADABLE",
+            )
+
+            ledger.record(
+                "POST",
+                "/batch",
+                {},
+                self.batch_body([{"event": "elu_sdk_upgrade_source"}]),
+            )
+            self.assertEqual(
+                ledger.marker_blocker_code("source", after_request=cursor),
+                "SOURCE_MARKER_IDENTITY_ABSENT",
+            )
+
+            ledger.record(
+                "POST",
+                "/batch",
+                {},
+                self.batch_body(
+                    [
+                        {
+                            "event": "elu_sdk_upgrade_source",
+                            "distinct_id": "opaque-identity",
+                            "properties": {},
+                        }
+                    ]
+                ),
+            )
+            self.assertEqual(
+                ledger.marker_blocker_code("source", after_request=cursor),
+                "SOURCE_MARKER_SESSION_ABSENT",
+            )
+
+            ledger.record("POST", "/batch", {}, self.marker_body())
+            self.assertTrue(ledger.wait_for("source", timeout=0, after_request=cursor))
+            self.assertIsNone(
+                ledger.marker_blocker_code("source", after_request=cursor)
+            )
+            ledger.raise_marker_timeout("source", after_request=cursor)
+
+    def test_marker_observation_cursor_isolates_each_launch(self) -> None:
+        candidate_body = self.batch_body(
+            [
+                {
+                    "event": "elu_sdk_upgrade_candidate",
+                    "distinct_id": "opaque-identity",
+                    "properties": {"$session_id": "candidate-session"},
+                }
+            ]
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            ledger = RUNNER.CaptureLedger(pathlib.Path(temporary))
+            prior_request = ledger.begin_request("POST", "/batch")
+            cursor = ledger.observation_cursor()
+            ledger.record(
+                "POST",
+                "/batch",
+                {},
+                candidate_body,
+                request_number=prior_request,
+            )
+            self.assertFalse(ledger.wait_for("candidate", timeout=0, after_request=cursor))
+            self.assertEqual(
+                ledger.marker_blocker_code("candidate", after_request=cursor),
+                "CANDIDATE_EXACT_BATCH_NOT_OBSERVED",
+            )
+            with self.assertRaises(RUNNER.HarnessBlocked) as blocked:
+                ledger.raise_marker_timeout("candidate", after_request=cursor)
+            self.assertEqual(blocked.exception.code, "CANDIDATE_EXACT_BATCH_NOT_OBSERVED")
+
+            ledger.record("POST", "/batch", {}, self.marker_body())
+            self.assertEqual(
+                ledger.marker_blocker_code("candidate", after_request=cursor),
+                "CANDIDATE_MARKER_EVENT_ABSENT",
+            )
+
+    def test_out_of_order_completion_keeps_the_newest_marker(self) -> None:
+        def candidate_body(identity: str, session: str) -> bytes:
+            return self.batch_body(
+                [
+                    {
+                        "event": "elu_sdk_upgrade_candidate",
+                        "distinct_id": identity,
+                        "properties": {"$session_id": session},
+                    }
+                ]
+            )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            ledger = RUNNER.CaptureLedger(pathlib.Path(temporary))
+            stale_request = ledger.begin_request("POST", "/batch")
+            cursor = ledger.observation_cursor()
+            current_request = ledger.begin_request("POST", "/batch")
+            ledger.record(
+                "POST",
+                "/batch",
+                {},
+                candidate_body("current-identity", "current-session"),
+                request_number=current_request,
+            )
+            ledger.record(
+                "POST",
+                "/batch",
+                {},
+                candidate_body("stale-identity", "stale-session"),
+                request_number=stale_request,
+            )
+            self.assertEqual(ledger.marker_request_numbers["candidate"], current_request)
+            self.assertEqual(
+                ledger.markers["candidate"],
+                ("current-identity", "current-session"),
+            )
+            self.assertTrue(
+                ledger.wait_for("candidate", timeout=0, after_request=cursor)
+            )
+
+    def test_started_exact_batch_is_unreadable_until_body_is_recorded(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            ledger = RUNNER.CaptureLedger(pathlib.Path(temporary))
+            cursor = ledger.observation_cursor()
+            request_number = ledger.begin_request("POST", "/batch")
+            self.assertEqual(
+                ledger.marker_blocker_code("source", after_request=cursor),
+                "SOURCE_BATCH_UNREADABLE",
+            )
+
+            ledger.record(
+                "POST",
+                "/batch",
+                {},
+                self.marker_body(),
+                request_number=request_number,
+            )
+            self.assertIsNone(
+                ledger.marker_blocker_code("source", after_request=cursor)
+            )
+
+    def test_handler_requires_bounded_complete_content_length(self) -> None:
+        def read_body(headers: object, body: bytes) -> tuple[bytes, bool, bool]:
+            handler = object.__new__(RUNNER.EvidenceHandler)
+            handler.headers = headers
+            handler.rfile = io.BytesIO(body)
+            handler.close_connection = False
+            captured, readable = handler._read_post_body()
+            return captured, readable, handler.close_connection
+
+        self.assertEqual(
+            read_body({"content-length": "4"}, b"body"),
+            (b"body", True, False),
+        )
+        for headers, body, expected_body in (
+            ({}, b"body", b""),
+            ({"Content-Length": "invalid"}, b"body", b""),
+            ({"Content-Length": "-1"}, b"body", b""),
+            ({"Content-Length": "9" * 5000}, b"body", b""),
+            ({"Content-Length": "5"}, b"body", b"body"),
+            ({"Content-Length": str(RUNNER.MAX_CAPTURE_BODY_BYTES + 1)}, b"body", b""),
+            ({"Transfer-Encoding": "chunked"}, b"4\r\nbody\r\n0\r\n\r\n", b""),
+            (
+                {"Content-Length": "4", "Transfer-Encoding": "chunked"},
+                b"body",
+                b"",
+            ),
+        ):
+            with self.subTest(headers=headers):
+                captured, readable, closes = read_body(headers, body)
+                self.assertEqual(captured, expected_body)
+                self.assertFalse(readable)
+                self.assertTrue(closes)
+
+    def test_handler_rejects_duplicate_content_encoding_before_header_collapse(self) -> None:
+        body = gzip.compress(self.marker_body())
+        headers = Message()
+        headers.add_header("Content-Length", str(len(body)))
+        headers.add_header("Content-Encoding", "br")
+        headers.add_header("Content-Encoding", "gzip")
+        with tempfile.TemporaryDirectory() as temporary:
+            ledger = RUNNER.CaptureLedger(pathlib.Path(temporary))
+            cursor = ledger.observation_cursor()
+            handler = object.__new__(RUNNER.EvidenceHandler)
+            handler.command = "POST"
+            handler.path = "/batch"
+            handler.headers = headers
+            handler.rfile = io.BytesIO(body)
+            handler.close_connection = False
+            handler.server = types.SimpleNamespace(ledger=ledger)
+            handler._respond = lambda _value, status=200: None
+            handler.do_POST()
+            self.assertEqual(ledger.markers, {})
+            self.assertEqual(
+                ledger.marker_blocker_code("source", after_request=cursor),
+                "SOURCE_BATCH_UNREADABLE",
+            )
+
+    def test_gzip_decode_is_streamed_and_bounded(self) -> None:
+        payload = self.marker_body()
+        self.assertEqual(RUNNER.decompress_gzip_bounded(gzip.compress(payload)), payload)
+        self.assertIsNone(
+            RUNNER.decompress_gzip_bounded(
+                gzip.compress(b"x" * 65),
+                max_output_bytes=64,
+            )
+        )
+        self.assertIsNone(
+            RUNNER.decompress_gzip_bounded(gzip.compress(payload)[:-1])
+        )
+        self.assertIsNone(
+            RUNNER.decompress_gzip_bounded(
+                gzip.compress(payload) + gzip.compress(b"trailing-member")
+            )
+        )
+
+    def test_marker_diagnostics_are_fixed_and_raw_formats_do_not_change(self) -> None:
+        raw_identity = "PRIVATE_IDENTITY_SENTINEL"
+        raw_session = "PRIVATE_SESSION_SENTINEL"
+        with tempfile.TemporaryDirectory() as temporary:
+            ledger = RUNNER.CaptureLedger(pathlib.Path(temporary))
+            cursor = ledger.observation_cursor()
+            ledger.record(
+                "POST",
+                "/batch",
+                {},
+                self.batch_body(
+                    [
+                        {
+                            "event": "elu_sdk_upgrade_source",
+                            "distinct_id": raw_identity,
+                            "properties": {"private": raw_session},
+                        }
+                    ]
+                ),
+            )
+            code = ledger.marker_blocker_code("source", after_request=cursor)
+            assert code is not None
+            public = json.dumps(
+                {"blockers": [{"code": code, "detail": RUNNER.BLOCKER_DETAILS[code]}]}
+            )
+        self.assertNotIn(raw_identity, public)
+        self.assertNotIn(raw_session, public)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            raw_directory = pathlib.Path(temporary)
+            ledger = RUNNER.CaptureLedger(raw_directory)
+            ledger.record("POST", "/batch", {}, self.marker_body())
+            request = json.loads(
+                (raw_directory / "requests" / "request-0001.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            status = json.loads(
+                (raw_directory / "capture-status.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                set(request),
+                {"method", "path", "headers", "bodyBase64"},
+            )
+            self.assertEqual(
+                set(status),
+                {
+                    "sourceMarkerObserved",
+                    "candidateMarkerObserved",
+                    "identityPreserved",
+                    "sourceSessionPresent",
+                    "candidateSessionPresent",
+                    "sessionRotated",
+                },
+            )
 
     def test_capture_ledger_rejects_marker_at_wrong_method_or_path(self) -> None:
         for method, path in (
