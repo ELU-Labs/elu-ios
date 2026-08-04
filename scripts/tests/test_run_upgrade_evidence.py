@@ -12,6 +12,7 @@ import unittest
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts" / "run-upgrade-evidence.py"
 PROJECT = ROOT / "UpgradeEvidence" / "0.1.0" / "Harness" / "UpgradeHarness.xcodeproj" / "project.pbxproj"
+HARNESS_SOURCE = ROOT / "UpgradeEvidence" / "0.1.0" / "Harness" / "AppDelegate.swift"
 SPEC = importlib.util.spec_from_file_location("run_upgrade_evidence", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 RUNNER = importlib.util.module_from_spec(SPEC)
@@ -19,6 +20,12 @@ SPEC.loader.exec_module(RUNNER)
 
 
 class UpgradeEvidenceCaptureTests(unittest.TestCase):
+    def test_harness_view_remains_ios_13_compatible(self) -> None:
+        source = HARNESS_SOURCE.read_text(encoding="utf-8")
+        project = PROJECT.read_text(encoding="utf-8")
+        self.assertNotIn(".accessibilityIdentifier(", source)
+        self.assertIn("IPHONEOS_DEPLOYMENT_TARGET = 13.0;", project)
+
     def test_harness_product_is_bound_to_the_local_package(self) -> None:
         project = PROJECT.read_text(encoding="utf-8")
         self.assertIn(

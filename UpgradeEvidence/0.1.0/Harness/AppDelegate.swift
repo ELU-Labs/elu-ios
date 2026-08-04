@@ -32,7 +32,6 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
 private struct UpgradeEvidenceView: View {
     var body: some View {
         Text("SDK upgrade evidence")
-            .accessibilityIdentifier("sdk-upgrade-evidence")
     }
 }
 
