@@ -11,6 +11,7 @@ import io
 import json
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -39,6 +40,36 @@ EVENT_NAMES = {
 TELEMETRY_METHOD = "POST"
 TELEMETRY_PATH = "/batch"
 FLAGS_PATH = "/flags?v=2"
+HARNESS_SOURCE = ROOT / HARNESS_RELATIVE / "AppDelegate.swift"
+HARNESS_DIAGNOSTIC_PATH = f"{HARNESS_RELATIVE.as_posix().casefold()}/appdelegate.swift"
+BUILD_PREFIXES = {"source": "SOURCE", "candidate": "CANDIDATE"}
+COMPILER_ORIGINS = {
+    "HARNESS_BOOTSTRAP": "the harness bootstrap",
+    "HARNESS_VIEW": "the harness view",
+    "HARNESS_CONFIG": "the harness config call",
+    "HARNESS_IDENTITY": "the harness identity probe",
+    "HARNESS_RESULT": "the harness result writer",
+    "SDK": "the ELU SDK source",
+    "DEPENDENCY": "the resolved dependency source",
+    "UNKNOWN": "an unclassified build source",
+}
+COMPILER_CATEGORIES = {
+    "AVAILABILITY": "an API availability error",
+    "CONCURRENCY": "a concurrency isolation error",
+    "API": "an API or type-checking error",
+    "OTHER": "another compiler error",
+}
+COMPILER_ORIGIN_PRIORITY = (
+    "HARNESS_BOOTSTRAP",
+    "HARNESS_VIEW",
+    "HARNESS_CONFIG",
+    "HARNESS_IDENTITY",
+    "HARNESS_RESULT",
+    "SDK",
+    "DEPENDENCY",
+    "UNKNOWN",
+)
+COMPILER_CATEGORY_PRIORITY = ("AVAILABILITY", "CONCURRENCY", "API", "OTHER")
 BLOCKER_DETAILS = {
     "FULL_XCODE_REQUIRED": "The selected developer directory does not provide Xcode and the iOS Simulator tools.",
     "CANDIDATE_CHECKOUT_DIRTY": "The candidate checkout must be clean so its revision exactly identifies the tested source.",
@@ -66,6 +97,12 @@ BLOCKER_DETAILS = {
     "RAW_CAPTURE_INCOMPLETE": "Observable network evidence did not contain both source and candidate session markers.",
     "UNEXPECTED_RUNNER_FAILURE": "The simulator evidence runner stopped before all required checks completed.",
 }
+for build_prefix, build_label in (("SOURCE", "source-version"), ("CANDIDATE", "candidate")):
+    for origin_code, origin_label in COMPILER_ORIGINS.items():
+        for category_code, category_label in COMPILER_CATEGORIES.items():
+            BLOCKER_DETAILS[f"{build_prefix}_BUILD_COMPILE_{origin_code}_{category_code}"] = (
+                f"The {build_label} build reported {category_label} in {origin_label}."
+            )
 
 
 class HarnessBlocked(RuntimeError):
@@ -74,8 +111,133 @@ class HarnessBlocked(RuntimeError):
         self.code = code
 
 
+def harness_compiler_origin(line_number: int) -> str:
+    try:
+        lines = HARNESS_SOURCE.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return "HARNESS_BOOTSTRAP"
+    if line_number < 1 or line_number > len(lines):
+        return "HARNESS_BOOTSTRAP"
+
+    def line_of(fragment: str, default: int) -> int:
+        return next((index for index, line in enumerate(lines, start=1) if fragment in line), default)
+
+    view_start = line_of("private struct UpgradeEvidenceView", len(lines) + 1)
+    probe_start = line_of("private enum UpgradeProbe", len(lines) + 1)
+    result_start = line_of("private struct UpgradeResult", len(lines) + 1)
+    app_start = line_of("@main", len(lines) + 1)
+    write_start = line_of("private static func write", len(lines) + 1)
+    if result_start <= line_number < app_start or write_start <= line_number:
+        return "HARNESS_RESULT"
+    if view_start <= line_number < probe_start:
+        return "HARNESS_VIEW"
+
+    source_line = lines[line_number - 1].casefold()
+    if "elu.setup" in source_line or "elusetupoptions" in source_line:
+        return "HARNESS_CONFIG"
+    identity_tokens = (
+        "expectedidentity",
+        "elu.identify",
+        "elu.distinctid",
+        "identitykey",
+        "waitforidentity",
+    )
+    if any(token in source_line for token in identity_tokens):
+        return "HARNESS_IDENTITY"
+    return "HARNESS_BOOTSTRAP"
+
+
+def compiler_error_category(message: str) -> str:
+    normalized = message.casefold()
+    category_markers = (
+        ("AVAILABILITY", ("only available in", "unavailable", "introduced in", "requires ios")),
+        (
+            "CONCURRENCY",
+            (
+                "actor-isolated",
+                "main actor",
+                "sendable",
+                "concurrency",
+                "data race",
+                "task-isolated",
+            ),
+        ),
+        (
+            "API",
+            (
+                "has no member",
+                "cannot find",
+                "extra argument",
+                "missing argument",
+                "incorrect argument label",
+                "no exact matches",
+                "ambiguous use",
+                "cannot convert value of type",
+                "does not conform to protocol",
+                "inaccessible due to",
+                "must be declared internal",
+            ),
+        ),
+    )
+    for category, markers in category_markers:
+        if any(marker in normalized for marker in markers):
+            return category
+    return "OTHER"
+
+
+def classify_compiler_failure(build: str, diagnostic: str) -> str | None:
+    prefix = BUILD_PREFIXES.get(build)
+    if prefix is None:
+        return "UNEXPECTED_RUNNER_FAILURE"
+    error_pattern = re.compile(
+        r"(?P<path>.+?\.(?:swift|m|mm|c|cc|cpp|cxx|h|hh|hpp|hxx)):"
+        r"(?P<line>\d+)(?::(?P<column>\d+))?:\s*(?:fatal\s+)?error:\s*(?P<message>.*)",
+        re.IGNORECASE,
+    )
+    records: list[tuple[str, int, str]] = []
+    for raw_line in diagnostic.splitlines():
+        match = error_pattern.search(raw_line)
+        if match is not None:
+            records.append((match.group("path"), int(match.group("line")), match.group("message")))
+    if not records:
+        normalized_diagnostic = diagnostic.casefold()
+        compiler_markers = (
+            "emit-swiftmodule command failed",
+            "emit-module command failed",
+            "swift compiler error",
+            "compilec command failed",
+        )
+        if not any(marker in normalized_diagnostic for marker in compiler_markers):
+            return None
+        return f"{prefix}_BUILD_COMPILE_UNKNOWN_OTHER"
+
+    classified: list[tuple[str, str]] = []
+    for path, line_number, message in records:
+        normalized_path = path.replace("\\", "/").casefold()
+        if "/checkouts/" in normalized_path or "/sourcepackages/" in normalized_path:
+            origin = "DEPENDENCY"
+        elif "/sources/eluanalytics/" in normalized_path:
+            origin = "SDK"
+        elif normalized_path == HARNESS_DIAGNOSTIC_PATH or normalized_path.endswith(
+            f"/{HARNESS_DIAGNOSTIC_PATH}"
+        ):
+            origin = harness_compiler_origin(line_number)
+        else:
+            origin = "UNKNOWN"
+        classified.append((origin, compiler_error_category(message)))
+    origin_rank = {origin: index for index, origin in enumerate(COMPILER_ORIGIN_PRIORITY)}
+    category_rank = {category: index for index, category in enumerate(COMPILER_CATEGORY_PRIORITY)}
+    origin, category = min(
+        set(classified),
+        key=lambda item: (origin_rank[item[0]], category_rank[item[1]]),
+    )
+    return f"{prefix}_BUILD_COMPILE_{origin}_{category}"
+
+
 def classify_build_failure(build: str, stdout: bytes, stderr: bytes) -> str:
-    prefix = build.upper()
+    prefix = BUILD_PREFIXES.get(build)
+    if prefix is None:
+        return "UNEXPECTED_RUNNER_FAILURE"
     diagnostic = (stdout + b"\n" + stderr).decode("utf-8", errors="replace").casefold()
     categories = (
         (
@@ -106,20 +268,13 @@ def classify_build_failure(build: str, stdout: bytes, stderr: bytes) -> str:
                 "ld: symbol(s) not found",
             ),
         ),
-        (
-            "COMPILATION_FAILED",
-            (
-                "swiftcompile normal",
-                "swiftemitmodule normal",
-                "emit-swiftmodule command failed",
-                "compilec ",
-                " error:",
-            ),
-        ),
     )
     for category, markers in categories:
         if any(marker in diagnostic for marker in markers):
             return f"{prefix}_BUILD_{category}"
+    compiler_code = classify_compiler_failure(build, diagnostic)
+    if compiler_code is not None:
+        return compiler_code
     return f"{prefix}_BUILD_FAILED"
 
 
@@ -401,7 +556,10 @@ def build_app(
     work_directory: pathlib.Path,
     raw_directory: pathlib.Path,
 ) -> tuple[pathlib.Path, dict[str, Any]]:
-    code = "SOURCE_BUILD_FAILED" if build == "source" else "CANDIDATE_BUILD_FAILED"
+    prefix = BUILD_PREFIXES.get(build)
+    if prefix is None:
+        raise HarnessBlocked("UNEXPECTED_RUNNER_FAILURE")
+    code = f"{prefix}_BUILD_FAILED"
     derived_data = work_directory / f"{build}-derived-data"
     packages = work_directory / f"{build}-packages"
     project = sdk_root / HARNESS_RELATIVE / "UpgradeHarness.xcodeproj"
@@ -431,7 +589,7 @@ def build_app(
     )
     app = derived_data / "Build" / "Products" / "Debug-iphonesimulator" / APP_NAME
     if not app.is_dir():
-        raise HarnessBlocked(f"{build.upper()}_BUILD_PRODUCT_MISSING")
+        raise HarnessBlocked(f"{prefix}_BUILD_PRODUCT_MISSING")
     return app, resolved_dependency(
         packages,
         raw_directory,
