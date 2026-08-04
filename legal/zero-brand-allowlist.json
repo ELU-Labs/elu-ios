@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "trackedPaths": [
+    "LICENSE",
+    "legal/THIRD_PARTY_NOTICES.md",
+    "legal/THIRD_PARTY_NOTICES.provenance.json"
+  ],
+  "artifactBasenames": [
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md",
+    "THIRD_PARTY_NOTICES.provenance.json"
+  ]
+}

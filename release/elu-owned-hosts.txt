@@ -1,0 +1,2 @@
+# Exact host or parent domain; subdomains are allowed only at label boundaries.
+elu.dev
