@@ -40,6 +40,8 @@ private enum UpgradeProbe {
     private static let sourceMarker = "elu_sdk_upgrade_source"
     private static let candidateMarker = "elu_sdk_upgrade_candidate"
     private static let timeoutSeconds: TimeInterval = 20
+    private static let flushRetryCount = 5
+    private static let flushRetryInterval: TimeInterval = 1
 
     static func start() {
         let environment = ProcessInfo.processInfo.environment
@@ -81,7 +83,7 @@ private enum UpgradeProbe {
         }
         if Elu.distinctId() == expectedIdentity {
             Elu.capture(build == .source ? sourceMarker : candidateMarker)
-            Elu.flush()
+            flushMarker(retriesRemaining: flushRetryCount)
             DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
                 write(build: build.rawValue, identityCheck: true)
             }
@@ -89,6 +91,14 @@ private enum UpgradeProbe {
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
             waitForIdentity(build: build, expectedIdentity: expectedIdentity, deadline: deadline)
+        }
+    }
+
+    private static func flushMarker(retriesRemaining: Int) {
+        Elu.flush()
+        guard retriesRemaining > 0 else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + flushRetryInterval) {
+            flushMarker(retriesRemaining: retriesRemaining - 1)
         }
     }
 

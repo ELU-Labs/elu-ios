@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gzip
 import importlib.util
 import io
 import json
@@ -43,6 +44,37 @@ class UpgradeEvidenceCaptureTests(unittest.TestCase):
         self.assertIn("deadline: deadline", wait_body)
         self.assertNotIn("identityCheck: matches", wait_body)
         self.assertNotIn("if let observed = Elu.distinctId()", wait_body)
+
+    def test_marker_capture_is_single_shot_with_bounded_flush_retries(self) -> None:
+        source = HARNESS_SOURCE.read_text(encoding="utf-8")
+        flush_body = source.split("private static func flushMarker", 1)[1].split(
+            "private static func write", 1
+        )[0]
+        self.assertEqual(source.count("Elu.capture("), 1)
+        self.assertIn("private static let flushRetryCount = 5", source)
+        self.assertIn("private static let flushRetryInterval: TimeInterval = 1", source)
+        self.assertEqual(flush_body.count("Elu.flush()"), 1)
+        self.assertIn("guard retriesRemaining > 0 else { return }", flush_body)
+        self.assertIn(".now() + flushRetryInterval", flush_body)
+        self.assertIn("retriesRemaining: retriesRemaining - 1", flush_body)
+
+    def test_marker_wait_exceeds_provider_timer_and_uses_fixed_codes(self) -> None:
+        self.assertEqual(RUNNER.MARKER_WAIT_SECONDS, 45)
+        self.assertGreater(RUNNER.MARKER_WAIT_SECONDS, 30)
+        self.assertEqual(
+            RUNNER.CaptureLedger.wait_for.__defaults__, (RUNNER.MARKER_WAIT_SECONDS,)
+        )
+        self.assertEqual(
+            RUNNER.MARKER_BLOCKER_CODES,
+            {
+                "source": "SOURCE_MARKER_NOT_OBSERVED",
+                "candidate": "CANDIDATE_MARKER_NOT_OBSERVED",
+            },
+        )
+        for code in RUNNER.MARKER_BLOCKER_CODES.values():
+            self.assertIn(code, RUNNER.BLOCKER_DETAILS)
+            self.assertRegex(code, r"^[A-Z][A-Z0-9_]+$")
+            self.assertNotIn("/", code)
 
     def test_harness_product_is_bound_to_the_local_package(self) -> None:
         project = PROJECT.read_text(encoding="utf-8")
@@ -401,6 +433,44 @@ class UpgradeEvidenceCaptureTests(unittest.TestCase):
             self.captured_markers("POST", "/batch"),
             {"source": ("opaque-identity", "source-session")},
         )
+
+    def test_capture_ledger_parses_realistic_lowercase_gzip_batch_strictly(self) -> None:
+        body = gzip.compress(
+            json.dumps(
+                {
+                    "api_key": "upgrade-evidence-token",
+                    "batch": [
+                        {
+                            "event": "Application Opened",
+                            "distinct_id": "opaque-identity",
+                            "properties": {"$session_id": "source-session"},
+                        },
+                        {
+                            "event": "elu_sdk_upgrade_source",
+                            "distinct_id": "opaque-identity",
+                            "properties": {"$session_id": "source-session"},
+                        },
+                        {
+                            "event": "elu_sdk_upgrade_candidate",
+                            "distinct_id": "opaque-identity",
+                            "properties": {},
+                        },
+                    ],
+                }
+            ).encode("utf-8")
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            ledger = RUNNER.CaptureLedger(pathlib.Path(temporary))
+            ledger.record("POST", "/batch", {"content-encoding": "gzip"}, body)
+            self.assertEqual(
+                ledger.markers,
+                {"source": ("opaque-identity", "source-session")},
+            )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            ledger = RUNNER.CaptureLedger(pathlib.Path(temporary))
+            ledger.record("POST", "/batch?forged=1", {"content-encoding": "gzip"}, body)
+            self.assertEqual(ledger.markers, {})
 
     def test_capture_ledger_rejects_marker_at_wrong_method_or_path(self) -> None:
         for method, path in (

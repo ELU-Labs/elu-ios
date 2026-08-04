@@ -42,6 +42,7 @@ TELEMETRY_METHOD = "POST"
 TELEMETRY_PATH = "/batch"
 FLAGS_PATH = "/flags?v=2"
 CONFIG_PATH = "/v1/upgrade-evidence/config"
+MARKER_WAIT_SECONDS = 45
 HARNESS_SOURCE = ROOT / HARNESS_RELATIVE / "AppDelegate.swift"
 HARNESS_DIAGNOSTIC_PATH = f"{HARNESS_RELATIVE.as_posix().casefold()}/appdelegate.swift"
 BUILD_PREFIXES = {"source": "SOURCE", "candidate": "CANDIDATE"}
@@ -83,6 +84,10 @@ CONFIG_GET_OBSERVATIONS = {
     True: ("CONFIG_GET_OBSERVED", "the exact configuration GET was observed"),
     False: ("CONFIG_GET_NOT_OBSERVED", "the exact configuration GET was not observed"),
 }
+MARKER_BLOCKER_CODES = {
+    "source": "SOURCE_MARKER_NOT_OBSERVED",
+    "candidate": "CANDIDATE_MARKER_NOT_OBSERVED",
+}
 BLOCKER_DETAILS = {
     "FULL_XCODE_REQUIRED": "The selected developer directory does not provide Xcode and the iOS Simulator tools.",
     "CANDIDATE_CHECKOUT_DIRTY": "The candidate checkout must be clean so its revision exactly identifies the tested source.",
@@ -107,6 +112,8 @@ BLOCKER_DETAILS = {
     "HISTORICAL_TAG_AUTHENTICATION_FAILED": "The resolved source dependency checkout did not authenticate the dated tag observation.",
     "SOURCE_RUN_FAILED": "The source-version application did not establish observable identity and session evidence.",
     "CANDIDATE_RUN_FAILED": "The candidate application did not produce its same-container continuity result.",
+    "SOURCE_MARKER_NOT_OBSERVED": "The source-version application completed its identity check without an observable marker event.",
+    "CANDIDATE_MARKER_NOT_OBSERVED": "The candidate application completed its identity check without an observable marker event.",
     "RAW_CAPTURE_INCOMPLETE": "Observable network evidence did not contain both source and candidate session markers.",
     "UNEXPECTED_RUNNER_FAILURE": "The simulator evidence runner stopped before all required checks completed.",
 }
@@ -463,7 +470,10 @@ class CaptureLedger:
             self.config_get_count += 1
         if method != TELEMETRY_METHOD or path != TELEMETRY_PATH:
             return
-        if headers.get("Content-Encoding", "").casefold() == "gzip":
+        content_encoding = next(
+            (value for key, value in headers.items() if key.casefold() == "content-encoding"), ""
+        )
+        if content_encoding.casefold() == "gzip":
             try:
                 body = gzip.decompress(body)
             except (OSError, EOFError):
@@ -503,7 +513,7 @@ class CaptureLedger:
         with self.lock:
             return self.config_get_count
 
-    def wait_for(self, build: str, timeout: float = 15) -> bool:
+    def wait_for(self, build: str, timeout: float = MARKER_WAIT_SECONDS) -> bool:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             with self.lock:
@@ -901,7 +911,8 @@ def install_and_run(
         {"build": build, "identityCheck": True},
     )
     if not ledger.wait_for(build):
-        raise HarnessBlocked("RAW_CAPTURE_INCOMPLETE")
+        marker_blocker = MARKER_BLOCKER_CODES.get(build)
+        raise HarnessBlocked(marker_blocker or "UNEXPECTED_RUNNER_FAILURE")
     run_command(
         ["xcrun", "simctl", "terminate", udid, BUNDLE_ID],
         code=code,
