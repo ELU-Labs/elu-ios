@@ -1,0 +1,33 @@
+{
+  "snapshotVersion": 1,
+  "module": "EluAnalytics",
+  "sourceTag": "0.1.0",
+  "sourceCommit": "5825dfb4ca9cd1d104d0a07e33d0394128750391",
+  "symbols": [
+    { "kind": "struct", "name": "EluSetupOptions" },
+    { "kind": "property", "name": "EluSetupOptions.configHost" },
+    { "kind": "initializer", "name": "EluSetupOptions.init(configHost:)" },
+    { "kind": "enum", "name": "Elu" },
+    { "kind": "method", "name": "Elu.setup(siteKey:)" },
+    { "kind": "method", "name": "Elu.setup(siteKey:options:)" },
+    { "kind": "method", "name": "Elu.identify(_:userProperties:)" },
+    { "kind": "method", "name": "Elu.reset()" },
+    { "kind": "method", "name": "Elu.alias(_:)" },
+    { "kind": "method", "name": "Elu.distinctId()" },
+    { "kind": "method", "name": "Elu.setPersonProperties(_:)" },
+    { "kind": "method", "name": "Elu.capture(_:properties:)" },
+    { "kind": "method", "name": "Elu.screen(_:properties:)" },
+    { "kind": "method", "name": "Elu.captureException(_:properties:)" },
+    { "kind": "method", "name": "Elu.register(_:)" },
+    { "kind": "method", "name": "Elu.unregister(_:)" },
+    { "kind": "method", "name": "Elu.group(_:key:properties:)" },
+    { "kind": "method", "name": "Elu.getFeatureFlag(_:)" },
+    { "kind": "method", "name": "Elu.getFeatureFlagPayload(_:)" },
+    { "kind": "method", "name": "Elu.isFeatureEnabled(_:)" },
+    { "kind": "method", "name": "Elu.reloadFeatureFlags(_:)" },
+    { "kind": "method", "name": "Elu.onFeatureFlagsLoaded(_:)" },
+    { "kind": "method", "name": "Elu.setPersonPropertiesForFlags(_:)" },
+    { "kind": "method", "name": "Elu.setGroupPropertiesForFlags(_:properties:)" },
+    { "kind": "method", "name": "Elu.flush()" }
+  ]
+}

@@ -1,0 +1,91 @@
+{
+  "schemaVersion": 1,
+  "baseline": {
+    "sdkVersion": "0.1.0",
+    "sourceTag": "0.1.0",
+    "sourceCommit": "5825dfb4ca9cd1d104d0a07e33d0394128750391"
+  },
+  "contractStatus": "provisional-awaiting-browser-v1",
+  "cases": [
+    {
+      "id": "identity.explicit-only",
+      "area": "identity",
+      "given": { "state": "running", "customerIdentity": null },
+      "operations": ["identify(user-123, plan=pro)"],
+      "expected": { "autoIdentify": false, "distinctIdBecomes": "user-123", "personPropertiesForwarded": true },
+      "evidence": { "kind": "source-audit", "status": "verified", "reference": "Sources/EluAnalytics/Elu.swift" }
+    },
+    {
+      "id": "reset.fifo-and-metadata",
+      "area": "reset",
+      "given": { "state": "pending", "buffer": [] },
+      "operations": ["capture(before)", "reset()", "capture(after)"],
+      "expected": { "drainOrder": ["capture(before)", "reset()", "capture(after)"], "eluSuperPropertiesRestoredAfterReset": true },
+      "evidence": { "kind": "source-audit", "status": "verified", "reference": "Sources/EluAnalytics/EluState.swift" }
+    },
+    {
+      "id": "groups.forwarded",
+      "area": "groups",
+      "given": { "state": "running" },
+      "operations": ["group(company, acme, tier=design-partner)", "setGroupPropertiesForFlags(company, region=us)"],
+      "expected": { "groupTypePreserved": true, "groupKeyPreserved": true, "flagContextMutationPreserved": true },
+      "evidence": { "kind": "source-audit", "status": "verified", "reference": "Sources/EluAnalytics/EluState.swift" }
+    },
+    {
+      "id": "flags.defaults-and-callback-queue",
+      "area": "flags",
+      "given": { "state": "idle" },
+      "operations": ["getFeatureFlag(checkout)", "isFeatureEnabled(checkout)", "reloadFeatureFlags(completion)"],
+      "expected": { "flagDefault": null, "enabledDefault": false, "reloadCompletionQueue": "main", "registeredCallbacksRetainOrder": true },
+      "evidence": { "kind": "source-audit", "status": "verified", "reference": "Sources/EluAnalytics/EluState.swift" }
+    },
+    {
+      "id": "lifecycle.fail-closed-activation",
+      "area": "lifecycle",
+      "given": { "state": "idle", "cachedConfig": null },
+      "operations": ["setup(siteKey)"],
+      "expected": { "nextState": "pending", "networkBeforePrivacyDecision": false, "secondSetup": "ignored" },
+      "evidence": { "kind": "source-audit", "status": "verified", "reference": "Sources/EluAnalytics/EluState.swift" }
+    },
+    {
+      "id": "events.preconfig-fifo-cap",
+      "area": "events",
+      "given": { "state": "pending", "operationCount": 101 },
+      "operations": ["enqueue operations 0...100", "receive enabled config", "drain"],
+      "expected": { "capacity": 100, "overflowPolicy": "drop-oldest", "deliveryOrder": "fifo", "persistence": false, "timestampPolicy": "drain-time" },
+      "evidence": { "kind": "source-audit", "status": "verified", "reference": "Sources/EluAnalytics/EluEventBuffer.swift" }
+    },
+    {
+      "id": "replay.mask-and-session-budget",
+      "area": "replay",
+      "given": { "platform": "iOS", "budgetMinutes": 1, "returningDevice": true },
+      "operations": ["apply config", "start session", "exceed budget"],
+      "expected": { "screenshotMode": true, "textMaskingFailClosed": true, "budgetScope": "session", "eventsContinueAfterReplayStops": true },
+      "evidence": { "kind": "source-audit", "status": "verified", "reference": "Sources/EluAnalytics/EluReplayBudget.swift" }
+    },
+    {
+      "id": "privacy.eu-default-block",
+      "area": "privacy",
+      "given": { "config": null, "timezone": "Europe/Paris" },
+      "operations": ["setup(siteKey)"],
+      "expected": { "blockEuDefault": true, "maskTextInputsDefault": true, "runtimeInitializes": false, "captureNetworkRequests": 0 },
+      "evidence": { "kind": "unit", "status": "foundation-only", "reference": "Tests/EluAnalyticsTests" }
+    },
+    {
+      "id": "persistence.wrapper-owned-state",
+      "area": "persistence",
+      "given": { "siteKey": "site/key", "firstLaunch": true },
+      "operations": ["load config cache", "record first launch", "record replay budget"],
+      "expected": { "configCacheAtomic": true, "siteKeyPathSanitized": true, "firstLaunchMarkerOwnedByElu": true, "futureIdentitySchema": "provisional-awaiting-browser-v1" },
+      "evidence": { "kind": "source-audit", "status": "verified", "reference": "Sources/EluAnalytics/EluConfigClient.swift" }
+    },
+    {
+      "id": "network.config-and-runtime-routing",
+      "area": "network",
+      "given": { "configOrigin": "https://elu.dev", "siteKey": "a/b c" },
+      "operations": ["fetch config", "initialize current wrapper runtime"],
+      "expected": { "configMethod": "GET", "configPathTemplate": "/v1/{percent-encoded-site-key}/config", "runtimeDestinationSource": "v1-config-response", "futureEluOnlyEndpoints": "provisional-awaiting-browser-v1" },
+      "evidence": { "kind": "network-trace", "status": "pending", "reference": "Fixtures/Simulator/README.md" }
+    }
+  ]
+}
