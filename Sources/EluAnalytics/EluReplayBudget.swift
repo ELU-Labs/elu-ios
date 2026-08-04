@@ -9,11 +9,14 @@ enum EluDeviceMarkers {
 
     /// Records the first-launch marker if absent. Returns true when the marker
     /// was absent at this call — the device is "new" for `replayNewUsersOnly`.
-    static func recordFirstLaunchIfNeeded(defaults: UserDefaults = .standard) -> Bool {
+    static func recordFirstLaunchIfNeeded(
+        defaults: UserDefaults = .standard,
+        now: Date = Date()
+    ) -> Bool {
         if defaults.object(forKey: firstLaunchKey) != nil {
             return false
         }
-        defaults.set(Date().timeIntervalSince1970 * 1000, forKey: firstLaunchKey)
+        defaults.set(now.timeIntervalSince1970 * 1000, forKey: firstLaunchKey)
         return true
     }
 
@@ -21,15 +24,19 @@ enum EluDeviceMarkers {
     /// creating it if absent, and prunes to the most recent 5 stamps. The
     /// surviving stamp means a relaunch within the same PostHog session
     /// resumes the REMAINING budget rather than granting a fresh one.
-    static func budgetStamp(sessionId: String, defaults: UserDefaults = .standard) -> Double {
+    static func budgetStamp(
+        sessionId: String,
+        defaults: UserDefaults = .standard,
+        now: Date = Date()
+    ) -> Double {
         let key = budgetKeyPrefix + sessionId
         if let existing = defaults.object(forKey: key) as? Double {
             return existing
         }
-        let now = Date().timeIntervalSince1970 * 1000
-        defaults.set(now, forKey: key)
+        let nowMs = now.timeIntervalSince1970 * 1000
+        defaults.set(nowMs, forKey: key)
         pruneBudgetStamps(defaults: defaults)
-        return now
+        return nowMs
     }
 
     static func pruneBudgetStamps(defaults: UserDefaults = .standard) {

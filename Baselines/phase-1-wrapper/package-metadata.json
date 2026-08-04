@@ -1,0 +1,23 @@
+{
+  "snapshotVersion": 1,
+  "sourceCommit": "96b8bb33453ae0502eeb801d7acacccfd3cbca3a",
+  "package": {
+    "toolsVersion": "5.9.0",
+    "name": "EluAnalytics",
+    "platforms": [
+      { "name": "ios", "minimumVersion": "13.0" }
+    ],
+    "products": [
+      { "name": "EluAnalytics", "type": "library", "targets": ["EluAnalytics"] }
+    ],
+    "targets": [
+      { "name": "EluAnalytics", "type": "regular" },
+      { "name": "EluAnalyticsTests", "type": "test" }
+    ]
+  },
+  "dependency": {
+    "identityAndSource": "legal/THIRD_PARTY_NOTICES.provenance.json",
+    "requirement": { "kind": "exact", "version": "3.69.0" },
+    "status": "temporary Phase 1 parity pin; removed by owned-runtime gate"
+  }
+}

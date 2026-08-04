@@ -13,7 +13,9 @@ let package = Package(
         ),
     ],
     dependencies: [
-        .package(url: "https://github.com/PostHog/posthog-ios.git", .upToNextMinor(from: "3.69.0")),
+        // Phase 1 baseline pin. The Phase 2 owned-runtime change removes this
+        // dependency entirely; pinning avoids a moving parity reference.
+        .package(url: "https://github.com/PostHog/posthog-ios.git", exact: "3.69.0"),
     ],
     targets: [
         .target(
@@ -24,6 +26,10 @@ let package = Package(
             resources: [
                 .copy("Resources/PrivacyInfo.xcprivacy"),
             ]
+        ),
+        .testTarget(
+            name: "EluAnalyticsTests",
+            dependencies: ["EluAnalytics"]
         ),
     ]
 )

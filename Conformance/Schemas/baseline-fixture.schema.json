@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://elu.dev/schemas/sdk/ios/baseline-fixture-v1.json",
+  "title": "ELU iOS SDK observable behavior baseline",
+  "type": "object",
+  "required": ["schemaVersion", "baseline", "contractStatus", "cases"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "baseline": {
+      "type": "object",
+      "required": ["sdkVersion", "sourceTag", "sourceCommit"],
+      "properties": {
+        "sdkVersion": { "type": "string" },
+        "sourceTag": { "type": "string" },
+        "sourceCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" }
+      },
+      "additionalProperties": false
+    },
+    "contractStatus": { "const": "provisional-awaiting-browser-v1" },
+    "cases": {
+      "type": "array",
+      "minItems": 10,
+      "items": {
+        "type": "object",
+        "required": ["id", "area", "given", "operations", "expected", "evidence"],
+        "properties": {
+          "id": { "type": "string", "pattern": "^[a-z][a-z0-9.-]+$" },
+          "area": {
+            "enum": ["identity", "reset", "groups", "flags", "lifecycle", "events", "replay", "privacy", "persistence", "network"]
+          },
+          "given": { "type": "object" },
+          "operations": { "type": "array", "minItems": 1, "items": { "type": "string" } },
+          "expected": { "type": "object", "minProperties": 1 },
+          "evidence": {
+            "type": "object",
+            "required": ["kind", "status"],
+            "properties": {
+              "kind": { "enum": ["source-audit", "unit", "simulator", "device", "network-trace", "engine-readback"] },
+              "status": { "enum": ["verified", "foundation-only", "pending"] },
+              "reference": { "type": "string" }
+            },
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}
