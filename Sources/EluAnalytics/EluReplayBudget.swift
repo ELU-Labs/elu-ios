@@ -20,9 +20,9 @@ enum EluDeviceMarkers {
         return true
     }
 
-    /// Returns the replay-start stamp (ms epoch) for a PostHog session id,
+    /// Returns the replay-start stamp (ms epoch) for an analytics session id,
     /// creating it if absent, and prunes to the most recent 5 stamps. The
-    /// surviving stamp means a relaunch within the same PostHog session
+    /// surviving stamp means a relaunch within the same analytics session
     /// resumes the REMAINING budget rather than granting a fresh one.
     static func budgetStamp(
         sessionId: String,

@@ -16,7 +16,7 @@
       },
       "additionalProperties": false
     },
-    "contractStatus": { "const": "provisional-awaiting-browser-v1" },
+    "contractStatus": { "const": "observable-surface-only" },
     "cases": {
       "type": "array",
       "minItems": 10,
@@ -36,7 +36,7 @@
             "required": ["kind", "status"],
             "properties": {
               "kind": { "enum": ["source-audit", "unit", "simulator", "device", "network-trace", "engine-readback"] },
-              "status": { "enum": ["verified", "foundation-only", "pending"] },
+              "status": { "enum": ["verified", "partial", "pending"] },
               "reference": { "type": "string" }
             },
             "additionalProperties": false

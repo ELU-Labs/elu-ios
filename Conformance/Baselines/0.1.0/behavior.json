@@ -5,7 +5,7 @@
     "sourceTag": "0.1.0",
     "sourceCommit": "5825dfb4ca9cd1d104d0a07e33d0394128750391"
   },
-  "contractStatus": "provisional-awaiting-browser-v1",
+  "contractStatus": "observable-surface-only",
   "cases": [
     {
       "id": "identity.explicit-only",
@@ -69,22 +69,22 @@
       "given": { "config": null, "timezone": "Europe/Paris" },
       "operations": ["setup(siteKey)"],
       "expected": { "blockEuDefault": true, "maskTextInputsDefault": true, "runtimeInitializes": false, "captureNetworkRequests": 0 },
-      "evidence": { "kind": "unit", "status": "foundation-only", "reference": "Tests/EluAnalyticsTests" }
+      "evidence": { "kind": "unit", "status": "partial", "reference": "Tests/EluAnalyticsTests" }
     },
     {
-      "id": "persistence.wrapper-owned-state",
+      "id": "persistence.sdk-state",
       "area": "persistence",
       "given": { "siteKey": "site/key", "firstLaunch": true },
       "operations": ["load config cache", "record first launch", "record replay budget"],
-      "expected": { "configCacheAtomic": true, "siteKeyPathSanitized": true, "firstLaunchMarkerOwnedByElu": true, "futureIdentitySchema": "provisional-awaiting-browser-v1" },
+      "expected": { "configCacheAtomic": true, "siteKeyPathSanitized": true, "firstLaunchMarkerOwnedByElu": true, "identitySchemaScope": "not-observed" },
       "evidence": { "kind": "source-audit", "status": "verified", "reference": "Sources/EluAnalytics/EluConfigClient.swift" }
     },
     {
       "id": "network.config-and-runtime-routing",
       "area": "network",
       "given": { "configOrigin": "https://elu.dev", "siteKey": "a/b c" },
-      "operations": ["fetch config", "initialize current wrapper runtime"],
-      "expected": { "configMethod": "GET", "configPathTemplate": "/v1/{percent-encoded-site-key}/config", "runtimeDestinationSource": "v1-config-response", "futureEluOnlyEndpoints": "provisional-awaiting-browser-v1" },
+      "operations": ["fetch config", "initialize SDK runtime"],
+      "expected": { "configMethod": "GET", "configPathTemplate": "/v1/{percent-encoded-site-key}/config", "runtimeDestinationSource": "v1-config-response", "runtimeEndpointEvidence": "pending-capture" },
       "evidence": { "kind": "network-trace", "status": "pending", "reference": "Fixtures/Simulator/README.md" }
     }
   ]

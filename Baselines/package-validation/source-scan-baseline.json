@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "mode": "ratchet",
+  "compatibilityReference": "0.1.0",
+  "strictReleaseRequirement": "zero findings",
+  "findings": {
+    "Package.swift": 4,
+    "Sources/EluAnalytics/EluState.swift": 8
+  }
+}

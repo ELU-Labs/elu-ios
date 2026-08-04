@@ -3,11 +3,11 @@
   "trackedPaths": [
     "LICENSE",
     "legal/THIRD_PARTY_NOTICES.md",
-    "legal/THIRD_PARTY_NOTICES.provenance.json"
+    "legal/THIRD_PARTY_NOTICES.dependencies.json"
   ],
   "artifactBasenames": [
     "LICENSE",
     "THIRD_PARTY_NOTICES.md",
-    "THIRD_PARTY_NOTICES.provenance.json"
+    "THIRD_PARTY_NOTICES.dependencies.json"
   ]
 }

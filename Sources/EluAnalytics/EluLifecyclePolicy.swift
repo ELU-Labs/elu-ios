@@ -23,9 +23,8 @@ struct EluStateDecision: Equatable {
     let disabledReason: EluDisabledReason?
 }
 
-/// Pure activation policy for the wrapper baseline. Keeping config decisions
-/// separate from side effects makes fail-closed state transitions testable
-/// while the future transport and persistence contracts remain provisional.
+/// Pure activation policy for the SDK. Keeping configuration decisions
+/// separate from side effects makes fail-closed state transitions testable.
 enum EluLifecyclePolicy {
     static func initial(cached: EluRemoteConfig?, deviceInEu: Bool) -> EluStateDecision {
         guard let cached else {

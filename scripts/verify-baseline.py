@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify immutable 0.1.0 package, API, fixture, and provenance snapshots."""
+"""Verify immutable 0.1.0 package, API, fixture, and dependency snapshots."""
 
 from __future__ import annotations
 
@@ -67,14 +67,14 @@ def main() -> int:
     symbols = json.loads((BASELINE / "public-symbols.json").read_text(encoding="utf-8"))
     if symbols["sourceCommit"] != COMMIT or symbols["module"] != "EluAnalytics":
         fail("public symbol snapshot is inconsistent")
-    provenance = json.loads(
-        (ROOT / "legal" / "THIRD_PARTY_NOTICES.provenance.json").read_text(encoding="utf-8")
+    dependency_inventory = json.loads(
+        (ROOT / "legal" / "THIRD_PARTY_NOTICES.dependencies.json").read_text(encoding="utf-8")
     )
-    if provenance["baseline"] != TAG or not provenance["packages"]:
-        fail("legal provenance inventory is incomplete")
+    if dependency_inventory["baseline"] != TAG or not dependency_inventory["packages"]:
+        fail("legal dependency inventory is incomplete")
 
     subprocess.check_call([sys.executable, "Conformance/validate-baselines.py"], cwd=ROOT)
-    print("verified immutable package/API snapshot and Phase 0 fixtures")
+    print("verified immutable package/API snapshot and conformance fixtures")
     return 0
 
 

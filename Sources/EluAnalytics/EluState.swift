@@ -5,7 +5,7 @@ import PostHog
 #endif
 
 /// The internal engine behind the `Elu` facade: owns the lifecycle state
-/// machine, the embedded PostHog instance, the pre-config buffer, config
+/// machine, the analytics runtime, the pre-config buffer, config
 /// refresh, and the replay budget. Every mutation runs on one serial queue;
 /// facade ops dispatch async (never block the caller), getters sync-hop.
 final class EluCore {
@@ -20,13 +20,13 @@ final class EluCore {
 
     private var state: EluLifecycleState = .idle
     private var disabledReason: EluDisabledReason?
-    private var posthog: PostHogSDK?
+    private var runtime: PostHogSDK?
     private var buffer = EluEventBuffer()
     private var configClient: EluConfigClient?
     private var deviceInEu = false
     private var isNewUser = false
 
-    /// Privacy actually applied to the live PostHog instance. Fresh configs
+    /// Privacy actually applied to the live analytics runtime. Fresh configs
     /// diff against this: tightening acts now, loosening waits for relaunch.
     private var appliedPrivacy: EluPrivacyConfig?
     /// Replay permanently stopped for this run (masking tightened, kill, or
@@ -67,7 +67,7 @@ final class EluCore {
             state = decision.state
             disabledReason = decision.disabledReason
             if decision.state == .running, let cached {
-                initializePostHog(with: cached)
+                initializeRuntime(with: cached)
             }
 
             client.fetchNow()
@@ -116,21 +116,21 @@ final class EluCore {
             if decision.state == .disabled {
                 buffer.dropAll()
             } else {
-                initializePostHog(with: cfg)
+                initializeRuntime(with: cfg)
                 for op in buffer.drain() {
                     execute(op)
                 }
             }
         case .disabled:
             // Only `enabled:false → true` re-initializes mid-run, and only if
-            // PostHog was never live. euBlocked/killSwitch loosens next launch.
+            // The runtime was never live. euBlocked/killSwitch loosens next launch.
             if EluLifecyclePolicy.shouldReactivate(
                 disabledReason: disabledReason,
-                runtimeWasInitialized: posthog != nil,
+                runtimeWasInitialized: runtime != nil,
                 config: cfg,
                 deviceInEu: deviceInEu
             ) {
-                initializePostHog(with: cfg)
+                initializeRuntime(with: cfg)
                 state = .running
                 disabledReason = nil
             }
@@ -141,19 +141,19 @@ final class EluCore {
 
     /// Mid-session rules: tightening acts immediately, loosening waits.
     private func applyWhileRunning(_ cfg: EluRemoteConfig) {
-        guard let ph = posthog, var applied = appliedPrivacy else { return }
+        guard let runtime, var applied = appliedPrivacy else { return }
 
         if !cfg.enabled {
-            ph.optOut()
-            stopReplayPermanently(ph)
+            runtime.optOut()
+            stopReplayPermanently(runtime)
             state = .disabled
             disabledReason = .killSwitch
             return
         }
 
         if deviceInEu, cfg.privacy.blockEu, !applied.blockEu {
-            ph.optOut()
-            stopReplayPermanently(ph)
+            runtime.optOut()
+            stopReplayPermanently(runtime)
             state = .disabled
             disabledReason = .killSwitch
             applied.blockEu = true
@@ -167,14 +167,14 @@ final class EluCore {
                 || (cfg.privacy.maskImages && !applied.maskImages)
         if maskingTightened {
             // Cannot re-mask live frames; correct masking applies next launch.
-            stopReplayPermanently(ph)
+            stopReplayPermanently(runtime)
             applied.maskTextInputs = applied.maskTextInputs || cfg.privacy.maskTextInputs
             applied.maskAllText = applied.maskAllText || cfg.privacy.maskAllText
             applied.maskImages = applied.maskImages || cfg.privacy.maskImages
         }
 
         if cfg.privacy.replayNewUsersOnly, !applied.replayNewUsersOnly, !isNewUser {
-            stopReplayPermanently(ph)
+            stopReplayPermanently(runtime)
             applied.replayNewUsersOnly = true
         }
 
@@ -192,9 +192,9 @@ final class EluCore {
         appliedPrivacy = applied
     }
 
-    // MARK: - PostHog init
+    // MARK: - Runtime initialization
 
-    private func initializePostHog(with cfg: EluRemoteConfig) {
+    private func initializeRuntime(with cfg: EluRemoteConfig) {
         let config = PostHogConfig(projectToken: cfg.publicToken, host: cfg.host)
         config.captureScreenViews = true
         config.captureApplicationLifecycleEvents = true
@@ -211,33 +211,33 @@ final class EluCore {
             // Screenshot mode is LOAD-BEARING: ELU's render/analysis pipeline
             // consumes the screenshot wireframe format only.
             config.sessionReplayConfig.screenshotMode = true
-            // posthog-ios has one text-masking knob covering labels AND inputs
+            // The runtime has one text-masking knob covering labels AND inputs
             // (see CONTRACT.md) — either ELU control turns it on.
             config.sessionReplayConfig.maskAllTextInputs =
                 cfg.privacy.maskTextInputs || cfg.privacy.maskAllText
             config.sessionReplayConfig.maskAllImages = cfg.privacy.maskImages
         #endif
 
-        let ph = PostHogSDK.with(config)
-        // A prior mid-session kill switch called optOut(), which posthog-ios
-        // PERSISTS and restores on every setup — without clearing it here a
+        let runtime = PostHogSDK.with(config)
+        // A prior mid-session kill switch called optOut(), which the runtime
+        // persists and restores on every setup — without clearing it here a
         // re-enabled org stays silently dark until app reinstall. This is the
         // ELU kill-switch path, the one sanctioned caller of optIn/optOut.
-        if ph.isOptOut() { ph.optIn() }
-        registerEluSuperProperties(ph)
+        if runtime.isOptOut() { runtime.optIn() }
+        registerEluSuperProperties(runtime)
 
-        posthog = ph
+        self.runtime = runtime
         appliedPrivacy = cfg.privacy
         replayKilled = false
         budgetStoppedSessionId = nil
         startBudgetTimerIfNeeded()
     }
 
-    /// PostHog `reset()` clears super properties along with identity, so both
+    /// Runtime `reset()` clears super properties along with identity, so both
     /// init and every reset path must (re-)register these — the backend
     /// depends on `elu_facade_version` for the fleet version histogram.
-    private func registerEluSuperProperties(_ ph: PostHogSDK) {
-        ph.register([
+    private func registerEluSuperProperties(_ runtime: PostHogSDK) {
+        runtime.register([
             "elu_sdk": "ios",
             "elu_sdk_version": Self.sdkVersion,
             "elu_facade_version": Self.facadeVersion,
@@ -250,7 +250,7 @@ final class EluCore {
         #if os(iOS)
             guard budgetTimer == nil,
                   let applied = appliedPrivacy, applied.replayMaxMinutes > 0,
-                  !replayKilled, posthog != nil
+                  !replayKilled, runtime != nil
             else { return }
             // First tick immediately: a relaunch inside an exhausted-budget
             // session must stop replay before meaningful capture, and the
@@ -265,29 +265,29 @@ final class EluCore {
 
     private func budgetTick() {
         #if os(iOS)
-            guard let ph = posthog, let applied = appliedPrivacy,
+            guard let runtime, let applied = appliedPrivacy,
                   applied.replayMaxMinutes > 0, !replayKilled, state == .running
             else { return }
-            guard let sessionId = ph.getSessionId(), !sessionId.isEmpty else { return }
+            guard let sessionId = runtime.getSessionId(), !sessionId.isEmpty else { return }
 
-            if ph.isSessionReplayActive() {
+            if runtime.isSessionReplayActive() {
                 let startMs = EluDeviceMarkers.budgetStamp(sessionId: sessionId)
                 let elapsedMs = Date().timeIntervalSince1970 * 1000 - startMs
                 if elapsedMs >= Double(applied.replayMaxMinutes) * 60_000 {
-                    ph.stopSessionRecording()
+                    runtime.stopSessionRecording()
                     budgetStoppedSessionId = sessionId
                 }
             } else if let stopped = budgetStoppedSessionId, stopped != sessionId {
-                // PostHog rotated to a new session: fresh per-session budget.
+                // A rotated session gets a fresh per-session budget.
                 budgetStoppedSessionId = nil
-                ph.startSessionRecording()
+                runtime.startSessionRecording()
             }
         #endif
     }
 
-    private func stopReplayPermanently(_ ph: PostHogSDK) {
+    private func stopReplayPermanently(_ runtime: PostHogSDK) {
         #if os(iOS)
-            ph.stopSessionRecording()
+            runtime.stopSessionRecording()
         #endif
         replayKilled = true
         budgetStoppedSessionId = nil
@@ -312,32 +312,32 @@ final class EluCore {
     }
 
     private func execute(_ op: EluBufferedOp) {
-        guard let ph = posthog else { return }
+        guard let runtime else { return }
         switch op {
         case let .capture(event, properties):
-            ph.capture(event, properties: properties)
+            runtime.capture(event, properties: properties)
         case let .identify(distinctId, userProperties):
-            ph.identify(distinctId, userProperties: userProperties)
+            runtime.identify(distinctId, userProperties: userProperties)
         case let .screen(name, properties):
-            ph.screen(name, properties: properties)
+            runtime.screen(name, properties: properties)
         case let .alias(alias):
-            ph.alias(alias)
+            runtime.alias(alias)
         case let .register(properties):
-            ph.register(properties)
+            runtime.register(properties)
         case let .unregister(key):
-            ph.unregister(key)
+            runtime.unregister(key)
         case let .group(type, key, properties):
-            ph.group(type: type, key: key, groupProperties: properties)
+            runtime.group(type: type, key: key, groupProperties: properties)
         case let .setPersonProperties(properties):
-            ph.setPersonProperties(userPropertiesToSet: properties)
+            runtime.setPersonProperties(userPropertiesToSet: properties)
         case let .setPersonPropertiesForFlags(properties):
-            ph.setPersonPropertiesForFlags(properties)
+            runtime.setPersonPropertiesForFlags(properties)
         case let .setGroupPropertiesForFlags(type, properties):
-            ph.setGroupPropertiesForFlags(type, properties: properties)
+            runtime.setGroupPropertiesForFlags(type, properties: properties)
         case let .captureException(error, properties):
-            ph.captureException(error, properties: properties)
+            runtime.captureException(error, properties: properties)
         case .reset:
-            performReset(ph)
+            performReset(runtime)
         }
     }
 
@@ -347,7 +347,7 @@ final class EluCore {
         queue.async { [self] in
             switch state {
             case .running:
-                if let ph = posthog { performReset(ph) }
+                if let runtime { performReset(runtime) }
             case .pending:
                 // Buffered in order so the drain replays capture → reset →
                 // capture exactly like web: pre-reset events deliver under the
@@ -359,21 +359,21 @@ final class EluCore {
         }
     }
 
-    private func performReset(_ ph: PostHogSDK) {
-        ph.reset()
-        registerEluSuperProperties(ph)
+    private func performReset(_ runtime: PostHogSDK) {
+        runtime.reset()
+        registerEluSuperProperties(runtime)
     }
 
     func flush() {
         queue.async { [self] in
-            if state == .running { posthog?.flush() }
+            if state == .running { runtime?.flush() }
         }
     }
 
     func distinctId() -> String? {
         queue.sync {
-            guard state == .running, let ph = posthog else { return nil }
-            let id = ph.getDistinctId()
+            guard state == .running, let runtime else { return nil }
+            let id = runtime.getDistinctId()
             return id.isEmpty ? nil : id
         }
     }
@@ -381,7 +381,7 @@ final class EluCore {
     func getFeatureFlag(_ key: String) -> Any? {
         queue.sync {
             guard state == .running else { return nil }
-            return posthog?.getFeatureFlag(key)
+            return runtime?.getFeatureFlag(key)
         }
     }
 
@@ -389,27 +389,27 @@ final class EluCore {
         queue.sync {
             guard state == .running else { return nil }
             // Web parity: payload reads do not emit $feature_flag_called.
-            return posthog?.getFeatureFlagResult(key, sendFeatureFlagEvent: false)?.payload
+            return runtime?.getFeatureFlagResult(key, sendFeatureFlagEvent: false)?.payload
         }
     }
 
     func isFeatureEnabled(_ key: String) -> Bool {
         queue.sync {
             guard state == .running else { return false }
-            return posthog?.isFeatureEnabled(key) ?? false
+            return runtime?.isFeatureEnabled(key) ?? false
         }
     }
 
     func reloadFeatureFlags(_ completion: (() -> Void)?) {
         queue.async { [self] in
-            guard state == .running, let ph = posthog else {
+            guard state == .running, let runtime else {
                 if let completion { DispatchQueue.main.async(execute: completion) }
                 return
             }
             if let completion {
-                ph.reloadFeatureFlags { DispatchQueue.main.async(execute: completion) }
+                runtime.reloadFeatureFlags { DispatchQueue.main.async(execute: completion) }
             } else {
-                ph.reloadFeatureFlags()
+                runtime.reloadFeatureFlags()
             }
         }
     }

@@ -35,7 +35,7 @@
       "version": "3.69.0",
       "revision": "1c9b3178746c8102c854c2569047aedcfdec8a0c"
     },
-    "identityAndSource": "legal/THIRD_PARTY_NOTICES.provenance.json",
+    "identityAndSource": "legal/THIRD_PARTY_NOTICES.dependencies.json",
     "note": "The tag did not commit Package.resolved; this is an observed resolution, not proof that every historical consumer selected the same patch."
   }
 }

@@ -43,8 +43,8 @@ python3 scripts/verify-baseline.py
 python3 Conformance/validate-baselines.py
 run_logged resolve swift package resolve
 swift package dump-package > "$output/package-metadata.json" 2> "$logs/dump-package.log"
-python3 scripts/verify-package-surface.py --mode owned-runtime "$output/package-metadata.json"
-python3 scripts/verify-dependencies.py --mode owned-runtime
+python3 scripts/verify-package-surface.py --mode strict "$output/package-metadata.json"
+python3 scripts/verify-dependencies.py --mode strict
 
 run_logged simulator-tests xcodebuild test \
   -scheme EluAnalytics \
