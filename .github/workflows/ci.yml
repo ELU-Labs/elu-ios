@@ -46,11 +46,17 @@ jobs:
           swift package dump-package > "$PWD/.build/package-metadata.json"
           python3 scripts/verify-package-surface.py "$PWD/.build/package-metadata.json"
           python3 scripts/verify-dependencies.py --mode baseline
+      - name: Prepare iOS simulator
+        run: |
+          simulator_udid="$(xcrun simctl create 'ELU SDK Tests' 'iPhone 16 Pro')"
+          xcrun simctl boot "$simulator_udid"
+          xcrun simctl bootstatus "$simulator_udid" -b
+          echo "ELU_SIMULATOR_UDID=$simulator_udid" >> "$GITHUB_ENV"
       - name: Swift unit and concurrency tests
         run: |
           xcodebuild test \
             -scheme EluAnalytics \
-            -destination 'platform=iOS Simulator,name=iPhone 16 Pro,OS=latest' \
+            -destination "id=$ELU_SIMULATOR_UDID" \
             -derivedDataPath "$PWD/.build/test-derived-data" \
             -skipMacroValidation \
             CODE_SIGNING_ALLOWED=NO
@@ -99,11 +105,14 @@ jobs:
             --input "$PWD/.build/interface-derived-data/Build/Products" \
             --input "$PWD/.build/symbol-graphs" \
             --input "$PWD/.build/release-evidence"
+      - name: Delete iOS simulator
+        if: always() && env.ELU_SIMULATOR_UDID != ''
+        run: xcrun simctl delete "$ELU_SIMULATOR_UDID"
 
   upgrade-evidence:
     name: 0.1.0 simulator upgrade evidence
     needs: validation
-    runs-on: macos-15
+    runs-on: macos-15-intel
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
