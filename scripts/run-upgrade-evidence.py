@@ -43,6 +43,7 @@ TELEMETRY_PATH = "/batch"
 FLAGS_PATH = "/flags?v=2"
 CONFIG_PATH = "/v1/upgrade-evidence/config"
 MARKER_WAIT_SECONDS = 45
+RUN_RESULT_WAIT_SECONDS = 45
 MAX_CAPTURE_BODY_BYTES = 8 * 1024 * 1024
 GZIP_INPUT_CHUNK_BYTES = 64 * 1024
 MAX_DECOMPRESSED_BODY_BYTES = 8 * 1024 * 1024
@@ -1132,7 +1133,7 @@ def install_and_run(
         diagnostics=diagnostics,
         env=environment,
     )
-    deadline = time.monotonic() + 30
+    deadline = time.monotonic() + RUN_RESULT_WAIT_SECONDS
     result: dict[str, Any] | None = None
     failure = "RESULT_MISSING"
     while time.monotonic() < deadline:

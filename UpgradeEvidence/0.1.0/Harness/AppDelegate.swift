@@ -42,6 +42,8 @@ private enum UpgradeProbe {
     private static let timeoutSeconds: TimeInterval = 20
     private static let flushRetryCount = 5
     private static let flushRetryInterval: TimeInterval = 1
+    private static let networkProbeTimeout: TimeInterval = 10
+    private static let networkProbeURL = URL(string: "https://github.com/favicon.ico")!
 
     static func start() {
         let environment = ProcessInfo.processInfo.environment
@@ -54,6 +56,35 @@ private enum UpgradeProbe {
             return
         }
 
+        probeNetwork { ready in
+            guard ready else {
+                write(build: build.rawValue, identityCheck: false)
+                return
+            }
+            begin(build: build, origin: origin)
+        }
+    }
+
+    private static func probeNetwork(completion: @escaping (Bool) -> Void) {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = networkProbeTimeout
+        configuration.timeoutIntervalForResource = networkProbeTimeout
+        let session = URLSession(configuration: configuration)
+        var request = URLRequest(url: networkProbeURL)
+        request.httpMethod = "GET"
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        request.timeoutInterval = networkProbeTimeout
+        let task = session.dataTask(with: request) { _, response, _ in
+            let ready = response is HTTPURLResponse
+            session.finishTasksAndInvalidate()
+            DispatchQueue.main.async {
+                completion(ready)
+            }
+        }
+        task.resume()
+    }
+
+    private static func begin(build: UpgradeBuild, origin: URL) {
         let defaults = UserDefaults.standard
         let expectedIdentity: String
         switch build {

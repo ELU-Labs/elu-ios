@@ -28,6 +28,43 @@ class UpgradeEvidenceCaptureTests(unittest.TestCase):
         self.assertNotIn(".accessibilityIdentifier(", source)
         self.assertIn("IPHONEOS_DEPLOYMENT_TARGET = 13.0;", project)
 
+    def test_harness_establishes_public_network_before_creating_identity(self) -> None:
+        source = HARNESS_SOURCE.read_text(encoding="utf-8")
+        start_body = source.split("static func start()", 1)[1].split(
+            "private static func probeNetwork", 1
+        )[0]
+        probe_body = source.split("private static func probeNetwork", 1)[1].split(
+            "private static func begin", 1
+        )[0]
+        begin_body = source.split("private static func begin", 1)[1].split(
+            "private static func waitForIdentity", 1
+        )[0]
+        self.assertIn('URL(string: "https://github.com/favicon.ico")!', source)
+        self.assertIn("private static let networkProbeTimeout: TimeInterval = 10", source)
+        self.assertIn("probeNetwork { ready in", start_body)
+        self.assertIn("guard ready else", start_body)
+        self.assertIn("identityCheck: false", start_body)
+        self.assertIn("URLSessionConfiguration.ephemeral", probe_body)
+        self.assertIn(
+            "configuration.timeoutIntervalForResource = networkProbeTimeout",
+            probe_body,
+        )
+        self.assertIn('request.httpMethod = "GET"', probe_body)
+        self.assertIn("request.cachePolicy = .reloadIgnoringLocalCacheData", probe_body)
+        self.assertIn("request.timeoutInterval = networkProbeTimeout", probe_body)
+        self.assertIn("response is HTTPURLResponse", probe_body)
+        self.assertNotIn("expectedIdentity", probe_body)
+        self.assertNotIn("Elu.", probe_body)
+        self.assertIn("expectedIdentity = UUID().uuidString", begin_body)
+        self.assertIn("Elu.setup", begin_body)
+
+    def test_runner_deadline_covers_network_and_identity_timeouts(self) -> None:
+        source = HARNESS_SOURCE.read_text(encoding="utf-8")
+        self.assertIn("private static let networkProbeTimeout: TimeInterval = 10", source)
+        self.assertIn("private static let timeoutSeconds: TimeInterval = 20", source)
+        self.assertEqual(RUNNER.RUN_RESULT_WAIT_SECONDS, 45)
+        self.assertGreater(RUNNER.RUN_RESULT_WAIT_SECONDS, 10 + 20 + 5)
+
     def test_app_delegate_window_can_witness_the_protocol_requirement(self) -> None:
         source = HARNESS_SOURCE.read_text(encoding="utf-8")
         self.assertIn("    var window: UIWindow?", source)

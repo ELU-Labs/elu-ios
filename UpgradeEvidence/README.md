@@ -40,6 +40,14 @@ payloads count only when captured on the source SDK's exact telemetry route,
 `POST /batch`; other methods, paths, and query-bearing variants are ignored by
 both the runner and the independent archive validator.
 
+Before SDK setup, the simulator harness makes one anonymous, cache-bypassed
+HTTPS request to `github.com/favicon.ico`. This bounded preflight establishes
+the simulator's default network route before the source SDK evaluates network
+reachability. It uses an ephemeral session and runs before an evidence identity
+is created, so it carries no SDK identity or captured event data. The evidence
+server remains loopback-only, and the exact `POST /batch` checks remain the
+authoritative proof.
+
 The `0.1.0` dependency starts a session during every SDK setup. A process
 replacement therefore rotates the session id; exact session-id equality is not
 a valid upgrade expectation for this source version. The harness requires the
