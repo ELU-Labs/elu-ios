@@ -8,9 +8,10 @@ configuration. The design rules:
 2. It fetches per-site-key remote config from
    `GET https://elu.dev/v1/<siteKey>/config` and caches it on disk.
 3. It ships **fail-closed compiled defaults** (EU-block ON, masking ON,
-   replay off-until-config); remote config may only LOOSEN behavior
-   mid-session, never pretend to retro-tighten (captured frames cannot be
-   re-masked).
+   replay off-until-config) until the first usable config arrives. That
+   initial config may loosen the defaults. Once the runtime is running, fresh
+   config tightens immediately while loosening waits for the next launch;
+   captured frames cannot be retroactively re-masked.
 4. Customer code only ever touches the `Elu.*` facade — never the underlying
    provider SDK.
 
@@ -44,8 +45,8 @@ Enabled:
 }
 ```
 
-The host is supplied by authenticated ELU remote configuration; this example
-does not prescribe a production hostname.
+The host is supplied by ELU remote configuration; this example does not
+prescribe a production hostname.
 
 Defaults when a privacy field is missing or unparseable: `blockEu` and
 `maskTextInputs` true, everything else off, `replayMaxMinutes` 0 = unlimited
@@ -72,8 +73,9 @@ EU-blocked).
 - Device-in-EU AND `blockEu` (from cached config, or the compiled default
   TRUE when no config exists yet) ⇒ blocked. Buffered ops held while the
   decision is pending flush if the fetched config says `blockEu:false` and
-  are dropped if it says `blockEu:true`. Nothing leaves the device until the
-  decision is made.
+  are dropped if it says `blockEu:true`. Until the decision is made, the
+  analytics runtime stays uninitialized and emits no events or replay; the
+  ELU config request itself still occurs.
 - Facade methods are safe in EVERY state: `pending` buffers event-class
   calls (getters return defaults), `disabled` no-ops, `running` delegates.
   Never throws, never blocks the caller.
@@ -93,8 +95,9 @@ immediately, loosening waits for the next launch:
 
 ## 3. Privacy semantics
 
-All controls act CLIENT-SIDE at capture time — masked or blocked content
-never leaves the device.
+All capture controls act CLIENT-SIDE — masked or blocked analytics content
+never leaves the device. ELU config requests still occur while capture is
+blocked so a re-enabled site can recover.
 
 - **`blockEu`** (compiled default ON, fail-closed): IANA-timezone heuristic —
   blocked when the zone is empty/unreadable, starts with `Europe/`, or is one
@@ -102,7 +105,8 @@ never leaves the device.
   Atlantic/Azores, Atlantic/Reykjavik, Atlantic/Faroe, Africa/Ceuta,
   America/Cayenne, America/Guadeloupe, America/Martinique, Indian/Reunion,
   Indian/Mayotte`. Blocked = the analytics runtime never initializes: no
-  network, no stored IDs, no events, no replay.
+  runtime identity storage, analytics events, or replay. ELU config fetches
+  continue so re-activation can recover.
 - **`maskTextInputs`** (default ON): mask typed input in replay. Platform
   note: the underlying mobile SDKs have a single text-masking knob that
   masks ALL rendered text (labels included), not just inputs — tighter than
