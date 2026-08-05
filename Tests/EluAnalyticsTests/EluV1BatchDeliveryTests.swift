@@ -115,7 +115,7 @@ final class EluV1BatchDeliveryTests: XCTestCase {
         _ = try await appendRecords(oversizeQueue, count: 1, valueBytes: 900)
         _ = try await appendRecords(oversizeQueue, count: 1, valueBytes: 8)
         let oversizeTransport = TestBatchTransport(replies: [.accept])
-        let oversizeCoordinator = try coordinator(
+        let oversizeCoordinator = try self.coordinator(
             queue: oversizeQueue,
             byteLimit: oneRecordBody.count - 1,
             transport: oversizeTransport,
@@ -148,32 +148,32 @@ final class EluV1BatchDeliveryTests: XCTestCase {
         await queue.close()
     }
 
-    func testPassCapsAtEightRequestsAndContinuesOnNextTrigger() async throws {
+    func testPassCapsAtElevenRequestsAndContinuesOnNextTrigger() async throws {
         let directory = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
         let queue = try await makeQueue(directory: directory)
-        for index in 0 ..< 9 {
+        for index in 0 ..< 12 {
             _ = try await appendRecords(
                 queue,
                 count: 1,
                 versions: versions(build: "bounded-\(index)")
             )
         }
-        let transport = TestBatchTransport(replies: Array(repeating: .accept, count: 9))
+        let transport = TestBatchTransport(replies: Array(repeating: .accept, count: 12))
         let coordinator = try self.coordinator(queue: queue, transport: transport)
 
         let first = await coordinator.trigger()
-        XCTAssertEqual(first, .bounded(delivered: 8, terminallyDiscarded: 0))
+        XCTAssertEqual(first, .bounded(delivered: 11, terminallyDiscarded: 0))
         let callsAfterFirst = await transport.callCount()
-        XCTAssertEqual(callsAfterFirst, 8)
+        XCTAssertEqual(callsAfterFirst, 11)
         let afterFirst = try await queue.snapshot()
-        XCTAssertEqual(afterFirst.headSequence, 8)
+        XCTAssertEqual(afterFirst.headSequence, 11)
         XCTAssertEqual(afterFirst.queuedCount, 1)
 
         let second = await coordinator.trigger()
         XCTAssertEqual(second, .resolved(delivered: 1, terminallyDiscarded: 0))
         let callsAfterSecond = await transport.callCount()
-        XCTAssertEqual(callsAfterSecond, 9)
+        XCTAssertEqual(callsAfterSecond, 12)
         let afterSecond = try await queue.snapshot()
         XCTAssertEqual(afterSecond.queuedCount, 0)
         await queue.close()
@@ -266,12 +266,51 @@ final class EluV1BatchDeliveryTests: XCTestCase {
         let oneQueue = try await makeQueue(directory: oneDirectory)
         _ = try await appendRecords(oneQueue, count: 1)
         let oneTransport = TestBatchTransport(replies: [.http(413, nil)])
-        let oneCoordinator = try coordinator(queue: oneQueue, transport: oneTransport)
+        let oneCoordinator = try self.coordinator(queue: oneQueue, transport: oneTransport)
         let oneResult = await oneCoordinator.trigger()
         XCTAssertEqual(oneResult, .resolved(delivered: 0, terminallyDiscarded: 1))
         let oneSnapshot = try await oneQueue.snapshot()
         XCTAssertEqual(oneSnapshot.queuedCount, 0)
         await oneQueue.close()
+    }
+
+    func testThousandRecordAll413PassMakesExactHeadProgressAndContinues() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let queue = try await makeQueue(directory: directory)
+        _ = try await appendRecords(queue, count: 1_000)
+        let transport = TestBatchTransport(
+            replies: Array(repeating: .http(413, nil), count: 22)
+        )
+        let coordinator = try self.coordinator(
+            queue: queue,
+            byteLimit: EluV1BatchAuthorizationSnapshot.maximumBatchBytes,
+            transport: transport
+        )
+
+        let first = await coordinator.trigger()
+        XCTAssertEqual(first, .bounded(delivered: 0, terminallyDiscarded: 1))
+        let afterFirst = try await queue.snapshot()
+        XCTAssertEqual(afterFirst.headSequence, 1)
+        XCTAssertEqual(afterFirst.queuedCount, 999)
+        let firstCallCount = await transport.callCount()
+        XCTAssertEqual(firstCallCount, 11)
+
+        let second = await coordinator.trigger()
+        XCTAssertEqual(second, .bounded(delivered: 0, terminallyDiscarded: 1))
+        let afterSecond = try await queue.snapshot()
+        XCTAssertEqual(afterSecond.headSequence, 2)
+        XCTAssertEqual(afterSecond.queuedCount, 998)
+
+        let sequences = await transport.recordSequences()
+        XCTAssertEqual(sequences.count, 22)
+        XCTAssertEqual(sequences[0].count, 1_000)
+        XCTAssertEqual(sequences[10], [0])
+        XCTAssertEqual(sequences[11].count, 999)
+        XCTAssertEqual(sequences[21], [1])
+        XCTAssertTrue(sequences.prefix(11).allSatisfy { $0.first == 0 })
+        XCTAssertTrue(sequences.suffix(11).allSatisfy { $0.first == 1 })
+        await queue.close()
     }
 
     func test413AgeTransitionDeletesOnlyAgedPrefixThenContinuesSubsegment() async throws {

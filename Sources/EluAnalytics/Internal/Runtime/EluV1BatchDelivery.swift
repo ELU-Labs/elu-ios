@@ -174,7 +174,7 @@ actor EluV1BatchDeliveryCoordinator {
     static let requestTimeoutSeconds: TimeInterval = 30
     static let baseRetryNanoseconds: UInt64 = 1_000_000_000
     static let maximumRetryNanoseconds: UInt64 = 60_000_000_000
-    static let maximumNetworkRequestsPerPass = 8
+    static let maximumNetworkRequestsPerPass = 11
     static let maximumLocalResolutionsPerPass = 64
 
     private let queue: EluSQLiteRuntimeQueue
