@@ -240,7 +240,7 @@ private final class EluRuntimeResources: @unchecked Sendable {
 
         connection.close()
         if descriptor >= 0 {
-            _ = Darwin.flock(descriptor, LOCK_UN)
+            _ = flock(descriptor, LOCK_UN)
             _ = Darwin.close(descriptor)
         }
         EluRuntimeOwnershipRegistry.shared.release(canonicalDirectory)
@@ -298,7 +298,7 @@ private final class EluSQLiteConnection: @unchecked Sendable {
         var errorMessage: UnsafeMutablePointer<CChar>?
         let result = sqlite3_exec(opened, sql, nil, nil, &errorMessage)
         guard result == SQLITE_OK else {
-            let message = errorMessage.map(String.init(cString:))
+            let message = errorMessage.map { String(cString: $0) }
                 ?? String(cString: sqlite3_errmsg(opened))
             sqlite3_free(errorMessage)
             throw EluSQLiteFailure.result(result, message)
@@ -493,7 +493,7 @@ private enum EluRuntimeQueueBootstrap {
             guard lockDescriptor >= 0 else {
                 throw EluRuntimeQueueError.databaseUnavailable
             }
-            guard Darwin.flock(lockDescriptor, LOCK_EX | LOCK_NB) == 0 else {
+            guard flock(lockDescriptor, LOCK_EX | LOCK_NB) == 0 else {
                 if errno == EWOULDBLOCK || errno == EAGAIN {
                     throw EluRuntimeQueueError.ownershipConflict
                 }
@@ -544,7 +544,7 @@ private enum EluRuntimeQueueBootstrap {
         } catch {
             connection?.close()
             if lockDescriptor >= 0 {
-                _ = Darwin.flock(lockDescriptor, LOCK_UN)
+                _ = flock(lockDescriptor, LOCK_UN)
                 _ = Darwin.close(lockDescriptor)
             }
             EluRuntimeOwnershipRegistry.shared.release(canonicalDirectory)

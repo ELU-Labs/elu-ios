@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import SQLite3
 import XCTest
@@ -1151,6 +1152,41 @@ final class EluSQLiteRuntimeQueueTests: XCTestCase {
             XCTAssertGreaterThanOrEqual(maintenance.checkpointHits, 2)
             XCTAssertEqual(maintenance.vacuumHits, 1)
             await second.close()
+        }
+    }
+
+    func testExternalFileLockBlocksQueueOpenUntilReleased() async throws {
+        try await withTemporaryDirectory { directory in
+            let lockURL = directory.appendingPathComponent(".runtime-state-v1.lock")
+            var descriptor = lockURL.path.withCString { path in
+                Darwin.open(path, O_CREAT | O_RDWR, mode_t(0o600))
+            }
+            XCTAssertGreaterThanOrEqual(descriptor, 0)
+            guard descriptor >= 0 else { return }
+            defer {
+                if descriptor >= 0 {
+                    _ = flock(descriptor, LOCK_UN)
+                    _ = Darwin.close(descriptor)
+                }
+            }
+            guard flock(descriptor, LOCK_EX | LOCK_NB) == 0 else {
+                XCTFail("Expected the external lock to be acquired")
+                return
+            }
+
+            do {
+                _ = try await makeQueue(directory: directory)
+                XCTFail("Expected an external lock ownership conflict")
+            } catch let error as EluRuntimeQueueError {
+                XCTAssertEqual(error, .ownershipConflict)
+            }
+
+            XCTAssertEqual(flock(descriptor, LOCK_UN), 0)
+            XCTAssertEqual(Darwin.close(descriptor), 0)
+            descriptor = -1
+
+            let queue = try await makeQueue(directory: directory)
+            await queue.close()
         }
     }
 
