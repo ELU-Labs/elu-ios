@@ -278,7 +278,11 @@ final class EluV1BatchDeliveryTests: XCTestCase {
         let directory = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
         let queue = try await makeQueue(directory: directory)
-        _ = try await appendRecords(queue, count: 1_000)
+        _ = try await appendRecords(
+            queue,
+            count: 1_000,
+            fixedPropertyKey: "delivery_stress_value"
+        )
         let transport = TestBatchTransport(
             replies: Array(repeating: .http(413, nil), count: 22)
         )
@@ -986,16 +990,20 @@ final class EluV1BatchDeliveryTests: XCTestCase {
         _ queue: EluSQLiteRuntimeQueue,
         count: Int,
         valueBytes: Int = 8,
-        versions: EluVersionContext? = nil
+        versions: EluVersionContext? = nil,
+        fixedPropertyKey: String? = nil
     ) async throws -> [EluQueuedRecord] {
         var records: [EluQueuedRecord] = []
         let captureVersions = try versions ?? self.versions()
         for index in 0 ..< count {
             let generation = try await queue.snapshot().generation
+            let propertyKey = fixedPropertyKey ?? "value_\(index)"
+            let baseValue = String(repeating: "x", count: valueBytes)
+            let propertyValue = fixedPropertyKey == nil ? baseValue : "\(baseValue)-\(index)"
             records.append(
                 contentsOf: try await queue.applyMutation(
                     .setPersonProperties(
-                        set: ["value_\(index)": .string(String(repeating: "x", count: valueBytes))],
+                        set: [propertyKey: .string(propertyValue)],
                         setOnce: [:],
                         unset: []
                     ),
