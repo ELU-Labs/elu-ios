@@ -736,6 +736,100 @@ struct EluV1Timestamp: Comparable, Sendable {
         return true
     }
 
+    /// Floors the exact duration from `earlier` to this timestamp to whole
+    /// nanoseconds. Leap-second windows and unrepresentable durations fail
+    /// closed instead of being rounded into a longer authority lease.
+    func floorNanoseconds(since earlier: EluV1Timestamp) -> UInt64? {
+        guard !isLeapSecond, !earlier.isLeapSecond else { return nil }
+        return Self.floorNanoseconds(
+            laterWholeSecond: baseSecond,
+            laterFractionDigits: fractionalDigits,
+            earlierWholeSecond: earlier.baseSecond,
+            earlierFractionDigits: earlier.fractionalDigits
+        )
+    }
+
+    /// Floors the exact duration from Foundation's binary64 wall-clock sample
+    /// to this timestamp without first rounding this timestamp through Date.
+    func floorNanoseconds(after clock: Date) -> UInt64? {
+        guard !isLeapSecond, clock.timeIntervalSinceReferenceDate.isFinite else {
+            return nil
+        }
+        let clockParts = Self.exactClockParts(clock.timeIntervalSinceReferenceDate)
+        guard let clockWhole = Int64(exactly: clockParts.wholeSecond),
+              clockWhole <= Int64.max - 978_307_200
+        else {
+            return nil
+        }
+        return Self.floorNanoseconds(
+            laterWholeSecond: baseSecond,
+            laterFractionDigits: fractionalDigits,
+            earlierWholeSecond: clockWhole + 978_307_200,
+            earlierFractionDigits: clockParts.fractionalDigits
+        )
+    }
+
+    private static func floorNanoseconds(
+        laterWholeSecond: Int64,
+        laterFractionDigits: [UInt8],
+        earlierWholeSecond: Int64,
+        earlierFractionDigits: [UInt8]
+    ) -> UInt64? {
+        let (wholeDelta, wholeOverflow) = laterWholeSecond.subtractingReportingOverflow(
+            earlierWholeSecond
+        )
+        guard !wholeOverflow else { return nil }
+
+        let later = nanosecondParts(laterFractionDigits)
+        let earlier = nanosecondParts(earlierFractionDigits)
+        let (scaledWhole, scaledOverflow) = wholeDelta.multipliedReportingOverflow(by: 1_000_000_000)
+        guard !scaledOverflow else { return nil }
+        let (withNanos, nanosOverflow) = scaledWhole.addingReportingOverflow(
+            later.nanoseconds - earlier.nanoseconds
+        )
+        guard !nanosOverflow else { return nil }
+
+        let remainderComparison = compareDecimalDigits(later.remainder, earlier.remainder)
+        let floorValue: Int64
+        if remainderComparison < 0 {
+            guard withNanos > Int64.min else { return nil }
+            floorValue = withNanos - 1
+        } else {
+            floorValue = withNanos
+        }
+        guard floorValue >= 0 else { return nil }
+        return UInt64(floorValue)
+    }
+
+    private static func nanosecondParts(
+        _ digits: [UInt8]
+    ) -> (nanoseconds: Int64, remainder: ArraySlice<UInt8>) {
+        var nanoseconds: Int64 = 0
+        for index in 0 ..< 9 {
+            nanoseconds *= 10
+            if index < digits.count {
+                nanoseconds += Int64(digits[index])
+            }
+        }
+        return (
+            nanoseconds,
+            digits.count > 9 ? digits[9...] : digits[digits.endIndex ..< digits.endIndex]
+        )
+    }
+
+    private static func compareDecimalDigits(
+        _ lhs: ArraySlice<UInt8>,
+        _ rhs: ArraySlice<UInt8>
+    ) -> Int {
+        let count = max(lhs.count, rhs.count)
+        for index in 0 ..< count {
+            let left = index < lhs.count ? lhs[lhs.index(lhs.startIndex, offsetBy: index)] : 0
+            let right = index < rhs.count ? rhs[rhs.index(rhs.startIndex, offsetBy: index)] : 0
+            if left != right { return left < right ? -1 : 1 }
+        }
+        return 0
+    }
+
     private static func exactClockParts(
         _ seconds: Double
     ) -> (wholeSecond: Double, fractionalDigits: [UInt8]) {
