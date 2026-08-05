@@ -1,0 +1,68 @@
+# iOS upgrade compatibility
+
+`0.1.0/dependency-resolutions.json` records what is known about the source
+version's dependency resolution. The source tag contains a version range and
+no resolved lockfile. The `3.69.0` revision in the inventory is one dated,
+provenanced observation, not a claim that every historical consumer selected
+that revision. Its annotated tag-object revision and peeled source revision
+are recorded separately.
+
+`0.1.0/manifest.json` is a checked-in evidence template, not a completed test
+result. A verified generated manifest must include
+the candidate revision, the source build's exact dependency version and source
+revision, and either the candidate's exact resolution or a digest proving the
+dependency is absent from its archived resolved graph. Verified validation
+inspects that graph and the raw network captures rather than trusting the
+manifest booleans. It also records exact Xcode and iOS versions, the fixed
+bundle id, the raw archive digest, and successful identity, session-rotation,
+and application-data preservation checks.
+
+## Simulator harness
+
+The harness is a UIKit application hosting a SwiftUI view. The runner:
+
+1. materializes the immutable `0.1.0` source and clean candidate revision with
+   `git archive`;
+2. builds both applications before starting the continuity clock;
+3. installs the source under `dev.elu.sdk-upgrade-evidence`, establishes a
+   generated identity, captures a source marker, and writes a random sentinel
+   under the application data container;
+4. installs the already-built candidate over the existing application, without
+   an uninstall;
+5. reads the sentinel from the candidate's current data-container path, then
+   compares the public distinct-id result and confirms that both network
+   captures contain a session id with the documented source-to-candidate
+   rotation; and
+6. writes a normalized manifest plus a SHA-256 digest.
+
+An iOS update may relocate the data container's absolute path, so path equality
+is not a continuity invariant. The runner and independent validator instead
+require the source and candidate sentinel bytes to match at the same relative
+location. The generated identity and session values appear only in the raw
+archive. The runner stores failure diagnostics there as well, prints only
+normalized status, and refuses an output directory inside the repository.
+Marker-shaped payloads count only when captured on the source SDK's
+parameter-free telemetry route. Foundation may serialize that route as
+`POST /batch` or `POST /batch?`;
+both spellings are accepted, while other methods, paths, and non-empty queries
+are ignored by both the runner and the independent archive validator.
+
+Before SDK setup, the simulator harness makes one anonymous, cache-bypassed
+HTTPS request to `github.com/favicon.ico`. This bounded preflight establishes
+the simulator's default network route, then waits for two consecutive reachable
+samples from the system API used by the source dependency before SDK setup.
+Both bounded checks run before an evidence identity is created, so they carry
+no SDK identity or captured event data. The evidence server remains
+loopback-only, and the parameter-free batch check remains the authoritative
+proof. CI runs this harness on the same Apple Silicon simulator image as the
+package's unit and consumer gates. A bounded readiness failure is reported as
+an explicit network-environment blocker rather than as missing telemetry.
+
+The `0.1.0` dependency starts a session during every SDK setup. A process
+replacement therefore rotates the session id; exact session-id equality is not
+a valid upgrade expectation for this source version. The harness requires the
+identity to remain equal while both session ids are present and different.
+
+The executable scripts expose their prerequisites and command-line options via
+`--help`. Generated captures must remain outside the repository and must not be
+printed to logs.

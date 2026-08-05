@@ -1,0 +1,171 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://elu.dev/schemas/sdk/ios/upgrade-evidence-v1.json",
+  "title": "ELU iOS SDK upgrade evidence manifest",
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "sourceVersion",
+    "sourceRevision",
+    "candidateRevision",
+    "resolvedDependency",
+    "environment",
+    "operations",
+    "expectedContinuity",
+    "observedContinuity",
+    "rawEvidence",
+    "verificationStatus",
+    "blockers"
+  ],
+  "properties": {
+    "$schema": { "type": "string" },
+    "schemaVersion": { "const": 1 },
+    "sourceVersion": { "const": "0.1.0" },
+    "sourceRevision": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "candidateRevision": {
+      "oneOf": [
+        { "type": "null" },
+        { "type": "string", "pattern": "^[0-9a-f]{40}$" }
+      ]
+    },
+    "resolvedDependency": {
+      "type": "object",
+      "required": ["inventoryReference", "source", "candidate"],
+      "properties": {
+        "inventoryReference": { "const": "legal/THIRD_PARTY_NOTICES.dependencies.json" },
+        "source": {
+          "oneOf": [
+            { "type": "null" },
+            { "$ref": "#/$defs/resolution" }
+          ]
+        },
+        "candidate": {
+          "oneOf": [
+            { "type": "null" },
+            { "$ref": "#/$defs/resolution" },
+            { "$ref": "#/$defs/dependencyAbsence" }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "environment": {
+      "type": "object",
+      "required": ["xcodeVersion", "iOSVersion", "bundleId"],
+      "properties": {
+        "xcodeVersion": { "type": ["string", "null"], "minLength": 1 },
+        "iOSVersion": { "type": ["string", "null"], "minLength": 1 },
+        "bundleId": { "const": "dev.elu.sdk-upgrade-evidence" }
+      },
+      "additionalProperties": false
+    },
+    "operations": {
+      "type": "array",
+      "minItems": 7,
+      "maxItems": 7,
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "build-source",
+          "build-candidate",
+          "install-source",
+          "establish-identity-and-session",
+          "install-candidate-without-uninstall",
+          "relaunch-candidate",
+          "verify-identity-and-session-continuity"
+        ]
+      }
+    },
+    "expectedContinuity": {
+      "type": "object",
+      "required": ["identity", "sourceSession", "candidateSession", "sessionTransition"],
+      "properties": {
+        "identity": { "const": "preserved" },
+        "sourceSession": { "const": "present" },
+        "candidateSession": { "const": "present" },
+        "sessionTransition": { "const": "rotated" }
+      },
+      "additionalProperties": false
+    },
+    "observedContinuity": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "required": [
+            "sameApplicationContainer",
+            "identityPreserved",
+            "sourceSessionPresent",
+            "candidateSessionPresent",
+            "sessionRotated"
+          ],
+          "properties": {
+            "sameApplicationContainer": { "type": "boolean" },
+            "identityPreserved": { "type": "boolean" },
+            "sourceSessionPresent": { "type": "boolean" },
+            "candidateSessionPresent": { "type": "boolean" },
+            "sessionRotated": { "type": "boolean" }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "rawEvidence": {
+      "type": "object",
+      "required": ["sha256", "custody", "status"],
+      "properties": {
+        "sha256": {
+          "oneOf": [
+            { "type": "null" },
+            { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+          ]
+        },
+        "custody": { "enum": ["external", "operator-managed", "runner-transient"] },
+        "status": { "enum": ["not-captured", "captured"] }
+      },
+      "additionalProperties": false
+    },
+    "verificationStatus": { "enum": ["blocked", "failed", "verified"] },
+    "blockers": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["code", "detail"],
+        "properties": {
+          "code": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]+$" },
+          "detail": { "type": "string", "minLength": 1 }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "$defs": {
+    "resolution": {
+      "type": "object",
+      "required": ["version", "revision"],
+      "properties": {
+        "version": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$" },
+        "revision": { "type": "string", "pattern": "^[0-9a-f]{40}$" }
+      },
+      "additionalProperties": false
+    },
+    "dependencyAbsence": {
+      "type": "object",
+      "required": ["status", "proof"],
+      "properties": {
+        "status": { "const": "absent" },
+        "proof": {
+          "type": "object",
+          "required": ["kind", "sha256"],
+          "properties": {
+            "kind": { "const": "resolved-package-graph-sha256" },
+            "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}
