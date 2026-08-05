@@ -1,0 +1,99 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validation:
+    name: Baselines and release gates
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Verify immutable baseline and conformance fixtures
+        run: python3 scripts/verify-baseline.py
+      - name: Enforce source scan baseline
+        run: python3 scripts/zero-brand-scan.py --mode baseline
+      - name: Test strict scanners, evidence, and release trust
+        run: python3 -m unittest discover -s scripts/tests -p 'test_*.py' -v
+
+  ios:
+    name: Tests, consumers, API, and artifacts
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Toolchain
+        run: xcodebuild -version
+      - name: Resolve and verify exact dependency
+        run: |
+          swift package resolve
+          swift package dump-package > "$PWD/.build/package-metadata.json"
+          python3 scripts/verify-package-surface.py "$PWD/.build/package-metadata.json"
+          python3 scripts/verify-dependencies.py --mode baseline
+      - name: Swift unit and concurrency tests
+        run: |
+          xcodebuild test \
+            -scheme EluAnalytics \
+            -destination 'platform=iOS Simulator,name=iPhone 16 Pro,OS=latest' \
+            -derivedDataPath "$PWD/.build/test-derived-data" \
+            -skipMacroValidation \
+            CODE_SIGNING_ALLOWED=NO
+      - name: Build public interface and symbol graph
+        run: |
+          mkdir -p "$PWD/.build/symbol-graphs"
+          xcodebuild build \
+            -scheme EluAnalytics \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath "$PWD/.build/interface-derived-data" \
+            -skipMacroValidation \
+            CODE_SIGNING_ALLOWED=NO \
+            BUILD_LIBRARY_FOR_DISTRIBUTION=YES \
+            OTHER_SWIFT_FLAGS="-emit-symbol-graph -emit-symbol-graph-dir $PWD/.build/symbol-graphs"
+          python3 scripts/verify-symbol-graph.py "$PWD/.build/symbol-graphs"
+      - name: Build UIKit and SwiftUI consumers
+        working-directory: Fixtures/Consumers
+        run: |
+          xcodebuild build \
+            -scheme UIKitConsumer \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath "$PWD/../../.build/uikit-consumer-derived-data" \
+            CODE_SIGNING_ALLOWED=NO
+          xcodebuild build \
+            -scheme SwiftUIConsumer \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath "$PWD/../../.build/swiftui-consumer-derived-data" \
+            CODE_SIGNING_ALLOWED=NO
+      - name: Generate source archive and release evidence
+        run: |
+          mkdir -p "$PWD/.build/artifacts"
+          git archive \
+            --format=zip \
+            --prefix=elu-ios-source/ \
+            --output="$PWD/.build/artifacts/elu-ios-source.zip" \
+            HEAD
+          python3 scripts/generate-release-evidence.py \
+            --output "$PWD/.build/release-evidence" \
+            --artifact "$PWD/.build/artifacts/elu-ios-source.zip" \
+            --artifact "$PWD/.build/interface-derived-data/Build/Products"
+          (cd "$PWD/.build/release-evidence" && shasum -a 256 -c SHA256SUMS)
+      - name: Report artifact scan findings
+        run: |
+          python3 scripts/zero-brand-scan.py --mode report \
+            --input "$PWD/.build/artifacts/elu-ios-source.zip" \
+            --input "$PWD/.build/interface-derived-data/Build/Products" \
+            --input "$PWD/.build/symbol-graphs" \
+            --input "$PWD/.build/release-evidence"

@@ -1,0 +1,18 @@
+{
+  "inventoryVersion": 1,
+  "baseline": "0.1.0",
+  "packages": [
+    {
+      "identity": "posthog-ios",
+      "source": "https://github.com/PostHog/posthog-ios.git",
+      "version": "3.69.0",
+      "revision": "1c9b3178746c8102c854c2569047aedcfdec8a0c",
+      "license": "MIT",
+      "runtimeProducts": ["PostHog"],
+      "bundledRuntimeComponents": [
+        { "name": "PLCrashReporter", "license": "MIT and Apache-2.0 portions" },
+        { "name": "libwebp", "license": "BSD-3-Clause" }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,26 @@
+module EluAnalytics
+public struct EluSetupOptions
+public var configHost: URL
+public init(configHost: URL = URL(string: "https://elu.dev")!)
+public enum Elu
+public static func setup(siteKey: String)
+public static func setup(siteKey: String, options: EluSetupOptions)
+public static func identify(_ distinctId: String, userProperties: [String: Any]? = nil)
+public static func reset()
+public static func alias(_ alias: String)
+public static func distinctId() -> String?
+public static func setPersonProperties(_ properties: [String: Any])
+public static func capture(_ event: String, properties: [String: Any]? = nil)
+public static func screen(_ name: String, properties: [String: Any]? = nil)
+public static func captureException(_ error: Error, properties: [String: Any]? = nil)
+public static func register(_ properties: [String: Any])
+public static func unregister(_ key: String)
+public static func group(_ type: String, key: String, properties: [String: Any]? = nil)
+public static func getFeatureFlag(_ key: String) -> Any?
+public static func getFeatureFlagPayload(_ key: String) -> Any?
+public static func isFeatureEnabled(_ key: String) -> Bool
+public static func reloadFeatureFlags(_ completion: (() -> Void)? = nil)
+public static func onFeatureFlagsLoaded(_ callback: @escaping () -> Void)
+public static func setPersonPropertiesForFlags(_ properties: [String: Any])
+public static func setGroupPropertiesForFlags(_ type: String, properties: [String: Any])
+public static func flush()

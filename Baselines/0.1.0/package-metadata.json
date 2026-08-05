@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "snapshotVersion": 1,
+  "source": {
+    "tag": "0.1.0",
+    "commit": "5825dfb4ca9cd1d104d0a07e33d0394128750391",
+    "manifestGitBlob": "b5e125cf55c39ea06e9d9fc6d3ec3cc762dde63e",
+    "manifestSha256": "9915a886e36d56accadf30f54471b8ff76b74409819ca626fb9496f311d65559"
+  },
+  "package": {
+    "toolsVersion": "5.9",
+    "name": "EluAnalytics",
+    "platforms": [
+      { "name": "iOS", "minimumVersion": "13.0" }
+    ],
+    "products": [
+      { "name": "EluAnalytics", "type": "library", "targets": ["EluAnalytics"] }
+    ],
+    "targets": [
+      {
+        "name": "EluAnalytics",
+        "type": "regular",
+        "resourceRules": ["copy Resources/PrivacyInfo.xcprivacy"],
+        "dependencyCount": 1
+      }
+    ]
+  },
+  "dependencyObservation": {
+    "manifestRequirement": {
+      "kind": "upToNextMinor",
+      "lowerBound": "3.69.0",
+      "exclusiveUpperBound": "3.70.0"
+    },
+    "resolvedOn2026-08-03": {
+      "version": "3.69.0",
+      "revision": "1c9b3178746c8102c854c2569047aedcfdec8a0c"
+    },
+    "identityAndSource": "legal/THIRD_PARTY_NOTICES.dependencies.json",
+    "note": "The tag did not commit Package.resolved; this is an observed resolution, not proof that every historical consumer selected the same patch."
+  }
+}
