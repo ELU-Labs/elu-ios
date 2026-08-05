@@ -207,55 +207,86 @@ final class EluIdentityCoreTests: XCTestCase {
         }
     }
 
-    func testCorruptIdentityUsesBackupIdentityFailClosedAndPreservesPrimaryStream() async throws {
+    func testCorruptPrimaryAfterResetNeverRestoresStaleBackupPII() async throws {
         try await withTemporaryDirectory { directory in
+            let anonymousIds = LockedIdentifierSequence([
+                "anon-before-reset",
+                "anon-after-reset",
+                "anon-after-corruption",
+            ])
             let store = try EluFileIdentityStateStore(directoryURL: directory)
-            let first = try self.makeCore(store: store)
-            try await first.identify("user-before-corruption")
-            try await first.setFlagPersonProperties(["beta": .bool(true)])
-            let before = await first.snapshot()
+            let first = try EluIdentityCore(
+                store: store,
+                clock: { self.now },
+                anonymousIdGenerator: { anonymousIds.next() },
+                streamIdGenerator: { "stream-stable" },
+                sessionIdGenerator: { "session-stable" }
+            )
+            try await first.identify("user-before-reset")
+            try await first.setGroup(type: "organization", key: "org-before-reset")
+            try await first.registerSuperProperties(["plan": .string("legacy")])
+            try await first.setFlagPersonProperties(["role": .string("owner")])
+            try await first.setFlagGroupProperties(
+                type: "organization",
+                properties: ["tier": .string("legacy")]
+            )
+            let stalePreResetBytes = try Data(contentsOf: store.stateFileURL)
+
+            try await first.reset()
+            let afterReset = await first.snapshot()
+            XCTAssertEqual(afterReset.identity.anonymousId, "anon-after-reset")
+            XCTAssertNil(afterReset.identity.userId)
+            XCTAssertTrue(afterReset.identity.groups.isEmpty)
+            XCTAssertTrue(afterReset.identity.superProperties.isEmpty)
+            XCTAssertTrue(afterReset.flagContext.personProperties.isEmpty)
+            XCTAssertTrue(afterReset.flagContext.groupProperties.isEmpty)
+
+            // Simulate cleanup failure leaving a pre-reset backup. The current
+            // primary exists and must remain the only recovery authority.
+            try stalePreResetBytes.write(to: store.backupFileURL)
 
             var aggregate = try self.jsonObject(at: store.stateFileURL)
             var identity = try XCTUnwrap(aggregate["identity"] as? [String: Any])
             identity["anonymousId"] = ""
             aggregate["identity"] = identity
-            var stream = try XCTUnwrap(aggregate["streamMetadata"] as? [String: Any])
-            stream["streamId"] = "stream-primary-newer"
-            stream["nextSequence"] = 42
-            aggregate["streamMetadata"] = stream
             try self.writeJSONObject(aggregate, to: store.stateFileURL)
 
             let recovered = try EluIdentityCore(
                 store: store,
                 clock: { self.now },
-                anonymousIdGenerator: { "anon-must-not-replace-backup" },
+                anonymousIdGenerator: { anonymousIds.next() },
                 streamIdGenerator: { "stream-must-not-replace-primary" },
                 sessionIdGenerator: { "session-recovered" }
             )
             let after = await recovered.snapshot()
-            XCTAssertEqual(after.identity.anonymousId, "anon-initial")
-            XCTAssertEqual(after.identity.userId, "user-before-corruption")
-            XCTAssertEqual(after.identity.identityRevision, 1)
-            XCTAssertEqual(after.identity.contextRevision, 1)
+            XCTAssertEqual(after.identity.anonymousId, "anon-after-corruption")
+            XCTAssertNotEqual(after.identity.anonymousId, "anon-before-reset")
+            XCTAssertNotEqual(after.identity.anonymousId, "anon-after-reset")
+            XCTAssertNil(after.identity.userId)
+            XCTAssertEqual(after.identity.identityRevision, 0)
+            XCTAssertEqual(after.identity.contextRevision, 0)
+            XCTAssertTrue(after.identity.groups.isEmpty)
+            XCTAssertTrue(after.identity.superProperties.isEmpty)
+            XCTAssertNil(after.identity.session)
             XCTAssertTrue(after.identity.optedOut)
             XCTAssertTrue(after.flagContext.personProperties.isEmpty)
             XCTAssertTrue(after.flagContext.groupProperties.isEmpty)
-            XCTAssertNotEqual(after.streamId, before.streamId)
-            XCTAssertEqual(after.streamId, "stream-primary-newer")
-            XCTAssertEqual(after.nextSequence, 42)
+            XCTAssertEqual(after.streamId, afterReset.streamId)
+            XCTAssertEqual(after.nextSequence, afterReset.nextSequence)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: store.backupFileURL.path))
         }
     }
 
-    func testUnreadablePrimaryRecoversFromSynchronizedBackupWithoutRelaxingOptOut() async throws {
+    func testMissingPrimaryRecoversSynchronizedBackupFailClosed() async throws {
         try await withTemporaryDirectory { directory in
             let store = try EluFileIdentityStateStore(directoryURL: directory)
             let first = try self.makeCore(store: store)
             try await first.identify("user-in-backup")
             try await first.registerSuperProperties(["latest": .bool(true)])
-            try await first.setOptedOut(true)
-            XCTAssertTrue(FileManager.default.fileExists(atPath: store.backupFileURL.path))
+            let backupBytes = try Data(contentsOf: store.stateFileURL)
+            try backupBytes.write(to: store.backupFileURL)
+            try FileManager.default.removeItem(at: store.stateFileURL)
 
-            try Data("not-json".utf8).write(to: store.stateFileURL)
             let recovered = try EluIdentityCore(
                 store: store,
                 clock: { self.now },
@@ -267,6 +298,7 @@ final class EluIdentityCoreTests: XCTestCase {
             XCTAssertEqual(snapshot.identity.userId, "user-in-backup")
             XCTAssertEqual(snapshot.identity.superProperties["latest"], .bool(true))
             XCTAssertTrue(snapshot.identity.optedOut)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: store.backupFileURL.path))
 
             guard case .loaded = try store.load() else {
                 return XCTFail("Expected backup recovery to restore the primary aggregate")
@@ -380,25 +412,19 @@ final class EluIdentityCoreTests: XCTestCase {
         }
     }
 
-    func testBackupReconciliationPreservesUnsupportedBackupBytes() async throws {
+    func testUnsupportedBackupBlocksLoadAndWritesWithoutChangingEitherRecord() async throws {
         for unsupportedKind in ["version", "extension"] {
             try await withTemporaryDirectory { directory in
                 let store = try EluFileIdentityStateStore(directoryURL: directory)
                 let core = try self.makeCore(store: store)
                 try await core.identify("user-current")
                 try await core.setFlagPersonProperties(["plan": .string("growth")])
+                guard case let .loaded(persisted) = try store.load() else {
+                    return XCTFail("Expected a valid primary before installing the future backup")
+                }
+                let primaryBytes = try Data(contentsOf: store.stateFileURL)
 
-                var primary = try self.jsonObject(at: store.stateFileURL)
-                var identity = try XCTUnwrap(primary["identity"] as? [String: Any])
-                identity["anonymousId"] = ""
-                primary["identity"] = identity
-                let primaryBytes = try JSONSerialization.data(
-                    withJSONObject: primary,
-                    options: [.sortedKeys]
-                )
-                try primaryBytes.write(to: store.stateFileURL)
-
-                var backup = try self.jsonObject(at: store.backupFileURL)
+                var backup = try self.jsonObject(at: store.stateFileURL)
                 if unsupportedKind == "version" {
                     backup["schemaVersion"] = 99
                 } else {
@@ -418,18 +444,17 @@ final class EluIdentityCoreTests: XCTestCase {
                         streamIdGenerator: { "must-not-run" },
                         sessionIdGenerator: { "must-not-run" }
                     )
-                    XCTFail("Expected unsupported backup \(unsupportedKind)")
+                    XCTFail("Expected unsupported backup \(unsupportedKind) to block loading")
                 } catch {
-                    if unsupportedKind == "version" {
-                        XCTAssertEqual(
-                            error as? EluIdentityStateError,
-                            .unsupportedSchemaVersion
-                        )
-                    } else {
-                        XCTAssertEqual(
-                            error as? EluIdentityStateStoreError,
-                            .unsupportedRecordExtension(.aggregate)
-                        )
+                    self.assertUnsupportedBackupError(error, kind: unsupportedKind)
+                }
+
+                for mode in [EluStateWriteMode.normal, .recovery] {
+                    do {
+                        try store.save(persisted, mode: mode)
+                        XCTFail("Expected unsupported backup \(unsupportedKind) to block \(mode)")
+                    } catch {
+                        self.assertUnsupportedBackupError(error, kind: unsupportedKind)
                     }
                 }
                 XCTAssertEqual(try Data(contentsOf: store.stateFileURL), primaryBytes)
@@ -531,7 +556,8 @@ final class EluIdentityCoreTests: XCTestCase {
                 afterSubsequentMutation.identity.superProperties["afterFailure"],
                 .bool(true)
             )
-            XCTAssertEqual(synchronizer.callCount, 5)
+            XCTAssertEqual(synchronizer.callCount, 6)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: store.backupFileURL.path))
         }
     }
 
@@ -827,6 +853,17 @@ final class EluIdentityCoreTests: XCTestCase {
             streamIdGenerator: { "stream-initial" },
             sessionIdGenerator: { "session-initial" }
         )
+    }
+
+    private func assertUnsupportedBackupError(_ error: Error, kind: String) {
+        if kind == "version" {
+            XCTAssertEqual(error as? EluIdentityStateError, .unsupportedSchemaVersion)
+        } else {
+            XCTAssertEqual(
+                error as? EluIdentityStateStoreError,
+                .unsupportedRecordExtension(.aggregate)
+            )
+        }
     }
 
     private func makeIdentity() throws -> EluIdentityState {

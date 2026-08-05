@@ -452,20 +452,22 @@ final class EluFileIdentityStateStore: EluIdentityStateStore, @unchecked Sendabl
     func load() throws -> EluPersistedStateLoadResult {
         try withLock {
             if fileManager.fileExists(atPath: stateFileURL.path) {
-                switch try readCandidate(from: stateFileURL) {
+                let primary = try readCandidate(from: stateFileURL)
+                try inspectBackupCompatibilityIfPresent()
+                switch primary {
                 case let .loaded(state):
                     return .loaded(state)
                 case let .recoverable(components):
-                    return try reconcileRecoverablePrimary(components)
+                    return .recoverable(components)
                 case .unreadable:
-                    return try recoverFromBackupOrCorruption()
+                    return failClosedPrimaryCorruption()
                 }
             }
 
             guard fileManager.fileExists(atPath: backupFileURL.path) else {
                 return .missing
             }
-            return try recoverFromBackupOrCorruption()
+            return try recoverFromBackupWhenPrimaryIsMissing()
         }
     }
 
@@ -481,9 +483,9 @@ final class EluFileIdentityStateStore: EluIdentityStateStore, @unchecked Sendabl
                 throw EluIdentityStateStoreError.recordTooLarge(.aggregate)
             }
 
+            try inspectBackupCompatibilityIfPresent()
             let previousPrimary = try validDataIfPresent(at: stateFileURL)
             if mode == .normal, let previousPrimary {
-                _ = try validDataIfPresent(at: backupFileURL)
                 try installDurably(
                     previousPrimary,
                     at: backupFileURL,
@@ -496,6 +498,7 @@ final class EluFileIdentityStateStore: EluIdentityStateStore, @unchecked Sendabl
                 at: stateFileURL,
                 durabilityError: .primaryCommitDurabilityUnconfirmed
             )
+            removeBackupAfterPrimaryCommit()
         }
     }
 
@@ -505,51 +508,7 @@ final class EluFileIdentityStateStore: EluIdentityStateStore, @unchecked Sendabl
         case unreadable
     }
 
-    private func reconcileRecoverablePrimary(
-        _ primary: EluRecoverablePersistedState
-    ) throws -> EluPersistedStateLoadResult {
-        guard primary.identity == nil,
-              fileManager.fileExists(atPath: backupFileURL.path)
-        else {
-            return .recoverable(primary)
-        }
-
-        switch try readCandidate(from: backupFileURL) {
-        case let .loaded(backup):
-            return .recoverable(
-                EluRecoverablePersistedState(
-                    identity: backup.identity,
-                    streamMetadata: primary.streamMetadata ?? backup.streamMetadata,
-                    flagContext: backup.flagContext,
-                    forceOptOut: true
-                )
-            )
-        case let .recoverable(backup) where backup.identity != nil:
-            return .recoverable(
-                EluRecoverablePersistedState(
-                    identity: backup.identity,
-                    streamMetadata: primary.streamMetadata ?? backup.streamMetadata,
-                    flagContext: backup.flagContext,
-                    forceOptOut: true
-                )
-            )
-        case .recoverable, .unreadable:
-            return .recoverable(primary)
-        }
-    }
-
-    private func recoverFromBackupOrCorruption() throws -> EluPersistedStateLoadResult {
-        guard fileManager.fileExists(atPath: backupFileURL.path) else {
-            return .recoverable(
-                EluRecoverablePersistedState(
-                    identity: nil,
-                    streamMetadata: nil,
-                    flagContext: nil,
-                    forceOptOut: true
-                )
-            )
-        }
-
+    private func recoverFromBackupWhenPrimaryIsMissing() throws -> EluPersistedStateLoadResult {
         switch try readCandidate(from: backupFileURL) {
         case let .loaded(state):
             return .recoverable(
@@ -574,6 +533,25 @@ final class EluFileIdentityStateStore: EluIdentityStateStore, @unchecked Sendabl
                 )
             )
         }
+    }
+
+    private func inspectBackupCompatibilityIfPresent() throws {
+        guard fileManager.fileExists(atPath: backupFileURL.path) else { return }
+        // The result is deliberately ignored. A supported backup may only be
+        // used when no primary path exists; this inspection solely protects
+        // unknown future records from being overwritten by an older SDK.
+        _ = try readCandidate(from: backupFileURL)
+    }
+
+    private func failClosedPrimaryCorruption() -> EluPersistedStateLoadResult {
+        .recoverable(
+            EluRecoverablePersistedState(
+                identity: nil,
+                streamMetadata: nil,
+                flagContext: nil,
+                forceOptOut: true
+            )
+        )
     }
 
     private func readCandidate(from url: URL) throws -> Candidate {
@@ -755,6 +733,18 @@ final class EluFileIdentityStateStore: EluIdentityStateStore, @unchecked Sendabl
         // Tightening after the durable commit is best-effort so no post-commit
         // error can make the caller believe an unpublished write occurred.
         try? fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: targetURL.path)
+    }
+
+    private func removeBackupAfterPrimaryCommit() {
+        guard fileManager.fileExists(atPath: backupFileURL.path) else { return }
+        do {
+            try fileManager.removeItem(at: backupFileURL)
+            try directorySynchronizer.synchronize(directoryURL: directoryURL)
+        } catch {
+            // Any existing primary remains authoritative. Cleanup is retried
+            // by the next successful primary commit and never authorizes
+            // loading the backup while that primary path exists.
+        }
     }
 
     private func replaceWithoutDirectorySync(_ data: Data, at targetURL: URL) throws {
