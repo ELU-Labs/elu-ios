@@ -93,8 +93,9 @@ final class EluV1FlagRuntimeTests: XCTestCase {
             root: root,
             fixturesURL: fixturesURL()
         )
+        let executedScenarios = try await runProductionActivityVector(vector)
         XCTAssertEqual(
-            try await runProductionActivityVector(vector),
+            executedScenarios,
             Set([
                 "install-and-read-complete-snapshot",
                 "empty-snapshot-replaces",
@@ -3035,16 +3036,16 @@ final class EluV1FlagRuntimeTests: XCTestCase {
             XCTAssertNotEqual(reset.identity.anonymousId, optedOut.identity.anonymousId)
             XCTAssertEqual(try self.completeFlagRows(database), futureHeader)
 
-            let authorityBytes = self.flagAuthorityBody(database)
+            let authorityBytes = try self.flagAuthorityBody(database)
             try self.updateFlagAuthorityBody(database, Data("{".utf8))
-            let corruptAuthorityBytes = self.flagAuthorityBody(database)
+            let corruptAuthorityBytes = try self.flagAuthorityBody(database)
             XCTAssertNotEqual(corruptAuthorityBytes, authorityBytes)
             let restoredOpt = try await runtime.setOptedOut(
                 false,
                 expectedGeneration: reset.generation
             )
             XCTAssertFalse(restoredOpt.identity.optedOut)
-            XCTAssertEqual(self.flagAuthorityBody(database), corruptAuthorityBytes)
+            XCTAssertEqual(try self.flagAuthorityBody(database), corruptAuthorityBytes)
             let terminalBegin = await runtime.beginFlagReload(
                 requestId: "flags_after_authority_corruption",
                 versions: try self.versions()
