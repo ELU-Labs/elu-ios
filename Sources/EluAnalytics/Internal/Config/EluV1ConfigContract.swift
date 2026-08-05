@@ -26,6 +26,7 @@ enum EluV1ConfigResolutionError: Error, Equatable, Sendable {
     case invalidClock
     case missingActiveConfig
     case conflictingConfigAtIssuedAt
+    case flagActivationGenerationExhausted
     case inactiveConfig(EluV1ConfigStatus)
     case untrustedEndpoint(EluV1EndpointRole)
     case privacyPolicyRevisionMismatch
@@ -667,6 +668,7 @@ struct EluV1EffectiveMasking: Decodable, Sendable {
 }
 
 struct EluV1Timestamp: Comparable, Sendable {
+    let source: String
     let date: Date
     private let baseSecond: Int64
     private let isLeapSecond: Bool
@@ -676,10 +678,53 @@ struct EluV1Timestamp: Comparable, Sendable {
         guard let parsed = EluV1Validation.parseRFC3339(value) else {
             throw EluV1ConfigResolutionError.malformedConfig
         }
+        source = value
         date = parsed.date
         baseSecond = parsed.baseSecond
         isLeapSecond = parsed.isLeapSecond
         fractionalDigits = parsed.fractionalDigits
+    }
+
+    static func exactClock(_ clock: Date) throws -> EluV1Timestamp {
+        let seconds = clock.timeIntervalSinceReferenceDate
+        guard seconds.isFinite else {
+            throw EluV1ConfigResolutionError.invalidClock
+        }
+        let parts = exactClockParts(seconds)
+        guard let whole = Int64(exactly: parts.wholeSecond) else {
+            throw EluV1ConfigResolutionError.invalidClock
+        }
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        var source = formatter.string(
+            from: Date(timeIntervalSinceReferenceDate: Double(whole))
+        )
+        if !parts.fractionalDigits.isEmpty {
+            source.removeLast()
+            source.append(".")
+            source.append(parts.fractionalDigits.map { String($0) }.joined())
+            source.append("Z")
+        }
+        return try EluV1Timestamp(source)
+    }
+
+    /// Stable lossless fields used by the flag authority ledger. Persistence
+    /// verifies these against `source` on every read instead of trusting Date.
+    var storageDay: Int64 {
+        let quotient = baseSecond / 86_400
+        let remainder = baseSecond % 86_400
+        return remainder < 0 ? quotient - 1 : quotient
+    }
+
+    var storageSecondOfDay: Int64 {
+        baseSecond - storageDay * 86_400
+    }
+
+    var storageIsLeapSecond: Bool { isLeapSecond }
+
+    var storageFractionDigits: String {
+        fractionalDigits.map { String($0) }.joined()
     }
 
     static func < (lhs: EluV1Timestamp, rhs: EluV1Timestamp) -> Bool {
@@ -913,7 +958,7 @@ struct EluV1Timestamp: Comparable, Sendable {
     }
 }
 
-private extension KeyedDecodingContainer {
+extension KeyedDecodingContainer {
     func eluDecodeIfPresent<T: Decodable>(_ type: T.Type, forKey key: Key) throws -> T? {
         guard contains(key) else { return nil }
         // Unlike decodeIfPresent, an explicit null is invalid for every

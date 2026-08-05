@@ -22,6 +22,7 @@ enum EluRuntimeQueueError: Error, Equatable, Sendable {
     case provenNotCommitted
     case captureAuthorityExpiredBeforeWrite
     case standaloneLegacyEntryPointUnavailable
+    case flagAuthorityTerminal
     case faultInjected(EluRuntimeQueueFaultPoint)
 }
 
@@ -112,7 +113,9 @@ private struct EluStoredQueueRecord: Sendable {
 }
 
 private enum EluSQLiteRuntimeSchema {
-    static let version: Int64 = 1
+    static let runtimeStateVersion: Int64 = 1
+    static let initialDatabaseVersion: Int64 = 1
+    static let flagDatabaseVersion: Int64 = 2
     static let databaseFilename = "runtime-state-v1.sqlite3"
     static let lockFilename = ".runtime-state-v1.lock"
     static let maximumPayloadBytes = 10 * 1_024 * 1_024
@@ -148,6 +151,36 @@ private enum EluSQLiteRuntimeSchema {
     )
     """
 
+    static let createFlagCacheRecords = """
+    CREATE TABLE flag_cache_records (
+        record_type TEXT NOT NULL CHECK (
+            record_type IN ('authority', 'request', 'chunk')
+        ),
+        record_index INTEGER NOT NULL CHECK (record_index >= 0),
+        storage_schema INTEGER NOT NULL CHECK (storage_schema >= 1),
+        initialized INTEGER NOT NULL CHECK (initialized IN (0, 1)),
+        declared_body_bytes INTEGER,
+        body_sha256 TEXT,
+        chunk_count INTEGER,
+        body BLOB NOT NULL,
+        PRIMARY KEY (record_type, record_index),
+        CHECK (
+            (record_type = 'authority' AND record_index = 0
+                AND declared_body_bytes IS NULL AND body_sha256 IS NULL
+                AND chunk_count IS NULL AND length(body) <= 1048576)
+            OR
+            (record_type = 'request' AND record_index = 0 AND initialized = 1
+                AND declared_body_bytes IS NOT NULL AND declared_body_bytes >= 0
+                AND body_sha256 IS NOT NULL AND chunk_count IS NOT NULL
+                AND chunk_count >= 0 AND length(body) <= 1048576)
+            OR
+            (record_type = 'chunk' AND initialized = 1
+                AND declared_body_bytes IS NULL AND body_sha256 IS NULL
+                AND chunk_count IS NULL AND length(body) <= 1048576)
+        )
+    )
+    """
+
     static let runtimeStateColumns = [
         "singleton": "INTEGER",
         "schema_version": "INTEGER",
@@ -169,6 +202,17 @@ private enum EluSQLiteRuntimeSchema {
         "payload": "BLOB",
         "capture_versions": "BLOB",
         "accounted_bytes": "INTEGER",
+    ]
+
+    static let flagCacheRecordColumns = [
+        "record_type": "TEXT",
+        "record_index": "INTEGER",
+        "storage_schema": "INTEGER",
+        "initialized": "INTEGER",
+        "declared_body_bytes": "INTEGER",
+        "body_sha256": "TEXT",
+        "chunk_count": "INTEGER",
+        "body": "BLOB",
     ]
 }
 
@@ -443,6 +487,12 @@ private final class EluSQLiteConnection: @unchecked Sendable {
 private struct EluRuntimeBootstrapResult: @unchecked Sendable {
     var resources: EluRuntimeResources
     var state: EluStoredRuntimeState
+    var databaseSchemaVersion: Int64
+}
+
+private struct EluRuntimeInspection: Sendable {
+    var state: EluStoredRuntimeState
+    var databaseSchemaVersion: Int64
 }
 
 private enum EluRuntimeQueueBootstrap {
@@ -527,11 +577,14 @@ private enum EluRuntimeQueueBootstrap {
                 )
             }
 
-            let inspectedState = try inspectExisting(databaseURL: databaseURL)
+            let inspected = try inspectExisting(databaseURL: databaseURL)
             let openedConnection = try EluSQLiteConnection(path: databaseURL.path, create: false)
             connection = openedConnection
-            var state = try inspectExisting(connection: openedConnection)
-            guard state == inspectedState else {
+            let liveInspection = try inspectExisting(connection: openedConnection)
+            var state = liveInspection.state
+            guard state == inspected.state,
+                  liveInspection.databaseSchemaVersion == inspected.databaseSchemaVersion
+            else {
                 throw EluRuntimeQueueError.corruptStorage
             }
             try configureDurability(openedConnection, initializing: false)
@@ -551,7 +604,11 @@ private enum EluRuntimeQueueBootstrap {
             )
             connection = nil
             lockDescriptor = -1
-            return EluRuntimeBootstrapResult(resources: resources, state: state)
+            return EluRuntimeBootstrapResult(
+                resources: resources,
+                state: state,
+                databaseSchemaVersion: liveInspection.databaseSchemaVersion
+            )
         } catch {
             connection?.close()
             if lockDescriptor >= 0 {
@@ -565,7 +622,7 @@ private enum EluRuntimeQueueBootstrap {
 
     private static func inspectExisting(
         databaseURL: URL
-    ) throws -> EluStoredRuntimeState {
+    ) throws -> EluRuntimeInspection {
         let fileManager = FileManager.default
         let inspectionDirectory = fileManager.temporaryDirectory.appendingPathComponent(
             "elu-runtime-inspection-\(UUID().uuidString)",
@@ -597,9 +654,11 @@ private enum EluRuntimeQueueBootstrap {
 
     private static func inspectExisting(
         connection: EluSQLiteConnection
-    ) throws -> EluStoredRuntimeState {
+    ) throws -> EluRuntimeInspection {
         let userVersion = try connection.integerPragma("user_version")
-        guard userVersion == EluSQLiteRuntimeSchema.version else {
+        guard userVersion == EluSQLiteRuntimeSchema.initialDatabaseVersion
+            || userVersion == EluSQLiteRuntimeSchema.flagDatabaseVersion
+        else {
             if userVersion == 0 {
                 _ = try EluRuntimeDatabase.schemaObjects(connection)
                 throw EluRuntimeQueueError.corruptStorage
@@ -607,8 +666,11 @@ private enum EluRuntimeQueueBootstrap {
             throw EluRuntimeQueueError.unsupportedSchemaVersion(userVersion)
         }
 
-        try EluRuntimeDatabase.verifySchema(connection)
-        return try EluRuntimeDatabase.loadState(connection, validateQueue: true)
+        try EluRuntimeDatabase.verifySchema(connection, databaseVersion: userVersion)
+        return EluRuntimeInspection(
+            state: try EluRuntimeDatabase.loadState(connection, validateQueue: true),
+            databaseSchemaVersion: userVersion
+        )
     }
 
     private static func installFreshDatabase(
@@ -638,7 +700,9 @@ private enum EluRuntimeQueueBootstrap {
             try connection.execute(EluSQLiteRuntimeSchema.createRuntimeState)
             try connection.execute(EluSQLiteRuntimeSchema.createQueueRecords)
             try EluRuntimeDatabase.insertInitialState(connection, state: state)
-            try connection.execute("PRAGMA user_version = \(EluSQLiteRuntimeSchema.version)")
+            try connection.execute(
+                "PRAGMA user_version = \(EluSQLiteRuntimeSchema.initialDatabaseVersion)"
+            )
             try connection.execute("COMMIT")
             try connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             try connection.withStatement("PRAGMA journal_mode=DELETE") { statement in
@@ -733,8 +797,17 @@ private enum EluRuntimeQueueBootstrap {
                     forceOptOut: recoverable.forceOptOut
                 )
             }
+            let optChanged = recoverable.forceOptOut && !identity.optedOut
+            let flagContextWasCleared = recoverable.flagContext == nil
             if recoverable.forceOptOut {
                 identity.optedOut = true
+                identity.session = nil
+            }
+            if optChanged || flagContextWasCleared {
+                guard identity.contextRevision < Int64.max else {
+                    throw EluRuntimeQueueError.counterExhausted
+                }
+                identity.contextRevision += 1
             }
             let stream: EluStreamMetadata
             if let recoveredStream = recoverable.streamMetadata {
@@ -893,7 +966,743 @@ private enum EluRuntimeQueueBootstrap {
     }
 }
 
+private struct EluStoredFlagAuthorityRow: Sendable {
+    let storageSchema: Int64
+    let initialized: Bool
+    let body: Data
+}
+
+private struct EluStoredFlagRequestRow: Sendable {
+    let storageSchema: Int64
+    let declaredBodyBytes: Int64
+    let bodySha256: String
+    let chunkCount: Int64
+    let metadataBody: Data
+}
+
 private enum EluRuntimeDatabase {
+    static func insertUninitializedFlagAuthority(
+        _ connection: EluSQLiteConnection,
+        exactConstructorSiteKey: String,
+        siteNamespaceDigest: String
+    ) throws {
+        let body = try EluV1FlagStorageCodec.encodeAuthority(
+            .uninitialized(
+                exactConstructorSiteKey: exactConstructorSiteKey,
+                siteNamespaceDigest: siteNamespaceDigest
+            )
+        )
+        try connection.withStatement(
+            """
+            INSERT INTO flag_cache_records (
+                record_type, record_index, storage_schema, initialized,
+                declared_body_bytes, body_sha256, chunk_count, body
+            ) VALUES ('authority', 0, 1, 0, NULL, NULL, NULL, ?)
+            """
+        ) { statement in
+            try connection.bind(body, at: 1, to: statement)
+            try connection.step(statement)
+        }
+    }
+
+    static func readFlagAuthority(
+        _ connection: EluSQLiteConnection
+    ) throws -> EluStoredFlagAuthorityRow {
+        try connection.withStatement(
+            """
+            SELECT storage_schema, initialized, body
+            FROM flag_cache_records
+            WHERE record_type = 'authority' AND record_index = 0
+            """
+        ) { statement in
+            let first = sqlite3_step(statement)
+            if first == SQLITE_DONE {
+                throw EluRuntimeQueueError.flagAuthorityTerminal
+            }
+            guard first == SQLITE_ROW else {
+                throw EluSQLiteFailure.result(first, "Unable to read flag authority")
+            }
+            guard sqlite3_column_type(statement, 0) == SQLITE_INTEGER else {
+                throw EluRuntimeQueueError.flagAuthorityTerminal
+            }
+            let storageSchema = sqlite3_column_int64(statement, 0)
+            if storageSchema != 1 {
+                let trailing = sqlite3_step(statement)
+                guard trailing == SQLITE_DONE else {
+                    if trailing == SQLITE_ROW {
+                        throw EluRuntimeQueueError.flagAuthorityTerminal
+                    }
+                    throw EluSQLiteFailure.result(
+                        trailing,
+                        "Unable to finish reading future flag authority"
+                    )
+                }
+                return EluStoredFlagAuthorityRow(
+                    storageSchema: storageSchema,
+                    initialized: false,
+                    body: Data()
+                )
+            }
+            guard sqlite3_column_type(statement, 1) == SQLITE_INTEGER else {
+                throw EluRuntimeQueueError.flagAuthorityTerminal
+            }
+            let initializedRaw = sqlite3_column_int64(statement, 1)
+            guard initializedRaw == 0 || initializedRaw == 1 else {
+                throw EluRuntimeQueueError.flagAuthorityTerminal
+            }
+            guard sqlite3_column_type(statement, 2) == SQLITE_BLOB else {
+                throw EluRuntimeQueueError.flagAuthorityTerminal
+            }
+            let bodyBytes = Int(sqlite3_column_bytes(statement, 2))
+            guard bodyBytes > 0,
+                  bodyBytes <= EluV1FlagStorageCodec.maximumMetadataBytes,
+                  let bytes = sqlite3_column_blob(statement, 2)
+            else {
+                throw EluRuntimeQueueError.flagAuthorityTerminal
+            }
+            let body = Data(bytes: bytes, count: bodyBytes)
+            let trailing = sqlite3_step(statement)
+            if trailing == SQLITE_ROW {
+                throw EluRuntimeQueueError.flagAuthorityTerminal
+            }
+            guard trailing == SQLITE_DONE else {
+                throw EluSQLiteFailure.result(
+                    trailing,
+                    "Unable to finish reading flag authority"
+                )
+            }
+            return EluStoredFlagAuthorityRow(
+                storageSchema: storageSchema,
+                initialized: initializedRaw == 1,
+                body: body
+            )
+        }
+    }
+
+    static func updateFlagAuthority(
+        _ connection: EluSQLiteConnection,
+        value: EluV1FlagDurableAuthority
+    ) throws {
+        let body = try EluV1FlagStorageCodec.encodeAuthority(value)
+        try connection.withStatement(
+            """
+            UPDATE flag_cache_records
+            SET storage_schema = 1, initialized = ?, body = ?
+            WHERE record_type = 'authority' AND record_index = 0
+            """
+        ) { statement in
+            try connection.bind(value.initialized ? 1 : 0, at: 1, to: statement)
+            try connection.bind(body, at: 2, to: statement)
+            try connection.step(statement)
+        }
+        guard try connection.changes() == 1 else {
+            throw EluRuntimeQueueError.corruptStorage
+        }
+    }
+
+    static func readFlagRequest(
+        _ connection: EluSQLiteConnection
+    ) throws -> EluStoredFlagRequestRow? {
+        try connection.withStatement(
+            """
+            SELECT storage_schema, declared_body_bytes, length(body_sha256),
+                   body_sha256, chunk_count, body
+            FROM flag_cache_records
+            WHERE record_type = 'request' AND record_index = 0
+            """
+        ) { statement in
+            let first = sqlite3_step(statement)
+            if first == SQLITE_DONE { return nil }
+            guard first == SQLITE_ROW else {
+                throw EluSQLiteFailure.result(first, "Unable to read flag request state")
+            }
+            guard sqlite3_column_type(statement, 0) == SQLITE_INTEGER else {
+                throw EluRuntimeQueueError.unsupportedSchemaVersion(2)
+            }
+            let storageSchema = sqlite3_column_int64(statement, 0)
+            if storageSchema != 1 {
+                let trailing = sqlite3_step(statement)
+                if trailing == SQLITE_ROW {
+                    throw EluRuntimeQueueError.unsupportedSchemaVersion(storageSchema)
+                }
+                guard trailing == SQLITE_DONE else {
+                    throw EluSQLiteFailure.result(
+                        trailing,
+                        "Unable to finish reading future flag request state"
+                    )
+                }
+                // Future metadata is classified from its fixed header without
+                // materializing its body or unbounded text fields.
+                return EluStoredFlagRequestRow(
+                    storageSchema: storageSchema,
+                    declaredBodyBytes: 0,
+                    bodySha256: "",
+                    chunkCount: 0,
+                    metadataBody: Data()
+                )
+            }
+            guard sqlite3_column_type(statement, 1) == SQLITE_INTEGER,
+                  sqlite3_column_type(statement, 2) == SQLITE_INTEGER,
+                  sqlite3_column_type(statement, 3) == SQLITE_TEXT,
+                  sqlite3_column_type(statement, 4) == SQLITE_INTEGER
+            else {
+                // The physical-v1 header is not sufficiently typed to prove
+                // ownership of any referenced inner body.
+                throw EluRuntimeQueueError.unsupportedSchemaVersion(2)
+            }
+            let declaredBodyBytes = sqlite3_column_int64(statement, 1)
+            let hashLength = sqlite3_column_int64(statement, 2)
+            guard hashLength >= 0,
+                  hashLength <= 1_024,
+                  let hashText = sqlite3_column_text(statement, 3)
+            else {
+                // Inner future envelopes own their digest representation. A
+                // resource-heavy or non-text header is opaque, not v1-corrupt.
+                throw EluRuntimeQueueError.unsupportedSchemaVersion(2)
+            }
+            let chunkCount = sqlite3_column_int64(statement, 4)
+            guard sqlite3_column_type(statement, 5) == SQLITE_BLOB else {
+                throw EluRuntimeQueueError.corruptStorage
+            }
+            let metadataBytes = Int(sqlite3_column_bytes(statement, 5))
+            guard metadataBytes >= 0,
+                  metadataBytes <= EluV1FlagStorageCodec.maximumMetadataBytes
+            else {
+                throw EluRuntimeQueueError.corruptStorage
+            }
+            let metadataBody: Data
+            if metadataBytes == 0 {
+                metadataBody = Data()
+            } else {
+                guard let metadata = sqlite3_column_blob(statement, 5) else {
+                    throw EluRuntimeQueueError.corruptStorage
+                }
+                metadataBody = Data(bytes: metadata, count: metadataBytes)
+            }
+            let row = EluStoredFlagRequestRow(
+                storageSchema: storageSchema,
+                declaredBodyBytes: declaredBodyBytes,
+                bodySha256: String(cString: hashText),
+                chunkCount: chunkCount,
+                metadataBody: metadataBody
+            )
+            let trailing = sqlite3_step(statement)
+            if trailing == SQLITE_ROW {
+                throw EluRuntimeQueueError.corruptStorage
+            }
+            guard trailing == SQLITE_DONE else {
+                throw EluSQLiteFailure.result(
+                    trailing,
+                    "Unable to finish reading flag request state"
+                )
+            }
+            return row
+        }
+    }
+
+    static func replaceFlagRequest(
+        _ connection: EluSQLiteConnection,
+        state: EluV1FlagRequestCacheState,
+        cacheBody: Data?
+    ) throws {
+        let metadata = try EluV1FlagStorageCodec.encodeRequestState(state)
+        let body = cacheBody ?? Data()
+        guard body.count <= EluV1FlagJSON.maximumCacheBytes else {
+            throw EluV1FlagContractError.cacheTooLarge
+        }
+        let chunks = body.isEmpty ? [] : stride(
+            from: 0,
+            to: body.count,
+            by: EluV1FlagJSON.maximumWireBytes
+        ).map { offset in
+            body.subdata(
+                in: offset ..< min(offset + EluV1FlagJSON.maximumWireBytes, body.count)
+            )
+        }
+        let digest = body.isEmpty ? "" : EluV1FlagJSON.hash(body)
+        try connection.execute("DELETE FROM flag_cache_records WHERE record_type = 'chunk'")
+        try connection.execute("DELETE FROM flag_cache_records WHERE record_type = 'request'")
+        try connection.withStatement(
+            """
+            INSERT INTO flag_cache_records (
+                record_type, record_index, storage_schema, initialized,
+                declared_body_bytes, body_sha256, chunk_count, body
+            ) VALUES ('request', 0, 1, 1, ?, ?, ?, ?)
+            """
+        ) { statement in
+            try connection.bind(Int64(body.count), at: 1, to: statement)
+            try connection.bind(digest, at: 2, to: statement)
+            try connection.bind(Int64(chunks.count), at: 3, to: statement)
+            try connection.bind(metadata, at: 4, to: statement)
+            try connection.step(statement)
+        }
+        for (index, chunk) in chunks.enumerated() {
+            try connection.withStatement(
+                """
+                INSERT INTO flag_cache_records (
+                    record_type, record_index, storage_schema, initialized,
+                    declared_body_bytes, body_sha256, chunk_count, body
+                ) VALUES ('chunk', ?, 1, 1, NULL, NULL, NULL, ?)
+                """
+            ) { statement in
+                try connection.bind(Int64(index), at: 1, to: statement)
+                try connection.bind(chunk, at: 2, to: statement)
+                try connection.step(statement)
+            }
+        }
+    }
+
+    /// Constant-memory lexical preclassifier for an oversized chunked cache.
+    /// It recognizes only an unambiguous top-level integer schemaVersion and
+    /// never applies the v1 AST/string/node limits to unknown future content.
+    private struct FlagFutureSchemaScanner {
+        enum Classification: Equatable {
+            case current
+            case future
+            case opaque
+        }
+
+        private enum Phase {
+            case root
+            case key
+            case colon
+            case value
+            case primitive
+            case nested
+            case afterValue
+            case done
+            case invalid
+        }
+
+        private static let maximumNesting = 4_096
+        private static let maximumCapturedKeyBytes = 1_024
+        private static let maximumSchemaTokenBytes = 32
+
+        private var phase: Phase = .root
+        private var stack: [UInt8] = []
+        private var inString = false
+        private var escaped = false
+        private var unicodeDigitsRemaining = 0
+        private var capturingKey = false
+        private var capturedKey = Data()
+        private var currentKeyIsSchema = false
+        private var schemaToken = Data()
+        private var sawSchema = false
+        private var resourceExhausted = false
+        private var schemaVersion: Int64?
+
+        mutating func update(_ data: Data) {
+            for byte in data where phase != .invalid {
+                consume(byte)
+            }
+        }
+
+        mutating func finish() -> Classification {
+            if phase == .primitive { finishPrimitive(delimiter: nil) }
+            guard !resourceExhausted,
+                  phase == .done,
+                  !inString,
+                  unicodeDigitsRemaining == 0,
+                  let schemaVersion
+            else {
+                return .opaque
+            }
+            return schemaVersion == Int64(EluV1FlagRequestCacheState.storageSchema)
+                ? .current
+                : .future
+        }
+
+        private mutating func consume(_ byte: UInt8) {
+            if phase == .done {
+                if !Self.isWhitespace(byte) { phase = .invalid }
+                return
+            }
+            if inString {
+                consumeStringByte(byte)
+                return
+            }
+
+            switch phase {
+            case .root:
+                guard Self.isWhitespace(byte) || byte == 0x7B else {
+                    phase = .invalid
+                    return
+                }
+                if byte == 0x7B {
+                    stack = [0x7D]
+                    phase = .key
+                }
+
+            case .key:
+                if Self.isWhitespace(byte) { return }
+                if byte == 0x7D {
+                    guard stack == [0x7D] else { phase = .invalid; return }
+                    stack.removeAll(keepingCapacity: false)
+                    phase = .done
+                } else if byte == 0x22 {
+                    beginString(capturingKey: true)
+                } else {
+                    phase = .invalid
+                }
+
+            case .colon:
+                if Self.isWhitespace(byte) { return }
+                phase = byte == 0x3A ? .value : .invalid
+
+            case .value:
+                if Self.isWhitespace(byte) { return }
+                if byte == 0x22 {
+                    guard !currentKeyIsSchema else { phase = .invalid; return }
+                    beginString(capturingKey: false)
+                } else if byte == 0x7B || byte == 0x5B {
+                    guard !currentKeyIsSchema else { phase = .invalid; return }
+                    push(byte == 0x7B ? 0x7D : 0x5D)
+                    if phase != .invalid { phase = .nested }
+                } else {
+                    phase = .primitive
+                    consumePrimitiveByte(byte)
+                }
+
+            case .primitive:
+                consumePrimitiveByte(byte)
+
+            case .nested:
+                if byte == 0x22 {
+                    beginString(capturingKey: false)
+                } else if byte == 0x7B || byte == 0x5B {
+                    push(byte == 0x7B ? 0x7D : 0x5D)
+                } else if byte == 0x7D || byte == 0x5D {
+                    guard stack.last == byte else { phase = .invalid; return }
+                    stack.removeLast()
+                    if stack.count == 1 { phase = .afterValue }
+                }
+
+            case .afterValue:
+                if Self.isWhitespace(byte) { return }
+                if byte == 0x2C {
+                    currentKeyIsSchema = false
+                    phase = .key
+                } else if byte == 0x7D, stack == [0x7D] {
+                    stack.removeAll(keepingCapacity: false)
+                    phase = .done
+                } else {
+                    phase = .invalid
+                }
+
+            case .done, .invalid:
+                break
+            }
+        }
+
+        private mutating func beginString(capturingKey: Bool) {
+            inString = true
+            escaped = false
+            unicodeDigitsRemaining = 0
+            self.capturingKey = capturingKey
+            if capturingKey {
+                capturedKey = Data([0x22])
+            }
+        }
+
+        private mutating func consumeStringByte(_ byte: UInt8) {
+            if capturingKey,
+               capturedKey.count < Self.maximumCapturedKeyBytes
+            {
+                capturedKey.append(byte)
+            } else if capturingKey {
+                resourceExhausted = true
+            }
+            if unicodeDigitsRemaining > 0 {
+                guard Self.isHex(byte) else { phase = .invalid; return }
+                unicodeDigitsRemaining -= 1
+                return
+            }
+            if escaped {
+                escaped = false
+                if byte == 0x75 {
+                    unicodeDigitsRemaining = 4
+                } else if ![0x22, 0x5C, 0x2F, 0x62, 0x66, 0x6E, 0x72, 0x74].contains(byte) {
+                    phase = .invalid
+                }
+                return
+            }
+            if byte == 0x5C {
+                escaped = true
+            } else if byte == 0x22 {
+                inString = false
+                if capturingKey {
+                    currentKeyIsSchema = (try? JSONDecoder().decode(
+                        String.self,
+                        from: capturedKey
+                    )) == "schemaVersion"
+                    phase = .colon
+                } else if stack.count == 1 {
+                    phase = .afterValue
+                }
+                capturingKey = false
+            } else if byte < 0x20 {
+                phase = .invalid
+            }
+        }
+
+        private mutating func consumePrimitiveByte(_ byte: UInt8) {
+            if Self.isWhitespace(byte) || byte == 0x2C || byte == 0x7D {
+                finishPrimitive(delimiter: byte)
+                return
+            }
+            if currentKeyIsSchema {
+                guard schemaToken.count < Self.maximumSchemaTokenBytes else {
+                    resourceExhausted = true
+                    phase = .invalid
+                    return
+                }
+                schemaToken.append(byte)
+            }
+        }
+
+        private mutating func finishPrimitive(delimiter: UInt8?) {
+            if currentKeyIsSchema {
+                guard !sawSchema,
+                      let token = String(data: schemaToken, encoding: .utf8),
+                      let value = Double(token),
+                      value.isFinite,
+                      value.rounded(.towardZero) == value,
+                      abs(value) <= EluV1FlagJSON.maximumSafeInteger,
+                      let version = Int64(exactly: value),
+                      (1 ... 9_007_199_254_740_991).contains(version)
+                else {
+                    phase = .invalid
+                    return
+                }
+                sawSchema = true
+                schemaVersion = version
+                schemaToken.removeAll(keepingCapacity: false)
+            }
+            phase = .afterValue
+            guard let delimiter else { return }
+            if Self.isWhitespace(delimiter) { return }
+            consume(delimiter)
+        }
+
+        private mutating func push(_ closing: UInt8) {
+            guard stack.count < Self.maximumNesting else {
+                resourceExhausted = true
+                phase = .invalid
+                return
+            }
+            stack.append(closing)
+        }
+
+        private static func isWhitespace(_ byte: UInt8) -> Bool {
+            byte == 0x20 || byte == 0x09 || byte == 0x0A || byte == 0x0D
+        }
+
+        private static func isHex(_ byte: UInt8) -> Bool {
+            (0x30 ... 0x39).contains(byte)
+                || (0x41 ... 0x46).contains(byte)
+                || (0x61 ... 0x66).contains(byte)
+        }
+    }
+
+    static func readFlagCacheBody(
+        _ connection: EluSQLiteConnection,
+        row: EluStoredFlagRequestRow
+    ) throws -> Data? {
+        guard row.storageSchema == 1 else { throw EluRuntimeQueueError.unsupportedSchemaVersion(row.storageSchema) }
+        let maximumFutureProbeBytes = Int64(EluRuntimeQueueLimits.defaultMaximumBytes)
+        let maximumFutureChunks = maximumFutureProbeBytes
+            / Int64(EluV1FlagJSON.maximumWireBytes)
+        guard row.declaredBodyBytes >= 0,
+              row.declaredBodyBytes <= maximumFutureProbeBytes,
+              row.chunkCount >= 0,
+              row.chunkCount <= maximumFutureChunks
+        else {
+            // A header outside the bounded probe cannot be proven to be a
+            // current-v1 body. Preserve it as opaque/future instead of using
+            // the current-schema corruption rotation path.
+            throw EluRuntimeQueueError.unsupportedSchemaVersion(2)
+        }
+        if row.declaredBodyBytes == 0 {
+            guard row.chunkCount == 0, row.bodySha256.isEmpty else {
+                // A lying zero-length header cannot prove that referenced
+                // chunks are current-v1. Preserve the opaque record.
+                throw EluRuntimeQueueError.unsupportedSchemaVersion(2)
+            }
+            let physicalChunks = try flagCacheChunkInventory(
+                connection,
+                maximumRows: maximumFutureChunks
+            )
+            guard physicalChunks == 0 else {
+                throw EluRuntimeQueueError.unsupportedSchemaVersion(2)
+            }
+            return nil
+        }
+        guard row.chunkCount > 0 else {
+            throw EluRuntimeQueueError.unsupportedSchemaVersion(2)
+        }
+        // Every physical chunk row participates in storage ownership, even
+        // when a stale current-v1 header does not reference it. Prove all
+        // fixed headers are current before any count mismatch can enter the
+        // v1 corruption/rotation path. A table too large to inspect within
+        // the bounded future probe remains opaque and byte-preserved.
+        let chunkRows = try flagCacheChunkInventory(
+            connection,
+            maximumRows: maximumFutureChunks
+        )
+        let isCurrentV1Envelope = row.declaredBodyBytes <= Int64(EluV1FlagJSON.maximumCacheBytes)
+            && row.chunkCount <= 4
+        var result = Data()
+        if isCurrentV1Envelope {
+            result.reserveCapacity(Int(row.declaredBodyBytes))
+        }
+        var scanner = FlagFutureSchemaScanner()
+        var hasher = SHA256()
+        var observedBytes: Int64 = 0
+        for index in 0 ..< row.chunkCount {
+            let chunk = try connection.withStatement(
+                """
+                SELECT storage_schema, body FROM flag_cache_records
+                WHERE record_type = 'chunk' AND record_index = ?
+                """
+            ) { statement -> Data in
+                try connection.bind(index, at: 1, to: statement)
+                let first = sqlite3_step(statement)
+                if first == SQLITE_DONE {
+                    throw EluRuntimeQueueError.unsupportedSchemaVersion(2)
+                }
+                guard first == SQLITE_ROW else {
+                    throw EluSQLiteFailure.result(first, "Unable to read flag cache chunk")
+                }
+                guard sqlite3_column_type(statement, 0) == SQLITE_INTEGER else {
+                    throw EluRuntimeQueueError.unsupportedSchemaVersion(2)
+                }
+                let chunkSchema = sqlite3_column_int64(statement, 0)
+                guard chunkSchema == 1 else {
+                    throw EluRuntimeQueueError.unsupportedSchemaVersion(chunkSchema)
+                }
+                guard sqlite3_column_type(statement, 1) == SQLITE_BLOB else {
+                    throw EluRuntimeQueueError.unsupportedSchemaVersion(2)
+                }
+                let byteCount = Int(sqlite3_column_bytes(statement, 1))
+                guard byteCount > 0,
+                      byteCount <= EluV1FlagJSON.maximumWireBytes,
+                      let bytes = sqlite3_column_blob(statement, 1)
+                else {
+                    throw EluRuntimeQueueError.unsupportedSchemaVersion(2)
+                }
+                let body = Data(bytes: bytes, count: byteCount)
+                let trailing = sqlite3_step(statement)
+                if trailing == SQLITE_ROW {
+                    throw EluRuntimeQueueError.unsupportedSchemaVersion(2)
+                }
+                guard trailing == SQLITE_DONE else {
+                    throw EluSQLiteFailure.result(
+                        trailing,
+                        "Unable to finish reading flag cache chunk"
+                    )
+                }
+                return body
+            }
+            guard observedBytes <= maximumFutureProbeBytes - Int64(chunk.count) else {
+                throw EluRuntimeQueueError.unsupportedSchemaVersion(2)
+            }
+            observedBytes += Int64(chunk.count)
+            scanner.update(chunk)
+            hasher.update(data: chunk)
+            if isCurrentV1Envelope {
+                result.append(chunk)
+            }
+        }
+        let observedHash = "sha256:"
+            + hasher.finalize().map { String(format: "%02x", $0) }.joined()
+
+        var classification = scanner.finish()
+        if classification == .opaque, isCurrentV1Envelope {
+            if let parsedVersion = flagCacheSchemaVersion(result) {
+                classification = parsedVersion
+                    == Int64(EluV1FlagRequestCacheState.storageSchema)
+                    ? .current
+                    : .future
+            }
+        }
+        // A complete lexical future discriminator owns its integrity rules;
+        // a stale v1 digest cannot turn future bytes into current corruption.
+        if classification == .future {
+            throw EluRuntimeQueueError.unsupportedSchemaVersion(2)
+        }
+        guard classification == .current else {
+            // Scanner ambiguity or resource exhaustion on an oversized body
+            // is fail-closed and byte-preserving.
+            throw EluRuntimeQueueError.unsupportedSchemaVersion(2)
+        }
+        guard isCurrentV1Envelope else {
+            // An explicitly current body is now owned by v1; exceeding its
+            // frozen size/chunk budget is quarantinable current corruption.
+            throw EluRuntimeQueueError.corruptStorage
+        }
+        guard chunkRows == row.chunkCount,
+              observedBytes == row.declaredBodyBytes,
+              observedHash == row.bodySha256
+        else {
+            throw EluRuntimeQueueError.corruptStorage
+        }
+        return result
+    }
+
+    private static func flagCacheChunkInventory(
+        _ connection: EluSQLiteConnection,
+        maximumRows: Int64
+    ) throws -> Int64 {
+        guard maximumRows >= 0 else {
+            throw EluRuntimeQueueError.unsupportedSchemaVersion(2)
+        }
+        return try connection.withStatement(
+            "SELECT storage_schema FROM flag_cache_records "
+                + "WHERE record_type = 'chunk' ORDER BY record_index"
+        ) { statement -> Int64 in
+            var count: Int64 = 0
+            while true {
+                let step = sqlite3_step(statement)
+                if step == SQLITE_DONE { return count }
+                guard step == SQLITE_ROW else {
+                    throw EluSQLiteFailure.result(
+                        step,
+                        "Unable to inventory flag cache chunks"
+                    )
+                }
+                guard count < maximumRows,
+                      sqlite3_column_type(statement, 0) == SQLITE_INTEGER
+                else {
+                    throw EluRuntimeQueueError.unsupportedSchemaVersion(2)
+                }
+                let storageSchema = sqlite3_column_int64(statement, 0)
+                guard storageSchema == 1 else {
+                    throw EluRuntimeQueueError.unsupportedSchemaVersion(storageSchema)
+                }
+                count += 1
+            }
+        }
+    }
+
+    private static func flagCacheSchemaVersion(_ body: Data) -> Int64? {
+        do {
+            let document = try EluV1StrictCanonicalJSON.parse(body)
+            guard case let .number(token)? = try document.objectProperty("schemaVersion")
+            else {
+                return nil
+            }
+            guard let value = Double(token),
+                  value.isFinite,
+                  value.rounded(.towardZero) == value,
+                  abs(value) <= EluV1FlagJSON.maximumSafeInteger
+            else {
+                return nil
+            }
+            return Int64(exactly: value)
+        } catch {
+            return nil
+        }
+    }
     static func schemaObjects(_ connection: EluSQLiteConnection) throws -> [String: String] {
         try connection.withStatement(
             "SELECT name, type FROM sqlite_master "
@@ -918,11 +1727,18 @@ private enum EluRuntimeDatabase {
         }
     }
 
-    static func verifySchema(_ connection: EluSQLiteConnection) throws {
-        guard try schemaObjects(connection) == [
+    static func verifySchema(
+        _ connection: EluSQLiteConnection,
+        databaseVersion: Int64
+    ) throws {
+        var expectedObjects = [
             "queue_records": "table",
             "runtime_state": "table",
-        ] else {
+        ]
+        if databaseVersion == EluSQLiteRuntimeSchema.flagDatabaseVersion {
+            expectedObjects["flag_cache_records"] = "table"
+        }
+        guard try schemaObjects(connection) == expectedObjects else {
             throw EluRuntimeQueueError.corruptStorage
         }
         try verifyColumns(
@@ -945,6 +1761,18 @@ private enum EluRuntimeDatabase {
             table: "queue_records",
             expected: EluSQLiteRuntimeSchema.createQueueRecords
         )
+        if databaseVersion == EluSQLiteRuntimeSchema.flagDatabaseVersion {
+            try verifyColumns(
+                connection,
+                table: "flag_cache_records",
+                expected: EluSQLiteRuntimeSchema.flagCacheRecordColumns
+            )
+            try verifyCreateSQL(
+                connection,
+                table: "flag_cache_records",
+                expected: EluSQLiteRuntimeSchema.createFlagCacheRecords
+            )
+        }
     }
 
     static func insertInitialState(
@@ -987,7 +1815,7 @@ private enum EluRuntimeDatabase {
                 throw EluRuntimeQueueError.corruptStorage
             }
             let schemaVersion = try connection.requiredInteger(statement, column: 1)
-            guard schemaVersion == EluSQLiteRuntimeSchema.version else {
+            guard schemaVersion == EluSQLiteRuntimeSchema.runtimeStateVersion else {
                 throw EluRuntimeQueueError.unsupportedSchemaVersion(schemaVersion)
             }
             let generation = try connection.requiredInteger(statement, column: 2)
@@ -1397,7 +2225,83 @@ private enum EluPreparedRecordDraft: Sendable {
     )
 }
 
+struct EluV1FlagConfigDeadlineIdentity: Equatable, Sendable {
+    let exactConstructorSiteKey: String
+    let siteNamespaceDigest: String
+    let siteId: String
+    let configRevision: String
+    let ordering: EluV1StoredTimestamp
+    let semanticHash: String
+    let endpoint: String
+    let configExpiresAt: EluV1StoredTimestamp
+    let barrierGeneration: Int64
+    /// Diagnostic/index aid only; excluded from semantic equality.
+    let indexHash: String?
+
+    static func == (
+        lhs: EluV1FlagConfigDeadlineIdentity,
+        rhs: EluV1FlagConfigDeadlineIdentity
+    ) -> Bool {
+        lhs.exactConstructorSiteKey == rhs.exactConstructorSiteKey
+            && lhs.siteNamespaceDigest == rhs.siteNamespaceDigest
+            && lhs.siteId == rhs.siteId
+            && lhs.configRevision == rhs.configRevision
+            && lhs.ordering == rhs.ordering
+            && lhs.semanticHash == rhs.semanticHash
+            && lhs.endpoint == rhs.endpoint
+            && lhs.configExpiresAt == rhs.configExpiresAt
+            && lhs.barrierGeneration == rhs.barrierGeneration
+    }
+}
+
+struct EluV1FlagCacheDeadlineIdentity: Equatable, Sendable {
+    let storeEpoch: String
+    let cacheRecordId: String
+    let cachedWitnessHash: String
+    let flagsRevision: String
+    let evaluatedAt: EluV1StoredTimestamp
+    let responseExpiresAt: EluV1StoredTimestamp
+    let effectiveExpiresAt: EluV1StoredTimestamp
+    let barrierGeneration: Int64
+    let declaredBodyBytes: Int64
+    let bodySha256: String
+    /// Diagnostic/index aid only; never the lease authority.
+    let indexHash: String?
+
+    static func == (
+        lhs: EluV1FlagCacheDeadlineIdentity,
+        rhs: EluV1FlagCacheDeadlineIdentity
+    ) -> Bool {
+        lhs.storeEpoch == rhs.storeEpoch
+            && lhs.cacheRecordId == rhs.cacheRecordId
+            && lhs.cachedWitnessHash == rhs.cachedWitnessHash
+            && lhs.flagsRevision == rhs.flagsRevision
+            && lhs.evaluatedAt == rhs.evaluatedAt
+            && lhs.responseExpiresAt == rhs.responseExpiresAt
+            && lhs.effectiveExpiresAt == rhs.effectiveExpiresAt
+            && lhs.barrierGeneration == rhs.barrierGeneration
+            && lhs.declaredBodyBytes == rhs.declaredBodyBytes
+            && lhs.bodySha256 == rhs.bodySha256
+    }
+}
+
 actor EluSQLiteRuntimeQueue {
+    private struct FlagClockSample {
+        let wallDate: Date
+        let wall: EluV1Timestamp
+        let continuous: UInt64
+    }
+
+    private struct FlagDeadline<Key: Equatable> {
+        let key: Key
+        let startedAt: UInt64
+        let budget: UInt64
+
+        func isExpired(at now: UInt64) -> Bool {
+            now &- startedAt >= budget
+        }
+    }
+
     private static let reservedVersionProperties: Set<String> = [
         "$elu_contract_version",
         "$elu_sdk_version",
@@ -1411,12 +2315,21 @@ actor EluSQLiteRuntimeQueue {
     private let sessionIdGenerator: @Sendable () -> String
     private let faultInjector: (any EluRuntimeQueueFaultInjecting)?
     private let captureConfigManager: EluV1ConfigManager?
+    private let flagConfigManager: EluV1ConfigManager?
+    private let exactConstructorSiteKey: String?
     private let ownerNamespaceHash: String?
     private let continuousClock: @Sendable () -> UInt64
     private let continuousBudgetConverter: @Sendable (UInt64) -> UInt64?
+    private let flagStoreEpochGenerator: @Sendable () -> String
     private var pinnedConfigSiteId: String?
     private var captureAuthority: EluV1CaptureAuthorityState = .absent
     private var authorityEpoch: UInt64 = 0
+    private var databaseSchemaVersion: Int64
+    private var flagWallLatch: EluV1Timestamp?
+    private var flagContinuousLatch: UInt64?
+    private var flagClockPoisoned = false
+    private var flagConfigDeadline: FlagDeadline<EluV1FlagConfigDeadlineIdentity>?
+    private var flagCacheDeadline: FlagDeadline<EluV1FlagCacheDeadlineIdentity>?
     private var isPoisoned = false
 
     static func open(
@@ -1451,6 +2364,8 @@ actor EluSQLiteRuntimeQueue {
             anonymousIdGenerator: anonymousIdGenerator,
             sessionIdGenerator: sessionIdGenerator,
             faultInjector: faultInjector,
+            databaseSchemaVersion: opened.databaseSchemaVersion,
+            exactConstructorSiteKey: nil,
             ownerNamespaceHash: nil,
             continuousClock: EluMachContinuousClock.now,
             continuousBudgetConverter: EluMachContinuousClock.floorTicks
@@ -1476,6 +2391,9 @@ actor EluSQLiteRuntimeQueue {
         },
         sessionIdGenerator: @escaping @Sendable () -> String = {
             "session_\(EluRuntimeIdentifier.compactUUID())"
+        },
+        flagStoreEpochGenerator: @escaping @Sendable () -> String = {
+            "flag_store_\(EluRuntimeIdentifier.compactUUID())"
         },
         faultInjector: (any EluRuntimeQueueFaultInjecting)? = nil
     ) async throws -> EluSQLiteRuntimeQueue {
@@ -1503,9 +2421,12 @@ actor EluSQLiteRuntimeQueue {
             anonymousIdGenerator: anonymousIdGenerator,
             sessionIdGenerator: sessionIdGenerator,
             faultInjector: faultInjector,
+            databaseSchemaVersion: opened.databaseSchemaVersion,
+            exactConstructorSiteKey: exactConstructorSiteKey,
             ownerNamespaceHash: namespaceHash,
             continuousClock: continuousClock,
-            continuousBudgetConverter: continuousBudgetConverter
+            continuousBudgetConverter: continuousBudgetConverter,
+            flagStoreEpochGenerator: flagStoreEpochGenerator
         )
     }
 
@@ -1525,6 +2446,9 @@ actor EluSQLiteRuntimeQueue {
         sessionIdGenerator: @escaping @Sendable () -> String = {
             "session_\(EluRuntimeIdentifier.compactUUID())"
         },
+        flagStoreEpochGenerator: @escaping @Sendable () -> String = {
+            "flag_store_\(EluRuntimeIdentifier.compactUUID())"
+        },
         faultInjector: (any EluRuntimeQueueFaultInjecting)? = nil
     ) async throws -> EluSQLiteRuntimeQueue {
         try await openCaptureRuntime(
@@ -1537,6 +2461,7 @@ actor EluSQLiteRuntimeQueue {
             anonymousIdGenerator: anonymousIdGenerator,
             streamIdGenerator: streamIdGenerator,
             sessionIdGenerator: sessionIdGenerator,
+            flagStoreEpochGenerator: flagStoreEpochGenerator,
             faultInjector: faultInjector
         )
     }
@@ -1574,9 +2499,14 @@ actor EluSQLiteRuntimeQueue {
         anonymousIdGenerator: @escaping @Sendable () -> String,
         sessionIdGenerator: @escaping @Sendable () -> String,
         faultInjector: (any EluRuntimeQueueFaultInjecting)?,
+        databaseSchemaVersion: Int64,
+        exactConstructorSiteKey: String?,
         ownerNamespaceHash: String?,
         continuousClock: @escaping @Sendable () -> UInt64,
-        continuousBudgetConverter: @escaping @Sendable (UInt64) -> UInt64?
+        continuousBudgetConverter: @escaping @Sendable (UInt64) -> UInt64?,
+        flagStoreEpochGenerator: @escaping @Sendable () -> String = {
+            "flag_store_\(EluRuntimeIdentifier.compactUUID())"
+        }
     ) {
         self.resources = resources
         self.state = state
@@ -1585,10 +2515,21 @@ actor EluSQLiteRuntimeQueue {
         self.anonymousIdGenerator = anonymousIdGenerator
         self.sessionIdGenerator = sessionIdGenerator
         self.faultInjector = faultInjector
+        self.databaseSchemaVersion = databaseSchemaVersion
+        flagWallLatch = nil
+        flagContinuousLatch = nil
+        flagClockPoisoned = false
+        flagConfigDeadline = nil
+        flagCacheDeadline = nil
+        self.exactConstructorSiteKey = exactConstructorSiteKey
         self.ownerNamespaceHash = ownerNamespaceHash
         captureConfigManager = ownerNamespaceHash == nil ? nil : EluV1ConfigManager()
+        flagConfigManager = exactConstructorSiteKey.flatMap {
+            try? EluV1ConfigManager(exactConstructorSiteKey: $0)
+        }
         self.continuousClock = continuousClock
         self.continuousBudgetConverter = continuousBudgetConverter
+        self.flagStoreEpochGenerator = flagStoreEpochGenerator
     }
 
     func snapshot() throws -> EluRuntimeQueueSnapshot {
@@ -1596,6 +2537,1622 @@ actor EluSQLiteRuntimeQueue {
             throw EluRuntimeQueueError.poisoned
         }
         return state.snapshot
+    }
+
+    /// Explicitly reached only by the unwired internal flag client. Ordinary
+    /// runtime open accepts v1/v2 and never calls this migration.
+    func ensureFlagSchema() throws {
+        guard flagConfigManager != nil,
+              let exactConstructorSiteKey,
+              let ownerNamespaceHash
+        else {
+            throw EluRuntimeQueueError.invalidState
+        }
+        let resources = try requireResources()
+        let connection = resources.connection
+        if databaseSchemaVersion == EluSQLiteRuntimeSchema.flagDatabaseVersion {
+            let row = try EluRuntimeDatabase.readFlagAuthority(connection)
+            guard row.storageSchema == 1 else {
+                throw EluRuntimeQueueError.unsupportedSchemaVersion(row.storageSchema)
+            }
+            let authority = try EluV1FlagStorageCodec.decodeAuthority(row.body)
+            guard row.initialized == authority.initialized,
+                  authority.exactConstructorSiteKey == exactConstructorSiteKey,
+                  authority.siteNamespaceDigest == ownerNamespaceHash
+            else {
+                throw EluRuntimeQueueError.corruptStorage
+            }
+            return
+        }
+        guard databaseSchemaVersion == EluSQLiteRuntimeSchema.initialDatabaseVersion else {
+            throw EluRuntimeQueueError.unsupportedSchemaVersion(databaseSchemaVersion)
+        }
+        do {
+            try connection.execute("BEGIN IMMEDIATE")
+            guard try connection.integerPragma("user_version")
+                == EluSQLiteRuntimeSchema.initialDatabaseVersion
+            else {
+                throw EluRuntimeQueueError.corruptStorage
+            }
+            try EluRuntimeDatabase.verifySchema(
+                connection,
+                databaseVersion: EluSQLiteRuntimeSchema.initialDatabaseVersion
+            )
+            try connection.execute(EluSQLiteRuntimeSchema.createFlagCacheRecords)
+            try EluRuntimeDatabase.insertUninitializedFlagAuthority(
+                connection,
+                exactConstructorSiteKey: exactConstructorSiteKey,
+                siteNamespaceDigest: ownerNamespaceHash
+            )
+            try connection.execute(
+                "PRAGMA user_version = \(EluSQLiteRuntimeSchema.flagDatabaseVersion)"
+            )
+            try connection.execute("COMMIT")
+            databaseSchemaVersion = EluSQLiteRuntimeSchema.flagDatabaseVersion
+        } catch {
+            try? connection.execute("ROLLBACK")
+            throw mapOperationError(error)
+        }
+    }
+
+    private func sampleFlagClock() -> FlagClockSample? {
+        guard !flagClockPoisoned else { return nil }
+        let wallDate = clock()
+        let wall: EluV1Timestamp
+        do {
+            guard wallDate.timeIntervalSinceReferenceDate.isFinite else {
+                throw EluRuntimeQueueError.generationMismatch
+            }
+            wall = try EluV1Timestamp.exactClock(wallDate)
+        } catch {
+            poisonFlagClock()
+            return nil
+        }
+        let continuous = continuousClock()
+        if let flagWallLatch, wall < flagWallLatch {
+            poisonFlagClock()
+            return nil
+        }
+        if let flagContinuousLatch, continuous < flagContinuousLatch {
+            poisonFlagClock()
+            return nil
+        }
+        if flagWallLatch.map({ $0 < wall }) ?? true { flagWallLatch = wall }
+        flagContinuousLatch = continuous
+        return FlagClockSample(
+            wallDate: wallDate,
+            wall: wall,
+            continuous: continuous
+        )
+    }
+
+    private func poisonFlagClock() {
+        flagClockPoisoned = true
+        flagConfigDeadline = nil
+        flagCacheDeadline = nil
+        flagConfigManager?.rejectPendingFlagConfig(nil)
+    }
+
+    private func installFlagConfigDeadline(
+        authority: EluV1FlagDurableAuthority,
+        sample: FlagClockSample
+    ) throws {
+        guard authority.isAllowed,
+              let key = flagConfigDeadlineKey(authority),
+              let expiry = try authority.configExpiresAt?.validated(),
+              let ordering = try authority.ordering?.validated(),
+              let durableWall = try authority.lastObservedWall?.validated()
+        else {
+            flagConfigDeadline = nil
+            return
+        }
+        if flagConfigDeadline?.key == key { return }
+        guard let wallRemaining = expiry.floorNanoseconds(after: sample.wallDate),
+              let declaredRemaining = expiry.floorNanoseconds(since: ordering),
+              let durableRemaining = expiry.floorNanoseconds(since: durableWall)
+        else {
+            flagConfigDeadline = FlagDeadline(key: key, startedAt: sample.continuous, budget: 0)
+            return
+        }
+        let remaining = min(min(wallRemaining, declaredRemaining), durableRemaining)
+        if remaining == 0 {
+            flagConfigDeadline = FlagDeadline(key: key, startedAt: sample.continuous, budget: 0)
+            return
+        }
+        guard let budget = continuousBudgetConverter(remaining), budget > 0 else {
+            poisonFlagClock()
+            throw EluRuntimeQueueError.generationMismatch
+        }
+        flagConfigDeadline = FlagDeadline(
+            key: key,
+            startedAt: sample.continuous,
+            budget: budget
+        )
+    }
+
+    private func installFlagCacheDeadline(
+        request: EluV1FlagRequestCacheState,
+        declaredBodyBytes: Int64,
+        bodySha256: String,
+        sample: FlagClockSample,
+        force: Bool = false
+    ) throws {
+        guard let key = flagCacheDeadlineKey(
+            request,
+            declaredBodyBytes: declaredBodyBytes,
+            bodySha256: bodySha256
+        ),
+              let expiry = try request.effectiveExpiresAt?.validated(),
+              let evaluated = try request.evaluatedAt?.validated()
+        else {
+            flagCacheDeadline = nil
+            return
+        }
+        if !force, flagCacheDeadline?.key == key { return }
+        guard let wallRemaining = expiry.floorNanoseconds(after: sample.wallDate),
+              let declaredRemaining = expiry.floorNanoseconds(since: evaluated)
+        else {
+            flagCacheDeadline = FlagDeadline(key: key, startedAt: sample.continuous, budget: 0)
+            return
+        }
+        let remaining = min(wallRemaining, declaredRemaining)
+        if remaining == 0 {
+            flagCacheDeadline = FlagDeadline(key: key, startedAt: sample.continuous, budget: 0)
+            return
+        }
+        guard let budget = continuousBudgetConverter(remaining), budget > 0 else {
+            poisonFlagClock()
+            throw EluRuntimeQueueError.generationMismatch
+        }
+        flagCacheDeadline = FlagDeadline(
+            key: key,
+            startedAt: sample.continuous,
+            budget: budget
+        )
+    }
+
+    private func flagConfigDeadlineKey(
+        _ authority: EluV1FlagDurableAuthority
+    ) -> EluV1FlagConfigDeadlineIdentity? {
+        guard authority.isAllowed,
+              let ordering = authority.ordering,
+              let semanticHash = authority.semanticHash,
+              let exactConstructorSiteKey = authority.exactConstructorSiteKey,
+              let siteNamespaceDigest = authority.siteNamespaceDigest,
+              let siteId = authority.siteId,
+              let configRevision = authority.configRevision,
+              let endpoint = authority.endpoint,
+              let configExpiresAt = authority.configExpiresAt
+        else {
+            return nil
+        }
+        let components = [
+            exactConstructorSiteKey, siteNamespaceDigest, siteId, configRevision,
+            ordering.source, semanticHash, endpoint, configExpiresAt.source,
+            String(authority.barrierGeneration),
+        ]
+        return EluV1FlagConfigDeadlineIdentity(
+            exactConstructorSiteKey: exactConstructorSiteKey,
+            siteNamespaceDigest: siteNamespaceDigest,
+            siteId: siteId,
+            configRevision: configRevision,
+            ordering: ordering,
+            semanticHash: semanticHash,
+            endpoint: endpoint,
+            configExpiresAt: configExpiresAt,
+            barrierGeneration: authority.barrierGeneration,
+            indexHash: EluV1FlagJSON.hash(
+                Data(components.joined(separator: "\u{0}").utf8)
+            )
+        )
+    }
+
+    private func flagCacheDeadlineKey(
+        _ request: EluV1FlagRequestCacheState,
+        declaredBodyBytes: Int64,
+        bodySha256: String
+    ) -> EluV1FlagCacheDeadlineIdentity? {
+        guard let cacheRecordId = request.cacheRecordId,
+              let cachedWitnessHash = request.cachedWitnessHash,
+              let flagsRevision = request.flagsRevision,
+              let evaluatedAt = request.evaluatedAt,
+              let responseExpiresAt = request.responseExpiresAt,
+              let effectiveExpiresAt = request.effectiveExpiresAt
+        else {
+            return nil
+        }
+        let components = [
+            request.storeEpoch, cacheRecordId, cachedWitnessHash, flagsRevision,
+            evaluatedAt.source, responseExpiresAt.source, effectiveExpiresAt.source,
+            String(request.barrierGeneration), String(declaredBodyBytes), bodySha256,
+        ]
+        return EluV1FlagCacheDeadlineIdentity(
+            storeEpoch: request.storeEpoch,
+            cacheRecordId: cacheRecordId,
+            cachedWitnessHash: cachedWitnessHash,
+            flagsRevision: flagsRevision,
+            evaluatedAt: evaluatedAt,
+            responseExpiresAt: responseExpiresAt,
+            effectiveExpiresAt: effectiveExpiresAt,
+            barrierGeneration: request.barrierGeneration,
+            declaredBodyBytes: declaredBodyBytes,
+            bodySha256: bodySha256,
+            indexHash: EluV1FlagJSON.hash(
+                Data(components.joined(separator: "\u{0}").utf8)
+            )
+        )
+    }
+
+    private func flagConfigDeadlineExpired(
+        _ authority: EluV1FlagDurableAuthority,
+        at sample: FlagClockSample
+    ) throws -> Bool {
+        try installFlagConfigDeadline(authority: authority, sample: sample)
+        guard let key = flagConfigDeadlineKey(authority),
+              let deadline = flagConfigDeadline,
+              deadline.key == key
+        else {
+            return false
+        }
+        return deadline.isExpired(at: sample.continuous)
+    }
+
+    private func flagCacheDeadlineExpired(
+        _ request: EluV1FlagRequestCacheState,
+        declaredBodyBytes: Int64,
+        bodySha256: String,
+        at sample: FlagClockSample
+    ) throws -> Bool {
+        try installFlagCacheDeadline(
+            request: request,
+            declaredBodyBytes: declaredBodyBytes,
+            bodySha256: bodySha256,
+            sample: sample
+        )
+        guard let key = flagCacheDeadlineKey(
+            request,
+            declaredBodyBytes: declaredBodyBytes,
+            bodySha256: bodySha256
+        ),
+              let deadline = flagCacheDeadline,
+              deadline.key == key
+        else {
+            return false
+        }
+        return deadline.isExpired(at: sample.continuous)
+    }
+
+    func submitFlagConfig(_ configData: Data) -> EluV1FlagAuthorization {
+        guard let manager = flagConfigManager,
+              databaseSchemaVersion == EluSQLiteRuntimeSchema.flagDatabaseVersion,
+              resources != nil
+        else {
+            return .restricted(flagClockPoisoned ? .wallRollback : .storageUnavailable)
+        }
+        // Storage ownership and durable authority must be classified before
+        // sampling a rollback-sensitive clock or advancing the owner-local
+        // activation generation. Future/opaque records and terminal authority
+        // therefore cannot poison or invalidate the last valid activation.
+        do {
+            try preflightFlagSubmissionStorage()
+        } catch EluRuntimeQueueError.unsupportedSchemaVersion(_) {
+            return .restricted(.terminal)
+        } catch EluRuntimeQueueError.flagAuthorityTerminal {
+            return .restricted(.terminal)
+        } catch {
+            return .restricted(.storageUnavailable)
+        }
+        guard !isPoisoned, let sample = sampleFlagClock() else {
+            return .restricted(flagClockPoisoned ? .wallRollback : .storageUnavailable)
+        }
+        let candidate: EluV1PreparedFlagConfig
+        do {
+            candidate = try manager.prepareFlagConfig(configData: configData, now: sample.wallDate)
+        } catch EluV1ConfigResolutionError.flagActivationGenerationExhausted {
+            manager.rejectPendingFlagConfig(nil)
+            do {
+                let durableRestriction = try applyUnversionedFlagRestriction(
+                    .terminal,
+                    sample: sample
+                )
+                return .restricted(durableRestriction)
+            } catch EluRuntimeQueueError.unsupportedSchemaVersion(_) {
+                return .restricted(.terminal)
+            } catch EluRuntimeQueueError.flagAuthorityTerminal {
+                return .restricted(.terminal)
+            } catch {
+                return .restricted(flagClockPoisoned ? .wallRollback : .storageUnavailable)
+            }
+        } catch {
+            manager.rejectPendingFlagConfig(nil)
+            do {
+                let durableRestriction = try applyUnversionedFlagRestriction(
+                    .malformed,
+                    sample: sample
+                )
+                return .restricted(durableRestriction)
+            } catch EluRuntimeQueueError.unsupportedSchemaVersion(_) {
+                return .restricted(.terminal)
+            } catch EluRuntimeQueueError.flagAuthorityTerminal {
+                return .restricted(.terminal)
+            } catch {
+                return .restricted(flagClockPoisoned ? .wallRollback : .storageUnavailable)
+            }
+        }
+
+        do {
+            let transition = try applyFlagBarrier(candidate, sample: sample)
+            guard transition.isCandidateAllowed else {
+                manager.rejectPendingFlagConfig(candidate)
+                return .restricted(transition.restriction ?? .missing)
+            }
+            let authorization = manager.commitFlagConfig(
+                candidate,
+                barrierGeneration: transition.barrierGeneration
+            )
+            guard case let .allowed(snapshot) = authorization else { return authorization }
+            let authority = try loadFlagAuthority(try requireResources().connection)
+            guard flagAuthorization(snapshot, matches: authority) else {
+                manager.rejectPendingFlagConfig(nil)
+                return .restricted(.storageUnavailable)
+            }
+            try installFlagConfigDeadline(authority: authority, sample: sample)
+            return authorization
+        } catch EluRuntimeQueueError.generationMismatch {
+            manager.rejectPendingFlagConfig(candidate)
+            return .restricted(.wallRollback)
+        } catch EluRuntimeQueueError.unsupportedSchemaVersion(_) {
+            manager.rejectPendingFlagConfig(candidate)
+            return .restricted(.terminal)
+        } catch EluRuntimeQueueError.flagAuthorityTerminal {
+            manager.rejectPendingFlagConfig(candidate)
+            return .restricted(.terminal)
+        } catch {
+            manager.rejectPendingFlagConfig(candidate)
+            return .restricted(.storageUnavailable)
+        }
+    }
+
+    private struct FlagBarrierTransition {
+        let barrierGeneration: Int64
+        let isCandidateAllowed: Bool
+        let restriction: EluV1FlagRestriction?
+    }
+
+    private func applyFlagBarrier(
+        _ candidate: EluV1PreparedFlagConfig,
+        sample: FlagClockSample
+    ) throws -> FlagBarrierTransition {
+        guard candidate.exactConstructorSiteKey == exactConstructorSiteKey,
+              candidate.siteNamespaceDigest == ownerNamespaceHash
+        else {
+            throw EluRuntimeQueueError.invalidState
+        }
+        let resources = try requireResources()
+        let connection = resources.connection
+        do {
+            try connection.execute("BEGIN IMMEDIATE")
+            try preflightOpaqueFlagRequest(connection)
+            var authority = try loadFlagAuthority(connection)
+            try advanceFlagWall(&authority, to: sample.wall)
+            if authority.restriction == .terminal {
+                try EluRuntimeDatabase.updateFlagAuthority(connection, value: authority)
+                try connection.execute("COMMIT")
+                return FlagBarrierTransition(
+                    barrierGeneration: authority.barrierGeneration,
+                    isCandidateAllowed: false,
+                    restriction: .terminal
+                )
+            }
+            let preservedAuthority = authority
+
+            let previousBarrier = authority.barrierGeneration
+            var transitionRequiresIncrement = false
+            var useCandidate = false
+            var isCandidateAllowed = false
+            var effectiveRestriction = authority.restriction
+
+            let hasSiteOwnershipConflict: Bool
+            if let candidateSiteId = candidate.siteId,
+               let boundSiteId = authority.siteId
+            {
+                hasSiteOwnershipConflict = candidateSiteId != boundSiteId
+            } else {
+                hasSiteOwnershipConflict = false
+            }
+            if hasSiteOwnershipConflict {
+                effectiveRestriction = .conflict
+                isCandidateAllowed = false
+                if authority.restriction != .conflict {
+                    authority.restriction = .conflict
+                    transitionRequiresIncrement = true
+                }
+            } else if let currentOrdering = authority.ordering {
+                if candidate.issuedAt < (try currentOrdering.validated()) {
+                    // A stale candidate never changes the durable barrier.
+                } else if candidate.issuedAt == (try currentOrdering.validated()) {
+                    if !flagAuthorityProjection(authority, matches: candidate) {
+                        authority.restriction = .conflict
+                        effectiveRestriction = .conflict
+                        transitionRequiresIncrement = true
+                    } else if authority.restriction != nil {
+                        // Equal authority can never weaken a prior restriction.
+                        effectiveRestriction = authority.restriction
+                    } else if let restriction = candidate.restriction {
+                        authority.restriction = restriction
+                        effectiveRestriction = restriction
+                        transitionRequiresIncrement = true
+                    } else {
+                        useCandidate = true
+                        isCandidateAllowed = true
+                        effectiveRestriction = nil
+                    }
+                } else {
+                    useCandidate = true
+                    transitionRequiresIncrement = true
+                }
+            } else {
+                useCandidate = true
+                transitionRequiresIncrement = true
+            }
+
+            if useCandidate {
+                authority.initialized = true
+                authority.ordering = EluV1StoredTimestamp(candidate.issuedAt)
+                authority.semanticHash = candidate.semanticHash
+                authority.restriction = candidate.restriction
+                if authority.siteId == nil {
+                    authority.siteId = candidate.siteId
+                }
+                authority.configRevision = candidate.configRevision
+                authority.endpoint = candidate.endpoint?.absoluteString
+                authority.configExpiresAt = EluV1StoredTimestamp(candidate.expiresAt)
+                effectiveRestriction = candidate.restriction
+                isCandidateAllowed = candidate.restriction == nil
+            }
+
+            if transitionRequiresIncrement {
+                if previousBarrier >= 9_007_199_254_740_991 {
+                    authority = preservedAuthority
+                    authority.restriction = .terminal
+                    effectiveRestriction = .terminal
+                    isCandidateAllowed = false
+                } else {
+                    authority.barrierGeneration = previousBarrier + 1
+                }
+                try invalidateFlagRequest(
+                    connection,
+                    barrierGeneration: authority.barrierGeneration
+                )
+                flagCacheDeadline = nil
+                if flagConfigDeadlineKey(authority) != flagConfigDeadline?.key {
+                    flagConfigDeadline = nil
+                }
+            }
+            try EluRuntimeDatabase.updateFlagAuthority(connection, value: authority)
+            try connection.execute("COMMIT")
+            return FlagBarrierTransition(
+                barrierGeneration: authority.barrierGeneration,
+                isCandidateAllowed: isCandidateAllowed && authority.isAllowed,
+                restriction: effectiveRestriction
+            )
+        } catch {
+            try? connection.execute("ROLLBACK")
+            throw error
+        }
+    }
+
+    private func applyUnversionedFlagRestriction(
+        _ restriction: EluV1FlagRestriction,
+        sample: FlagClockSample
+    ) throws -> EluV1FlagRestriction {
+        let resources = try requireResources()
+        let connection = resources.connection
+        do {
+            try connection.execute("BEGIN IMMEDIATE")
+            try preflightOpaqueFlagRequest(connection)
+            var authority = try loadFlagAuthority(connection)
+            try advanceFlagWall(&authority, to: sample.wall)
+            if authority.restriction == .terminal
+                || authority.barrierGeneration >= 9_007_199_254_740_991
+            {
+                authority.initialized = true
+                authority.restriction = .terminal
+                try invalidateFlagRequest(
+                    connection,
+                    barrierGeneration: authority.barrierGeneration
+                )
+                flagConfigDeadline = nil
+                flagCacheDeadline = nil
+                try EluRuntimeDatabase.updateFlagAuthority(connection, value: authority)
+                try connection.execute("COMMIT")
+                return .terminal
+            }
+            authority.initialized = true
+            authority.restriction = restriction
+            authority.barrierGeneration += 1
+            try invalidateFlagRequest(
+                connection,
+                barrierGeneration: authority.barrierGeneration
+            )
+            flagConfigDeadline = nil
+            flagCacheDeadline = nil
+            try EluRuntimeDatabase.updateFlagAuthority(connection, value: authority)
+            try connection.execute("COMMIT")
+            return restriction
+        } catch {
+            try? connection.execute("ROLLBACK")
+            throw error
+        }
+    }
+
+    private func loadFlagAuthority(
+        _ connection: EluSQLiteConnection
+    ) throws -> EluV1FlagDurableAuthority {
+        do {
+            let row = try EluRuntimeDatabase.readFlagAuthority(connection)
+            guard row.storageSchema == 1 else {
+                throw EluRuntimeQueueError.flagAuthorityTerminal
+            }
+            let authority = try EluV1FlagStorageCodec.decodeAuthority(row.body)
+            guard authority.initialized == row.initialized,
+                  authority.exactConstructorSiteKey == exactConstructorSiteKey,
+                  authority.siteNamespaceDigest == ownerNamespaceHash
+            else {
+                throw EluRuntimeQueueError.flagAuthorityTerminal
+            }
+            return authority
+        } catch let error as EluSQLiteFailure {
+            throw error
+        } catch EluRuntimeQueueError.databaseUnavailable {
+            throw EluRuntimeQueueError.databaseUnavailable
+        } catch {
+            throw EluRuntimeQueueError.flagAuthorityTerminal
+        }
+    }
+
+    private func advanceFlagWall(
+        _ authority: inout EluV1FlagDurableAuthority,
+        to wall: EluV1Timestamp
+    ) throws {
+        if let durable = authority.lastObservedWall {
+            let durableTimestamp = try durable.validated()
+            guard !(wall < durableTimestamp) else {
+                poisonFlagClock()
+                throw EluRuntimeQueueError.generationMismatch
+            }
+        }
+        authority.lastObservedWall = EluV1StoredTimestamp(wall)
+    }
+
+    private func invalidateFlagRequest(
+        _ connection: EluSQLiteConnection,
+        barrierGeneration: Int64
+    ) throws {
+        guard let row = try EluRuntimeDatabase.readFlagRequest(connection),
+              row.storageSchema == 1,
+              let request = try? EluV1FlagStorageCodec.decodeRequestState(row.metadataBody)
+        else {
+            // Missing/current-corrupt metadata may only be initialized by begin;
+            // future metadata is byte-preserved. The changed barrier is enough
+            // to make any old cache or completion ineligible.
+            return
+        }
+        do {
+            let body = try EluRuntimeDatabase.readFlagCacheBody(connection, row: row)
+            if let body {
+                let cached = try EluV1FlagCodec.decodeCache(body)
+                guard request.cacheRecordId != nil,
+                      request.cachedWitnessHash
+                        == (try EluV1FlagCodec.witnessHash(cached.witness)),
+                      request.flagsRevision == cached.response.flagsRevision,
+                      request.evaluatedAt == cached.response.evaluatedAt,
+                      request.responseExpiresAt == cached.response.expiresAt
+                else {
+                    return
+                }
+            } else if request.cacheRecordId != nil {
+                return
+            }
+        } catch let error as EluSQLiteFailure {
+            throw error
+        } catch EluRuntimeQueueError.databaseUnavailable {
+            throw EluRuntimeQueueError.databaseUnavailable
+        } catch let EluRuntimeQueueError.unsupportedSchemaVersion(version) {
+            throw EluRuntimeQueueError.unsupportedSchemaVersion(version)
+        } catch EluV1FlagContractError.unsupportedSchemaVersion {
+            throw EluRuntimeQueueError.unsupportedSchemaVersion(2)
+        } catch {
+            // A corrupt body/chunk is byte-preserved. Only begin may rotate
+            // known-current corruption; no invalidation path deletes it.
+            return
+        }
+        var invalidated = request
+        if invalidated.requestGeneration < 9_007_199_254_740_991 {
+            invalidated.requestGeneration += 1
+        }
+        invalidated.activeRequestId = nil
+        invalidated.activeWitnessHash = nil
+        invalidated.barrierGeneration = barrierGeneration
+        invalidated.cacheRecordId = nil
+        invalidated.cachedWitnessHash = nil
+        invalidated.flagsRevision = nil
+        invalidated.evaluatedAt = nil
+        invalidated.responseExpiresAt = nil
+        invalidated.effectiveExpiresAt = nil
+        try EluRuntimeDatabase.replaceFlagRequest(
+            connection,
+            state: invalidated,
+            cacheBody: nil
+        )
+        flagCacheDeadline = nil
+    }
+
+    /// Future/opaque request storage owns precedence over every current-v1
+    /// authority transition, including expiry. Known-current corruption is
+    /// left for the operation-specific rotate/miss path; storage ambiguity is
+    /// terminal and byte-preserving.
+    private func preflightOpaqueFlagRequest(
+        _ connection: EluSQLiteConnection
+    ) throws {
+        guard let row = try EluRuntimeDatabase.readFlagRequest(connection) else {
+            return
+        }
+        guard row.storageSchema == 1 else {
+            throw EluRuntimeQueueError.unsupportedSchemaVersion(row.storageSchema)
+        }
+        do {
+            _ = try EluRuntimeDatabase.readFlagCacheBody(connection, row: row)
+        } catch let error as EluSQLiteFailure {
+            throw error
+        } catch EluRuntimeQueueError.databaseUnavailable {
+            throw EluRuntimeQueueError.databaseUnavailable
+        } catch let EluRuntimeQueueError.unsupportedSchemaVersion(version) {
+            throw EluRuntimeQueueError.unsupportedSchemaVersion(version)
+        } catch {
+            // A fully identified current-v1 body may be handled as corrupt by
+            // begin/read after authority precedence has been established.
+        }
+    }
+
+    private func preflightFlagSubmissionStorage() throws {
+        let connection = try requireResources().connection
+        var transactionBegan = false
+
+        func rollbackOrPoison() throws {
+            guard transactionBegan else { return }
+            do {
+                try faultInjector?.hit(.beforeRollback)
+                try connection.execute("ROLLBACK")
+                transactionBegan = false
+            } catch {
+                // No write or COMMIT was attempted. Closing the connection
+                // rolls back the read-only transaction and, critically,
+                // releases both SQLite and process ownership so this actor
+                // cannot retain a wedged transaction.
+                poisonAndRelease()
+                throw EluRuntimeQueueError.databaseUnavailable
+            }
+        }
+
+        do {
+            try connection.execute("BEGIN IMMEDIATE")
+            transactionBegan = true
+            try preflightOpaqueFlagRequest(connection)
+            let authority = try loadFlagAuthority(connection)
+            guard authority.restriction != .terminal else {
+                throw EluRuntimeQueueError.flagAuthorityTerminal
+            }
+        } catch {
+            let classificationError = error
+            try rollbackOrPoison()
+            throw classificationError
+        }
+        do {
+            try rollbackOrPoison()
+        } catch {
+            throw error
+        }
+    }
+
+    func beginFlagReload(
+        requestId: String,
+        versions: EluVersionContext
+    ) -> EluV1FlagBeginResult {
+        guard databaseSchemaVersion == EluSQLiteRuntimeSchema.flagDatabaseVersion,
+              EluV1FlagEvaluationWitness.validIdentifier(requestId, maximum: 256),
+              let manager = flagConfigManager
+        else {
+            return .restricted(flagClockPoisoned ? .wallRollback : .storageUnavailable)
+        }
+        let connection: EluSQLiteConnection
+        do {
+            connection = try requireResources().connection
+        } catch {
+            return .restricted(.storageUnavailable)
+        }
+
+        do {
+            try connection.execute("BEGIN IMMEDIATE")
+            try preflightOpaqueFlagRequest(connection)
+            var authority = try loadFlagAuthority(connection)
+            guard let sample = sampleFlagClock() else {
+                try connection.execute("ROLLBACK")
+                return .restricted(flagClockPoisoned ? .wallRollback : .storageUnavailable)
+            }
+            let managerAuthorization = manager.currentFlagAuthorization(now: sample.wallDate)
+            guard authority.initialized else {
+                try connection.execute("ROLLBACK")
+                return .restricted(.missing)
+            }
+            try advanceFlagWall(&authority, to: sample.wall)
+            if authority.restriction == .terminal {
+                try EluRuntimeDatabase.updateFlagAuthority(connection, value: authority)
+                try connection.execute("COMMIT")
+                return .terminal
+            }
+            if try flagConfigIsExpired(authority, at: sample) {
+                let terminal = try persistFlagConfigExpiry(
+                    connection,
+                    authority: &authority
+                )
+                try EluRuntimeDatabase.updateFlagAuthority(connection, value: authority)
+                try connection.execute("COMMIT")
+                return terminal ? .terminal : .restricted(.expired)
+            }
+            guard case let .allowed(authorization) = managerAuthorization,
+                  flagAuthorization(authorization, matches: authority)
+            else {
+                try EluRuntimeDatabase.updateFlagAuthority(connection, value: authority)
+                try connection.execute("COMMIT")
+                return .restricted(authority.restriction ?? .missing)
+            }
+            let diskState = try EluRuntimeDatabase.loadState(connection, validateQueue: false)
+            guard diskState == state else {
+                throw EluRuntimeQueueError.generationMismatch
+            }
+            let witness = try EluV1FlagEvaluationWitness(
+                authorization: authorization,
+                runtime: diskState.snapshot,
+                versions: versions
+            )
+            let witnessHash = try EluV1FlagCodec.witnessHash(witness)
+            let request = try EluV1FlagCodec.makeRequest(
+                requestId: requestId,
+                witness: witness
+            )
+
+            var requestState: EluV1FlagRequestCacheState
+            var preservedBody: Data?
+            var rotateEpoch = false
+            if let row = try EluRuntimeDatabase.readFlagRequest(connection) {
+                guard row.storageSchema == 1 else {
+                    try connection.execute("ROLLBACK")
+                    return .terminal
+                }
+                do {
+                    requestState = try EluV1FlagStorageCodec.decodeRequestState(row.metadataBody)
+                    preservedBody = try EluRuntimeDatabase.readFlagCacheBody(
+                        connection,
+                        row: row
+                    )
+                    if let body = preservedBody {
+                        let cached = try EluV1FlagCodec.decodeCache(body)
+                        guard requestState.cacheRecordId != nil,
+                              requestState.cachedWitnessHash
+                                == (try EluV1FlagCodec.witnessHash(cached.witness)),
+                              requestState.flagsRevision == cached.response.flagsRevision,
+                              requestState.barrierGeneration == authority.barrierGeneration
+                        else {
+                            throw EluRuntimeQueueError.corruptStorage
+                        }
+                        if let expiry = requestState.effectiveExpiresAt,
+                           try ((expiry.validated()).isAtOrBefore(sample.wallDate)
+                               || flagCacheDeadlineExpired(
+                                   requestState,
+                                   declaredBodyBytes: row.declaredBodyBytes,
+                                   bodySha256: row.bodySha256,
+                                   at: sample
+                               ))
+                        {
+                            try expireFlagCacheState(&requestState)
+                            preservedBody = nil
+                            flagCacheDeadline = nil
+                        }
+                    } else if requestState.cacheRecordId != nil {
+                        throw EluRuntimeQueueError.corruptStorage
+                    }
+                } catch let error as EluSQLiteFailure {
+                    throw error
+                } catch EluRuntimeQueueError.databaseUnavailable {
+                    throw EluRuntimeQueueError.databaseUnavailable
+                } catch EluRuntimeQueueError.unsupportedSchemaVersion(_) {
+                    try connection.execute("ROLLBACK")
+                    return .terminal
+                } catch EluV1FlagContractError.unsupportedSchemaVersion {
+                    try connection.execute("ROLLBACK")
+                    return .terminal
+                } catch {
+                    rotateEpoch = true
+                    requestState = freshFlagRequestState(
+                        barrierGeneration: authority.barrierGeneration
+                    )
+                    preservedBody = nil
+                    flagCacheDeadline = nil
+                }
+            } else {
+                rotateEpoch = true
+                requestState = freshFlagRequestState(
+                    barrierGeneration: authority.barrierGeneration
+                )
+            }
+
+            if rotateEpoch {
+                // The missing/corrupt branch already minted exactly one fresh
+                // epoch. Do not consume a second generator value here: the
+                // cross-platform recovery contract exposes the first durable
+                // replacement epoch.
+                preservedBody = nil
+                flagCacheDeadline = nil
+            } else if requestState.requestGeneration >= 9_007_199_254_740_991 {
+                requestState = freshFlagRequestState(
+                    barrierGeneration: authority.barrierGeneration
+                )
+                preservedBody = nil
+                flagCacheDeadline = nil
+            } else {
+                requestState.requestGeneration += 1
+            }
+            requestState.activeRequestId = requestId
+            requestState.activeWitnessHash = witnessHash
+            requestState.barrierGeneration = authority.barrierGeneration
+            try EluRuntimeDatabase.replaceFlagRequest(
+                connection,
+                state: requestState,
+                cacheBody: preservedBody
+            )
+            try EluRuntimeDatabase.updateFlagAuthority(connection, value: authority)
+            try connection.execute("COMMIT")
+
+            let token = EluV1FlagBeginToken(
+                storeEpoch: requestState.storeEpoch,
+                requestGeneration: requestState.requestGeneration,
+                barrierGeneration: requestState.barrierGeneration,
+                requestId: requestId,
+                witnessHash: witnessHash,
+                activationGeneration: authorization.activationGeneration,
+                witness: witness,
+                versions: versions
+            )
+            return .begun(
+                EluV1FlagBegunRequest(
+                    token: token,
+                    endpoint: authorization.endpoint,
+                    request: request
+                )
+            )
+        } catch EluRuntimeQueueError.generationMismatch {
+            try? connection.execute("ROLLBACK")
+            return .restricted(.wallRollback)
+        } catch EluRuntimeQueueError.flagAuthorityTerminal {
+            try? connection.execute("ROLLBACK")
+            return .terminal
+        } catch EluRuntimeQueueError.unsupportedSchemaVersion(_) {
+            try? connection.execute("ROLLBACK")
+            return .terminal
+        } catch {
+            try? connection.execute("ROLLBACK")
+            return .restricted(.storageUnavailable)
+        }
+    }
+
+    /// Revalidates the exact durable request immediately before the injected
+    /// transport is allowed to observe it. This is intentionally a separate
+    /// store transaction from begin: suspension between begin and send must
+    /// not let config expiry, identity/context changes, or a newer begin slip
+    /// past the durable barrier.
+    func authorizeFlagSend(
+        token: EluV1FlagBeginToken
+    ) -> EluV1FlagSendResult {
+        guard databaseSchemaVersion == EluSQLiteRuntimeSchema.flagDatabaseVersion,
+              let manager = flagConfigManager
+        else {
+            return .restricted(flagClockPoisoned ? .wallRollback : .storageUnavailable)
+        }
+
+        let connection: EluSQLiteConnection
+        do {
+            connection = try requireResources().connection
+        } catch {
+            return .restricted(.storageUnavailable)
+        }
+
+        do {
+            try connection.execute("BEGIN IMMEDIATE")
+            try preflightOpaqueFlagRequest(connection)
+            var authority = try loadFlagAuthority(connection)
+            guard let sample = sampleFlagClock() else {
+                try connection.execute("ROLLBACK")
+                return .restricted(flagClockPoisoned ? .wallRollback : .storageUnavailable)
+            }
+            // The manager may restrict its process-local snapshot at equality,
+            // but only after future storage has won precedence.
+            let managerAuthorization = manager.currentFlagAuthorization(now: sample.wallDate)
+            guard authority.initialized else {
+                try connection.execute("ROLLBACK")
+                return .restricted(.missing)
+            }
+            try advanceFlagWall(&authority, to: sample.wall)
+            if authority.restriction == .terminal {
+                try EluRuntimeDatabase.updateFlagAuthority(connection, value: authority)
+                try connection.execute("COMMIT")
+                return .terminal
+            }
+            if try flagConfigIsExpired(authority, at: sample) {
+                let terminal = try persistFlagConfigExpiry(
+                    connection,
+                    authority: &authority
+                )
+                try EluRuntimeDatabase.updateFlagAuthority(connection, value: authority)
+                try connection.execute("COMMIT")
+                return terminal ? .terminal : .restricted(.expired)
+            }
+            guard case let .allowed(authorization) = managerAuthorization,
+                  flagAuthorization(authorization, matches: authority),
+                  token.activationGeneration == authorization.activationGeneration,
+                  token.barrierGeneration == authority.barrierGeneration
+            else {
+                try EluRuntimeDatabase.updateFlagAuthority(connection, value: authority)
+                try connection.execute("COMMIT")
+                return .stale
+            }
+
+            let diskState = try EluRuntimeDatabase.loadState(
+                connection,
+                validateQueue: false
+            )
+            guard diskState == state else {
+                try EluRuntimeDatabase.updateFlagAuthority(connection, value: authority)
+                try connection.execute("COMMIT")
+                return .stale
+            }
+            let currentWitness = try EluV1FlagEvaluationWitness(
+                authorization: authorization,
+                runtime: diskState.snapshot,
+                versions: token.versions
+            )
+            guard currentWitness == token.witness,
+                  try EluV1FlagCodec.witnessHash(currentWitness) == token.witnessHash,
+                  let row = try EluRuntimeDatabase.readFlagRequest(connection)
+            else {
+                try EluRuntimeDatabase.updateFlagAuthority(connection, value: authority)
+                try connection.execute("COMMIT")
+                return .stale
+            }
+            guard row.storageSchema == 1 else {
+                try connection.execute("ROLLBACK")
+                return .terminal
+            }
+
+            let requestState: EluV1FlagRequestCacheState
+            do {
+                requestState = try EluV1FlagStorageCodec.decodeRequestState(
+                    row.metadataBody
+                )
+                let priorBody = try EluRuntimeDatabase.readFlagCacheBody(
+                    connection,
+                    row: row
+                )
+                if let priorBody {
+                    let priorCache = try EluV1FlagCodec.decodeCache(priorBody)
+                    guard requestState.cacheRecordId != nil,
+                          requestState.cachedWitnessHash
+                            == (try EluV1FlagCodec.witnessHash(priorCache.witness)),
+                          requestState.flagsRevision == priorCache.response.flagsRevision,
+                          requestState.evaluatedAt == priorCache.response.evaluatedAt,
+                          requestState.responseExpiresAt == priorCache.response.expiresAt
+                    else {
+                        throw EluRuntimeQueueError.corruptStorage
+                    }
+                } else if requestState.cacheRecordId != nil {
+                    throw EluRuntimeQueueError.corruptStorage
+                }
+            } catch let error as EluSQLiteFailure {
+                throw error
+            } catch EluRuntimeQueueError.databaseUnavailable {
+                throw EluRuntimeQueueError.databaseUnavailable
+            } catch EluRuntimeQueueError.unsupportedSchemaVersion(_) {
+                try connection.execute("ROLLBACK")
+                return .terminal
+            } catch EluV1FlagContractError.unsupportedSchemaVersion {
+                try connection.execute("ROLLBACK")
+                return .terminal
+            } catch {
+                try connection.execute("ROLLBACK")
+                return .stale
+            }
+
+            guard requestState.storeEpoch == token.storeEpoch,
+                  requestState.requestGeneration == token.requestGeneration,
+                  requestState.barrierGeneration == token.barrierGeneration,
+                  requestState.activeRequestId == token.requestId,
+                  requestState.activeWitnessHash == token.witnessHash
+            else {
+                try EluRuntimeDatabase.updateFlagAuthority(connection, value: authority)
+                try connection.execute("COMMIT")
+                return .stale
+            }
+            try EluRuntimeDatabase.updateFlagAuthority(connection, value: authority)
+            try connection.execute("COMMIT")
+            return .allowed
+        } catch EluRuntimeQueueError.generationMismatch {
+            try? connection.execute("ROLLBACK")
+            return .restricted(.wallRollback)
+        } catch EluRuntimeQueueError.flagAuthorityTerminal {
+            try? connection.execute("ROLLBACK")
+            return .terminal
+        } catch EluRuntimeQueueError.unsupportedSchemaVersion(_) {
+            try? connection.execute("ROLLBACK")
+            return .terminal
+        } catch {
+            try? connection.execute("ROLLBACK")
+            return .restricted(.storageUnavailable)
+        }
+    }
+
+    func commitFlagReload(
+        token: EluV1FlagBeginToken,
+        response: EluV1FlagResponse
+    ) -> EluV1FlagCommitResult {
+        guard databaseSchemaVersion == EluSQLiteRuntimeSchema.flagDatabaseVersion,
+              let manager = flagConfigManager
+        else {
+            return .restricted(flagClockPoisoned ? .wallRollback : .storageUnavailable)
+        }
+        let connection: EluSQLiteConnection
+        do {
+            connection = try requireResources().connection
+        } catch {
+            return .restricted(.storageUnavailable)
+        }
+        do {
+            try connection.execute("BEGIN IMMEDIATE")
+            try preflightOpaqueFlagRequest(connection)
+            var authority = try loadFlagAuthority(connection)
+            guard let sample = sampleFlagClock() else {
+                try connection.execute("ROLLBACK")
+                return .restricted(flagClockPoisoned ? .wallRollback : .storageUnavailable)
+            }
+            let managerAuthorization = manager.currentFlagAuthorization(now: sample.wallDate)
+            try advanceFlagWall(&authority, to: sample.wall)
+            if authority.restriction == .terminal {
+                try EluRuntimeDatabase.updateFlagAuthority(connection, value: authority)
+                try connection.execute("COMMIT")
+                return .terminal
+            }
+            if try flagConfigIsExpired(authority, at: sample) {
+                let terminal = try persistFlagConfigExpiry(
+                    connection,
+                    authority: &authority
+                )
+                try EluRuntimeDatabase.updateFlagAuthority(connection, value: authority)
+                try connection.execute("COMMIT")
+                return terminal ? .terminal : .restricted(.expired)
+            }
+            guard case let .allowed(authorization) = managerAuthorization,
+                  flagAuthorization(authorization, matches: authority),
+                  token.activationGeneration == authorization.activationGeneration,
+                  token.barrierGeneration == authority.barrierGeneration
+            else {
+                try EluRuntimeDatabase.updateFlagAuthority(connection, value: authority)
+                try connection.execute("COMMIT")
+                return .stale
+            }
+            let diskState = try EluRuntimeDatabase.loadState(connection, validateQueue: false)
+            guard diskState == state else { throw EluRuntimeQueueError.generationMismatch }
+            let currentWitness = try EluV1FlagEvaluationWitness(
+                authorization: authorization,
+                runtime: diskState.snapshot,
+                versions: token.versions
+            )
+            guard currentWitness == token.witness,
+                  try EluV1FlagCodec.witnessHash(currentWitness) == token.witnessHash,
+                  let row = try EluRuntimeDatabase.readFlagRequest(connection)
+            else {
+                try EluRuntimeDatabase.updateFlagAuthority(connection, value: authority)
+                try connection.execute("COMMIT")
+                return .stale
+            }
+            guard row.storageSchema == 1 else {
+                try connection.execute("ROLLBACK")
+                return .terminal
+            }
+            let requestState: EluV1FlagRequestCacheState
+            do {
+                requestState = try EluV1FlagStorageCodec.decodeRequestState(row.metadataBody)
+                let priorBody = try EluRuntimeDatabase.readFlagCacheBody(
+                    connection,
+                    row: row
+                )
+                if let priorBody {
+                    let priorCache = try EluV1FlagCodec.decodeCache(priorBody)
+                    guard requestState.cacheRecordId != nil,
+                          requestState.cachedWitnessHash
+                            == (try EluV1FlagCodec.witnessHash(priorCache.witness)),
+                          requestState.flagsRevision == priorCache.response.flagsRevision,
+                          requestState.evaluatedAt == priorCache.response.evaluatedAt,
+                          requestState.responseExpiresAt == priorCache.response.expiresAt
+                    else {
+                        throw EluRuntimeQueueError.corruptStorage
+                    }
+                } else if requestState.cacheRecordId != nil {
+                    throw EluRuntimeQueueError.corruptStorage
+                }
+            } catch let error as EluSQLiteFailure {
+                throw error
+            } catch EluRuntimeQueueError.databaseUnavailable {
+                throw EluRuntimeQueueError.databaseUnavailable
+            } catch EluRuntimeQueueError.unsupportedSchemaVersion(_) {
+                try connection.execute("ROLLBACK")
+                return .terminal
+            } catch EluV1FlagContractError.unsupportedSchemaVersion {
+                try connection.execute("ROLLBACK")
+                return .terminal
+            } catch {
+                try connection.execute("ROLLBACK")
+                return .stale
+            }
+            guard requestState.storeEpoch == token.storeEpoch,
+                  requestState.requestGeneration == token.requestGeneration,
+                  requestState.barrierGeneration == token.barrierGeneration,
+                  requestState.activeRequestId == token.requestId,
+                  requestState.activeWitnessHash == token.witnessHash,
+                  response.requestId == token.requestId,
+                  response.contextRevision == token.witness.contextRevision,
+                  response.identityRevision == token.witness.identityRevision
+            else {
+                try EluRuntimeDatabase.updateFlagAuthority(connection, value: authority)
+                try connection.execute("COMMIT")
+                return .stale
+            }
+            let responseExpiry = try response.expiresAt.validated()
+            let configExpiry = try token.witness.configExpiresAt.validated()
+            guard !responseExpiry.isAtOrBefore(sample.wallDate),
+                  !configExpiry.isAtOrBefore(sample.wallDate)
+            else {
+                try EluRuntimeDatabase.updateFlagAuthority(connection, value: authority)
+                try connection.execute("COMMIT")
+                return .restricted(.expired)
+            }
+            let effectiveExpiry = min(responseExpiry, configExpiry)
+            let body = try EluV1FlagCodec.encodeCache(
+                witness: token.witness,
+                response: response
+            )
+            var committed = requestState
+            committed.activeRequestId = nil
+            committed.activeWitnessHash = nil
+            committed.cacheRecordId = "flag_cache_\(EluRuntimeIdentifier.compactUUID())"
+            committed.cachedWitnessHash = token.witnessHash
+            committed.flagsRevision = response.flagsRevision
+            committed.evaluatedAt = response.evaluatedAt
+            committed.responseExpiresAt = response.expiresAt
+            committed.effectiveExpiresAt = EluV1StoredTimestamp(effectiveExpiry)
+            try installFlagCacheDeadline(
+                request: committed,
+                declaredBodyBytes: Int64(body.count),
+                bodySha256: EluV1FlagJSON.hash(body),
+                sample: sample,
+                force: true
+            )
+            try EluRuntimeDatabase.replaceFlagRequest(
+                connection,
+                state: committed,
+                cacheBody: body
+            )
+            try EluRuntimeDatabase.updateFlagAuthority(connection, value: authority)
+            try connection.execute("COMMIT")
+            return .updated
+        } catch EluRuntimeQueueError.generationMismatch {
+            try? connection.execute("ROLLBACK")
+            return flagClockPoisoned ? .restricted(.wallRollback) : .stale
+        } catch EluRuntimeQueueError.flagAuthorityTerminal {
+            try? connection.execute("ROLLBACK")
+            return .terminal
+        } catch EluRuntimeQueueError.unsupportedSchemaVersion(_) {
+            try? connection.execute("ROLLBACK")
+            return .terminal
+        } catch {
+            try? connection.execute("ROLLBACK")
+            return .restricted(.storageUnavailable)
+        }
+    }
+
+    func readFlagCache(versions: EluVersionContext) -> EluV1FlagCacheReadResult {
+        readFlagCache(versions: versions, cleanupToken: nil)
+    }
+
+    func finalizeFlagReload(
+        token: EluV1FlagBeginToken,
+        versions: EluVersionContext
+    ) -> EluV1FlagCacheReadResult {
+        readFlagCache(versions: versions, cleanupToken: token)
+    }
+
+    private func readFlagCache(
+        versions: EluVersionContext,
+        cleanupToken: EluV1FlagBeginToken?
+    ) -> EluV1FlagCacheReadResult {
+        guard databaseSchemaVersion == EluSQLiteRuntimeSchema.flagDatabaseVersion,
+              let manager = flagConfigManager
+        else {
+            return .restricted(flagClockPoisoned ? .wallRollback : .storageUnavailable)
+        }
+        let connection: EluSQLiteConnection
+        do {
+            connection = try requireResources().connection
+        } catch {
+            return .restricted(.storageUnavailable)
+        }
+        do {
+            try connection.execute("BEGIN IMMEDIATE")
+            try preflightOpaqueFlagRequest(connection)
+            var authority = try loadFlagAuthority(connection)
+            guard let sample = sampleFlagClock() else {
+                try connection.execute("ROLLBACK")
+                return .restricted(flagClockPoisoned ? .wallRollback : .storageUnavailable)
+            }
+            let managerAuthorization = manager.currentFlagAuthorization(now: sample.wallDate)
+            guard authority.initialized else {
+                try connection.execute("ROLLBACK")
+                return .miss
+            }
+            try advanceFlagWall(&authority, to: sample.wall)
+            if authority.restriction == .terminal {
+                try EluRuntimeDatabase.updateFlagAuthority(connection, value: authority)
+                try connection.execute("COMMIT")
+                return .terminal
+            }
+            if try flagConfigIsExpired(authority, at: sample) {
+                let terminal = try persistFlagConfigExpiry(
+                    connection,
+                    authority: &authority
+                )
+                try EluRuntimeDatabase.updateFlagAuthority(connection, value: authority)
+                try connection.execute("COMMIT")
+                return terminal ? .terminal : .restricted(.expired)
+            }
+            let diskState = try EluRuntimeDatabase.loadState(connection, validateQueue: false)
+            guard diskState == state else { throw EluRuntimeQueueError.generationMismatch }
+            guard case let .allowed(authorization) = managerAuthorization,
+                  flagAuthorization(authorization, matches: authority)
+            else {
+                try deleteFlagCacheIfMatches(
+                    connection,
+                    token: cleanupToken
+                )
+                try EluRuntimeDatabase.updateFlagAuthority(connection, value: authority)
+                try connection.execute("COMMIT")
+                return .restricted(authority.restriction ?? .missing)
+            }
+            let currentWitness = try EluV1FlagEvaluationWitness(
+                authorization: authorization,
+                runtime: diskState.snapshot,
+                versions: versions
+            )
+            let currentWitnessHash = try EluV1FlagCodec.witnessHash(currentWitness)
+            guard let row = try EluRuntimeDatabase.readFlagRequest(connection) else {
+                try EluRuntimeDatabase.updateFlagAuthority(connection, value: authority)
+                try connection.execute("COMMIT")
+                return .miss
+            }
+            guard row.storageSchema == 1 else {
+                try connection.execute("ROLLBACK")
+                return .terminal
+            }
+            let requestState: EluV1FlagRequestCacheState
+            let body: Data?
+            do {
+                requestState = try EluV1FlagStorageCodec.decodeRequestState(row.metadataBody)
+                body = try EluRuntimeDatabase.readFlagCacheBody(connection, row: row)
+            } catch let error as EluSQLiteFailure {
+                throw error
+            } catch EluRuntimeQueueError.databaseUnavailable {
+                throw EluRuntimeQueueError.databaseUnavailable
+            } catch EluRuntimeQueueError.unsupportedSchemaVersion(_) {
+                try connection.execute("ROLLBACK")
+                return .terminal
+            } catch {
+                // Reads never quarantine or recreate request/cache metadata.
+                // Only begin may rotate a current-corrupt request epoch.
+                try EluRuntimeDatabase.updateFlagAuthority(connection, value: authority)
+                try connection.execute("COMMIT")
+                return .miss
+            }
+            guard let body,
+                  requestState.cacheRecordId != nil,
+                  requestState.cachedWitnessHash == currentWitnessHash,
+                  requestState.barrierGeneration == authority.barrierGeneration,
+                  let effectiveExpiry = requestState.effectiveExpiresAt
+            else {
+                try EluRuntimeDatabase.updateFlagAuthority(connection, value: authority)
+                try connection.execute("COMMIT")
+                return .miss
+            }
+            if try ((effectiveExpiry.validated()).isAtOrBefore(sample.wallDate)
+                || flagCacheDeadlineExpired(
+                    requestState,
+                    declaredBodyBytes: row.declaredBodyBytes,
+                    bodySha256: row.bodySha256,
+                    at: sample
+                ))
+            {
+                var expired = requestState
+                try expireFlagCacheState(&expired)
+                flagCacheDeadline = nil
+                try EluRuntimeDatabase.replaceFlagRequest(
+                    connection,
+                    state: expired,
+                    cacheBody: nil
+                )
+                try EluRuntimeDatabase.updateFlagAuthority(connection, value: authority)
+                try connection.execute("COMMIT")
+                return .miss
+            }
+            let cached: (witness: EluV1FlagEvaluationWitness, response: EluV1FlagResponse)
+            do {
+                cached = try EluV1FlagCodec.decodeCache(body)
+            } catch EluV1FlagContractError.unsupportedSchemaVersion {
+                try connection.execute("ROLLBACK")
+                return .terminal
+            } catch {
+                try EluRuntimeDatabase.updateFlagAuthority(connection, value: authority)
+                try connection.execute("COMMIT")
+                return .miss
+            }
+            let finalTokenMatches = cleanupToken.map {
+                requestState.storeEpoch == $0.storeEpoch
+                    && requestState.requestGeneration == $0.requestGeneration
+                    && requestState.barrierGeneration == $0.barrierGeneration
+                    && requestState.cachedWitnessHash == $0.witnessHash
+                    && cached.response.requestId == $0.requestId
+                    && cached.witness == $0.witness
+            } ?? true
+            guard finalTokenMatches,
+                  cached.witness == currentWitness,
+                  try EluV1FlagCodec.witnessHash(cached.witness) == currentWitnessHash,
+                  cached.response.flagsRevision == requestState.flagsRevision,
+                  cached.response.evaluatedAt == requestState.evaluatedAt,
+                  cached.response.expiresAt == requestState.responseExpiresAt
+            else {
+                try deleteFlagCacheIfMatches(
+                    connection,
+                    token: cleanupToken
+                )
+                try EluRuntimeDatabase.updateFlagAuthority(connection, value: authority)
+                try connection.execute("COMMIT")
+                return .miss
+            }
+            try EluRuntimeDatabase.updateFlagAuthority(connection, value: authority)
+            try connection.execute("COMMIT")
+            return .hit(
+                EluV1FlagCacheSnapshot(
+                    witness: cached.witness,
+                    response: cached.response
+                )
+            )
+        } catch EluRuntimeQueueError.generationMismatch {
+            try? connection.execute("ROLLBACK")
+            return .restricted(.wallRollback)
+        } catch EluRuntimeQueueError.flagAuthorityTerminal {
+            try? connection.execute("ROLLBACK")
+            return .terminal
+        } catch EluRuntimeQueueError.unsupportedSchemaVersion(_) {
+            try? connection.execute("ROLLBACK")
+            return .terminal
+        } catch {
+            try? connection.execute("ROLLBACK")
+            return .restricted(.storageUnavailable)
+        }
+    }
+
+    func flagWitnessFingerprint(versions: EluVersionContext) -> String? {
+        guard let manager = flagConfigManager else {
+            return nil
+        }
+        do {
+            let connection = try requireResources().connection
+            try preflightOpaqueFlagRequest(connection)
+            var authority = try loadFlagAuthority(connection)
+            guard let sample = sampleFlagClock() else {
+                return nil
+            }
+            guard case let .allowed(authorization) = manager.currentFlagAuthorization(
+                now: sample.wallDate
+            ) else {
+                return nil
+            }
+            try advanceFlagWall(&authority, to: sample.wall)
+            guard flagAuthorization(authorization, matches: authority),
+                  !(try flagConfigIsExpired(authority, at: sample))
+            else {
+                return nil
+            }
+            let witness = try EluV1FlagEvaluationWitness(
+                authorization: authorization,
+                runtime: state.snapshot,
+                versions: versions
+            )
+            return "\(authorization.activationGeneration):"
+                + (try EluV1FlagCodec.witnessHash(witness))
+        } catch EluRuntimeQueueError.generationMismatch {
+            poisonFlagClock()
+            return nil
+        } catch {
+            return nil
+        }
+    }
+
+    private func freshFlagRequestState(
+        barrierGeneration: Int64
+    ) -> EluV1FlagRequestCacheState {
+        EluV1FlagRequestCacheState(
+            storeEpoch: flagStoreEpochGenerator(),
+            requestGeneration: 1,
+            activeRequestId: nil,
+            barrierGeneration: barrierGeneration,
+            activeWitnessHash: nil,
+            cacheRecordId: nil,
+            cachedWitnessHash: nil,
+            flagsRevision: nil,
+            evaluatedAt: nil,
+            responseExpiresAt: nil,
+            effectiveExpiresAt: nil
+        )
+    }
+
+    /// Final-recheck cleanup is deliberately token-scoped. A stale response
+    /// can remove only the exact cache entry it just committed; a newer begin,
+    /// cache, epoch, barrier, or witness turns this into a no-op.
+    private func deleteFlagCacheIfMatches(
+        _ connection: EluSQLiteConnection,
+        token: EluV1FlagBeginToken?
+    ) throws {
+        guard let token,
+              let row = try EluRuntimeDatabase.readFlagRequest(connection),
+              row.storageSchema == 1,
+              let request = try? EluV1FlagStorageCodec.decodeRequestState(row.metadataBody),
+              request.storeEpoch == token.storeEpoch,
+              request.requestGeneration == token.requestGeneration,
+              request.barrierGeneration == token.barrierGeneration,
+              request.cachedWitnessHash == token.witnessHash
+        else {
+            return
+        }
+        let cached: (witness: EluV1FlagEvaluationWitness, response: EluV1FlagResponse)
+        do {
+            guard let body = try EluRuntimeDatabase.readFlagCacheBody(
+                connection,
+                row: row
+            ) else {
+                return
+            }
+            cached = try EluV1FlagCodec.decodeCache(body)
+        } catch {
+            return
+        }
+        guard cached.witness == token.witness,
+              cached.response.requestId == token.requestId,
+              (try? EluV1FlagCodec.witnessHash(cached.witness)) == token.witnessHash
+        else {
+            return
+        }
+        var invalidated = request
+        try expireFlagCacheState(&invalidated)
+        try EluRuntimeDatabase.replaceFlagRequest(
+            connection,
+            state: invalidated,
+            cacheBody: nil
+        )
+    }
+
+    private func expireFlagCacheState(
+        _ request: inout EluV1FlagRequestCacheState
+    ) throws {
+        flagCacheDeadline = nil
+        guard request.requestGeneration < 9_007_199_254_740_991 else {
+            // Begin is the sole operation allowed to rotate the store epoch.
+            request.activeRequestId = nil
+            request.activeWitnessHash = nil
+            request.cacheRecordId = nil
+            request.cachedWitnessHash = nil
+            request.flagsRevision = nil
+            request.evaluatedAt = nil
+            request.responseExpiresAt = nil
+            request.effectiveExpiresAt = nil
+            return
+        }
+        request.requestGeneration += 1
+        request.activeRequestId = nil
+        request.activeWitnessHash = nil
+        request.cacheRecordId = nil
+        request.cachedWitnessHash = nil
+        request.flagsRevision = nil
+        request.evaluatedAt = nil
+        request.responseExpiresAt = nil
+        request.effectiveExpiresAt = nil
+    }
+
+    private func flagConfigIsExpired(
+        _ authority: EluV1FlagDurableAuthority,
+        at sample: FlagClockSample
+    ) throws -> Bool {
+        guard authority.isAllowed, let expiry = authority.configExpiresAt else { return false }
+        return try expiry.validated() <= sample.wall
+            || flagConfigDeadlineExpired(authority, at: sample)
+    }
+
+    private func persistFlagConfigExpiry(
+        _ connection: EluSQLiteConnection,
+        authority: inout EluV1FlagDurableAuthority
+    ) throws -> Bool {
+        guard authority.restriction != .terminal else { return true }
+        guard authority.barrierGeneration < 9_007_199_254_740_991 else {
+            authority.restriction = .terminal
+            try invalidateFlagRequest(
+                connection,
+                barrierGeneration: authority.barrierGeneration
+            )
+            flagConfigManager?.rejectPendingFlagConfig(nil)
+            flagConfigDeadline = nil
+            flagCacheDeadline = nil
+            return true
+        }
+        authority.restriction = .expired
+        authority.barrierGeneration += 1
+        try invalidateFlagRequest(
+            connection,
+            barrierGeneration: authority.barrierGeneration
+        )
+        flagConfigManager?.rejectPendingFlagConfig(nil)
+        flagConfigDeadline = nil
+        flagCacheDeadline = nil
+        return false
+    }
+
+    private func flagAuthorization(
+        _ authorization: EluV1FlagAuthorizationSnapshot,
+        matches authority: EluV1FlagDurableAuthority
+    ) -> Bool {
+        guard authority.isAllowed,
+              authority.barrierGeneration == authorization.barrierGeneration,
+              authority.exactConstructorSiteKey == authorization.exactConstructorSiteKey,
+              authority.siteNamespaceDigest == authorization.siteNamespaceDigest,
+              authority.siteId == authorization.siteId,
+              authority.configRevision == authorization.configRevision,
+              authority.semanticHash == authorization.configSemanticHash,
+              authority.endpoint == authorization.endpoint.absoluteString,
+              authority.ordering == EluV1StoredTimestamp(authorization.configIssuedAt),
+              authority.configExpiresAt == EluV1StoredTimestamp(authorization.configExpiresAt)
+        else {
+            return false
+        }
+        return true
+    }
+
+    private func flagAuthorityProjection(
+        _ authority: EluV1FlagDurableAuthority,
+        matches candidate: EluV1PreparedFlagConfig
+    ) -> Bool {
+        let siteOwnershipMatches = candidate.siteId.map { authority.siteId == $0 } ?? true
+        return authority.ordering == EluV1StoredTimestamp(candidate.issuedAt)
+            && authority.semanticHash == candidate.semanticHash
+            && authority.exactConstructorSiteKey == candidate.exactConstructorSiteKey
+            && authority.siteNamespaceDigest == candidate.siteNamespaceDigest
+            && siteOwnershipMatches
+            && authority.configRevision == candidate.configRevision
+            && authority.endpoint == candidate.endpoint?.absoluteString
+            && authority.configExpiresAt == EluV1StoredTimestamp(candidate.expiresAt)
     }
 
     /// Validates raw config and effective privacy on this actor and installs a
@@ -2144,6 +4701,43 @@ actor EluSQLiteRuntimeQueue {
         ).records
     }
 
+    /// Applies flag evaluation context through the owner runtime so the
+    /// durable request barrier and the in-memory witness advance atomically.
+    /// This is separate from the legacy standalone mutation entrypoint above.
+    @discardableResult
+    func setFlagPersonProperties(
+        _ properties: [String: EluJSONValue],
+        versions: EluVersionContext,
+        expectedGeneration: Int64
+    ) throws -> EluRuntimeQueueSnapshot {
+        guard ownerNamespaceHash != nil else {
+            throw EluRuntimeQueueError.invalidState
+        }
+        guard expectedGeneration == state.generation else {
+            throw EluRuntimeQueueError.generationMismatch
+        }
+        let prepared: (
+            identity: EluIdentityState,
+            flagContext: EluPersistedFlagContext,
+            drafts: [EluPreparedRecordDraft]
+        )
+        do {
+            prepared = try prepareMutationTransition(
+                .setPersonProperties(set: properties, setOnce: [:], unset: []),
+                occurredAt: clock(),
+                versions: versions
+            )
+        } catch {
+            throw mapOperationError(error)
+        }
+        return try commitPrepared(
+            expectedGeneration: expectedGeneration,
+            identity: prepared.identity,
+            flagContext: prepared.flagContext,
+            drafts: prepared.drafts
+        ).snapshot
+    }
+
     @discardableResult
     func recordEligibleActivity(
         expectedGeneration: Int64,
@@ -2220,6 +4814,9 @@ actor EluSQLiteRuntimeQueue {
     ) throws -> EluRuntimeQueueSnapshot {
         guard expectedGeneration == state.generation else {
             throw EluRuntimeQueueError.generationMismatch
+        }
+        if state.identity.optedOut == optedOut {
+            return state.snapshot
         }
         guard state.identity.contextRevision < Int64.max else {
             throw EluRuntimeQueueError.counterExhausted
@@ -2369,6 +4966,37 @@ actor EluSQLiteRuntimeQueue {
                 liveCount: nextCount,
                 liveBytes: nextBytes
             )
+            let flagWitnessChanged = diskState.identity.contextRevision
+                != canonicalIdentity.contextRevision
+                || diskState.identity.revision != canonicalIdentity.revision
+                || diskState.identity.anonymousId != canonicalIdentity.anonymousId
+                || diskState.identity.userId != canonicalIdentity.userId
+                || diskState.identity.groups != canonicalIdentity.groups
+                || diskState.identity.optedOut != canonicalIdentity.optedOut
+                || diskState.flagContext != canonicalFlagContext
+            if databaseSchemaVersion == EluSQLiteRuntimeSchema.flagDatabaseVersion,
+               flagWitnessChanged
+            {
+                do {
+                    let authority = try loadFlagAuthority(connection)
+                    try invalidateFlagRequest(
+                        connection,
+                        barrierGeneration: authority.barrierGeneration
+                    )
+                } catch EluRuntimeQueueError.flagAuthorityTerminal {
+                    // A corrupt/future/missing flag authority is already
+                    // permanently unreadable. Preserve its bytes and keep the
+                    // public identity/capture state machine independent.
+                } catch EluRuntimeQueueError.corruptStorage {
+                    // Known-current flag-only request/header corruption is
+                    // unreadable but cannot roll back core identity/context.
+                } catch EluRuntimeQueueError.unsupportedSchemaVersion(_) {
+                    // Future flag rows remain byte-preserved and fail closed.
+                } catch is EluV1FlagContractError {
+                    // Known-current flag-only metadata/body corruption is
+                    // isolated from the core state mutation transaction.
+                }
+            }
             try faultInjector?.hit(.beforeStateUpdate)
             try EluRuntimeDatabase.updateState(
                 connection,

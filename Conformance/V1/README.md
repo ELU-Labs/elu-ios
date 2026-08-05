@@ -1,9 +1,9 @@
-# ELU SDK v1 config fixtures
+# ELU SDK v1 contract fixtures
 
 This directory contains byte-exact public manifest, schema, and fixture
 snapshots of the frozen cross-platform semantic contract from `ELU-Labs/elu-js` commit
 `4df023251557bacc15c93b49d3f1ac2c6ca934da` (`contracts/v1`). They let this
-package validate the config/privacy fixtures against their canonical schemas
+package validate the config/privacy/feature-flag fixtures against their canonical schemas
 without a sibling checkout or a network dependency. CI verifies every digest
 below before schema evaluation.
 
@@ -17,6 +17,11 @@ Canonical SHA-256 values:
 - disabled config fixture: `c60d32c9701ea726cac342a8c06b89d9a6bd0cf6cea3441bcdd37c2de9055270`
 - allowed privacy fixture: `a0fa41fbb06f263510b35c8d27863e8c69ecc52c940eac8fa23bdd4411c68f40`
 - blocked privacy fixture: `503a2d118737bff7206f05c3cb83f4098579a5c92e7f49670b80e86df2e1e24d`
+- flags request schema: `aef0ae186355db81806561abb4b1c89885ee5024eb3d99a587531a9c7430a770`
+- flags response schema: `723161b3c0f3a448d679faa7a0723cb819cdb162e62ba605fc7935e15df69db2`
+- flags request fixture: `19b4f681c8f2c059d39403a5621c0c60a4b6b4328e2bbe8ae28341724604238a`
+- flags response fixture: `ae943a59d4362cd297e2ea6d7838f5075ad1f949d1401d07d5585db0102326be`
+- feature-flag activity vector: `dbceaa7bee48caf8bf54b73e494fb3f28460eeaf366bbe26f606b659c62a47c4`
 
 The transport remains `specified-not-wired`; these fixtures authorize no
 public facade, network client, or production runtime by themselves.
