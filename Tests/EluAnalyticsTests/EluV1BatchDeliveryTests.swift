@@ -1410,16 +1410,18 @@ private final class TestScriptedWallClock: @unchecked Sendable {
 @MainActor
 final class EluV1BatchBackgroundAdapterTests: XCTestCase {
     func testBackgroundAssertionEndsOnceOnSuccessFailureCancellationAndExpiry() async {
-        let success = TestBackgroundTaskManager()
+        let successEnded = expectation(description: "successful pass ended")
+        let success = TestBackgroundTaskManager { _ in successEnded.fulfill() }
         let successAdapter = EluV1BatchBackgroundAdapter(manager: success)
         XCTAssertTrue(successAdapter.start {})
-        await eventually { success.ended.count == 1 }
+        await fulfillment(of: [successEnded], timeout: 1)
         XCTAssertEqual(success.ended.count, 1)
 
-        let failure = TestBackgroundTaskManager()
+        let failureEnded = expectation(description: "failed pass ended")
+        let failure = TestBackgroundTaskManager { _ in failureEnded.fulfill() }
         let failureAdapter = EluV1BatchBackgroundAdapter(manager: failure)
         XCTAssertTrue(failureAdapter.start { throw TestBatchTransportError.network })
-        await eventually { failure.ended.count == 1 }
+        await fulfillment(of: [failureEnded], timeout: 1)
         XCTAssertEqual(failure.ended.count, 1)
 
         let cancellation = TestBackgroundTaskManager()
@@ -1469,12 +1471,6 @@ final class EluV1BatchBackgroundAdapterTests: XCTestCase {
         adapter.cancel()
         XCTAssertEqual(manager.ended.count, 1)
     }
-
-    private func eventually(_ predicate: @MainActor () -> Bool) async {
-        for _ in 0 ..< 100 where !predicate() {
-            await Task.yield()
-        }
-    }
 }
 
 @MainActor
@@ -1483,9 +1479,14 @@ private final class TestBackgroundTaskManager: EluV1IOSBackgroundTaskManaging {
     var ended: [UIBackgroundTaskIdentifier] = []
     private var expiration: (@MainActor @Sendable () -> Void)?
     private let expireSynchronously: Bool
+    private let onEnd: (@MainActor (UIBackgroundTaskIdentifier) -> Void)?
 
-    init(expireSynchronously: Bool = false) {
+    init(
+        expireSynchronously: Bool = false,
+        onEnd: (@MainActor (UIBackgroundTaskIdentifier) -> Void)? = nil
+    ) {
         self.expireSynchronously = expireSynchronously
+        self.onEnd = onEnd
     }
 
     func begin(
@@ -1502,6 +1503,7 @@ private final class TestBackgroundTaskManager: EluV1IOSBackgroundTaskManaging {
 
     func end(_ identifier: UIBackgroundTaskIdentifier) {
         ended.append(identifier)
+        onEnd?(identifier)
     }
 
     func expire() {
