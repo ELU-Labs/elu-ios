@@ -22,9 +22,22 @@ EXPECTED_SHA256 = {
     "schemas/event.schema.json": "4a0deeb19b8406d31aa519bf1d3978294d6d06eb451d4588668cb6f67f4edee9",
     "schemas/mutation.schema.json": "8482af6b66c04701b014acd27e6d59aaef3f27864086c755f9abde498e5c8f5f",
     "schemas/version.schema.json": "3b4ca74e470efbf6610f2a1743f2bc78805882bd294a6984ef2c93fe42fea4ab",
+    "schemas/batch-request.schema.json": "2e4c5c03e964f81aa0d5bd69230f66a8266137571261e117a1a3cd18ba28dfd8",
+    "schemas/batch-ack.schema.json": "95ccd5e87001515b258fd2ea6a6e346ac265220708f8b1931d4f000276e0f3d9",
+    "schemas/transport-error.schema.json": "67255aa898bb33fd75440e29573969c14b1d883f5b846865a3b3e5ba3051aaae",
+    "schemas/transport-policy.schema.json": "16064cf3f7c513f3a05f57dbb4ad91386918dda4b0910c51aec544a492e2df6b",
     "Fixtures/event.json": "44ea5d14646ec08aaa1805dffd8ea6403487ba7cb48e8ce7ea7f3752b241809d",
     "Fixtures/mutations.json": "a02a4db1d1ef0bf6b9eac0334fe83c3564526cbd21c79ccfe14aa303ff2ae3d4",
     "Fixtures/version.json": "61bf97e8eeea78df05df13434501a4bc9e81eaa3351fecaff2bdc06da9f1f8e2",
+    "Fixtures/batch-request.json": "c0446316c5b75c163b27e27abe7b079b1c88bdb198a4985f4ceb544a8d154bbb",
+    "Fixtures/batch-ack.json": "0a71284941a71646641095f772c34f9f84d8d7d0083574d7d35ef0148bf22cb5",
+    "Fixtures/batch-ack-retryable-head.json": "f9e79b1a7bb913b2a07a3a66257c29f2a68973bbe6db7de99d47b30dbb2aa27e",
+    "Fixtures/transport-error-unauthorized.json": "ba7bfd5c60c14dcb306de45515529d12af3310e84b495986c6ca67cb2a0578dc",
+    "Fixtures/transport-error-forbidden.json": "630970155fdb2758850ddc5c7a84ece927a7bcba9ce8431b00d6d3edb8d9cf41",
+    "Fixtures/transport-error-payload-too-large.json": "ef95b96c01bbbf44559554f9afeaacac15f41bedfc236516095eb0c8f8549259",
+    "Fixtures/transport-error-rate-limited.json": "c29a01e3dac3d12e2722a20240201838423c07457f50aca455ebc523bda7a9fd",
+    "Fixtures/transport-error-service-unavailable.json": "b93f84f5ee3591a0723f393413a28a1bb85cd7863b39313251fe54d6034f9b9c",
+    "Fixtures/transport-policy.json": "992900180683af04f69d5e459b7c0c9e68edf92c6ebf320136ed36dbae8b60ce",
 }
 RUNTIME_NAME = re.compile(r"^elu-[a-z0-9-]+$")
 FACADE_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9._-]+$")
@@ -124,6 +137,10 @@ def validate_schema_instance(
     schemas: dict[str, Any],
     path: str = "$",
 ) -> None:
+    if schema is True:
+        return
+    if schema is False:
+        schema_violation(path, "boolean schema rejects every value")
     if not isinstance(schema, dict):
         schema_violation(path, "schema node is not an object")
     if "$ref" in schema:
@@ -142,7 +159,35 @@ def validate_schema_instance(
             matches += 1
         if matches != 1:
             schema_violation(path, f"oneOf matched {matches} branches")
-        return
+    if "allOf" in schema:
+        for candidate in schema["allOf"]:
+            validate_schema_instance(value, candidate, current_name, schemas, path)
+    if "anyOf" in schema:
+        matches = 0
+        for candidate in schema["anyOf"]:
+            try:
+                validate_schema_instance(value, candidate, current_name, schemas, path)
+            except SchemaViolation:
+                continue
+            matches += 1
+        if matches == 0:
+            schema_violation(path, "anyOf matched no branches")
+    if "not" in schema:
+        try:
+            validate_schema_instance(value, schema["not"], current_name, schemas, path)
+        except SchemaViolation:
+            pass
+        else:
+            schema_violation(path, "not schema matched")
+    if "if" in schema:
+        try:
+            validate_schema_instance(value, schema["if"], current_name, schemas, path)
+        except SchemaViolation:
+            conditional = schema.get("else")
+        else:
+            conditional = schema.get("then")
+        if conditional is not None:
+            validate_schema_instance(value, conditional, current_name, schemas, path)
 
     if "const" in schema and value != schema["const"]:
         schema_violation(path, "value does not match const")
@@ -191,8 +236,20 @@ def validate_schema_instance(
             ]
             if len(stable) != len(set(stable)):
                 schema_violation(path, "array items are not unique")
+        prefix_items = schema.get("prefixItems", [])
+        for index, item_schema in enumerate(prefix_items):
+            if index >= len(value):
+                break
+            validate_schema_instance(
+                value[index],
+                item_schema,
+                current_name,
+                schemas,
+                f"{path}[{index}]",
+            )
         if "items" in schema:
-            for index, item in enumerate(value):
+            start = len(prefix_items) if prefix_items else 0
+            for index, item in enumerate(value[start:], start=start):
                 validate_schema_instance(
                     item,
                     schema["items"],
@@ -443,6 +500,129 @@ def expect_rejected(value: Any, validator: Any, description: str) -> None:
     fail(f"negative probe was accepted: {description}")
 
 
+def batch_record_facts(request: Any) -> list[tuple[int, str, str]]:
+    request = require_keys(
+        request,
+        {"schemaVersion", "requestId", "streamId", "sentAt", "versions", "records"},
+    )
+    if request["schemaVersion"] != 1:
+        fail("batch request schemaVersion must be 1")
+    require_string(request["requestId"], "requestId", 1, 256)
+    stream_id = require_string(request["streamId"], "streamId", 1, 256)
+    require_timestamp(request["sentAt"], "sentAt")
+    validate_versions(request["versions"])
+    records = request["records"]
+    if not isinstance(records, list) or not 1 <= len(records) <= 1_000:
+        fail("batch records must contain 1...1000 records")
+    facts: list[tuple[int, str, str]] = []
+    for record in records:
+        if not isinstance(record, dict) or record.get("kind") not in {"event", "mutation"}:
+            fail("batch record kind is invalid")
+        kind = record["kind"]
+        record = require_keys(record, {"kind", kind})
+        payload = record[kind]
+        if kind == "event":
+            validate_event(payload)
+            if payload["streamId"] != stream_id:
+                fail("batch event stream does not match envelope")
+            facts.append((payload["sequence"], payload["eventId"], kind))
+        else:
+            sequence, record_id, _ = validate_mutation(payload)
+            facts.append((sequence, record_id, kind))
+    sequences = [fact[0] for fact in facts]
+    if sequences != list(range(sequences[0], sequences[0] + len(sequences))):
+        fail("batch record sequences are not contiguous")
+    if len({(fact[2], fact[1]) for fact in facts}) != len(facts):
+        fail("batch record IDs are not kind-scoped unique")
+    return facts
+
+
+def validate_batch_ack(request: Any, acknowledgement: Any) -> None:
+    facts = batch_record_facts(request)
+    acknowledgement = require_keys(
+        acknowledgement,
+        {
+            "schemaVersion",
+            "requestId",
+            "streamId",
+            "resolvedThroughSequence",
+            "retryFromSequence",
+            "outcomes",
+        },
+    )
+    if acknowledgement["schemaVersion"] != 1:
+        fail("batch acknowledgement schemaVersion must be 1")
+    if acknowledgement["requestId"] != request["requestId"]:
+        fail("batch acknowledgement requestId mismatch")
+    if acknowledgement["streamId"] != request["streamId"]:
+        fail("batch acknowledgement streamId mismatch")
+    outcomes = acknowledgement["outcomes"]
+    if not isinstance(outcomes, list) or not 1 <= len(outcomes) <= len(facts):
+        fail("batch acknowledgement outcomes are not a request prefix")
+
+    retryable_index: int | None = None
+    for index, outcome in enumerate(outcomes):
+        outcome = require_keys(
+            outcome,
+            {"sequence", "recordId", "kind", "result"},
+            {"code"},
+        )
+        sequence, record_id, kind = facts[index]
+        if (outcome["sequence"], outcome["recordId"], outcome["kind"]) != (
+            sequence,
+            record_id,
+            kind,
+        ):
+            fail("batch acknowledgement outcome mismatch")
+        result = outcome["result"]
+        if result not in {"accepted", "terminally-rejected", "retryable"}:
+            fail("batch acknowledgement result is invalid")
+        if result == "accepted" and "code" in outcome:
+            fail("accepted outcome carries a code")
+        if result != "accepted":
+            code = outcome.get("code")
+            if not isinstance(code, str) or re.fullmatch(r"[a-z][a-z0-9-]{0,63}", code) is None:
+                fail("non-accepted outcome code is invalid")
+        if result == "retryable":
+            if retryable_index is not None or index != len(outcomes) - 1:
+                fail("retryable outcome must be the final reported outcome")
+            retryable_index = index
+
+    if retryable_index is None and len(outcomes) != len(facts):
+        fail("acknowledgement without retryable head must resolve the request")
+    resolved_count = len(outcomes) if retryable_index is None else retryable_index
+    expected_resolved = None if resolved_count == 0 else facts[resolved_count - 1][0]
+    expected_retry = None if retryable_index is None else facts[retryable_index][0]
+    if acknowledgement["resolvedThroughSequence"] != expected_resolved:
+        fail("resolvedThroughSequence contradicts the validated prefix")
+    if acknowledgement["retryFromSequence"] != expected_retry:
+        fail("retryFromSequence contradicts the retryable head")
+
+
+def validate_transport_error(value: Any, expected_status: int) -> None:
+    value = require_keys(
+        value,
+        {"schemaVersion", "status", "code", "disposition", "message"},
+        {"requestId"},
+    )
+    dispositions = {
+        401: "permanent",
+        403: "permanent",
+        413: "retry-after-reduction",
+        429: "retryable",
+        503: "retryable",
+    }
+    if value["schemaVersion"] != 1 or value["status"] != expected_status:
+        fail("transport error status/schema mismatch")
+    if value["disposition"] != dispositions[expected_status]:
+        fail("transport error disposition mismatch")
+    if not isinstance(value["code"], str) or re.fullmatch(
+        r"[a-z][a-z0-9-]{0,63}", value["code"]
+    ) is None:
+        fail("transport error code is invalid")
+    require_string(value["message"], "transport error message", 1, 256)
+
+
 def main() -> int:
     pinned_schemas = {
         relative: load_pinned(relative)
@@ -456,6 +636,17 @@ def main() -> int:
     event = load_pinned("Fixtures/event.json")
     mutations = load_pinned("Fixtures/mutations.json")
     versions = load_pinned("Fixtures/version.json")
+    batch_request = load_pinned("Fixtures/batch-request.json")
+    batch_ack = load_pinned("Fixtures/batch-ack.json")
+    batch_retryable_ack = load_pinned("Fixtures/batch-ack-retryable-head.json")
+    transport_policy = load_pinned("Fixtures/transport-policy.json")
+    transport_errors = {
+        401: load_pinned("Fixtures/transport-error-unauthorized.json"),
+        403: load_pinned("Fixtures/transport-error-forbidden.json"),
+        413: load_pinned("Fixtures/transport-error-payload-too-large.json"),
+        429: load_pinned("Fixtures/transport-error-rate-limited.json"),
+        503: load_pinned("Fixtures/transport-error-service-unavailable.json"),
+    }
 
     if schemas["event.schema.json"].get("additionalProperties") is not False:
         fail("event schema must remain closed")
@@ -482,6 +673,40 @@ def main() -> int:
         schemas,
         "mutation fixture",
     )
+    validate_against_schema(
+        batch_request,
+        "batch-request.schema.json",
+        schemas,
+        "batch request fixture",
+    )
+    validate_against_schema(
+        batch_ack,
+        "batch-ack.schema.json",
+        schemas,
+        "batch acknowledgement fixture",
+    )
+    validate_against_schema(
+        batch_retryable_ack,
+        "batch-ack.schema.json",
+        schemas,
+        "retryable batch acknowledgement fixture",
+    )
+    for status, transport_error in transport_errors.items():
+        validate_against_schema(
+            transport_error,
+            "transport-error.schema.json",
+            schemas,
+            f"{status} transport error fixture",
+        )
+        validate_transport_error(transport_error, status)
+    validate_against_schema(
+        transport_policy,
+        "transport-policy.schema.json",
+        schemas,
+        "transport policy fixture",
+    )
+    validate_batch_ack(batch_request, batch_ack)
+    validate_batch_ack(batch_request, batch_retryable_ack)
 
     validate_versions(versions)
     validate_event(event)
@@ -574,8 +799,8 @@ def main() -> int:
     )
 
     print(
-        "validated 6 pinned event/mutation/version files against JSON schemas "
-        "and strict queue semantics"
+        "validated 19 pinned queue and batch-transport files against JSON schemas "
+        "and strict ordered acknowledgement semantics"
     )
     return 0
 
