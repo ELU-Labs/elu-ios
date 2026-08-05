@@ -55,6 +55,7 @@ EVENT_NAMES = {
 }
 TELEMETRY_METHOD = "POST"
 TELEMETRY_PATH = "/batch"
+TELEMETRY_TARGETS = frozenset((TELEMETRY_PATH, f"{TELEMETRY_PATH}?"))
 
 
 def parse_args() -> argparse.Namespace:
@@ -482,7 +483,7 @@ def derive_capture(files: dict[str, bytes], errors: list[str]) -> tuple[dict[str
         errors.append("raw archive contains no captured requests")
     for name in request_names:
         request = raw_json(files, name, errors)
-        if request.get("method") != TELEMETRY_METHOD or request.get("path") != TELEMETRY_PATH:
+        if request.get("method") != TELEMETRY_METHOD or request.get("path") not in TELEMETRY_TARGETS:
             continue
         headers = request.get("headers")
         encoded_body = request.get("bodyBase64")

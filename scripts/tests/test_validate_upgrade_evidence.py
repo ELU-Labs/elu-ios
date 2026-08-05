@@ -236,25 +236,34 @@ class UpgradeEvidenceValidationTests(unittest.TestCase):
             result = self.run_validator(manifest=path, raw_archive=archive, require_verified=True)
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_exact_post_batch_marker_is_accepted(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            directory = pathlib.Path(temporary)
-            manifest = self.verified_manifest()
-            archive = self.write_raw_archive(
-                directory,
-                manifest,
-                source_method="POST",
-                source_path="/batch",
-            )
-            path = self.write_json(directory, "manifest.json", manifest)
-            result = self.run_validator(manifest=path, raw_archive=archive, require_verified=True)
-        self.assertEqual(result.returncode, 0, result.stderr)
+    def test_parameter_free_post_batch_marker_is_accepted(self) -> None:
+        for source_path in ("/batch", "/batch?"):
+            with (
+                self.subTest(source_path=source_path),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                directory = pathlib.Path(temporary)
+                manifest = self.verified_manifest()
+                archive = self.write_raw_archive(
+                    directory,
+                    manifest,
+                    source_method="POST",
+                    source_path=source_path,
+                )
+                path = self.write_json(directory, "manifest.json", manifest)
+                result = self.run_validator(
+                    manifest=path,
+                    raw_archive=archive,
+                    require_verified=True,
+                )
+            self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_marker_shaped_payload_at_wrong_method_or_path_is_rejected(self) -> None:
         cases = (
             ("GET", "/batch"),
             ("POST", "/not-batch"),
             ("POST", "/batch?forged=1"),
+            ("POST", "/batch??"),
         )
         for method, path_value in cases:
             with self.subTest(method=method, path=path_value), tempfile.TemporaryDirectory() as temporary:

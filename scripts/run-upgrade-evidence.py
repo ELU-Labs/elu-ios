@@ -41,6 +41,7 @@ EVENT_NAMES = {
 }
 TELEMETRY_METHOD = "POST"
 TELEMETRY_PATH = "/batch"
+TELEMETRY_TARGETS = frozenset((TELEMETRY_PATH, f"{TELEMETRY_PATH}?"))
 FLAGS_PATH = "/flags?v=2"
 CONFIG_PATH = "/v1/upgrade-evidence/config"
 MARKER_WAIT_SECONDS = 45
@@ -550,7 +551,7 @@ class CaptureLedger:
     def begin_request(self, method: str, path: str) -> int:
         with self.lock:
             self.request_count += 1
-            if method == TELEMETRY_METHOD and path == TELEMETRY_PATH:
+            if method == TELEMETRY_METHOD and path in TELEMETRY_TARGETS:
                 self._record_unreadable_batch(self.request_count)
             return self.request_count
 
@@ -628,7 +629,7 @@ class CaptureLedger:
     ) -> None:
         if method == "GET" and path == CONFIG_PATH:
             self.config_get_count += 1
-        if method != TELEMETRY_METHOD or path != TELEMETRY_PATH:
+        if method != TELEMETRY_METHOD or path not in TELEMETRY_TARGETS:
             return
         if not body_readable:
             self._record_unreadable_batch(request_number)
@@ -835,7 +836,7 @@ class EvidenceHandler(BaseHTTPRequestHandler):
         self._record(request_number, body, body_readable=body_readable)
         if self.path == FLAGS_PATH:
             self._respond({"flags": {}, "featureFlags": {}})
-        elif self.path == TELEMETRY_PATH:
+        elif self.path in TELEMETRY_TARGETS:
             self._respond({"status": "ok"})
         else:
             self._respond({"status": "not-found"}, status=404)

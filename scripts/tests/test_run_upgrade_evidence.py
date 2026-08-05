@@ -522,11 +522,13 @@ class UpgradeEvidenceCaptureTests(unittest.TestCase):
             ledger.record(method, path, {}, b"")
             return ledger.exact_config_get_count()
 
-    def test_capture_ledger_accepts_exact_post_batch(self) -> None:
-        self.assertEqual(
-            self.captured_markers("POST", "/batch"),
-            {"source": ("opaque-identity", "source-session")},
-        )
+    def test_capture_ledger_accepts_parameter_free_post_batch(self) -> None:
+        for path in ("/batch", "/batch?"):
+            with self.subTest(path=path):
+                self.assertEqual(
+                    self.captured_markers("POST", path),
+                    {"source": ("opaque-identity", "source-session")},
+                )
 
     def test_capture_ledger_parses_realistic_lowercase_gzip_batch_strictly(self) -> None:
         body = gzip.compress(
@@ -925,6 +927,7 @@ class UpgradeEvidenceCaptureTests(unittest.TestCase):
             ("GET", "/batch"),
             ("POST", "/not-batch"),
             ("POST", "/batch?forged=1"),
+            ("POST", "/batch??"),
         ):
             with self.subTest(method=method, path=path):
                 self.assertEqual(self.captured_markers(method, path), {})
@@ -946,6 +949,13 @@ class UpgradeEvidenceCaptureTests(unittest.TestCase):
         self.assertEqual(batch_statuses, [200])
         self.assertEqual(
             batch_markers,
+            {"source": ("opaque-identity", "source-session")},
+        )
+
+        empty_query_statuses, empty_query_markers = self.route_post("/batch?")
+        self.assertEqual(empty_query_statuses, [200])
+        self.assertEqual(
+            empty_query_markers,
             {"source": ("opaque-identity", "source-session")},
         )
 

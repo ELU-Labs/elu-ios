@@ -36,9 +36,10 @@ The harness is a UIKit application hosting a SwiftUI view. The runner:
 The generated identity and session values appear only in the raw archive. The
 runner stores failure diagnostics there as well, prints only normalized
 status, and refuses an output directory inside the repository. Marker-shaped
-payloads count only when captured on the source SDK's exact telemetry route,
-`POST /batch`; other methods, paths, and query-bearing variants are ignored by
-both the runner and the independent archive validator.
+payloads count only when captured on the source SDK's parameter-free telemetry
+route. Foundation may serialize that route as `POST /batch` or `POST /batch?`;
+both spellings are accepted, while other methods, paths, and non-empty queries
+are ignored by both the runner and the independent archive validator.
 
 Before SDK setup, the simulator harness makes one anonymous, cache-bypassed
 HTTPS request to `github.com/favicon.ico`. This bounded preflight establishes
@@ -46,7 +47,7 @@ the simulator's default network route, then waits for two consecutive reachable
 samples from the system API used by the source dependency before SDK setup.
 Both bounded checks run before an evidence identity is created, so they carry
 no SDK identity or captured event data. The evidence server remains
-loopback-only, and the exact `POST /batch` checks remain the authoritative
+loopback-only, and the parameter-free batch check remains the authoritative
 proof. CI runs this harness on the same Apple Silicon simulator image as the
 package's unit and consumer gates. A bounded readiness failure is reported as
 an explicit network-environment blocker rather than as missing telemetry.
