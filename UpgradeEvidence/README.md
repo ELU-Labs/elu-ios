@@ -42,11 +42,14 @@ both the runner and the independent archive validator.
 
 Before SDK setup, the simulator harness makes one anonymous, cache-bypassed
 HTTPS request to `github.com/favicon.ico`. This bounded preflight establishes
-the simulator's default network route before the source SDK evaluates network
-reachability. It uses an ephemeral session and runs before an evidence identity
-is created, so it carries no SDK identity or captured event data. The evidence
-server remains loopback-only, and the exact `POST /batch` checks remain the
-authoritative proof.
+the simulator's default network route, then waits for two consecutive reachable
+samples from the system API used by the source dependency before SDK setup.
+Both bounded checks run before an evidence identity is created, so they carry
+no SDK identity or captured event data. The evidence server remains
+loopback-only, and the exact `POST /batch` checks remain the authoritative
+proof. CI runs this harness on the same Apple Silicon simulator image as the
+package's unit and consumer gates. A bounded readiness failure is reported as
+an explicit network-environment blocker rather than as missing telemetry.
 
 The `0.1.0` dependency starts a session during every SDK setup. A process
 replacement therefore rotates the session id; exact session-id equality is not

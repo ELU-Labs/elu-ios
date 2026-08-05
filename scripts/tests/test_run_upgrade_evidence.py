@@ -15,6 +15,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts" / "run-upgrade-evidence.py"
 PROJECT = ROOT / "UpgradeEvidence" / "0.1.0" / "Harness" / "UpgradeHarness.xcodeproj" / "project.pbxproj"
 HARNESS_SOURCE = ROOT / "UpgradeEvidence" / "0.1.0" / "Harness" / "AppDelegate.swift"
+WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 SPEC = importlib.util.spec_from_file_location("run_upgrade_evidence", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 RUNNER = importlib.util.module_from_spec(SPEC)
@@ -34,6 +35,11 @@ class UpgradeEvidenceCaptureTests(unittest.TestCase):
             "private static func probeNetwork", 1
         )[0]
         probe_body = source.split("private static func probeNetwork", 1)[1].split(
+            "private static func waitForSystemReachability", 1
+        )[0]
+        reachability_body = source.split(
+            "private static func waitForSystemReachability", 1
+        )[1].split(
             "private static func begin", 1
         )[0]
         begin_body = source.split("private static func begin", 1)[1].split(
@@ -41,9 +47,15 @@ class UpgradeEvidenceCaptureTests(unittest.TestCase):
         )[0]
         self.assertIn('URL(string: "https://github.com/favicon.ico")!', source)
         self.assertIn("private static let networkProbeTimeout: TimeInterval = 10", source)
+        self.assertIn("private static let reachabilityProbeTimeout: TimeInterval = 10", source)
+        self.assertIn("private static let requiredReachabilitySamples = 2", source)
         self.assertIn("probeNetwork { ready in", start_body)
         self.assertIn("guard ready else", start_body)
-        self.assertIn("identityCheck: false", start_body)
+        self.assertEqual(start_body.count('write(build: "invalid", identityCheck: false)'), 1)
+        self.assertEqual(
+            start_body.count('write(build: "network-unready", identityCheck: false)'),
+            2,
+        )
         self.assertIn("URLSessionConfiguration.ephemeral", probe_body)
         self.assertIn(
             "configuration.timeoutIntervalForResource = networkProbeTimeout",
@@ -55,15 +67,31 @@ class UpgradeEvidenceCaptureTests(unittest.TestCase):
         self.assertIn("response is HTTPURLResponse", probe_body)
         self.assertNotIn("expectedIdentity", probe_body)
         self.assertNotIn("Elu.", probe_body)
+        self.assertIn("waitForSystemReachability(", start_body)
+        self.assertIn("guard reachable else", start_body)
+        self.assertIn("SCNetworkReachabilityCreateWithAddress", reachability_body)
+        self.assertIn("SCNetworkReachabilityGetFlags", reachability_body)
+        self.assertIn("flags.contains(.reachable)", reachability_body)
+        self.assertIn("nextReachableSamples >= requiredReachabilitySamples", reachability_body)
+        self.assertIn("reachableSamples: nextReachableSamples", reachability_body)
+        self.assertNotIn("expectedIdentity", reachability_body)
+        self.assertNotIn("Elu.", reachability_body)
         self.assertIn("expectedIdentity = UUID().uuidString", begin_body)
         self.assertIn("Elu.setup", begin_body)
 
     def test_runner_deadline_covers_network_and_identity_timeouts(self) -> None:
         source = HARNESS_SOURCE.read_text(encoding="utf-8")
         self.assertIn("private static let networkProbeTimeout: TimeInterval = 10", source)
+        self.assertIn("private static let reachabilityProbeTimeout: TimeInterval = 10", source)
         self.assertIn("private static let timeoutSeconds: TimeInterval = 20", source)
-        self.assertEqual(RUNNER.RUN_RESULT_WAIT_SECONDS, 45)
-        self.assertGreater(RUNNER.RUN_RESULT_WAIT_SECONDS, 10 + 20 + 5)
+        self.assertEqual(RUNNER.RUN_RESULT_WAIT_SECONDS, 60)
+        self.assertGreater(RUNNER.RUN_RESULT_WAIT_SECONDS, 10 + 10 + 20 + 5)
+
+    def test_upgrade_harness_uses_the_supported_simulator_image(self) -> None:
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        upgrade_job = workflow.split("  upgrade-evidence:", 1)[1]
+        self.assertIn("    runs-on: macos-15\n", upgrade_job)
+        self.assertNotIn("macos-15-intel", upgrade_job)
 
     def test_app_delegate_window_can_witness_the_protocol_requirement(self) -> None:
         source = HARNESS_SOURCE.read_text(encoding="utf-8")
@@ -376,6 +404,17 @@ class UpgradeEvidenceCaptureTests(unittest.TestCase):
             )
             _, failure = RUNNER.inspect_changed_run_result("source", documents, before)
             self.assertEqual(failure, "ENVIRONMENT_INVALID")
+            self.assertFalse(RUNNER.should_retry_run_result(failure))
+
+        with tempfile.TemporaryDirectory() as temporary:
+            documents = pathlib.Path(temporary)
+            before = RUNNER.snapshot_result_files(documents)
+            (documents / RUNNER.NETWORK_UNREADY_RESULT_NAME).write_text(
+                json.dumps({"build": "network-unready", "identityCheck": False}),
+                encoding="utf-8",
+            )
+            _, failure = RUNNER.inspect_changed_run_result("source", documents, before)
+            self.assertEqual(failure, "NETWORK_UNREADY")
             self.assertFalse(RUNNER.should_retry_run_result(failure))
 
         expected_cases = (

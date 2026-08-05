@@ -112,7 +112,7 @@ jobs:
   upgrade-evidence:
     name: 0.1.0 simulator upgrade evidence
     needs: validation
-    runs-on: macos-15-intel
+    runs-on: macos-15
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4

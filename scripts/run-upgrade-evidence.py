@@ -34,6 +34,7 @@ RESULT_NAMES = {
     "candidate": "elu-upgrade-candidate-result.json",
 }
 INVALID_RESULT_NAME = "elu-upgrade-invalid-result.json"
+NETWORK_UNREADY_RESULT_NAME = "elu-upgrade-network-unready-result.json"
 EVENT_NAMES = {
     "source": "elu_sdk_upgrade_source",
     "candidate": "elu_sdk_upgrade_candidate",
@@ -43,7 +44,7 @@ TELEMETRY_PATH = "/batch"
 FLAGS_PATH = "/flags?v=2"
 CONFIG_PATH = "/v1/upgrade-evidence/config"
 MARKER_WAIT_SECONDS = 45
-RUN_RESULT_WAIT_SECONDS = 45
+RUN_RESULT_WAIT_SECONDS = 60
 MAX_CAPTURE_BODY_BYTES = 8 * 1024 * 1024
 GZIP_INPUT_CHUNK_BYTES = 64 * 1024
 MAX_DECOMPRESSED_BODY_BYTES = 8 * 1024 * 1024
@@ -89,6 +90,7 @@ RUN_RESULT_FAILURES = {
     "RESULT_SCHEMA_INVALID": "wrote a result that did not match the fixed result schema",
     "RESULT_BUILD_MISMATCH": "wrote a result for a different build role",
     "ENVIRONMENT_INVALID": "reported that its fixed launch environment was invalid",
+    "NETWORK_UNREADY": "reported that system network reachability did not become ready",
     "IDENTITY_FALSE": "reported that the expected identity was not observed",
 }
 CONFIG_GET_OBSERVATIONS = {
@@ -376,7 +378,11 @@ def result_file_stamp(path: pathlib.Path) -> tuple[int, int, int] | None:
 
 
 def snapshot_result_files(documents: pathlib.Path) -> dict[str, tuple[int, int, int] | None]:
-    names = {**RESULT_NAMES, "invalid": INVALID_RESULT_NAME}
+    names = {
+        **RESULT_NAMES,
+        "invalid": INVALID_RESULT_NAME,
+        "networkUnready": NETWORK_UNREADY_RESULT_NAME,
+    }
     return {role: result_file_stamp(documents / name) for role, name in names.items()}
 
 
@@ -387,7 +393,11 @@ def inspect_changed_run_result(
 ) -> tuple[dict[str, Any] | None, str | None]:
     if build not in BUILD_PREFIXES:
         return None, "UNEXPECTED_RUNNER_FAILURE"
-    names = {**RESULT_NAMES, "invalid": INVALID_RESULT_NAME}
+    names = {
+        **RESULT_NAMES,
+        "invalid": INVALID_RESULT_NAME,
+        "networkUnready": NETWORK_UNREADY_RESULT_NAME,
+    }
     changed = {
         role: path
         for role, name in names.items()
@@ -403,6 +413,8 @@ def inspect_changed_run_result(
         return inspect_run_result(build, payload)
     if "invalid" in changed:
         return None, "ENVIRONMENT_INVALID"
+    if "networkUnready" in changed:
+        return None, "NETWORK_UNREADY"
     for role in BUILD_PREFIXES:
         if role == build or role not in changed:
             continue
