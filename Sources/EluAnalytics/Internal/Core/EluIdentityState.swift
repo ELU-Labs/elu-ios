@@ -40,6 +40,8 @@ struct EluSessionState: Codable, Equatable, Sendable {
         case backgroundedAt
     }
 
+    static let persistedKeys = Set(CodingKeys.allCases.map(\.stringValue))
+
     init(
         id: String,
         startedAt: Date,
@@ -116,6 +118,8 @@ struct EluIdentityMigration: Codable, Equatable, Sendable {
         case completedAt
     }
 
+    static let persistedKeys = Set(CodingKeys.allCases.map(\.stringValue))
+
     init(sourceSchema: String, completedAt: Date) throws {
         self.sourceSchema = sourceSchema
         self.completedAt = completedAt
@@ -179,6 +183,8 @@ struct EluIdentityState: Codable, Equatable, Sendable {
         case migration
     }
 
+    static let persistedKeys = Set(CodingKeys.allCases.map(\.stringValue))
+
     private static let requiredKeys: Set<CodingKeys> = [
         .schemaVersion,
         .revision,
@@ -238,7 +244,20 @@ struct EluIdentityState: Codable, Equatable, Sendable {
         session = try container.decodeIfPresent(EluSessionState.self, forKey: .session)
         optedOut = try container.decode(Bool.self, forKey: .optedOut)
         updatedAt = try container.decode(Date.self, forKey: .updatedAt)
-        migration = try container.decodeIfPresent(EluIdentityMigration.self, forKey: .migration)
+        if container.contains(.migration) {
+            guard try !container.decodeNil(forKey: .migration) else {
+                throw DecodingError.valueNotFound(
+                    EluIdentityMigration.self,
+                    DecodingError.Context(
+                        codingPath: decoder.codingPath + [CodingKeys.migration],
+                        debugDescription: "migration must be absent or an object"
+                    )
+                )
+            }
+            migration = try container.decode(EluIdentityMigration.self, forKey: .migration)
+        } else {
+            migration = nil
+        }
         try validate()
     }
 
@@ -304,7 +323,7 @@ struct EluIdentityState: Codable, Equatable, Sendable {
     }
 
     static func valid(_ value: String, maximumLength: Int) -> Bool {
-        !value.isEmpty && value.count <= maximumLength
+        !value.isEmpty && value.unicodeScalars.count <= maximumLength
     }
 }
 
@@ -336,14 +355,43 @@ enum EluRFC3339 {
     }
 
     static func date(from value: String) -> Date? {
-        let fractional = ISO8601DateFormatter()
-        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let date = fractional.date(from: value) {
-            return date
+        let bytes = Array(value.utf8)
+        guard bytes.count >= 20 else { return nil }
+        let fixedDigitsAreValid = [
+            0 ..< 4, 5 ..< 7, 8 ..< 10, 11 ..< 13, 14 ..< 16, 17 ..< 19,
+        ].allSatisfy { range in
+            bytes[range].allSatisfy { (48 ... 57).contains($0) }
         }
-        let wholeSeconds = ISO8601DateFormatter()
-        wholeSeconds.formatOptions = [.withInternetDateTime]
-        return wholeSeconds.date(from: value)
+        guard bytes[4] == 45,
+              bytes[7] == 45,
+              bytes[10] == 84,
+              bytes[13] == 58,
+              bytes[16] == 58,
+              bytes.last == 90,
+              fixedDigitsAreValid
+        else {
+            return nil
+        }
+
+        let usesFractionalSeconds: Bool
+        if bytes.count == 20 {
+            usesFractionalSeconds = false
+        } else {
+            guard bytes.count >= 22,
+                  bytes[19] == 46,
+                  bytes[20 ..< (bytes.count - 1)].allSatisfy({ (48 ... 57).contains($0) })
+            else {
+                return nil
+            }
+            usesFractionalSeconds = true
+        }
+
+        let formatter = ISO8601DateFormatter()
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        formatter.formatOptions = usesFractionalSeconds
+            ? [.withInternetDateTime, .withFractionalSeconds]
+            : [.withInternetDateTime]
+        return formatter.date(from: value)
     }
 }
 

@@ -121,7 +121,7 @@ enum EluJSONValue: Codable, Equatable, Sendable {
                 throw EluIdentityStateError.invalidJSONNumber
             }
         case let .string(value):
-            guard value.count <= Self.maximumStringLength else {
+            guard value.unicodeScalars.count <= Self.maximumStringLength else {
                 throw EluIdentityStateError.jsonValueTooLarge
             }
         case let .array(values):
@@ -136,7 +136,7 @@ enum EluJSONValue: Codable, Equatable, Sendable {
                 throw EluIdentityStateError.jsonValueTooLarge
             }
             for (key, value) in values {
-                guard !key.isEmpty, key.count <= Self.maximumKeyLength else {
+                guard !key.isEmpty, key.unicodeScalars.count <= Self.maximumKeyLength else {
                     throw EluIdentityStateError.invalidPropertyKey
                 }
                 try value.validate(depth: depth + 1, remainingNodes: &remainingNodes)

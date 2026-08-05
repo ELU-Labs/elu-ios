@@ -12,15 +12,7 @@ struct EluIdentitySnapshot: Equatable, Sendable {
     var flagContext: EluFlagContext
 }
 
-struct EluStreamPosition: Equatable, Sendable {
-    var streamId: String
-    var sequence: Int64
-}
-
 actor EluIdentityCore {
-    private static let maximumFlagGroups = 64
-    private static let maximumFlagProperties = 256
-
     private let store: any EluIdentityStateStore
     private let clock: @Sendable () -> Date
     private let anonymousIdGenerator: @Sendable () -> String
@@ -28,7 +20,7 @@ actor EluIdentityCore {
 
     private var identity: EluIdentityState
     private var streamMetadata: EluStreamMetadata
-    private var flagContext = EluFlagContext()
+    private var flagContext: EluFlagContext
 
     init(
         store: any EluIdentityStateStore,
@@ -48,40 +40,27 @@ actor EluIdentityCore {
         self.anonymousIdGenerator = anonymousIdGenerator
         self.sessionIdGenerator = sessionIdGenerator
 
-        identity = try Self.loadOrCreateIdentity(
+        let state = try Self.loadOrCreateState(
             store: store,
             now: clock(),
-            anonymousIdGenerator: anonymousIdGenerator
-        )
-        streamMetadata = try Self.loadOrCreateStreamMetadata(
-            store: store,
+            anonymousIdGenerator: anonymousIdGenerator,
             streamIdGenerator: streamIdGenerator
         )
+        identity = state.identity
+        streamMetadata = state.streamMetadata
+        flagContext = Self.runtimeFlagContext(from: state.flagContext)
     }
 
     func snapshot() -> EluIdentitySnapshot {
+        // Sequence allocation belongs to the future durable queue. That layer
+        // must advance nextSequence atomically with enqueue; this core never
+        // reserves or advances it independently.
         EluIdentitySnapshot(
             identity: identity,
             streamId: streamMetadata.streamId,
             nextSequence: streamMetadata.nextSequence,
             flagContext: flagContext
         )
-    }
-
-    func nextSequence() throws -> EluStreamPosition {
-        guard streamMetadata.nextSequence < Int64.max else {
-            throw EluIdentityStateError.counterExhausted
-        }
-        let position = EluStreamPosition(
-            streamId: streamMetadata.streamId,
-            sequence: streamMetadata.nextSequence
-        )
-        var next = streamMetadata
-        next.nextSequence += 1
-        try next.validate()
-        try store.saveStreamMetadata(next)
-        streamMetadata = next
-        return position
     }
 
     func identify(_ userId: String) throws {
@@ -114,21 +93,25 @@ actor EluIdentityCore {
         }
 
         let previousKey = identity.groups[type]
-        var next = identity
+        var nextIdentity = identity
         if let key {
-            if next.groups[type] == nil, next.groups.count >= EluIdentityState.maximumGroups {
+            if nextIdentity.groups[type] == nil,
+               nextIdentity.groups.count >= EluIdentityState.maximumGroups
+            {
                 throw EluIdentityStateError.tooManyGroups
             }
-            next.groups[type] = key
+            nextIdentity.groups[type] = key
         } else {
-            next.groups.removeValue(forKey: type)
+            nextIdentity.groups.removeValue(forKey: type)
         }
-        next.contextRevision = try increment(next.contextRevision)
-        next.updatedAt = clock()
-        try persist(next)
+
+        var nextFlagContext = flagContext
         if previousKey != key {
-            flagContext.groupProperties.removeValue(forKey: type)
+            nextFlagContext.groupProperties.removeValue(forKey: type)
         }
+        nextIdentity.contextRevision = try increment(nextIdentity.contextRevision)
+        nextIdentity.updatedAt = clock()
+        try persist(nextIdentity, flagContext: nextFlagContext)
     }
 
     func registerSuperProperties(_ properties: [String: EluJSONValue]) throws {
@@ -146,12 +129,14 @@ actor EluIdentityCore {
     }
 
     func resetGroups() throws {
-        var next = identity
-        next.groups = [:]
-        next.contextRevision = try increment(next.contextRevision)
-        next.updatedAt = clock()
-        try persist(next)
-        flagContext.groupProperties = [:]
+        var nextIdentity = identity
+        nextIdentity.groups = [:]
+        nextIdentity.contextRevision = try increment(nextIdentity.contextRevision)
+        nextIdentity.updatedAt = clock()
+
+        var nextFlagContext = flagContext
+        nextFlagContext.groupProperties = [:]
+        try persist(nextIdentity, flagContext: nextFlagContext)
     }
 
     func unregisterSuperProperty(_ key: String) throws {
@@ -171,7 +156,7 @@ actor EluIdentityCore {
         for (key, value) in properties {
             nextFlagContext.personProperties[key] = value
         }
-        guard nextFlagContext.personProperties.count <= Self.maximumFlagProperties else {
+        guard nextFlagContext.personProperties.count <= EluPersistedFlagContext.maximumProperties else {
             throw EluIdentityStateError.tooManySuperProperties
         }
         try persistContextMutation(flagContext: nextFlagContext)
@@ -187,11 +172,11 @@ actor EluIdentityCore {
         for (key, value) in properties {
             group[key] = value
         }
-        guard group.count <= Self.maximumFlagProperties else {
+        guard group.count <= EluPersistedFlagContext.maximumProperties else {
             throw EluIdentityStateError.tooManySuperProperties
         }
         if nextFlagContext.groupProperties[type] == nil,
-           nextFlagContext.groupProperties.count >= Self.maximumFlagGroups
+           nextFlagContext.groupProperties.count >= EluPersistedFlagContext.maximumGroups
         {
             throw EluIdentityStateError.tooManyGroups
         }
@@ -207,27 +192,47 @@ actor EluIdentityCore {
     }
 
     @discardableResult
-    func startSession(timeoutSeconds: Int = 1_800) throws -> EluSessionState {
+    func recordEligibleActivity(timeoutSeconds requestedTimeoutSeconds: Int = 1_800) throws
+        -> EluSessionState
+    {
+        let timeoutSeconds = min(max(requestedTimeoutSeconds, 60), 36_000)
         let now = clock()
-        let session = try EluSessionState(
-            id: sessionIdGenerator(),
-            startedAt: now,
-            lastActivityAt: now,
-            timeoutSeconds: timeoutSeconds
-        )
-        var next = identity
-        next.session = session
-        next.updatedAt = now
-        try persist(next)
-        return session
-    }
+        let previousSession = identity.session
 
-    @discardableResult
-    func touchSession() throws -> EluSessionState? {
-        guard var session = identity.session else { return nil }
-        let now = clock()
-        session.lastActivityAt = now
-        try session.validate()
+        let shouldRotate: Bool
+        if let previousSession {
+            let idleSeconds = now.timeIntervalSince(previousSession.lastActivityAt)
+            let durationSeconds = now.timeIntervalSince(previousSession.startedAt)
+            let clockMovedBackward = now < previousSession.lastActivityAt
+                || now < previousSession.startedAt
+            shouldRotate = clockMovedBackward
+                || idleSeconds >= Double(timeoutSeconds)
+                || durationSeconds >= Double(EluSessionState.requiredMaximumDurationSeconds)
+        } else {
+            shouldRotate = true
+        }
+
+        let session: EluSessionState
+        if shouldRotate {
+            let nextId = sessionIdGenerator()
+            if let previousSession, nextId == previousSession.id {
+                throw EluIdentityStateError.invalidIdentifier("sessionId")
+            }
+            session = try EluSessionState(
+                id: nextId,
+                startedAt: now,
+                lastActivityAt: now,
+                timeoutSeconds: timeoutSeconds
+            )
+        } else if var resumed = previousSession {
+            resumed.lastActivityAt = now
+            resumed.timeoutSeconds = timeoutSeconds
+            try resumed.validate()
+            session = resumed
+        } else {
+            preconditionFailure("A missing session must take the rotation path")
+        }
+
         var next = identity
         next.session = session
         next.updatedAt = now
@@ -272,8 +277,7 @@ actor EluIdentityCore {
         next.revision = try increment(next.revision)
         next.contextRevision = try increment(next.contextRevision)
         next.updatedAt = clock()
-        try persist(next)
-        flagContext = EluFlagContext()
+        try persist(next, flagContext: EluFlagContext())
     }
 
     private func advanceContextRevision() throws {
@@ -287,14 +291,26 @@ actor EluIdentityCore {
         var next = identity
         next.contextRevision = try increment(next.contextRevision)
         next.updatedAt = clock()
-        try persist(next)
-        flagContext = nextFlagContext
+        try persist(next, flagContext: nextFlagContext)
     }
 
-    private func persist(_ next: EluIdentityState) throws {
-        try next.validate()
-        try store.saveIdentity(next)
-        identity = next
+    private func persist(
+        _ nextIdentity: EluIdentityState,
+        flagContext nextFlagContext: EluFlagContext? = nil
+    ) throws {
+        let resolvedFlagContext = nextFlagContext ?? flagContext
+        let persistedFlagContext = try EluPersistedFlagContext(
+            personProperties: resolvedFlagContext.personProperties,
+            groupProperties: resolvedFlagContext.groupProperties
+        )
+        let state = try EluPersistedState(
+            identity: nextIdentity,
+            streamMetadata: streamMetadata,
+            flagContext: persistedFlagContext
+        )
+        try store.save(state, mode: .normal)
+        identity = nextIdentity
+        flagContext = resolvedFlagContext
     }
 
     private func increment(_ value: Int64) throws -> Int64 {
@@ -305,7 +321,7 @@ actor EluIdentityCore {
     }
 
     private func validateProperties(_ properties: [String: EluJSONValue]) throws {
-        guard properties.count <= Self.maximumFlagProperties else {
+        guard properties.count <= EluPersistedFlagContext.maximumProperties else {
             throw EluIdentityStateError.tooManySuperProperties
         }
         for (key, value) in properties {
@@ -316,68 +332,99 @@ actor EluIdentityCore {
         }
     }
 
-    private static func loadOrCreateIdentity(
+    private static func loadOrCreateState(
         store: any EluIdentityStateStore,
         now: Date,
-        anonymousIdGenerator: @Sendable () -> String
-    ) throws -> EluIdentityState {
-        var recoveringCorruption = false
-        var identityWasMissing = false
-        do {
-            if let identity = try store.loadIdentity() {
-                try identity.validate()
-                return identity
-            }
-            identityWasMissing = true
-        } catch let error as EluIdentityStateStoreError {
-            guard error == .corrupted(.identity) else { throw error }
-            recoveringCorruption = true
-        } catch is EluIdentityStateError {
-            // A decodable but invalid record is recoverable corruption.
-            recoveringCorruption = true
+        anonymousIdGenerator: @Sendable () -> String,
+        streamIdGenerator: @Sendable () -> String
+    ) throws -> EluPersistedState {
+        switch try store.load() {
+        case let .loaded(state):
+            return state
+        case .missing:
+            let state = try makeState(
+                identity: nil,
+                streamMetadata: nil,
+                flagContext: nil,
+                failClosed: false,
+                now: now,
+                anonymousIdGenerator: anonymousIdGenerator,
+                streamIdGenerator: streamIdGenerator
+            )
+            try store.save(state, mode: .recovery)
+            return state
+        case let .recoverable(components):
+            let identityIsValid = components.identity != nil
+            let state = try makeState(
+                identity: components.identity,
+                streamMetadata: components.streamMetadata,
+                flagContext: identityIsValid ? components.flagContext : nil,
+                failClosed: !identityIsValid,
+                forceOptOut: components.forceOptOut,
+                now: now,
+                anonymousIdGenerator: anonymousIdGenerator,
+                streamIdGenerator: streamIdGenerator
+            )
+            try store.save(state, mode: .recovery)
+            return state
         }
-
-        if identityWasMissing {
-            do {
-                recoveringCorruption = try store.loadStreamMetadata() != nil
-            } catch let error as EluIdentityStateStoreError {
-                guard error == .corrupted(.streamMetadata) else { throw error }
-                recoveringCorruption = true
-            }
-        }
-
-        let identity = try EluIdentityState(
-            revision: 0,
-            contextRevision: 0,
-            anonymousId: anonymousIdGenerator(),
-            userId: nil,
-            groups: [:],
-            superProperties: [:],
-            session: nil,
-            optedOut: recoveringCorruption,
-            updatedAt: now
-        )
-        try store.saveIdentity(identity)
-        return identity
     }
 
-    private static func loadOrCreateStreamMetadata(
-        store: any EluIdentityStateStore,
+    private static func makeState(
+        identity existingIdentity: EluIdentityState?,
+        streamMetadata existingStreamMetadata: EluStreamMetadata?,
+        flagContext existingFlagContext: EluPersistedFlagContext?,
+        failClosed: Bool,
+        forceOptOut: Bool = false,
+        now: Date,
+        anonymousIdGenerator: @Sendable () -> String,
         streamIdGenerator: @Sendable () -> String
-    ) throws -> EluStreamMetadata {
-        do {
-            if let metadata = try store.loadStreamMetadata() {
-                try metadata.validate()
-                return metadata
+    ) throws -> EluPersistedState {
+        let identity: EluIdentityState
+        if var existingIdentity {
+            if forceOptOut, !existingIdentity.optedOut {
+                existingIdentity.optedOut = true
+                existingIdentity.updatedAt = now
             }
-        } catch let error as EluIdentityStateStoreError {
-            guard error == .corrupted(.streamMetadata) else { throw error }
-        } catch is EluIdentityStateError {
-            // A decodable but invalid record is recoverable corruption.
+            identity = existingIdentity
+        } else {
+            identity = try EluIdentityState(
+                revision: 0,
+                contextRevision: 0,
+                anonymousId: anonymousIdGenerator(),
+                userId: nil,
+                groups: [:],
+                superProperties: [:],
+                session: nil,
+                optedOut: failClosed,
+                updatedAt: now
+            )
         }
 
-        let metadata = try EluStreamMetadata(streamId: streamIdGenerator())
-        try store.saveStreamMetadata(metadata)
-        return metadata
+        let streamMetadata: EluStreamMetadata
+        if let existingStreamMetadata {
+            streamMetadata = existingStreamMetadata
+        } else {
+            streamMetadata = try EluStreamMetadata(streamId: streamIdGenerator())
+        }
+
+        let flagContext: EluPersistedFlagContext
+        if let existingFlagContext {
+            flagContext = existingFlagContext
+        } else {
+            flagContext = try EluPersistedFlagContext()
+        }
+        return try EluPersistedState(
+            identity: identity,
+            streamMetadata: streamMetadata,
+            flagContext: flagContext
+        )
+    }
+
+    private static func runtimeFlagContext(from context: EluPersistedFlagContext) -> EluFlagContext {
+        EluFlagContext(
+            personProperties: context.personProperties,
+            groupProperties: context.groupProperties
+        )
     }
 }
