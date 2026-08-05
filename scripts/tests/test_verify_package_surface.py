@@ -32,7 +32,16 @@ def package_dump() -> dict[str, object]:
             }
         ],
         "targets": [
-            {"name": "EluAnalytics", "type": "regular"},
+            {
+                "name": "EluAnalytics",
+                "type": "regular",
+                "settings": [
+                    {
+                        "kind": {"linkedLibrary": {"_0": "sqlite3"}},
+                        "tool": "linker",
+                    }
+                ],
+            },
             {"name": "EluAnalyticsTests", "type": "test"},
         ],
         "dependencies": [

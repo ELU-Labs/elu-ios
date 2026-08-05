@@ -14,7 +14,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 SNAPSHOT = ROOT / "Baselines" / "package-validation" / "package-metadata.json"
 DEPENDENCIES = ROOT / "legal" / "THIRD_PARTY_NOTICES.dependencies.json"
 PACKAGE_MANIFEST = ROOT / "Package.swift"
-SNAPSHOT_VERSION = 2
+SNAPSHOT_VERSION = 3
 
 
 def parse_args() -> argparse.Namespace:
@@ -93,6 +93,24 @@ def main() -> int:
         required_target_names = {item["name"] for item in package["targets"]}
         if not required_target_names.issubset(actual_target_names):
             fail("strict package removed a frozen facade or test target")
+
+    actual_target_settings: dict[str, list[dict[str, str]]] = {}
+    for target in actual.get("targets", []):
+        settings: list[dict[str, str]] = []
+        for setting in target.get("settings", []):
+            kind = setting.get("kind", {})
+            linked_library = kind.get("linkedLibrary") if isinstance(kind, dict) else None
+            if (
+                setting.get("tool") != "linker"
+                or not isinstance(linked_library, dict)
+                or set(linked_library) != {"_0"}
+                or not isinstance(linked_library.get("_0"), str)
+            ):
+                fail(f"unsupported target setting on {target.get('name')}")
+            settings.append({"tool": "linker", "linkedLibrary": linked_library["_0"]})
+        actual_target_settings[target["name"]] = settings
+    if actual_target_settings != package["targetSettings"]:
+        fail(f"target linker settings changed: {actual_target_settings!r}")
 
     dependencies = actual.get("dependencies", [])
     if args.mode == "strict":
