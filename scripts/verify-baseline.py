@@ -74,6 +74,7 @@ def main() -> int:
         fail("legal dependency inventory is incomplete")
 
     subprocess.check_call([sys.executable, "Conformance/validate-baselines.py"], cwd=ROOT)
+    subprocess.check_call([sys.executable, "scripts/validate-upgrade-evidence.py"], cwd=ROOT)
     print("verified immutable package/API snapshot and conformance fixtures")
     return 0
 
