@@ -922,6 +922,20 @@ class UpgradeEvidenceCaptureTests(unittest.TestCase):
                 },
             )
 
+    def test_failed_continuity_diagnostic_contains_only_check_names(self) -> None:
+        observed = {
+            "sameApplicationContainer": True,
+            "identityPreserved": False,
+            "sourceSessionPresent": True,
+            "candidateSessionPresent": True,
+            "sessionRotated": False,
+        }
+
+        self.assertEqual(
+            RUNNER.failed_continuity_checks(observed),
+            ("identityPreserved", "sessionRotated"),
+        )
+
     def test_capture_ledger_rejects_marker_at_wrong_method_or_path(self) -> None:
         for method, path in (
             ("GET", "/batch"),

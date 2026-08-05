@@ -439,6 +439,11 @@ def run_result_blocker_code(build: str, failure: str, config_get_observed: bool)
     return f"{prefix}_RUN_{failure}_{observation[0]}"
 
 
+def failed_continuity_checks(observed: dict[str, bool]) -> tuple[str, ...]:
+    """Return only fixed check names; never expose captured identity or session values."""
+    return tuple(name for name, passed in observed.items() if not passed)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=pathlib.Path, required=True)
@@ -1308,6 +1313,7 @@ def main() -> int:
             manifest["blockers"] = []
             status = 0
         else:
+            failed_checks = failed_continuity_checks(observed)
             manifest["verificationStatus"] = "failed"
             manifest["blockers"] = [
                 {
@@ -1315,6 +1321,11 @@ def main() -> int:
                     "detail": "At least one same-container identity or observable network-session check failed.",
                 }
             ]
+            print(
+                "upgrade evidence failed: CONTINUITY_NOT_PRESERVED "
+                f"(failed checks: {','.join(failed_checks)})",
+                file=sys.stderr,
+            )
             status = 1
     except HarnessBlocked as error:
         manifest["verificationStatus"] = "blocked"
