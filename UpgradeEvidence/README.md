@@ -40,9 +40,10 @@ is not a continuity invariant. The runner and independent validator instead
 require the source and candidate sentinel bytes to match at the same relative
 location. The generated identity and session values appear only in the raw
 archive. The runner stores failure diagnostics there as well, prints only
-normalized status, and refuses an output directory inside the repository. Marker-shaped
-payloads count only when captured on the source SDK's parameter-free telemetry
-route. Foundation may serialize that route as `POST /batch` or `POST /batch?`;
+normalized status, and refuses an output directory inside the repository.
+Marker-shaped payloads count only when captured on the source SDK's
+parameter-free telemetry route. Foundation may serialize that route as
+`POST /batch` or `POST /batch?`;
 both spellings are accepted, while other methods, paths, and non-empty queries
 are ignored by both the runner and the independent archive validator.
 

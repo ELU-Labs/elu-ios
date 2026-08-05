@@ -975,6 +975,38 @@ class UpgradeEvidenceCaptureTests(unittest.TestCase):
                 candidate,
             )
 
+    def test_missing_candidate_sentinel_is_negative_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            raw_directory = root / "raw"
+            observed = RUNNER.observe_candidate_container_sentinel(
+                root / "candidate-container",
+                raw_directory,
+            )
+
+            self.assertEqual(observed, b"")
+            self.assertEqual(
+                (raw_directory / RUNNER.RAW_CONTAINER_SENTINELS["candidate"]).read_bytes(),
+                b"",
+            )
+
+    def test_candidate_sentinel_io_error_is_a_runner_blocker(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            target = root / "candidate-container" / RUNNER.CONTAINER_SENTINEL_RELATIVE
+            target.mkdir(parents=True)
+
+            with self.assertRaises(RUNNER.HarnessBlocked) as raised:
+                RUNNER.observe_candidate_container_sentinel(
+                    root / "candidate-container",
+                    root / "raw",
+                )
+
+            self.assertEqual(
+                raised.exception.code,
+                "CANDIDATE_CONTAINER_SENTINEL_READ_FAILED",
+            )
+
     def test_capture_ledger_rejects_marker_at_wrong_method_or_path(self) -> None:
         for method, path in (
             ("GET", "/batch"),

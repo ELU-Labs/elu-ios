@@ -57,6 +57,9 @@ TELEMETRY_METHOD = "POST"
 TELEMETRY_PATH = "/batch"
 TELEMETRY_TARGETS = frozenset((TELEMETRY_PATH, f"{TELEMETRY_PATH}?"))
 CONTAINER_SENTINEL_BYTES = 32
+CONTAINER_SENTINEL_RELATIVE = (
+    "Library/Application Support/dev.elu.sdk-upgrade-evidence/container-sentinel.bin"
+)
 RAW_CONTAINER_SENTINELS = {
     "source": "application-container/source-sentinel.bin",
     "candidate": "application-container/candidate-sentinel.bin",
@@ -680,6 +683,7 @@ def verify_raw_evidence(
     if exact_keys(
         container,
         {
+            "sentinelRelativePath",
             "sourcePathSha256",
             "candidatePathSha256",
             "sourceSentinelSha256",
@@ -688,6 +692,8 @@ def verify_raw_evidence(
         "raw provenance applicationContainer",
         errors,
     ):
+        if container.get("sentinelRelativePath") != CONTAINER_SENTINEL_RELATIVE:
+            errors.append("raw provenance application-container sentinel path is invalid")
         for field in (
             "sourcePathSha256",
             "candidatePathSha256",
@@ -708,8 +714,8 @@ def verify_raw_evidence(
             candidate_sentinel = b""
         if len(source_sentinel) != CONTAINER_SENTINEL_BYTES:
             errors.append("raw source application-container sentinel has an invalid length")
-        if len(candidate_sentinel) != CONTAINER_SENTINEL_BYTES:
-            errors.append("raw candidate application-container sentinel has an invalid length")
+        if len(candidate_sentinel) > CONTAINER_SENTINEL_BYTES + 1:
+            errors.append("raw candidate application-container sentinel exceeds the observation bound")
         if container.get("sourceSentinelSha256") != hashlib.sha256(source_sentinel).hexdigest():
             errors.append("raw source application-container sentinel digest does not match provenance")
         if container.get("candidateSentinelSha256") != hashlib.sha256(candidate_sentinel).hexdigest():

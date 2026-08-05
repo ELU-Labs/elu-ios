@@ -178,6 +178,9 @@ class UpgradeEvidenceValidationTests(unittest.TestCase):
             },
             "environment": manifest["environment"],
             "applicationContainer": {
+                "sentinelRelativePath": (
+                    "Library/Application Support/dev.elu.sdk-upgrade-evidence/container-sentinel.bin"
+                ),
                 "sourcePathSha256": "e" * 64,
                 "candidatePathSha256": "f" * 64,
                 "sourceSentinelSha256": hashlib.sha256(source_container_sentinel).hexdigest(),
@@ -277,6 +280,27 @@ class UpgradeEvidenceValidationTests(unittest.TestCase):
                 )
             self.assertNotEqual(result.returncode, 0)
 
+    def test_missing_candidate_sentinel_is_valid_failed_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = pathlib.Path(temporary)
+            manifest = self.verified_manifest()
+            manifest["observedContinuity"]["sameApplicationContainer"] = False  # type: ignore[index]
+            manifest["verificationStatus"] = "failed"
+            manifest["blockers"] = [
+                {
+                    "code": "CONTINUITY_NOT_PRESERVED",
+                    "detail": "Application data was not preserved.",
+                }
+            ]
+            archive = self.write_raw_archive(
+                directory,
+                manifest,
+                candidate_container_sentinel=b"",
+            )
+            path = self.write_json(directory, "manifest.json", manifest)
+            result = self.run_validator(manifest=path, raw_archive=archive)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_parameter_free_post_batch_marker_is_accepted(self) -> None:
         for source_path in ("/batch", "/batch?"):

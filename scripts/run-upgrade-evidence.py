@@ -147,6 +147,7 @@ BLOCKER_DETAILS = {
     "SOURCE_RUN_FAILED": "The source-version application did not establish observable identity and session evidence.",
     "CANDIDATE_RUN_FAILED": "The candidate application did not produce its same-container continuity result.",
     "SOURCE_CONTAINER_SENTINEL_FAILED": "The runner could not establish its source application-data sentinel.",
+    "CANDIDATE_CONTAINER_SENTINEL_READ_FAILED": "The runner could not read the candidate application-data sentinel.",
     "SOURCE_EXACT_BATCH_NOT_OBSERVED": "No exact source-version telemetry batch request was observed after launch.",
     "SOURCE_BATCH_UNREADABLE": "A source-version telemetry batch request was observed, but its fixed envelope could not be read.",
     "SOURCE_MARKER_EVENT_ABSENT": "Readable source-version telemetry batches did not contain the fixed marker event.",
@@ -520,8 +521,10 @@ def observe_candidate_container_sentinel(
     try:
         with target.open("rb") as stream:
             observed = stream.read(CONTAINER_SENTINEL_BYTES + 1)
-    except OSError:
+    except FileNotFoundError:
         observed = b""
+    except OSError:
+        raise HarnessBlocked("CANDIDATE_CONTAINER_SENTINEL_READ_FAILED") from None
     record_container_sentinel(raw_directory, "candidate", observed)
     return observed
 
@@ -1380,6 +1383,7 @@ def main() -> int:
                 "resolvedDependency": {"source": source_resolution, "candidate": candidate_resolution},
                 "environment": run_environment,
                 "applicationContainer": {
+                    "sentinelRelativePath": CONTAINER_SENTINEL_RELATIVE.as_posix(),
                     "sourcePathSha256": hashlib.sha256(str(source_container).encode("utf-8")).hexdigest(),
                     "candidatePathSha256": hashlib.sha256(str(candidate_container).encode("utf-8")).hexdigest(),
                     "sourceSentinelSha256": hashlib.sha256(source_container_sentinel).hexdigest(),
