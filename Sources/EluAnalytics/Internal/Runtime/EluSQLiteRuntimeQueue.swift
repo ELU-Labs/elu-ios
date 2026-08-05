@@ -19,6 +19,9 @@ enum EluRuntimeQueueError: Error, Equatable, Sendable {
     case headRecordExceedsPeekLimit(Int64)
     case poisoned
     case ambiguousCommit
+    case provenNotCommitted
+    case captureAuthorityExpiredBeforeWrite
+    case standaloneLegacyEntryPointUnavailable
     case faultInjected(EluRuntimeQueueFaultPoint)
 }
 
@@ -26,12 +29,14 @@ enum EluRuntimeQueueFaultPoint: Equatable, Sendable {
     case open
     case beforeInitialInstall
     case afterInitialInstall
+    case beforeBegin
     case afterBegin
     case afterStateRead
     case afterRecordInsert(Int)
     case beforeStateUpdate
     case beforeCommit
     case afterCommit
+    case beforeRollback
     case checkpoint
     case vacuum
 }
@@ -507,11 +512,13 @@ private enum EluRuntimeQueueBootstrap {
             )
             let databaseExists = fileManager.fileExists(atPath: databaseURL.path)
             if !databaseExists {
-                let importedState = try loadLegacyOrFreshState(
-                    directoryURL: canonicalURL,
-                    clock: clock,
-                    anonymousIdGenerator: anonymousIdGenerator,
-                    streamIdGenerator: streamIdGenerator
+                let importedState = normalizeLegacyOptedOutSession(
+                    try loadLegacyOrFreshState(
+                        directoryURL: canonicalURL,
+                        clock: clock,
+                        anonymousIdGenerator: anonymousIdGenerator,
+                        streamIdGenerator: streamIdGenerator
+                    )
                 )
                 try installFreshDatabase(
                     at: databaseURL,
@@ -523,11 +530,15 @@ private enum EluRuntimeQueueBootstrap {
             let inspectedState = try inspectExisting(databaseURL: databaseURL)
             let openedConnection = try EluSQLiteConnection(path: databaseURL.path, create: false)
             connection = openedConnection
-            let state = try inspectExisting(connection: openedConnection)
+            var state = try inspectExisting(connection: openedConnection)
             guard state == inspectedState else {
                 throw EluRuntimeQueueError.corruptStorage
             }
             try configureDurability(openedConnection, initializing: false)
+            state = try normalizeLegacyOptedOutSession(
+                connection: openedConnection,
+                state: state
+            )
 
             try? fileManager.setAttributes(
                 [.posixPermissions: 0o600],
@@ -744,6 +755,54 @@ private enum EluRuntimeQueueBootstrap {
                     flagContext: flagContext
                 )
             )
+        }
+    }
+
+    private static func normalizeLegacyOptedOutSession(
+        _ state: EluStoredRuntimeState
+    ) -> EluStoredRuntimeState {
+        guard state.identity.optedOut, state.identity.session != nil else { return state }
+        var normalized = state
+        normalized.identity.session = nil
+        return normalized
+    }
+
+    private static func normalizeLegacyOptedOutSession(
+        connection: EluSQLiteConnection,
+        state: EluStoredRuntimeState
+    ) throws -> EluStoredRuntimeState {
+        guard state.identity.optedOut, state.identity.session != nil else { return state }
+        guard state.generation < Int64.max else {
+            throw EluRuntimeQueueError.counterExhausted
+        }
+        try connection.execute("BEGIN IMMEDIATE")
+        do {
+            let diskState = try EluRuntimeDatabase.loadState(connection, validateQueue: false)
+            guard diskState == state else {
+                throw EluRuntimeQueueError.generationMismatch
+            }
+            var identity = diskState.identity
+            identity.session = nil
+            let normalized = EluStoredRuntimeState(
+                generation: diskState.generation + 1,
+                identity: identity,
+                flagContext: diskState.flagContext,
+                streamId: diskState.streamId,
+                nextSequence: diskState.nextSequence,
+                headSequence: diskState.headSequence,
+                liveCount: diskState.liveCount,
+                liveBytes: diskState.liveBytes
+            )
+            try EluRuntimeDatabase.updateState(
+                connection,
+                from: diskState.generation,
+                to: normalized
+            )
+            try connection.execute("COMMIT")
+            return normalized
+        } catch {
+            try? connection.execute("ROLLBACK")
+            throw error
         }
     }
 
@@ -1339,6 +1398,11 @@ private enum EluPreparedRecordDraft: Sendable {
 }
 
 actor EluSQLiteRuntimeQueue {
+    private static let reservedVersionProperties: Set<String> = [
+        "$elu_contract_version",
+        "$elu_sdk_version",
+        "$elu_facade_version",
+    ]
     private var resources: EluRuntimeResources?
     private var state: EluStoredRuntimeState
     private let limits: EluRuntimeQueueLimits
@@ -1346,6 +1410,13 @@ actor EluSQLiteRuntimeQueue {
     private let anonymousIdGenerator: @Sendable () -> String
     private let sessionIdGenerator: @Sendable () -> String
     private let faultInjector: (any EluRuntimeQueueFaultInjecting)?
+    private let captureConfigManager: EluV1ConfigManager?
+    private let ownerNamespaceHash: String?
+    private let continuousClock: @Sendable () -> UInt64
+    private let continuousBudgetConverter: @Sendable (UInt64) -> UInt64?
+    private var pinnedConfigSiteId: String?
+    private var captureAuthority: EluV1CaptureAuthorityState = .absent
+    private var authorityEpoch: UInt64 = 0
     private var isPoisoned = false
 
     static func open(
@@ -1378,6 +1449,93 @@ actor EluSQLiteRuntimeQueue {
             limits: limits,
             clock: clock,
             anonymousIdGenerator: anonymousIdGenerator,
+            sessionIdGenerator: sessionIdGenerator,
+            faultInjector: faultInjector,
+            ownerNamespaceHash: nil,
+            continuousClock: EluMachContinuousClock.now,
+            continuousBudgetConverter: EluMachContinuousClock.floorTicks
+        )
+    }
+
+    /// Opens the internal standalone runtime in a constructor-site-key scoped
+    /// directory. The site key never enters raw candidate submission or the
+    /// event wire shape. This runtime remains unreferenced by the public facade.
+    static func openCaptureRuntime(
+        rootDirectoryURL: URL,
+        exactConstructorSiteKey: String,
+        limits: EluRuntimeQueueLimits,
+        clock: @escaping @Sendable () -> Date = { Date() },
+        continuousClock: @escaping @Sendable () -> UInt64 = EluMachContinuousClock.now,
+        continuousBudgetConverter: @escaping @Sendable (UInt64) -> UInt64? =
+            EluMachContinuousClock.floorTicks,
+        anonymousIdGenerator: @escaping @Sendable () -> String = {
+            "anon_\(EluRuntimeIdentifier.compactUUID())"
+        },
+        streamIdGenerator: @escaping @Sendable () -> String = {
+            "stream_\(EluRuntimeIdentifier.compactUUID())"
+        },
+        sessionIdGenerator: @escaping @Sendable () -> String = {
+            "session_\(EluRuntimeIdentifier.compactUUID())"
+        },
+        faultInjector: (any EluRuntimeQueueFaultInjecting)? = nil
+    ) async throws -> EluSQLiteRuntimeQueue {
+        let namespaceHash = try EluV1SiteNamespace.digest(
+            exactConstructorSiteKey: exactConstructorSiteKey
+        )
+        let directoryURL = rootDirectoryURL.appendingPathComponent(
+            "site-\(namespaceHash)",
+            isDirectory: true
+        )
+        let opened = try await Task.detached(priority: .utility) {
+            try EluRuntimeQueueBootstrap.open(
+                directoryURL: directoryURL,
+                clock: clock,
+                anonymousIdGenerator: anonymousIdGenerator,
+                streamIdGenerator: streamIdGenerator,
+                faultInjector: faultInjector
+            )
+        }.value
+        return EluSQLiteRuntimeQueue(
+            resources: opened.resources,
+            state: opened.state,
+            limits: limits,
+            clock: clock,
+            anonymousIdGenerator: anonymousIdGenerator,
+            sessionIdGenerator: sessionIdGenerator,
+            faultInjector: faultInjector,
+            ownerNamespaceHash: namespaceHash,
+            continuousClock: continuousClock,
+            continuousBudgetConverter: continuousBudgetConverter
+        )
+    }
+
+    static func openCaptureRuntime(
+        rootDirectoryURL: URL,
+        exactConstructorSiteKey: String,
+        clock: @escaping @Sendable () -> Date = { Date() },
+        continuousClock: @escaping @Sendable () -> UInt64 = EluMachContinuousClock.now,
+        continuousBudgetConverter: @escaping @Sendable (UInt64) -> UInt64? =
+            EluMachContinuousClock.floorTicks,
+        anonymousIdGenerator: @escaping @Sendable () -> String = {
+            "anon_\(EluRuntimeIdentifier.compactUUID())"
+        },
+        streamIdGenerator: @escaping @Sendable () -> String = {
+            "stream_\(EluRuntimeIdentifier.compactUUID())"
+        },
+        sessionIdGenerator: @escaping @Sendable () -> String = {
+            "session_\(EluRuntimeIdentifier.compactUUID())"
+        },
+        faultInjector: (any EluRuntimeQueueFaultInjecting)? = nil
+    ) async throws -> EluSQLiteRuntimeQueue {
+        try await openCaptureRuntime(
+            rootDirectoryURL: rootDirectoryURL,
+            exactConstructorSiteKey: exactConstructorSiteKey,
+            limits: EluRuntimeQueueLimits(),
+            clock: clock,
+            continuousClock: continuousClock,
+            continuousBudgetConverter: continuousBudgetConverter,
+            anonymousIdGenerator: anonymousIdGenerator,
+            streamIdGenerator: streamIdGenerator,
             sessionIdGenerator: sessionIdGenerator,
             faultInjector: faultInjector
         )
@@ -1415,7 +1573,10 @@ actor EluSQLiteRuntimeQueue {
         clock: @escaping @Sendable () -> Date,
         anonymousIdGenerator: @escaping @Sendable () -> String,
         sessionIdGenerator: @escaping @Sendable () -> String,
-        faultInjector: (any EluRuntimeQueueFaultInjecting)?
+        faultInjector: (any EluRuntimeQueueFaultInjecting)?,
+        ownerNamespaceHash: String?,
+        continuousClock: @escaping @Sendable () -> UInt64,
+        continuousBudgetConverter: @escaping @Sendable (UInt64) -> UInt64?
     ) {
         self.resources = resources
         self.state = state
@@ -1424,6 +1585,10 @@ actor EluSQLiteRuntimeQueue {
         self.anonymousIdGenerator = anonymousIdGenerator
         self.sessionIdGenerator = sessionIdGenerator
         self.faultInjector = faultInjector
+        self.ownerNamespaceHash = ownerNamespaceHash
+        captureConfigManager = ownerNamespaceHash == nil ? nil : EluV1ConfigManager()
+        self.continuousClock = continuousClock
+        self.continuousBudgetConverter = continuousBudgetConverter
     }
 
     func snapshot() throws -> EluRuntimeQueueSnapshot {
@@ -1433,10 +1598,488 @@ actor EluSQLiteRuntimeQueue {
         return state.snapshot
     }
 
+    /// Validates raw config and effective privacy on this actor and installs a
+    /// non-transferable executable authority or terminal latch.
+    func submitCaptureAuthority(
+        configData: Data,
+        effectivePrivacyStateData: Data?
+    ) -> EluV1CaptureAuthorityUpdateResult {
+        // Lease time starts before any wall-clock read, decoding, hashing, or
+        // policy validation. Validation latency must consume the lease.
+        let monotonicOrigin = continuousClock()
+        guard let manager = captureConfigManager,
+              let ownerNamespaceHash,
+              !isPoisoned,
+              resources != nil
+        else {
+            return terminateCaptureAuthority(reason: .malformed)
+        }
+
+        let update: EluV1ConfigUpdateResult
+        do {
+            update = try manager.update(configData: configData, now: clock())
+        } catch let error as EluV1ConfigResolutionError {
+            let reason: EluV1CaptureAuthorityTerminalReason = error == .conflictingConfigAtIssuedAt
+                ? .conflict
+                : .malformed
+            let candidate = manager.validatedCandidateIdentity()
+            let candidateBoundary = candidate.map(Self.captureBoundary)
+            if let expired = expiredTerminalDominating(candidateBoundary) {
+                return .terminated(expired)
+            }
+            if reason == .malformed,
+               let restriction = restrictionTerminalDominating(
+                   candidateBoundary,
+                   candidateContextRevision: nil
+               )
+            {
+                return .terminated(restriction)
+            }
+            return terminateCaptureAuthority(
+                candidateBoundary: candidateBoundary,
+                policySourceHash: candidate?.policySourceHash,
+                reason: reason
+            )
+        } catch {
+            if let expired = expiredTerminalDominating(nil) {
+                return .terminated(expired)
+            }
+            if let restriction = restrictionTerminalDominating(
+                nil,
+                candidateContextRevision: nil
+            ) {
+                return .terminated(restriction)
+            }
+            return terminateCaptureAuthority(reason: .malformed)
+        }
+
+        let validatedCandidate = manager.validatedCandidateIdentity()
+        let validatedBoundary = validatedCandidate.map(Self.captureBoundary)
+        if let expired = expiredTerminalDominating(validatedBoundary) {
+            return .terminated(expired)
+        }
+
+        switch update {
+        case .disabled:
+            return terminateCaptureAuthority(
+                trustedBoundary: validatedBoundary,
+                candidateBoundary: validatedBoundary,
+                policySourceHash: validatedCandidate?.policySourceHash,
+                reason: .disabled
+            )
+        case .revoked:
+            return terminateCaptureAuthority(
+                trustedBoundary: validatedBoundary,
+                candidateBoundary: validatedBoundary,
+                policySourceHash: validatedCandidate?.policySourceHash,
+                reason: .revoked
+            )
+        case .expired:
+            return terminateCaptureAuthority(
+                trustedBoundary: validatedBoundary,
+                candidateBoundary: validatedBoundary,
+                policySourceHash: validatedCandidate?.policySourceHash,
+                reason: .expired
+            )
+        case .stale:
+            if let restriction = restrictionTerminalDominating(
+                validatedBoundary,
+                candidateContextRevision: nil
+            ) {
+                return .terminated(restriction)
+            }
+            return terminateCaptureAuthority(
+                candidateBoundary: validatedBoundary,
+                policySourceHash: validatedCandidate?.policySourceHash,
+                reason: .stale
+            )
+        case .enabled:
+            break
+        }
+
+        let resolution: EluV1ConfigResolution
+        let authorizationNow = clock()
+        do {
+            resolution = try manager.authorize(
+                effectivePrivacyStateData: effectivePrivacyStateData,
+                identity: identitySnapshot,
+                now: authorizationNow
+            )
+        } catch {
+            if let expired = expiredTerminalDominating(validatedBoundary) {
+                return .terminated(expired)
+            }
+            if let restriction = restrictionTerminalDominating(
+                validatedBoundary,
+                candidateContextRevision: nil
+            ) {
+                return .terminated(restriction)
+            }
+            return terminateCaptureAuthority(
+                trustedBoundary: validatedBoundary,
+                candidateBoundary: validatedBoundary,
+                policySourceHash: validatedCandidate?.policySourceHash,
+                reason: .malformed
+            )
+        }
+
+        let boundary = EluV1CaptureConfigBoundary(
+            issuedAt: resolution.exactIssuedAt,
+            semanticHash: resolution.configSemanticHash
+        )
+        if let pinnedConfigSiteId {
+            guard pinnedConfigSiteId == resolution.siteId else {
+                return terminateCaptureAuthority(
+                    trustedBoundary: boundary,
+                    candidateBoundary: boundary,
+                    policySourceHash: resolution.policySourceHash,
+                    contextRevision: resolution.decisionContextRevision,
+                    reason: .siteChanged
+                )
+            }
+        } else {
+            pinnedConfigSiteId = resolution.siteId
+        }
+
+        // Once this exact config boundary has expired under either wall or
+        // monotonic time, mutable identity/context changes cannot revive it.
+        if case let .terminal(current) = captureAuthority,
+           current.reason == .expired,
+           current.trustedConfigBoundary == boundary
+        {
+            return .terminated(current)
+        }
+
+        guard resolution.captureAuthorization == .authorized,
+              let decisionHash = resolution.decisionHash,
+              !state.identity.optedOut
+        else {
+            let reason: EluV1CaptureAuthorityTerminalReason
+            switch resolution.captureAuthorization {
+            case .restricted:
+                reason = .privacyBlocked
+            case let .invalid(invalidReason):
+                if invalidReason == .contextRevisionMismatch,
+                   let candidateContext = resolution.decisionContextRevision,
+                   candidateContext < state.identity.contextRevision
+                {
+                    reason = .stale
+                } else {
+                    reason = .malformed
+                }
+            case .authorized:
+                reason = .privacyBlocked
+            }
+            if reason == .stale || reason == .malformed,
+               let restriction = restrictionTerminalDominating(
+                   boundary,
+                   candidateContextRevision: resolution.decisionContextRevision
+               )
+            {
+                return .terminated(restriction)
+            }
+            return terminateCaptureAuthority(
+                trustedBoundary: boundary,
+                candidateBoundary: boundary,
+                policySourceHash: resolution.policySourceHash,
+                contextRevision: resolution.decisionContextRevision,
+                reason: reason
+            )
+        }
+
+        // Restriction dominates a same-config, same-context allow. A higher
+        // context witness or newer config is required to loosen it.
+        if case let .terminal(current) = captureAuthority,
+           current.reason == .privacyBlocked,
+           current.trustedConfigBoundary == boundary,
+           current.contextRevision == state.identity.contextRevision
+        {
+            return .terminated(current)
+        }
+
+        guard !resolution.exactExpiresAt.isAtOrBefore(authorizationNow),
+              let wallRemaining = resolution.exactExpiresAt.floorNanoseconds(
+                  after: authorizationNow
+              ),
+              let declaredRemaining = resolution.exactExpiresAt.floorNanoseconds(
+                  since: resolution.exactIssuedAt
+              ),
+              let durableRemaining = resolution.exactExpiresAt.floorNanoseconds(
+                  after: durableWallFloor
+              )
+        else {
+            return terminateCaptureAuthority(
+                trustedBoundary: boundary,
+                candidateBoundary: boundary,
+                policySourceHash: resolution.policySourceHash,
+                contextRevision: resolution.decisionContextRevision,
+                reason: .expired
+            )
+        }
+        let remainingNanoseconds = min(
+            min(wallRemaining, declaredRemaining),
+            durableRemaining
+        )
+        guard remainingNanoseconds > 0,
+              let monotonicBudget = continuousBudgetConverter(remainingNanoseconds),
+              monotonicBudget > 0
+        else {
+            return terminateCaptureAuthority(
+                trustedBoundary: boundary,
+                candidateBoundary: boundary,
+                policySourceHash: resolution.policySourceHash,
+                contextRevision: resolution.decisionContextRevision,
+                reason: .expired
+            )
+        }
+        let monotonicInstalledAt = continuousClock()
+        guard monotonicInstalledAt &- monotonicOrigin < monotonicBudget else {
+            return terminateCaptureAuthority(
+                trustedBoundary: boundary,
+                candidateBoundary: boundary,
+                policySourceHash: resolution.policySourceHash,
+                contextRevision: resolution.decisionContextRevision,
+                reason: .expired
+            )
+        }
+
+        let epoch = nextAuthorityEpoch()
+        let authority = EluV1CaptureAuthoritySnapshot(
+            ownerEpoch: epoch,
+            configBoundary: boundary,
+            expiresAt: resolution.exactExpiresAt,
+            policySourceHash: resolution.policySourceHash,
+            decisionHash: decisionHash,
+            ownerNamespaceHash: ownerNamespaceHash,
+            configSiteId: resolution.siteId,
+            streamId: state.streamId,
+            identityRevision: state.identity.revision,
+            contextRevision: state.identity.contextRevision,
+            identityOptedOut: state.identity.optedOut,
+            monotonicStartedAt: monotonicOrigin,
+            monotonicBudget: monotonicBudget,
+            idleTimeoutSeconds: resolution.sessionIdleTimeoutSeconds,
+            maximumDurationSeconds: resolution.sessionMaximumDurationSeconds
+        )
+        captureAuthority = .authorized(authority)
+        return .activated(authority)
+    }
+
+    /// Creates and consumes admission entirely inside this actor operation.
+    /// No authority token or detached resolution is returned to the caller.
+    func capture(_ command: EluV1CaptureCommand) -> EluV1CaptureResult {
+        let before = state.snapshot
+        guard command.kind == .capture || command.kind == .screen,
+              validCaptureName(command.name),
+              validateCaptureProperties(command.properties),
+              let occurredAt = canonicalDate(command.occurredAt),
+              occurredAt >= state.identity.updatedAt
+        else {
+            return .rejected(.invalidEvent, snapshot: before)
+        }
+
+        let authority: EluV1CaptureAuthoritySnapshot
+        switch captureAuthority {
+        case .absent:
+            return .rejected(.authorityAbsent, snapshot: before)
+        case .terminal:
+            return .rejected(.authorityTerminal, snapshot: before)
+        case let .authorized(snapshot):
+            authority = snapshot
+        }
+
+        guard authorityWitnessMatches(authority, diskState: state) else {
+            return .rejected(
+                state.identity.optedOut ? .optedOut : .authorityWitnessChanged,
+                snapshot: before
+            )
+        }
+        guard authorityIsLive(authority, wallNow: clock(), monotonicNow: continuousClock()) else {
+            latchExpiredAuthority(authority)
+            return .rejected(.authorityExpired, snapshot: before)
+        }
+
+        let prepared: (identity: EluIdentityState, draft: EluEventDraft)
+        do {
+            prepared = try prepareCapture(
+                command: command,
+                occurredAt: occurredAt,
+                authority: authority
+            )
+        } catch {
+            return .rejected(.invalidEvent, snapshot: before)
+        }
+
+        for attempt in 0 ... 1 {
+            do {
+                let result = try commitPrepared(
+                    expectedGeneration: state.generation,
+                    identity: prepared.identity,
+                    flagContext: state.flagContext,
+                    drafts: [.event(prepared.draft)],
+                    surfaceProvenNotCommitted: true,
+                    prewriteValidation: { diskState in
+                        guard self.authorityWitnessMatches(authority, diskState: diskState) else {
+                            throw EluRuntimeQueueError.generationMismatch
+                        }
+                        guard self.authorityIsLive(
+                            authority,
+                            wallNow: self.clock(),
+                            monotonicNow: self.continuousClock()
+                        ) else {
+                            throw EluRuntimeQueueError.captureAuthorityExpiredBeforeWrite
+                        }
+                    }
+                )
+                guard let record = result.records.first else {
+                    return .rejected(.invalidEvent, snapshot: before)
+                }
+                return .accepted(record, snapshot: result.snapshot)
+            } catch EluRuntimeQueueError.provenNotCommitted where attempt == 0 {
+                guard !isPoisoned, resources != nil else {
+                    return .rejected(
+                        .storageProvenNotCommitted,
+                        snapshot: state.snapshot
+                    )
+                }
+                guard authorityWitnessMatches(authority, diskState: state) else {
+                    return .rejected(
+                        state.identity.optedOut ? .optedOut : .authorityWitnessChanged,
+                        snapshot: state.snapshot
+                    )
+                }
+                guard authorityIsLive(
+                    authority,
+                    wallNow: clock(),
+                    monotonicNow: continuousClock()
+                ) else {
+                    latchExpiredAuthority(authority)
+                    return .rejected(.authorityExpired, snapshot: state.snapshot)
+                }
+                continue
+            } catch EluRuntimeQueueError.provenNotCommitted {
+                return .rejected(.storageProvenNotCommitted, snapshot: state.snapshot)
+            } catch EluRuntimeQueueError.ambiguousCommit {
+                return .rejected(.storageOutcomeUnknown, snapshot: before)
+            } catch EluRuntimeQueueError.poisoned {
+                // This capture could not acquire the already-poisoned owner,
+                // so no transaction or write was attempted for this call.
+                return .rejected(.storageProvenNotCommitted, snapshot: state.snapshot)
+            } catch EluRuntimeQueueError.queueCountLimitExceeded,
+                    EluRuntimeQueueError.queueByteLimitExceeded {
+                return .rejected(.queueLimit, snapshot: state.snapshot)
+            } catch EluRuntimeQueueError.generationMismatch {
+                return .rejected(.authorityWitnessChanged, snapshot: state.snapshot)
+            } catch EluRuntimeQueueError.captureAuthorityExpiredBeforeWrite {
+                latchExpiredAuthority(authority)
+                return .rejected(.authorityExpired, snapshot: state.snapshot)
+            } catch EluRuntimeQueueError.invalidState {
+                if !authorityIsLive(
+                    authority,
+                    wallNow: clock(),
+                    monotonicNow: continuousClock()
+                ) {
+                    latchExpiredAuthority(authority)
+                    return .rejected(.authorityExpired, snapshot: state.snapshot)
+                }
+                return .rejected(.authorityWitnessChanged, snapshot: state.snapshot)
+            } catch {
+                return .rejected(.invalidEvent, snapshot: state.snapshot)
+            }
+        }
+        return .rejected(.storageProvenNotCommitted, snapshot: state.snapshot)
+    }
+
+    @discardableResult
+    func registerStandaloneSuperProperties(
+        _ properties: [String: EluJSONValue]
+    ) throws -> EluRuntimeQueueSnapshot {
+        guard !properties.isEmpty,
+              validateCaptureProperties(properties),
+              Set(properties.keys).isDisjoint(with: Self.reservedVersionProperties),
+              state.identity.contextRevision < Int64.max,
+              let now = canonicalDate(clock()),
+              now >= state.identity.updatedAt
+        else {
+            throw EluRuntimeQueueError.invalidRecord
+        }
+        var identity = state.identity
+        for (key, value) in properties { identity.superProperties[key] = value }
+        guard identity.superProperties.count <= EluIdentityState.maximumSuperProperties else {
+            throw EluRuntimeQueueError.invalidRecord
+        }
+        identity.contextRevision += 1
+        identity.updatedAt = now
+        return try commitPrepared(
+            expectedGeneration: state.generation,
+            identity: identity,
+            flagContext: state.flagContext,
+            drafts: []
+        ).snapshot
+    }
+
+    @discardableResult
+    func unregisterStandaloneSuperProperty(_ key: String) throws -> EluRuntimeQueueSnapshot {
+        guard EluIdentityState.valid(key, maximumLength: 256),
+              !Self.reservedVersionProperties.contains(key),
+              state.identity.contextRevision < Int64.max,
+              let now = canonicalDate(clock()),
+              now >= state.identity.updatedAt
+        else {
+            throw EluRuntimeQueueError.invalidRecord
+        }
+        var identity = state.identity
+        identity.superProperties.removeValue(forKey: key)
+        identity.contextRevision += 1
+        identity.updatedAt = now
+        return try commitPrepared(
+            expectedGeneration: state.generation,
+            identity: identity,
+            flagContext: state.flagContext,
+            drafts: []
+        ).snapshot
+    }
+
+    @discardableResult
+    func markStandaloneBackgrounded(at rawDate: Date? = nil) throws -> EluV1BackgroundResult {
+        let before = state.snapshot
+        guard !state.identity.optedOut else { return .rejectedOptedOut(before) }
+        guard var session = state.identity.session else { return .unchanged(before) }
+        guard let occurredAt = canonicalDate(rawDate ?? clock()),
+              occurredAt >= state.identity.updatedAt,
+              occurredAt >= session.lastActivityAt
+        else {
+            throw EluRuntimeQueueError.invalidState
+        }
+        if session.lifecycle == .background {
+            if session.backgroundedAt == occurredAt { return .unchanged(before) }
+            throw EluRuntimeQueueError.invalidState
+        }
+        session.lifecycle = .background
+        session.backgroundedAt = occurredAt
+        var identity = state.identity
+        identity.session = session
+        identity.updatedAt = occurredAt
+        let snapshot = try commitPrepared(
+            expectedGeneration: state.generation,
+            identity: identity,
+            flagContext: state.flagContext,
+            drafts: []
+        ).snapshot
+        return .changed(snapshot)
+    }
+
+    func captureAuthorityForTesting() -> EluV1CaptureAuthorityState {
+        captureAuthority
+    }
+
     func appendEvent(
         _ draft: EluEventDraft,
         sessionUpdate: EluRuntimeEventSessionUpdate
     ) throws -> EluQueuedRecord {
+        guard ownerNamespaceHash == nil else {
+            throw EluRuntimeQueueError.standaloneLegacyEntryPointUnavailable
+        }
         guard draft.occurredAt.timeIntervalSinceReferenceDate.isFinite,
               let canonicalOccurredAt = EluRFC3339.date(
                   from: EluRFC3339.string(from: draft.occurredAt)
@@ -1472,6 +2115,9 @@ actor EluSQLiteRuntimeQueue {
         versions: EluVersionContext,
         expectedGeneration: Int64
     ) throws -> [EluQueuedRecord] {
+        guard ownerNamespaceHash == nil else {
+            throw EluRuntimeQueueError.standaloneLegacyEntryPointUnavailable
+        }
         guard expectedGeneration == state.generation else {
             throw EluRuntimeQueueError.generationMismatch
         }
@@ -1503,6 +2149,9 @@ actor EluSQLiteRuntimeQueue {
         expectedGeneration: Int64,
         timeoutSeconds requestedTimeoutSeconds: Int = 1_800
     ) throws -> EluRuntimeQueueSnapshot {
+        guard ownerNamespaceHash == nil else {
+            throw EluRuntimeQueueError.standaloneLegacyEntryPointUnavailable
+        }
         guard expectedGeneration == state.generation else {
             throw EluRuntimeQueueError.generationMismatch
         }
@@ -1577,8 +2226,14 @@ actor EluSQLiteRuntimeQueue {
         }
         var identity = state.identity
         identity.optedOut = optedOut
+        if optedOut {
+            identity.session = nil
+        }
         identity.contextRevision += 1
-        identity.updatedAt = clock()
+        guard let now = canonicalDate(clock()), now >= identity.updatedAt else {
+            throw EluRuntimeQueueError.invalidState
+        }
+        identity.updatedAt = now
         return try commitPrepared(
             expectedGeneration: expectedGeneration,
             identity: identity,
@@ -1624,7 +2279,9 @@ actor EluSQLiteRuntimeQueue {
         expectedGeneration: Int64,
         identity: EluIdentityState,
         flagContext: EluPersistedFlagContext,
-        drafts: [EluPreparedRecordDraft]
+        drafts: [EluPreparedRecordDraft],
+        surfaceProvenNotCommitted: Bool = false,
+        prewriteValidation: ((EluStoredRuntimeState) throws -> Void)? = nil
     ) throws -> (records: [EluQueuedRecord], snapshot: EluRuntimeQueueSnapshot) {
         let resources = try requireResources()
         let canonicalIdentity: EluIdentityState
@@ -1645,9 +2302,12 @@ actor EluSQLiteRuntimeQueue {
         }
 
         let connection = resources.connection
+        var transactionBegan = false
         var commitAttempted = false
         do {
+            try faultInjector?.hit(.beforeBegin)
             try connection.execute("BEGIN IMMEDIATE")
+            transactionBegan = true
             try faultInjector?.hit(.afterBegin)
             let diskState = try EluRuntimeDatabase.loadState(
                 connection,
@@ -1691,6 +2351,8 @@ actor EluSQLiteRuntimeQueue {
                 throw EluRuntimeQueueError.counterExhausted
             }
 
+            try prewriteValidation?(diskState)
+
             for (index, storedRecord) in storedRecords.enumerated() {
                 try EluRuntimeDatabase.insert(connection, storedRecord: storedRecord)
                 try faultInjector?.hit(.afterRecordInsert(index))
@@ -1733,11 +2395,27 @@ actor EluSQLiteRuntimeQueue {
             return (storedRecords.map(\.record), nextState.snapshot)
         } catch {
             if !commitAttempted {
-                do {
-                    try connection.execute("ROLLBACK")
-                } catch {
-                    poisonAndRelease()
-                    throw EluRuntimeQueueError.databaseUnavailable
+                if transactionBegan {
+                    do {
+                        try faultInjector?.hit(.beforeRollback)
+                        try connection.execute("ROLLBACK")
+                        transactionBegan = false
+                    } catch {
+                        // COMMIT was never attempted, so closing the poisoned
+                        // connection cannot turn this into an ambiguous write.
+                        // The capture owner receives the typed, fail-closed
+                        // not-committed outcome and must not retry this owner.
+                        poisonAndRelease()
+                        if surfaceProvenNotCommitted {
+                            throw EluRuntimeQueueError.provenNotCommitted
+                        }
+                        throw EluRuntimeQueueError.databaseUnavailable
+                    }
+                }
+                if surfaceProvenNotCommitted,
+                   shouldSurfaceProvenNotCommitted(error)
+                {
+                    throw EluRuntimeQueueError.provenNotCommitted
                 }
             }
             throw mapOperationError(error)
@@ -1935,8 +2613,268 @@ actor EluSQLiteRuntimeQueue {
 
     func close() {
         isPoisoned = true
+        captureAuthority = .absent
         resources?.close()
         resources = nil
+    }
+
+    private var identitySnapshot: EluIdentitySnapshot {
+        EluIdentitySnapshot(
+            identity: state.identity,
+            streamId: state.streamId,
+            nextSequence: state.nextSequence,
+            flagContext: EluFlagContext(
+                personProperties: state.flagContext.personProperties,
+                groupProperties: state.flagContext.groupProperties
+            )
+        )
+    }
+
+    private var durableWallFloor: Date {
+        var floor = state.identity.updatedAt
+        if let session = state.identity.session {
+            floor = max(max(floor, session.startedAt), session.lastActivityAt)
+            if let backgroundedAt = session.backgroundedAt {
+                floor = max(floor, backgroundedAt)
+            }
+        }
+        return floor
+    }
+
+    private func nextAuthorityEpoch() -> UInt64 {
+        if authorityEpoch < UInt64.max { authorityEpoch += 1 }
+        return authorityEpoch
+    }
+
+    private static func captureBoundary(
+        _ candidate: EluV1ConfigManager.ValidatedCandidateIdentity
+    ) -> EluV1CaptureConfigBoundary {
+        EluV1CaptureConfigBoundary(
+            issuedAt: candidate.issuedAt,
+            semanticHash: candidate.semanticHash
+        )
+    }
+
+    private func terminateCaptureAuthority(
+        trustedBoundary: EluV1CaptureConfigBoundary? = nil,
+        candidateBoundary: EluV1CaptureConfigBoundary? = nil,
+        policySourceHash: String? = nil,
+        contextRevision: Int64? = nil,
+        reason: EluV1CaptureAuthorityTerminalReason
+    ) -> EluV1CaptureAuthorityUpdateResult {
+        let retained: (
+            boundary: EluV1CaptureConfigBoundary?,
+            policySourceHash: String?
+        )
+        switch captureAuthority {
+        case let .authorized(current):
+            retained = (
+                current.configBoundary,
+                current.policySourceHash
+            )
+        case let .terminal(current):
+            retained = (
+                current.trustedConfigBoundary,
+                current.policySourceHash
+            )
+        case .absent:
+            retained = (nil, nil)
+        }
+        let terminal = EluV1CaptureAuthorityTerminal(
+            ownerEpoch: nextAuthorityEpoch(),
+            trustedConfigBoundary: trustedBoundary ?? retained.boundary,
+            candidateConfigBoundary: candidateBoundary,
+            policySourceHash: trustedBoundary == nil
+                ? retained.policySourceHash
+                : policySourceHash,
+            contextRevision: contextRevision,
+            reason: reason
+        )
+        captureAuthority = .terminal(terminal)
+        return .terminated(terminal)
+    }
+
+    private func authorityWitnessMatches(
+        _ authority: EluV1CaptureAuthoritySnapshot,
+        diskState: EluStoredRuntimeState
+    ) -> Bool {
+        guard let ownerNamespaceHash else { return false }
+        return authority.ownerNamespaceHash == ownerNamespaceHash
+            && authority.configSiteId == pinnedConfigSiteId
+            && authority.streamId == diskState.streamId
+            && authority.identityRevision == diskState.identity.revision
+            && authority.contextRevision == diskState.identity.contextRevision
+            && authority.identityOptedOut == diskState.identity.optedOut
+            && !diskState.identity.optedOut
+    }
+
+    private func expiredTerminalDominating(
+        _ candidateBoundary: EluV1CaptureConfigBoundary?
+    ) -> EluV1CaptureAuthorityTerminal? {
+        guard case let .terminal(current) = captureAuthority,
+              current.reason == .expired,
+              let expiredBoundary = current.trustedConfigBoundary
+        else {
+            return nil
+        }
+        guard let candidateBoundary else { return current }
+        if candidateBoundary.issuedAt < expiredBoundary.issuedAt {
+            return current
+        }
+        if candidateBoundary.issuedAt == expiredBoundary.issuedAt,
+           candidateBoundary.semanticHash == expiredBoundary.semanticHash
+        {
+            return current
+        }
+        return nil
+    }
+
+    private func authorityIsLive(
+        _ authority: EluV1CaptureAuthoritySnapshot,
+        wallNow: Date,
+        monotonicNow: UInt64
+    ) -> Bool {
+        guard wallNow.timeIntervalSinceReferenceDate.isFinite,
+              !authority.expiresAt.isAtOrBefore(wallNow),
+              authority.monotonicBudget > 0
+        else {
+            return false
+        }
+        let elapsed = monotonicNow &- authority.monotonicStartedAt
+        return elapsed < authority.monotonicBudget
+    }
+
+    private func restrictionTerminalDominating(
+        _ candidateBoundary: EluV1CaptureConfigBoundary?,
+        candidateContextRevision _: Int64?
+    ) -> EluV1CaptureAuthorityTerminal? {
+        guard case let .terminal(current) = captureAuthority,
+              current.reason == .privacyBlocked,
+              let restrictedBoundary = current.trustedConfigBoundary,
+              current.contextRevision != nil
+        else {
+            return nil
+        }
+        guard let candidateBoundary else { return current }
+        if candidateBoundary.issuedAt < restrictedBoundary.issuedAt {
+            return current
+        }
+        guard candidateBoundary == restrictedBoundary else { return nil }
+        return current
+    }
+
+    private func latchExpiredAuthority(_ authority: EluV1CaptureAuthoritySnapshot) {
+        _ = terminateCaptureAuthority(
+            trustedBoundary: authority.configBoundary,
+            candidateBoundary: authority.configBoundary,
+            policySourceHash: authority.policySourceHash,
+            contextRevision: authority.contextRevision,
+            reason: .expired
+        )
+    }
+
+    private func prepareCapture(
+        command: EluV1CaptureCommand,
+        occurredAt: Date,
+        authority: EluV1CaptureAuthoritySnapshot
+    ) throws -> (identity: EluIdentityState, draft: EluEventDraft) {
+        var properties = state.identity.superProperties
+        for (key, value) in command.properties { properties[key] = value }
+        properties["$elu_contract_version"] = .string(command.versions.contractVersion)
+        properties["$elu_sdk_version"] = .string(command.versions.runtime.version)
+        properties["$elu_facade_version"] = .string(command.versions.facade.version)
+        guard validateCaptureProperties(properties) else {
+            throw EluRuntimeQueueError.invalidRecord
+        }
+
+        let previous = state.identity.session
+        let session: EluSessionState
+        if let previous {
+            try validateStoredSession(previous, identityUpdatedAt: state.identity.updatedAt)
+            guard occurredAt >= previous.lastActivityAt,
+                  occurredAt >= previous.startedAt
+            else {
+                throw EluRuntimeQueueError.invalidState
+            }
+            let effectiveTimeout = min(
+                previous.timeoutSeconds,
+                authority.idleTimeoutSeconds
+            )
+            let idleSeconds = occurredAt.timeIntervalSince(previous.lastActivityAt)
+            let durationSeconds = occurredAt.timeIntervalSince(previous.startedAt)
+            if idleSeconds >= Double(effectiveTimeout)
+                || durationSeconds >= Double(authority.maximumDurationSeconds)
+            {
+                let identifier = sessionIdGenerator()
+                guard identifier != previous.id else {
+                    throw EluRuntimeQueueError.invalidState
+                }
+                session = try EluSessionState(
+                    id: identifier,
+                    startedAt: occurredAt,
+                    lastActivityAt: occurredAt,
+                    timeoutSeconds: authority.idleTimeoutSeconds
+                )
+            } else {
+                var resumed = previous
+                resumed.lastActivityAt = occurredAt
+                resumed.timeoutSeconds = effectiveTimeout
+                resumed.lifecycle = .active
+                resumed.backgroundedAt = nil
+                try resumed.validate()
+                session = resumed
+            }
+        } else {
+            session = try EluSessionState(
+                id: sessionIdGenerator(),
+                startedAt: occurredAt,
+                lastActivityAt: occurredAt,
+                timeoutSeconds: authority.idleTimeoutSeconds
+            )
+        }
+
+        var identity = state.identity
+        identity.session = session
+        identity.updatedAt = occurredAt
+        let draft = EluEventDraft(
+            kind: command.kind,
+            name: command.name,
+            occurredAt: occurredAt,
+            expectedSessionId: session.id,
+            properties: properties,
+            versions: command.versions
+        )
+        return (identity, draft)
+    }
+
+    private func canonicalDate(_ date: Date) -> Date? {
+        guard date.timeIntervalSinceReferenceDate.isFinite else { return nil }
+        return EluRFC3339.date(from: EluRFC3339.string(from: date))
+    }
+
+    private func validCaptureName(_ name: String) -> Bool {
+        EluIdentityState.valid(name, maximumLength: 512)
+    }
+
+    private func validateCaptureProperties(_ properties: [String: EluJSONValue]) -> Bool {
+        guard properties.count <= 1_024 else { return false }
+        do {
+            for (key, value) in properties {
+                guard EluIdentityState.valid(key, maximumLength: 256) else { return false }
+                try value.validate()
+            }
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    private func shouldSurfaceProvenNotCommitted(_ error: Error) -> Bool {
+        if let queueError = error as? EluRuntimeQueueError {
+            if case .faultInjected = queueError { return true }
+            return queueError == .databaseUnavailable
+        }
+        return error is EluSQLiteFailure
     }
 
     private func prepareMutationTransition(

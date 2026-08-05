@@ -1,4 +1,3 @@
-import CryptoKit
 import Foundation
 
 struct EluV1AuthorizedEndpointSet: Equatable, Sendable {
@@ -86,6 +85,14 @@ struct EluV1ConfigResolution: Equatable, Sendable {
     let siteId: String
     let issuedAt: Date
     let expiresAt: Date
+    let exactIssuedAt: EluV1Timestamp
+    let exactExpiresAt: EluV1Timestamp
+    let configSemanticHash: String
+    let policySourceHash: String
+    let decisionHash: String?
+    let decisionContextRevision: Int64?
+    let sessionIdleTimeoutSeconds: Int
+    let sessionMaximumDurationSeconds: Int
     let endpoints: EluV1AuthorizedEndpointSet
     let captureAuthorization: EluV1CaptureAuthorization
     let replayAuthorization: EluV1ReplayAuthorization
@@ -109,8 +116,16 @@ final class EluV1ConfigManager: @unchecked Sendable {
 
     private struct PreparedConfig {
         let document: EluV1ConfigDocument
-        let semanticValue: EluJSONValue
+        let canonicalData: Data
+        let semanticHash: String
+        let policySourceHash: String?
         let trustedEndpoints: [EluV1EndpointRole: URL]?
+    }
+
+    struct ValidatedCandidateIdentity: Equatable, Sendable {
+        let issuedAt: EluV1Timestamp
+        let semanticHash: String
+        let policySourceHash: String?
     }
 
     private enum BoundaryOutcome: Equatable {
@@ -134,6 +149,7 @@ final class EluV1ConfigManager: @unchecked Sendable {
     private let readbackProvenReplayTransports: Set<EluV1ReplayTransportSelection>
     private var newestBoundary: ConfigBoundary?
     private var activeConfig: PreparedConfig?
+    private var lastValidatedCandidateIdentity: ValidatedCandidateIdentity?
 
     init(
         readbackProvenReplayTransports: Set<EluV1ReplayTransportSelection> = []
@@ -146,8 +162,14 @@ final class EluV1ConfigManager: @unchecked Sendable {
         defer { lock.unlock() }
 
         do {
+            lastValidatedCandidateIdentity = nil
             try Self.validateClock(now)
             let prepared = try Self.prepareConfig(configData)
+            lastValidatedCandidateIdentity = ValidatedCandidateIdentity(
+                issuedAt: prepared.document.issuedAt,
+                semanticHash: prepared.semanticHash,
+                policySourceHash: prepared.policySourceHash
+            )
             expireActiveConfigIfNeeded(now: now)
 
             if var boundary = newestBoundary {
@@ -156,8 +178,8 @@ final class EluV1ConfigManager: @unchecked Sendable {
                 }
 
                 if prepared.document.issuedAt == boundary.prepared.document.issuedAt {
-                    guard prepared.document.revision == boundary.prepared.document.revision,
-                          prepared.semanticValue == boundary.prepared.semanticValue,
+                    guard prepared.semanticHash == boundary.prepared.semanticHash,
+                          prepared.canonicalData == boundary.prepared.canonicalData,
                           boundary.outcome != .conflicted
                     else {
                         boundary.outcome = .conflicted
@@ -201,6 +223,12 @@ final class EluV1ConfigManager: @unchecked Sendable {
         }
     }
 
+    func validatedCandidateIdentity() -> ValidatedCandidateIdentity? {
+        lock.lock()
+        defer { lock.unlock() }
+        return lastValidatedCandidateIdentity
+    }
+
     func authorize(
         effectivePrivacyStateData: Data?,
         identity: EluIdentitySnapshot,
@@ -219,6 +247,8 @@ final class EluV1ConfigManager: @unchecked Sendable {
               let privacyPolicy = config.privacy,
               let features = config.features,
               let capabilities = config.capabilities,
+              let session = config.session,
+              let policySourceHash = active.policySourceHash,
               let trustedEndpoints = active.trustedEndpoints
         else {
             throw EluV1ConfigResolutionError.malformedConfig
@@ -232,6 +262,8 @@ final class EluV1ConfigManager: @unchecked Sendable {
         func resolution(
             capture: EluV1CaptureAuthorization,
             replay: EluV1ReplayAuthorization,
+            decisionHash: String? = nil,
+            decisionContextRevision: Int64? = nil,
             eventsAuthorized: Bool = false,
             replayAuthorized: Bool = false
         ) -> EluV1ConfigResolution {
@@ -247,14 +279,29 @@ final class EluV1ConfigManager: @unchecked Sendable {
                 siteId: site.id,
                 issuedAt: config.issuedAt.date,
                 expiresAt: config.expiresAt.date,
+                exactIssuedAt: config.issuedAt,
+                exactExpiresAt: config.expiresAt,
+                configSemanticHash: active.semanticHash,
+                policySourceHash: policySourceHash,
+                decisionHash: decisionHash,
+                decisionContextRevision: decisionContextRevision,
+                sessionIdleTimeoutSeconds: session.idleTimeoutSeconds,
+                sessionMaximumDurationSeconds: session.maximumDurationSeconds,
                 endpoints: EluV1AuthorizedEndpointSet(authorized),
                 captureAuthorization: capture,
                 replayAuthorization: replay
             )
         }
 
-        func invalidPrivacy(_ reason: EluV1PrivacyInvalidReason) -> EluV1ConfigResolution {
-            resolution(capture: .invalid(reason), replay: .invalid(reason))
+        func invalidPrivacy(
+            _ reason: EluV1PrivacyInvalidReason,
+            contextRevision: Int64? = nil
+        ) -> EluV1ConfigResolution {
+            resolution(
+                capture: .invalid(reason),
+                replay: .invalid(reason),
+                decisionContextRevision: contextRevision
+            )
         }
 
         guard let effectivePrivacyStateData else {
@@ -262,10 +309,12 @@ final class EluV1ConfigManager: @unchecked Sendable {
         }
 
         let effectivePrivacy: EluV1EffectivePrivacyState
+        let decisionHash: String
         do {
-            effectivePrivacy = try Self.decodePrivacyState(effectivePrivacyStateData)
-            try Self.verifyEffectivePolicyHash(
-                effectivePrivacyStateData,
+            let decoded = try Self.decodePrivacyState(effectivePrivacyStateData)
+            effectivePrivacy = decoded.state
+            decisionHash = try Self.verifyEffectivePolicyHash(
+                decoded.document,
                 expected: effectivePrivacy.effectivePolicyHash
             )
         } catch {
@@ -273,13 +322,22 @@ final class EluV1ConfigManager: @unchecked Sendable {
         }
 
         guard effectivePrivacy.policyRevision == privacyPolicy.revision else {
-            return invalidPrivacy(.policyRevisionMismatch)
+            return invalidPrivacy(
+                .policyRevisionMismatch,
+                contextRevision: effectivePrivacy.contextRevision
+            )
         }
         guard effectivePrivacy.contextRevision == identity.identity.contextRevision else {
-            return invalidPrivacy(.contextRevisionMismatch)
+            return invalidPrivacy(
+                .contextRevisionMismatch,
+                contextRevision: effectivePrivacy.contextRevision
+            )
         }
         guard effectivePrivacy.identityOptedOut == identity.identity.optedOut else {
-            return invalidPrivacy(.identityOptStateMismatch)
+            return invalidPrivacy(
+                .identityOptStateMismatch,
+                contextRevision: effectivePrivacy.contextRevision
+            )
         }
 
         let captureAllowed = features.capture
@@ -383,6 +441,8 @@ final class EluV1ConfigManager: @unchecked Sendable {
         return resolution(
             capture: captureAuthorization,
             replay: replayAuthorization,
+            decisionHash: decisionHash,
+            decisionContextRevision: effectivePrivacy.contextRevision,
             eventsAuthorized: captureAuthorization == .authorized,
             replayAuthorized: {
                 if case .authorized = replayAuthorization { return true }
@@ -493,7 +553,7 @@ final class EluV1ConfigManager: @unchecked Sendable {
     }
 
     private static func prepareConfig(_ data: Data) throws -> PreparedConfig {
-        let (document, semanticValue) = try decodeConfig(data)
+        let (document, strictDocument) = try decodeConfig(data)
         guard document.issuedAt < document.expiresAt else {
             throw EluV1ConfigResolutionError.invalidConfigValidityWindow
         }
@@ -508,19 +568,32 @@ final class EluV1ConfigManager: @unchecked Sendable {
         }
         return PreparedConfig(
             document: document,
-            semanticValue: semanticValue,
+            canonicalData: strictDocument.canonicalData,
+            semanticHash: EluV1StrictCanonicalJSON.hash(strictDocument.canonicalData),
+            policySourceHash: try strictDocument.canonicalObjectProperty("privacy").map {
+                EluV1StrictCanonicalJSON.hash($0)
+            },
             trustedEndpoints: trustedEndpoints
         )
     }
 
-    private static func decodeConfig(_ data: Data) throws -> (EluV1ConfigDocument, EluJSONValue) {
+    private static func decodeConfig(_ data: Data) throws
+        -> (EluV1ConfigDocument, EluV1StrictCanonicalJSON.Document)
+    {
         guard data.count <= maximumConfigBytes else {
             throw EluV1ConfigResolutionError.configPayloadTooLarge
         }
         do {
+            let strictDocument = try EluV1StrictCanonicalJSON.parse(data)
+            guard case .object = strictDocument.value else {
+                throw EluV1ConfigResolutionError.malformedConfig
+            }
             return (
-                try JSONDecoder().decode(EluV1ConfigDocument.self, from: data),
-                try JSONDecoder().decode(EluJSONValue.self, from: data)
+                try JSONDecoder().decode(
+                    EluV1ConfigDocument.self,
+                    from: strictDocument.canonicalData
+                ),
+                strictDocument
             )
         } catch let error as EluV1ConfigResolutionError {
             throw error
@@ -529,12 +602,24 @@ final class EluV1ConfigManager: @unchecked Sendable {
         }
     }
 
-    private static func decodePrivacyState(_ data: Data) throws -> EluV1EffectivePrivacyState {
+    private static func decodePrivacyState(_ data: Data) throws
+        -> (state: EluV1EffectivePrivacyState, document: EluV1StrictCanonicalJSON.Document)
+    {
         guard data.count <= maximumPrivacyStateBytes else {
             throw EluV1ConfigResolutionError.privacyPayloadTooLarge
         }
         do {
-            return try JSONDecoder().decode(EluV1EffectivePrivacyState.self, from: data)
+            let strictDocument = try EluV1StrictCanonicalJSON.parse(data)
+            guard case .object = strictDocument.value else {
+                throw EluV1ConfigResolutionError.malformedPrivacyState
+            }
+            return (
+                try JSONDecoder().decode(
+                    EluV1EffectivePrivacyState.self,
+                    from: strictDocument.canonicalData
+                ),
+                strictDocument
+            )
         } catch EluV1ConfigResolutionError.unsupportedPrivacyStateSchemaVersion {
             throw EluV1ConfigResolutionError.unsupportedPrivacyStateSchemaVersion
         } catch {
@@ -606,92 +691,39 @@ final class EluV1ConfigManager: @unchecked Sendable {
             && imagesAreSufficient
     }
 
-    private static func verifyEffectivePolicyHash(_ data: Data, expected: String) throws {
-        let actual = try computedEffectivePolicyHash(for: data)
+    @discardableResult
+    private static func verifyEffectivePolicyHash(
+        _ document: EluV1StrictCanonicalJSON.Document,
+        expected: String
+    ) throws -> String {
+        let actual = EluV1StrictCanonicalJSON.hash(
+            try document.canonicalRemovingObjectProperty("effectivePolicyHash")
+        )
         guard actual == expected else {
             throw EluV1ConfigResolutionError.invalidEffectivePolicyHash
         }
+        return actual
     }
 
     /// Shared by privacy evaluation and conformance tests. Computing a hash
     /// does not validate or authorize the state.
     static func computedEffectivePolicyHash(for data: Data) throws -> String {
-        let value: EluJSONValue
         do {
-            value = try JSONDecoder().decode(EluJSONValue.self, from: data)
-        } catch {
-            throw EluV1ConfigResolutionError.malformedPrivacyState
-        }
-        guard case var .object(object) = value,
-              case let .string(rawHash)? = object.removeValue(forKey: "effectivePolicyHash"),
-              EluV1Validation.validPolicyHash(rawHash)
-        else {
-            throw EluV1ConfigResolutionError.malformedPrivacyState
-        }
-        let canonical: String
-        do {
-            canonical = try canonicalJSON(.object(object))
-        } catch {
-            throw EluV1ConfigResolutionError.malformedPrivacyState
-        }
-        let digest = SHA256.hash(data: Data(canonical.utf8))
-        return "sha256:" + digest.map { String(format: "%02x", $0) }.joined()
-    }
-
-    private static func canonicalJSON(_ value: EluJSONValue) throws -> String {
-        switch value {
-        case .null:
-            return "null"
-        case let .bool(value):
-            return value ? "true" : "false"
-        case let .integer(value):
-            return String(value)
-        case let .number(value):
-            guard value.isFinite,
-                  value.rounded(.towardZero) == value,
-                  value >= Double(Int64.min),
-                  value < Double(Int64.max)
+            let document = try EluV1StrictCanonicalJSON.parse(data)
+            guard case .object = document.value,
+                  case let .string(hashUnits)? = try document.objectProperty("effectivePolicyHash")
             else {
                 throw EluV1ConfigResolutionError.malformedPrivacyState
             }
-            return String(Int64(value))
-        case let .string(value):
-            return canonicalJSONString(value)
-        case let .array(values):
-            return "[" + (try values.map(canonicalJSON).joined(separator: ",")) + "]"
-        case let .object(values):
-            let members = try values.keys.sorted().map { key in
-                canonicalJSONString(key) + ":" + (try canonicalJSON(values[key]!))
+            let rawHash = String(decoding: hashUnits, as: UTF16.self)
+            guard EluV1Validation.validPolicyHash(rawHash) else {
+                throw EluV1ConfigResolutionError.malformedPrivacyState
             }
-            return "{" + members.joined(separator: ",") + "}"
+            return EluV1StrictCanonicalJSON.hash(
+                try document.canonicalRemovingObjectProperty("effectivePolicyHash")
+            )
+        } catch {
+            throw EluV1ConfigResolutionError.malformedPrivacyState
         }
-    }
-
-    private static func canonicalJSONString(_ value: String) -> String {
-        var output = "\""
-        for scalar in value.unicodeScalars {
-            switch scalar.value {
-            case 0x08:
-                output += "\\b"
-            case 0x09:
-                output += "\\t"
-            case 0x0A:
-                output += "\\n"
-            case 0x0C:
-                output += "\\f"
-            case 0x0D:
-                output += "\\r"
-            case 0x22:
-                output += "\\\""
-            case 0x5C:
-                output += "\\\\"
-            case 0 ... 0x1F:
-                output += String(format: "\\u%04x", scalar.value)
-            default:
-                output.unicodeScalars.append(scalar)
-            }
-        }
-        output += "\""
-        return output
     }
 }
