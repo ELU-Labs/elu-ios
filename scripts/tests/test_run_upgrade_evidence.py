@@ -9,6 +9,7 @@ import tempfile
 import types
 import unittest
 from email.message import Message
+from unittest import mock
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -23,6 +24,37 @@ SPEC.loader.exec_module(RUNNER)
 
 
 class UpgradeEvidenceCaptureTests(unittest.TestCase):
+    def test_runner_refuses_nonempty_output_without_deleting_caller_data(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = pathlib.Path(temporary) / "evidence"
+            unrelated = output / "raw" / "keep.txt"
+            unrelated.parent.mkdir(parents=True)
+            unrelated.write_text("caller-owned\n", encoding="utf-8")
+            args = types.SimpleNamespace(output=output, custody="operator-managed")
+
+            with (
+                mock.patch.object(RUNNER, "parse_args", return_value=args),
+                mock.patch.object(RUNNER.sys, "stderr", io.StringIO()) as stderr,
+            ):
+                status = RUNNER.main()
+
+            self.assertEqual(status, 2)
+            self.assertEqual(stderr.getvalue(), "upgrade evidence blocked: OUTPUT_MUST_BE_EMPTY\n")
+            self.assertEqual(unrelated.read_text(encoding="utf-8"), "caller-owned\n")
+            self.assertFalse((output / "manifest.json").exists())
+
+    def test_runner_atomically_claims_only_an_absent_output_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            absent = root / "absent"
+            empty = root / "empty"
+            empty.mkdir()
+
+            self.assertTrue(RUNNER.prepare_output_directory(absent))
+            self.assertTrue(absent.is_dir())
+            self.assertFalse(RUNNER.prepare_output_directory(absent))
+            self.assertFalse(RUNNER.prepare_output_directory(empty))
+
     def test_harness_view_remains_ios_13_compatible(self) -> None:
         source = HARNESS_SOURCE.read_text(encoding="utf-8")
         project = PROJECT.read_text(encoding="utf-8")

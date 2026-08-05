@@ -126,6 +126,7 @@ BLOCKER_DETAILS = {
     "FULL_XCODE_REQUIRED": "The selected developer directory does not provide Xcode and the iOS Simulator tools.",
     "CANDIDATE_CHECKOUT_DIRTY": "The candidate checkout must be clean so its revision exactly identifies the tested source.",
     "OUTPUT_MUST_BE_EXTERNAL": "The evidence output directory must be outside the repository.",
+    "OUTPUT_MUST_BE_EMPTY": "The evidence output path must not already exist so this run can own it exclusively.",
     "SOURCE_ARCHIVE_FAILED": "The immutable source version could not be materialized for the harness.",
     "SOURCE_TAG_MISMATCH": "The source tag does not resolve to the revision recorded by the historical inventory.",
     "CANDIDATE_ARCHIVE_FAILED": "The clean candidate revision could not be materialized for the harness.",
@@ -471,6 +472,15 @@ def inside_repository(path: pathlib.Path) -> bool:
         return True
     except ValueError:
         return False
+
+
+def prepare_output_directory(output: pathlib.Path) -> bool:
+    """Atomically claim an absent output path so cleanup owns every child."""
+    try:
+        output.mkdir(parents=True, exist_ok=False)
+    except OSError:
+        return False
+    return True
 
 
 def write_json(path: pathlib.Path, value: object) -> None:
@@ -1275,7 +1285,9 @@ def main() -> int:
     if inside_repository(output):
         print("upgrade evidence blocked: OUTPUT_MUST_BE_EXTERNAL", file=sys.stderr)
         return 2
-    output.mkdir(parents=True, exist_ok=True)
+    if not prepare_output_directory(output):
+        print("upgrade evidence blocked: OUTPUT_MUST_BE_EMPTY", file=sys.stderr)
+        return 2
     raw_directory = output / "raw"
     raw_directory.mkdir(parents=True, exist_ok=True)
     work_directory = output / "work"
