@@ -1,5 +1,7 @@
 import EluAnalytics
+import Foundation
 import SwiftUI
+import SystemConfiguration
 import UIKit
 
 private enum UpgradeBuild: String {
@@ -44,6 +46,9 @@ private enum UpgradeProbe {
     private static let flushRetryInterval: TimeInterval = 1
     private static let networkProbeTimeout: TimeInterval = 10
     private static let networkProbeURL = URL(string: "https://github.com/favicon.ico")!
+    private static let reachabilityProbeTimeout: TimeInterval = 10
+    private static let reachabilityProbeInterval: TimeInterval = 0.2
+    private static let requiredReachabilitySamples = 2
 
     static func start() {
         let environment = ProcessInfo.processInfo.environment
@@ -58,10 +63,18 @@ private enum UpgradeProbe {
 
         probeNetwork { ready in
             guard ready else {
-                write(build: build.rawValue, identityCheck: false)
+                write(build: "network-unready", identityCheck: false)
                 return
             }
-            begin(build: build, origin: origin)
+            waitForSystemReachability(
+                deadline: Date().addingTimeInterval(reachabilityProbeTimeout)
+            ) { reachable in
+                guard reachable else {
+                    write(build: "network-unready", identityCheck: false)
+                    return
+                }
+                begin(build: build, origin: origin)
+            }
         }
     }
 
@@ -82,6 +95,40 @@ private enum UpgradeProbe {
             }
         }
         task.resume()
+    }
+
+    private static func waitForSystemReachability(
+        deadline: Date,
+        reachableSamples: Int = 0,
+        completion: @escaping (Bool) -> Void
+    ) {
+        let nextReachableSamples = systemNetworkIsReachable() ? reachableSamples + 1 : 0
+        if nextReachableSamples >= requiredReachabilitySamples {
+            completion(true)
+            return
+        }
+        guard Date() < deadline else {
+            completion(false)
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + reachabilityProbeInterval) {
+            waitForSystemReachability(
+                deadline: deadline,
+                reachableSamples: nextReachableSamples,
+                completion: completion
+            )
+        }
+    }
+
+    private static func systemNetworkIsReachable() -> Bool {
+        var zeroAddress = sockaddr()
+        zeroAddress.sa_len = UInt8(MemoryLayout<sockaddr>.size)
+        zeroAddress.sa_family = sa_family_t(AF_INET)
+        guard let reachability = SCNetworkReachabilityCreateWithAddress(nil, &zeroAddress) else {
+            return false
+        }
+        var flags = SCNetworkReachabilityFlags()
+        return SCNetworkReachabilityGetFlags(reachability, &flags) && flags.contains(.reachable)
     }
 
     private static func begin(build: UpgradeBuild, origin: URL) {

@@ -145,7 +145,12 @@ class UpgradeEvidenceValidationTests(unittest.TestCase):
         source_identity_check: bool = True,
         source_method: str = "POST",
         source_path: str = "/batch",
+        source_container_sentinel: bytes = b"s" * 32,
+        candidate_container_sentinel: bytes | None = None,
+        omit_candidate_container_sentinel: bool = False,
     ) -> pathlib.Path:
+        if candidate_container_sentinel is None:
+            candidate_container_sentinel = source_container_sentinel
         identity = self.historical_identity()
         resolution = manifest["resolvedDependency"]["source"]  # type: ignore[index]
         source_graph = self.json_bytes(
@@ -173,8 +178,13 @@ class UpgradeEvidenceValidationTests(unittest.TestCase):
             },
             "environment": manifest["environment"],
             "applicationContainer": {
+                "sentinelRelativePath": (
+                    "Library/Application Support/dev.elu.sdk-upgrade-evidence/container-sentinel.bin"
+                ),
                 "sourcePathSha256": "e" * 64,
-                "candidatePathSha256": "e" * 64,
+                "candidatePathSha256": "f" * 64,
+                "sourceSentinelSha256": hashlib.sha256(source_container_sentinel).hexdigest(),
+                "candidateSentinelSha256": hashlib.sha256(candidate_container_sentinel).hexdigest(),
             },
         }
         files = {
@@ -208,7 +218,10 @@ class UpgradeEvidenceValidationTests(unittest.TestCase):
             "resolved-package-graphs/source.json": source_graph,
             "resolved-package-graphs/candidate.json": candidate_graph,
             "historical-dependency-tag-object.txt": self.tag_payload(),
+            "application-container/source-sentinel.bin": source_container_sentinel,
         }
+        if not omit_candidate_container_sentinel:
+            files["application-container/candidate-sentinel.bin"] = candidate_container_sentinel
         archive_path = directory / "raw-evidence.tar.gz"
         with tarfile.open(archive_path, "w:gz") as archive:
             for name, payload in sorted(files.items()):
@@ -236,25 +249,87 @@ class UpgradeEvidenceValidationTests(unittest.TestCase):
             result = self.run_validator(manifest=path, raw_archive=archive, require_verified=True)
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_exact_post_batch_marker_is_accepted(self) -> None:
+    def test_container_continuity_allows_absolute_path_relocation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = pathlib.Path(temporary)
             manifest = self.verified_manifest()
+            archive = self.write_raw_archive(directory, manifest)
+            path = self.write_json(directory, "manifest.json", manifest)
+            result = self.run_validator(
+                manifest=path,
+                raw_archive=archive,
+                require_verified=True,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_container_continuity_rejects_changed_or_missing_sentinel(self) -> None:
+        cases = (
+            {"candidate_container_sentinel": b"c" * 32},
+            {"omit_candidate_container_sentinel": True},
+        )
+        for options in cases:
+            with self.subTest(options=options), tempfile.TemporaryDirectory() as temporary:
+                directory = pathlib.Path(temporary)
+                manifest = self.verified_manifest()
+                archive = self.write_raw_archive(directory, manifest, **options)
+                path = self.write_json(directory, "manifest.json", manifest)
+                result = self.run_validator(
+                    manifest=path,
+                    raw_archive=archive,
+                    require_verified=True,
+                )
+            self.assertNotEqual(result.returncode, 0)
+
+    def test_missing_candidate_sentinel_is_valid_failed_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = pathlib.Path(temporary)
+            manifest = self.verified_manifest()
+            manifest["observedContinuity"]["sameApplicationContainer"] = False  # type: ignore[index]
+            manifest["verificationStatus"] = "failed"
+            manifest["blockers"] = [
+                {
+                    "code": "CONTINUITY_NOT_PRESERVED",
+                    "detail": "Application data was not preserved.",
+                }
+            ]
             archive = self.write_raw_archive(
                 directory,
                 manifest,
-                source_method="POST",
-                source_path="/batch",
+                candidate_container_sentinel=b"",
             )
             path = self.write_json(directory, "manifest.json", manifest)
-            result = self.run_validator(manifest=path, raw_archive=archive, require_verified=True)
+            result = self.run_validator(manifest=path, raw_archive=archive)
+
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_parameter_free_post_batch_marker_is_accepted(self) -> None:
+        for source_path in ("/batch", "/batch?"):
+            with (
+                self.subTest(source_path=source_path),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                directory = pathlib.Path(temporary)
+                manifest = self.verified_manifest()
+                archive = self.write_raw_archive(
+                    directory,
+                    manifest,
+                    source_method="POST",
+                    source_path=source_path,
+                )
+                path = self.write_json(directory, "manifest.json", manifest)
+                result = self.run_validator(
+                    manifest=path,
+                    raw_archive=archive,
+                    require_verified=True,
+                )
+            self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_marker_shaped_payload_at_wrong_method_or_path_is_rejected(self) -> None:
         cases = (
             ("GET", "/batch"),
             ("POST", "/not-batch"),
             ("POST", "/batch?forged=1"),
+            ("POST", "/batch??"),
         )
         for method, path_value in cases:
             with self.subTest(method=method, path=path_value), tempfile.TemporaryDirectory() as temporary:

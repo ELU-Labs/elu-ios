@@ -34,16 +34,26 @@ RESULT_NAMES = {
     "candidate": "elu-upgrade-candidate-result.json",
 }
 INVALID_RESULT_NAME = "elu-upgrade-invalid-result.json"
+NETWORK_UNREADY_RESULT_NAME = "elu-upgrade-network-unready-result.json"
 EVENT_NAMES = {
     "source": "elu_sdk_upgrade_source",
     "candidate": "elu_sdk_upgrade_candidate",
 }
 TELEMETRY_METHOD = "POST"
 TELEMETRY_PATH = "/batch"
+TELEMETRY_TARGETS = frozenset((TELEMETRY_PATH, f"{TELEMETRY_PATH}?"))
 FLAGS_PATH = "/flags?v=2"
 CONFIG_PATH = "/v1/upgrade-evidence/config"
 MARKER_WAIT_SECONDS = 45
-RUN_RESULT_WAIT_SECONDS = 45
+RUN_RESULT_WAIT_SECONDS = 60
+CONTAINER_SENTINEL_BYTES = 32
+CONTAINER_SENTINEL_RELATIVE = pathlib.Path(
+    "Library/Application Support/dev.elu.sdk-upgrade-evidence/container-sentinel.bin"
+)
+RAW_CONTAINER_SENTINELS = {
+    "source": pathlib.Path("application-container/source-sentinel.bin"),
+    "candidate": pathlib.Path("application-container/candidate-sentinel.bin"),
+}
 MAX_CAPTURE_BODY_BYTES = 8 * 1024 * 1024
 GZIP_INPUT_CHUNK_BYTES = 64 * 1024
 MAX_DECOMPRESSED_BODY_BYTES = 8 * 1024 * 1024
@@ -89,6 +99,7 @@ RUN_RESULT_FAILURES = {
     "RESULT_SCHEMA_INVALID": "wrote a result that did not match the fixed result schema",
     "RESULT_BUILD_MISMATCH": "wrote a result for a different build role",
     "ENVIRONMENT_INVALID": "reported that its fixed launch environment was invalid",
+    "NETWORK_UNREADY": "reported that system network reachability did not become ready",
     "IDENTITY_FALSE": "reported that the expected identity was not observed",
 }
 CONFIG_GET_OBSERVATIONS = {
@@ -115,6 +126,7 @@ BLOCKER_DETAILS = {
     "FULL_XCODE_REQUIRED": "The selected developer directory does not provide Xcode and the iOS Simulator tools.",
     "CANDIDATE_CHECKOUT_DIRTY": "The candidate checkout must be clean so its revision exactly identifies the tested source.",
     "OUTPUT_MUST_BE_EXTERNAL": "The evidence output directory must be outside the repository.",
+    "OUTPUT_MUST_BE_EMPTY": "The evidence output path must not already exist so this run can own it exclusively.",
     "SOURCE_ARCHIVE_FAILED": "The immutable source version could not be materialized for the harness.",
     "SOURCE_TAG_MISMATCH": "The source tag does not resolve to the revision recorded by the historical inventory.",
     "CANDIDATE_ARCHIVE_FAILED": "The clean candidate revision could not be materialized for the harness.",
@@ -135,6 +147,8 @@ BLOCKER_DETAILS = {
     "HISTORICAL_TAG_AUTHENTICATION_FAILED": "The resolved source dependency checkout did not authenticate the dated tag observation.",
     "SOURCE_RUN_FAILED": "The source-version application did not establish observable identity and session evidence.",
     "CANDIDATE_RUN_FAILED": "The candidate application did not produce its same-container continuity result.",
+    "SOURCE_CONTAINER_SENTINEL_FAILED": "The runner could not establish its source application-data sentinel.",
+    "CANDIDATE_CONTAINER_SENTINEL_READ_FAILED": "The runner could not read the candidate application-data sentinel.",
     "SOURCE_EXACT_BATCH_NOT_OBSERVED": "No exact source-version telemetry batch request was observed after launch.",
     "SOURCE_BATCH_UNREADABLE": "A source-version telemetry batch request was observed, but its fixed envelope could not be read.",
     "SOURCE_MARKER_EVENT_ABSENT": "Readable source-version telemetry batches did not contain the fixed marker event.",
@@ -376,7 +390,11 @@ def result_file_stamp(path: pathlib.Path) -> tuple[int, int, int] | None:
 
 
 def snapshot_result_files(documents: pathlib.Path) -> dict[str, tuple[int, int, int] | None]:
-    names = {**RESULT_NAMES, "invalid": INVALID_RESULT_NAME}
+    names = {
+        **RESULT_NAMES,
+        "invalid": INVALID_RESULT_NAME,
+        "networkUnready": NETWORK_UNREADY_RESULT_NAME,
+    }
     return {role: result_file_stamp(documents / name) for role, name in names.items()}
 
 
@@ -387,7 +405,11 @@ def inspect_changed_run_result(
 ) -> tuple[dict[str, Any] | None, str | None]:
     if build not in BUILD_PREFIXES:
         return None, "UNEXPECTED_RUNNER_FAILURE"
-    names = {**RESULT_NAMES, "invalid": INVALID_RESULT_NAME}
+    names = {
+        **RESULT_NAMES,
+        "invalid": INVALID_RESULT_NAME,
+        "networkUnready": NETWORK_UNREADY_RESULT_NAME,
+    }
     changed = {
         role: path
         for role, name in names.items()
@@ -403,6 +425,8 @@ def inspect_changed_run_result(
         return inspect_run_result(build, payload)
     if "invalid" in changed:
         return None, "ENVIRONMENT_INVALID"
+    if "networkUnready" in changed:
+        return None, "NETWORK_UNREADY"
     for role in BUILD_PREFIXES:
         if role == build or role not in changed:
             continue
@@ -426,6 +450,11 @@ def run_result_blocker_code(build: str, failure: str, config_get_observed: bool)
     return f"{prefix}_RUN_{failure}_{observation[0]}"
 
 
+def failed_continuity_checks(observed: dict[str, bool]) -> tuple[str, ...]:
+    """Return only fixed check names; never expose captured identity or session values."""
+    return tuple(name for name, passed in observed.items() if not passed)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=pathlib.Path, required=True)
@@ -445,9 +474,77 @@ def inside_repository(path: pathlib.Path) -> bool:
         return False
 
 
+def prepare_output_directory(output: pathlib.Path) -> bool:
+    """Atomically claim an absent output path so cleanup owns every child."""
+    try:
+        output.mkdir(parents=True, exist_ok=False)
+    except OSError:
+        return False
+    return True
+
+
 def write_json(path: pathlib.Path, value: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def record_container_sentinel(
+    raw_directory: pathlib.Path,
+    build: str,
+    payload: bytes,
+) -> None:
+    relative = RAW_CONTAINER_SENTINELS.get(build)
+    if relative is None:
+        raise HarnessBlocked("UNEXPECTED_RUNNER_FAILURE")
+    output = raw_directory / relative
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_bytes(payload)
+
+
+def establish_source_container_sentinel(
+    container: pathlib.Path,
+    raw_directory: pathlib.Path,
+) -> bytes:
+    payload = os.urandom(CONTAINER_SENTINEL_BYTES)
+    target = container / CONTAINER_SENTINEL_RELATIVE
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with target.open("wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        with target.open("rb") as stream:
+            observed = stream.read(CONTAINER_SENTINEL_BYTES + 1)
+    except OSError:
+        raise HarnessBlocked("SOURCE_CONTAINER_SENTINEL_FAILED") from None
+    if observed != payload:
+        raise HarnessBlocked("SOURCE_CONTAINER_SENTINEL_FAILED")
+    record_container_sentinel(raw_directory, "source", observed)
+    return observed
+
+
+def observe_candidate_container_sentinel(
+    container: pathlib.Path,
+    raw_directory: pathlib.Path,
+) -> bytes:
+    target = container / CONTAINER_SENTINEL_RELATIVE
+    try:
+        with target.open("rb") as stream:
+            observed = stream.read(CONTAINER_SENTINEL_BYTES + 1)
+    except FileNotFoundError:
+        observed = b""
+    except OSError:
+        raise HarnessBlocked("CANDIDATE_CONTAINER_SENTINEL_READ_FAILED") from None
+    record_container_sentinel(raw_directory, "candidate", observed)
+    return observed
+
+
+def container_sentinel_preserved(source: bytes, candidate: bytes) -> bool:
+    return (
+        len(source) == CONTAINER_SENTINEL_BYTES
+        and len(candidate) == CONTAINER_SENTINEL_BYTES
+        and source == candidate
+    )
 
 
 def run_command(
@@ -538,7 +635,7 @@ class CaptureLedger:
     def begin_request(self, method: str, path: str) -> int:
         with self.lock:
             self.request_count += 1
-            if method == TELEMETRY_METHOD and path == TELEMETRY_PATH:
+            if method == TELEMETRY_METHOD and path in TELEMETRY_TARGETS:
                 self._record_unreadable_batch(self.request_count)
             return self.request_count
 
@@ -616,7 +713,7 @@ class CaptureLedger:
     ) -> None:
         if method == "GET" and path == CONFIG_PATH:
             self.config_get_count += 1
-        if method != TELEMETRY_METHOD or path != TELEMETRY_PATH:
+        if method != TELEMETRY_METHOD or path not in TELEMETRY_TARGETS:
             return
         if not body_readable:
             self._record_unreadable_batch(request_number)
@@ -823,7 +920,7 @@ class EvidenceHandler(BaseHTTPRequestHandler):
         self._record(request_number, body, body_readable=body_readable)
         if self.path == FLAGS_PATH:
             self._respond({"flags": {}, "featureFlags": {}})
-        elif self.path == TELEMETRY_PATH:
+        elif self.path in TELEMETRY_TARGETS:
             self._respond({"status": "ok"})
         else:
             self._respond({"status": "not-found"}, status=404)
@@ -1188,7 +1285,9 @@ def main() -> int:
     if inside_repository(output):
         print("upgrade evidence blocked: OUTPUT_MUST_BE_EXTERNAL", file=sys.stderr)
         return 2
-    output.mkdir(parents=True, exist_ok=True)
+    if not prepare_output_directory(output):
+        print("upgrade evidence blocked: OUTPUT_MUST_BE_EMPTY", file=sys.stderr)
+        return 2
     raw_directory = output / "raw"
     raw_directory.mkdir(parents=True, exist_ok=True)
     work_directory = output / "work"
@@ -1246,14 +1345,25 @@ def main() -> int:
         source_container, _ = install_and_run(
             source_app, "source", simulator_udid, server.origin, ledger, raw_directory
         )
+        source_container_sentinel = establish_source_container_sentinel(
+            source_container,
+            raw_directory,
+        )
         candidate_container, identity_result = install_and_run(
             candidate_app, "candidate", simulator_udid, server.origin, ledger, raw_directory
+        )
+        candidate_container_sentinel = observe_candidate_container_sentinel(
+            candidate_container,
+            raw_directory,
         )
 
         source_marker = ledger.markers.get("source")
         candidate_marker = ledger.markers.get("candidate")
         observed = {
-            "sameApplicationContainer": source_container == candidate_container,
+            "sameApplicationContainer": container_sentinel_preserved(
+                source_container_sentinel,
+                candidate_container_sentinel,
+            ),
             "identityPreserved": identity_result
             and source_marker is not None
             and candidate_marker is not None
@@ -1285,8 +1395,11 @@ def main() -> int:
                 "resolvedDependency": {"source": source_resolution, "candidate": candidate_resolution},
                 "environment": run_environment,
                 "applicationContainer": {
+                    "sentinelRelativePath": CONTAINER_SENTINEL_RELATIVE.as_posix(),
                     "sourcePathSha256": hashlib.sha256(str(source_container).encode("utf-8")).hexdigest(),
                     "candidatePathSha256": hashlib.sha256(str(candidate_container).encode("utf-8")).hexdigest(),
+                    "sourceSentinelSha256": hashlib.sha256(source_container_sentinel).hexdigest(),
+                    "candidateSentinelSha256": hashlib.sha256(candidate_container_sentinel).hexdigest(),
                 },
             },
         )
@@ -1295,6 +1408,7 @@ def main() -> int:
             manifest["blockers"] = []
             status = 0
         else:
+            failed_checks = failed_continuity_checks(observed)
             manifest["verificationStatus"] = "failed"
             manifest["blockers"] = [
                 {
@@ -1302,6 +1416,11 @@ def main() -> int:
                     "detail": "At least one same-container identity or observable network-session check failed.",
                 }
             ]
+            print(
+                "upgrade evidence failed: CONTINUITY_NOT_PRESERVED "
+                f"(failed checks: {','.join(failed_checks)})",
+                file=sys.stderr,
+            )
             status = 1
     except HarnessBlocked as error:
         manifest["verificationStatus"] = "blocked"
