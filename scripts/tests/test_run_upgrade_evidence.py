@@ -936,6 +936,45 @@ class UpgradeEvidenceCaptureTests(unittest.TestCase):
             ("identityPreserved", "sessionRotated"),
         )
 
+    def test_container_continuity_uses_preserved_sentinel_bytes(self) -> None:
+        sentinel = b"s" * RUNNER.CONTAINER_SENTINEL_BYTES
+        self.assertTrue(RUNNER.container_sentinel_preserved(sentinel, sentinel))
+        self.assertFalse(
+            RUNNER.container_sentinel_preserved(
+                sentinel,
+                b"c" * RUNNER.CONTAINER_SENTINEL_BYTES,
+            )
+        )
+        self.assertFalse(RUNNER.container_sentinel_preserved(sentinel, b""))
+
+    def test_container_sentinel_is_observed_at_the_same_relative_location(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            raw_directory = root / "raw"
+            source_container = root / "source-container"
+            candidate_container = root / "candidate-container"
+            source = RUNNER.establish_source_container_sentinel(
+                source_container,
+                raw_directory,
+            )
+            candidate_target = candidate_container / RUNNER.CONTAINER_SENTINEL_RELATIVE
+            candidate_target.parent.mkdir(parents=True)
+            candidate_target.write_bytes(source)
+            candidate = RUNNER.observe_candidate_container_sentinel(
+                candidate_container,
+                raw_directory,
+            )
+
+            self.assertTrue(RUNNER.container_sentinel_preserved(source, candidate))
+            self.assertEqual(
+                (raw_directory / RUNNER.RAW_CONTAINER_SENTINELS["source"]).read_bytes(),
+                source,
+            )
+            self.assertEqual(
+                (raw_directory / RUNNER.RAW_CONTAINER_SENTINELS["candidate"]).read_bytes(),
+                candidate,
+            )
+
     def test_capture_ledger_rejects_marker_at_wrong_method_or_path(self) -> None:
         for method, path in (
             ("GET", "/batch"),

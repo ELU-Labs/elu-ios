@@ -46,6 +46,14 @@ FLAGS_PATH = "/flags?v=2"
 CONFIG_PATH = "/v1/upgrade-evidence/config"
 MARKER_WAIT_SECONDS = 45
 RUN_RESULT_WAIT_SECONDS = 60
+CONTAINER_SENTINEL_BYTES = 32
+CONTAINER_SENTINEL_RELATIVE = pathlib.Path(
+    "Library/Application Support/dev.elu.sdk-upgrade-evidence/container-sentinel.bin"
+)
+RAW_CONTAINER_SENTINELS = {
+    "source": pathlib.Path("application-container/source-sentinel.bin"),
+    "candidate": pathlib.Path("application-container/candidate-sentinel.bin"),
+}
 MAX_CAPTURE_BODY_BYTES = 8 * 1024 * 1024
 GZIP_INPUT_CHUNK_BYTES = 64 * 1024
 MAX_DECOMPRESSED_BODY_BYTES = 8 * 1024 * 1024
@@ -138,6 +146,7 @@ BLOCKER_DETAILS = {
     "HISTORICAL_TAG_AUTHENTICATION_FAILED": "The resolved source dependency checkout did not authenticate the dated tag observation.",
     "SOURCE_RUN_FAILED": "The source-version application did not establish observable identity and session evidence.",
     "CANDIDATE_RUN_FAILED": "The candidate application did not produce its same-container continuity result.",
+    "SOURCE_CONTAINER_SENTINEL_FAILED": "The runner could not establish its source application-data sentinel.",
     "SOURCE_EXACT_BATCH_NOT_OBSERVED": "No exact source-version telemetry batch request was observed after launch.",
     "SOURCE_BATCH_UNREADABLE": "A source-version telemetry batch request was observed, but its fixed envelope could not be read.",
     "SOURCE_MARKER_EVENT_ABSENT": "Readable source-version telemetry batches did not contain the fixed marker event.",
@@ -466,6 +475,63 @@ def inside_repository(path: pathlib.Path) -> bool:
 def write_json(path: pathlib.Path, value: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def record_container_sentinel(
+    raw_directory: pathlib.Path,
+    build: str,
+    payload: bytes,
+) -> None:
+    relative = RAW_CONTAINER_SENTINELS.get(build)
+    if relative is None:
+        raise HarnessBlocked("UNEXPECTED_RUNNER_FAILURE")
+    output = raw_directory / relative
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_bytes(payload)
+
+
+def establish_source_container_sentinel(
+    container: pathlib.Path,
+    raw_directory: pathlib.Path,
+) -> bytes:
+    payload = os.urandom(CONTAINER_SENTINEL_BYTES)
+    target = container / CONTAINER_SENTINEL_RELATIVE
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with target.open("wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        with target.open("rb") as stream:
+            observed = stream.read(CONTAINER_SENTINEL_BYTES + 1)
+    except OSError:
+        raise HarnessBlocked("SOURCE_CONTAINER_SENTINEL_FAILED") from None
+    if observed != payload:
+        raise HarnessBlocked("SOURCE_CONTAINER_SENTINEL_FAILED")
+    record_container_sentinel(raw_directory, "source", observed)
+    return observed
+
+
+def observe_candidate_container_sentinel(
+    container: pathlib.Path,
+    raw_directory: pathlib.Path,
+) -> bytes:
+    target = container / CONTAINER_SENTINEL_RELATIVE
+    try:
+        with target.open("rb") as stream:
+            observed = stream.read(CONTAINER_SENTINEL_BYTES + 1)
+    except OSError:
+        observed = b""
+    record_container_sentinel(raw_directory, "candidate", observed)
+    return observed
+
+
+def container_sentinel_preserved(source: bytes, candidate: bytes) -> bool:
+    return (
+        len(source) == CONTAINER_SENTINEL_BYTES
+        and len(candidate) == CONTAINER_SENTINEL_BYTES
+        and source == candidate
+    )
 
 
 def run_command(
@@ -1264,14 +1330,25 @@ def main() -> int:
         source_container, _ = install_and_run(
             source_app, "source", simulator_udid, server.origin, ledger, raw_directory
         )
+        source_container_sentinel = establish_source_container_sentinel(
+            source_container,
+            raw_directory,
+        )
         candidate_container, identity_result = install_and_run(
             candidate_app, "candidate", simulator_udid, server.origin, ledger, raw_directory
+        )
+        candidate_container_sentinel = observe_candidate_container_sentinel(
+            candidate_container,
+            raw_directory,
         )
 
         source_marker = ledger.markers.get("source")
         candidate_marker = ledger.markers.get("candidate")
         observed = {
-            "sameApplicationContainer": source_container == candidate_container,
+            "sameApplicationContainer": container_sentinel_preserved(
+                source_container_sentinel,
+                candidate_container_sentinel,
+            ),
             "identityPreserved": identity_result
             and source_marker is not None
             and candidate_marker is not None
@@ -1305,6 +1382,8 @@ def main() -> int:
                 "applicationContainer": {
                     "sourcePathSha256": hashlib.sha256(str(source_container).encode("utf-8")).hexdigest(),
                     "candidatePathSha256": hashlib.sha256(str(candidate_container).encode("utf-8")).hexdigest(),
+                    "sourceSentinelSha256": hashlib.sha256(source_container_sentinel).hexdigest(),
+                    "candidateSentinelSha256": hashlib.sha256(candidate_container_sentinel).hexdigest(),
                 },
             },
         )

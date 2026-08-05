@@ -15,7 +15,7 @@ dependency is absent from its archived resolved graph. Verified validation
 inspects that graph and the raw network captures rather than trusting the
 manifest booleans. It also records exact Xcode and iOS versions, the fixed
 bundle id, the raw archive digest, and successful identity, session-rotation,
-and application-container checks.
+and application-data preservation checks.
 
 ## Simulator harness
 
@@ -25,17 +25,22 @@ The harness is a UIKit application hosting a SwiftUI view. The runner:
    `git archive`;
 2. builds both applications before starting the continuity clock;
 3. installs the source under `dev.elu.sdk-upgrade-evidence`, establishes a
-   generated identity, and captures a source marker;
+   generated identity, captures a source marker, and writes a random sentinel
+   under the application data container;
 4. installs the already-built candidate over the existing application, without
    an uninstall;
-5. compares the public distinct-id result and confirms that both network
+5. reads the sentinel from the candidate's current data-container path, then
+   compares the public distinct-id result and confirms that both network
    captures contain a session id with the documented source-to-candidate
    rotation; and
 6. writes a normalized manifest plus a SHA-256 digest.
 
-The generated identity and session values appear only in the raw archive. The
-runner stores failure diagnostics there as well, prints only normalized
-status, and refuses an output directory inside the repository. Marker-shaped
+An iOS update may relocate the data container's absolute path, so path equality
+is not a continuity invariant. The runner and independent validator instead
+require the source and candidate sentinel bytes to match at the same relative
+location. The generated identity and session values appear only in the raw
+archive. The runner stores failure diagnostics there as well, prints only
+normalized status, and refuses an output directory inside the repository. Marker-shaped
 payloads count only when captured on the source SDK's parameter-free telemetry
 route. Foundation may serialize that route as `POST /batch` or `POST /batch?`;
 both spellings are accepted, while other methods, paths, and non-empty queries

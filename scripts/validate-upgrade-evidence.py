@@ -56,6 +56,11 @@ EVENT_NAMES = {
 TELEMETRY_METHOD = "POST"
 TELEMETRY_PATH = "/batch"
 TELEMETRY_TARGETS = frozenset((TELEMETRY_PATH, f"{TELEMETRY_PATH}?"))
+CONTAINER_SENTINEL_BYTES = 32
+RAW_CONTAINER_SENTINELS = {
+    "source": "application-container/source-sentinel.bin",
+    "candidate": "application-container/candidate-sentinel.bin",
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -671,20 +676,49 @@ def verify_raw_evidence(
         errors.append("raw provenance dependency resolutions do not match the manifest")
 
     container = provenance.get("applicationContainer")
-    container_equal = False
+    container_preserved = False
     if exact_keys(
         container,
-        {"sourcePathSha256", "candidatePathSha256"},
+        {
+            "sourcePathSha256",
+            "candidatePathSha256",
+            "sourceSentinelSha256",
+            "candidateSentinelSha256",
+        },
         "raw provenance applicationContainer",
         errors,
     ):
-        source_digest = container["sourcePathSha256"]
-        candidate_digest = container["candidatePathSha256"]
-        if not isinstance(source_digest, str) or not HEX_64.fullmatch(source_digest):
-            errors.append("raw provenance source container digest is invalid")
-        if not isinstance(candidate_digest, str) or not HEX_64.fullmatch(candidate_digest):
-            errors.append("raw provenance candidate container digest is invalid")
-        container_equal = source_digest == candidate_digest
+        for field in (
+            "sourcePathSha256",
+            "candidatePathSha256",
+            "sourceSentinelSha256",
+            "candidateSentinelSha256",
+        ):
+            digest = container[field]
+            if not isinstance(digest, str) or not HEX_64.fullmatch(digest):
+                errors.append(f"raw provenance applicationContainer.{field} is invalid")
+
+        source_sentinel = files.get(RAW_CONTAINER_SENTINELS["source"])
+        candidate_sentinel = files.get(RAW_CONTAINER_SENTINELS["candidate"])
+        if source_sentinel is None:
+            errors.append("raw archive is missing the source application-container sentinel")
+            source_sentinel = b""
+        if candidate_sentinel is None:
+            errors.append("raw archive is missing the candidate application-container sentinel")
+            candidate_sentinel = b""
+        if len(source_sentinel) != CONTAINER_SENTINEL_BYTES:
+            errors.append("raw source application-container sentinel has an invalid length")
+        if len(candidate_sentinel) != CONTAINER_SENTINEL_BYTES:
+            errors.append("raw candidate application-container sentinel has an invalid length")
+        if container.get("sourceSentinelSha256") != hashlib.sha256(source_sentinel).hexdigest():
+            errors.append("raw source application-container sentinel digest does not match provenance")
+        if container.get("candidateSentinelSha256") != hashlib.sha256(candidate_sentinel).hexdigest():
+            errors.append("raw candidate application-container sentinel digest does not match provenance")
+        container_preserved = (
+            len(source_sentinel) == CONTAINER_SENTINEL_BYTES
+            and len(candidate_sentinel) == CONTAINER_SENTINEL_BYTES
+            and source_sentinel == candidate_sentinel
+        )
 
     capture, markers = derive_capture(files, errors)
     expected_status = {
@@ -703,7 +737,7 @@ def verify_raw_evidence(
             errors,
         ) and application_result != {"build": build, "identityCheck": True}:
             errors.append(f"raw {build} application result did not confirm the public identity facade")
-    derived_observed = {"sameApplicationContainer": container_equal, **capture}
+    derived_observed = {"sameApplicationContainer": container_preserved, **capture}
     if manifest.get("observedContinuity") != derived_observed:
         errors.append("manifest continuity results do not match raw evidence")
 
