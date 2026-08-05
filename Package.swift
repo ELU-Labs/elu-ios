@@ -24,6 +24,9 @@ let package = Package(
             ],
             resources: [
                 .copy("Resources/PrivacyInfo.xcprivacy"),
+            ],
+            linkerSettings: [
+                .linkedLibrary("sqlite3"),
             ]
         ),
         .testTarget(

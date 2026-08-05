@@ -1,8 +1,8 @@
 {
-  "snapshotVersion": 2,
+  "snapshotVersion": 3,
   "manifestProvenance": {
     "path": "Package.swift",
-    "sha256": "f1ffa16b337d7f839b2363a8dabbaa4dcfbd883655bc0ae85f84f03aef3bab08"
+    "sha256": "fb7e4817911a75b2bd2ea0c173163f7a44dcf4c4356b31ac49c5ac13276a348b"
   },
   "package": {
     "toolsVersion": "5.9.0",
@@ -16,7 +16,13 @@
     "targets": [
       { "name": "EluAnalytics", "type": "regular" },
       { "name": "EluAnalyticsTests", "type": "test" }
-    ]
+    ],
+    "targetSettings": {
+      "EluAnalytics": [
+        { "tool": "linker", "linkedLibrary": "sqlite3" }
+      ],
+      "EluAnalyticsTests": []
+    }
   },
   "dependency": {
     "identityAndSource": "legal/THIRD_PARTY_NOTICES.dependencies.json",

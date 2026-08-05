@@ -42,6 +42,7 @@ run_logged() {
 python3 scripts/verify-baseline.py
 python3 Conformance/validate-baselines.py
 python3 Conformance/validate-v1-config.py
+python3 Conformance/validate-v1-queue.py
 run_logged resolve swift package resolve
 swift package dump-package > "$output/package-metadata.json" 2> "$logs/dump-package.log"
 python3 scripts/verify-package-surface.py --mode strict "$output/package-metadata.json"
