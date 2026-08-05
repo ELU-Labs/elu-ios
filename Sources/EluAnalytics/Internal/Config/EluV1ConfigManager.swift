@@ -106,6 +106,73 @@ enum EluV1ConfigUpdateResult: Equatable, Sendable {
     case stale(revision: String)
 }
 
+enum EluV1FlagRestriction: String, Codable, Equatable, Sendable {
+    case missing
+    case disabled
+    case revoked
+    case expired
+    case featureDisabled
+    case malformed
+    case conflict
+    case terminal
+    case wallRollback
+    case storageUnavailable
+}
+
+struct EluV1FlagAuthorizationSnapshot: Equatable, Sendable {
+    let exactConstructorSiteKey: String
+    let siteNamespaceDigest: String
+    let siteId: String
+    let endpoint: URL
+    let configRevision: String
+    let configIssuedAt: EluV1Timestamp
+    let configSemanticHash: String
+    let activationGeneration: Int64
+    let barrierGeneration: Int64
+    let configExpiresAt: EluV1Timestamp
+}
+
+enum EluV1FlagAuthorization: Equatable, Sendable {
+    case allowed(EluV1FlagAuthorizationSnapshot)
+    case restricted(EluV1FlagRestriction)
+}
+
+struct EluV1PreparedFlagConfig: Equatable, Sendable {
+    let token: String
+    let exactConstructorSiteKey: String
+    let siteNamespaceDigest: String
+    let siteId: String?
+    let endpoint: URL?
+    let configRevision: String
+    let issuedAt: EluV1Timestamp
+    let expiresAt: EluV1Timestamp
+    let semanticHash: String
+    let activationGeneration: Int64
+    let restriction: EluV1FlagRestriction?
+}
+
+struct EluV1FlagActivationCounter: Equatable, Sendable {
+    static let maximum = Int64(9_007_199_254_740_991)
+
+    private(set) var value: Int64
+    private(set) var isTerminal: Bool
+
+    init(value: Int64 = 0, isTerminal: Bool = false) {
+        precondition((0 ... Self.maximum).contains(value))
+        self.value = value
+        self.isTerminal = isTerminal
+    }
+
+    mutating func advance() -> Int64? {
+        guard !isTerminal, value < Self.maximum else {
+            isTerminal = true
+            return nil
+        }
+        value += 1
+        return value
+    }
+}
+
 /// Internal, serialized v1 config owner. It retains one active config and a
 /// terminal boundary for the newest validated document, including disabled,
 /// revoked, expired, and conflicting outcomes. Older responses can never
@@ -120,6 +187,145 @@ final class EluV1ConfigManager: @unchecked Sendable {
         let semanticHash: String
         let policySourceHash: String?
         let trustedEndpoints: [EluV1EndpointRole: URL]?
+    }
+
+    private struct PreparedFlagProjection {
+        let revision: String
+        let issuedAt: EluV1Timestamp
+        let expiresAt: EluV1Timestamp
+        let status: EluV1ConfigStatus
+        let siteId: String?
+        let endpoint: URL?
+        let flagsEnabled: Bool?
+        let semanticHash: String
+    }
+
+    /// Closed projection of the config envelope for the flags channel. Known
+    /// unrelated channel members may be present, absent, or unauthorized, but
+    /// they are never decoded into flag authority.
+    private struct FlagConfigProjection: Decodable {
+        let revision: String
+        let issuedAt: EluV1Timestamp
+        let expiresAt: EluV1Timestamp
+        let status: EluV1ConfigStatus
+        let siteId: String?
+        let flagsEndpoint: String?
+        let flagsEnabled: Bool?
+
+        private enum CodingKeys: String, CodingKey, CaseIterable {
+            case schemaVersion
+            case revision
+            case issuedAt
+            case expiresAt
+            case status
+            case site
+            case endpoints
+            case privacy
+            case features
+            case capabilities
+            case session
+            case limits
+            case reason
+        }
+
+        init(from decoder: Decoder) throws {
+            try EluClosedRecord.requireOnly(CodingKeys.self, from: decoder)
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            guard try container.decode(Int.self, forKey: .schemaVersion)
+                == EluV1ConfigDocument.schemaVersion
+            else {
+                throw EluV1ConfigResolutionError.unsupportedConfigSchemaVersion
+            }
+            revision = try container.decode(String.self, forKey: .revision)
+            guard EluV1Validation.validString(revision, minimum: 1, maximum: 128) else {
+                throw EluV1ConfigResolutionError.malformedConfig
+            }
+            issuedAt = try EluV1Timestamp(
+                container.decode(String.self, forKey: .issuedAt)
+            )
+            expiresAt = try EluV1Timestamp(
+                container.decode(String.self, forKey: .expiresAt)
+            )
+            status = try container.decode(EluV1ConfigStatus.self, forKey: .status)
+            let reason = try container.eluDecodeIfPresent(String.self, forKey: .reason)
+            if let reason, !EluV1Validation.validString(reason, minimum: 0, maximum: 256) {
+                throw EluV1ConfigResolutionError.malformedConfig
+            }
+
+            if status == .enabled {
+                let site = try container.decode(FlagSiteProjection.self, forKey: .site)
+                let endpoints = try container.decode(
+                    FlagEndpointsProjection.self,
+                    forKey: .endpoints
+                )
+                let features = try container.decode(
+                    FlagFeaturesProjection.self,
+                    forKey: .features
+                )
+                siteId = site.id
+                flagsEndpoint = endpoints.flags
+                flagsEnabled = features.flags
+            } else {
+                guard reason != nil,
+                      !container.contains(.site),
+                      !container.contains(.endpoints)
+                else {
+                    throw EluV1ConfigResolutionError.malformedConfig
+                }
+                siteId = nil
+                flagsEndpoint = nil
+                flagsEnabled = nil
+            }
+        }
+    }
+
+    private struct FlagSiteProjection: Decodable {
+        let id: String
+
+        private enum CodingKeys: String, CodingKey, CaseIterable { case id }
+
+        init(from decoder: Decoder) throws {
+            try EluClosedRecord.requireOnly(CodingKeys.self, from: decoder)
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            id = try container.decode(String.self, forKey: .id)
+            guard EluV1Validation.validString(id, minimum: 1, maximum: 128) else {
+                throw EluV1ConfigResolutionError.malformedConfig
+            }
+        }
+    }
+
+    private struct FlagEndpointsProjection: Decodable {
+        let flags: String
+
+        private enum CodingKeys: String, CodingKey, CaseIterable {
+            case events
+            case replay
+            case flags
+            case assets
+        }
+
+        init(from decoder: Decoder) throws {
+            try EluClosedRecord.requireOnly(CodingKeys.self, from: decoder)
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            flags = try container.decode(String.self, forKey: .flags)
+        }
+    }
+
+    private struct FlagFeaturesProjection: Decodable {
+        let flags: Bool
+
+        private enum CodingKeys: String, CodingKey, CaseIterable {
+            case capture
+            case replay
+            case flags
+            case assets
+        }
+
+        init(from decoder: Decoder) throws {
+            try EluClosedRecord.requireOnly(CodingKeys.self, from: decoder)
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            flags = try container.decode(Bool.self, forKey: .flags)
+        }
     }
 
     struct ValidatedCandidateIdentity: Equatable, Sendable {
@@ -147,14 +353,166 @@ final class EluV1ConfigManager: @unchecked Sendable {
 
     private let lock = NSLock()
     private let readbackProvenReplayTransports: Set<EluV1ReplayTransportSelection>
+    private let flagOwner: (siteKey: String, namespaceDigest: String)?
     private var newestBoundary: ConfigBoundary?
     private var activeConfig: PreparedConfig?
     private var lastValidatedCandidateIdentity: ValidatedCandidateIdentity?
+    private var pendingFlagConfig: EluV1PreparedFlagConfig?
+    private var activeFlagAuthorization: EluV1FlagAuthorizationSnapshot?
+    private var flagActivationCounter: EluV1FlagActivationCounter
 
     init(
         readbackProvenReplayTransports: Set<EluV1ReplayTransportSelection> = []
     ) {
         self.readbackProvenReplayTransports = readbackProvenReplayTransports
+        flagOwner = nil
+        flagActivationCounter = EluV1FlagActivationCounter()
+    }
+
+    init(
+        exactConstructorSiteKey: String,
+        readbackProvenReplayTransports: Set<EluV1ReplayTransportSelection> = [],
+        flagActivationCounter: EluV1FlagActivationCounter = EluV1FlagActivationCounter()
+    ) throws {
+        self.readbackProvenReplayTransports = readbackProvenReplayTransports
+        flagOwner = (
+            exactConstructorSiteKey,
+            try EluV1SiteNamespace.digest(exactConstructorSiteKey: exactConstructorSiteKey)
+        )
+        self.flagActivationCounter = flagActivationCounter
+    }
+
+    /// Phase one of flag activation. It invalidates the owner-local generation
+    /// immediately and returns a closed candidate without publishing allow
+    /// authority. The flag client must durably apply its barrier before commit.
+    func prepareFlagConfig(configData: Data, now: Date) throws -> EluV1PreparedFlagConfig {
+        lock.lock()
+        defer { lock.unlock() }
+
+        guard let flagOwner else {
+            throw EluV1ConfigResolutionError.malformedConfig
+        }
+        guard let activationGeneration = flagActivationCounter.advance() else {
+            activeFlagAuthorization = nil
+            pendingFlagConfig = nil
+            throw EluV1ConfigResolutionError.flagActivationGenerationExhausted
+        }
+        activeFlagAuthorization = nil
+        pendingFlagConfig = nil
+
+        do {
+            try Self.validateClock(now)
+            let prepared = try Self.prepareFlagProjection(configData)
+            let restriction: EluV1FlagRestriction?
+            switch prepared.status {
+            case .disabled:
+                restriction = .disabled
+            case .revoked:
+                restriction = .revoked
+            case .enabled:
+                if prepared.expiresAt.isAtOrBefore(now) {
+                    restriction = .expired
+                } else if prepared.flagsEnabled != true {
+                    restriction = .featureDisabled
+                } else {
+                    restriction = nil
+                }
+            }
+            let siteId = prepared.siteId
+            let endpoint = prepared.endpoint
+            guard restriction != nil || (siteId != nil && endpoint != nil) else {
+                throw EluV1ConfigResolutionError.malformedConfig
+            }
+            let candidate = EluV1PreparedFlagConfig(
+                token: UUID().uuidString,
+                exactConstructorSiteKey: flagOwner.siteKey,
+                siteNamespaceDigest: flagOwner.namespaceDigest,
+                siteId: siteId,
+                endpoint: endpoint,
+                configRevision: prepared.revision,
+                issuedAt: prepared.issuedAt,
+                expiresAt: prepared.expiresAt,
+                semanticHash: prepared.semanticHash,
+                activationGeneration: activationGeneration,
+                restriction: restriction
+            )
+            pendingFlagConfig = candidate
+            return candidate
+        } catch {
+            activeFlagAuthorization = nil
+            pendingFlagConfig = nil
+            throw error
+        }
+    }
+
+    /// Phase three of flag activation. Only the exact pending token can be
+    /// published, and only after the store returns its durable barrier token.
+    func commitFlagConfig(
+        _ candidate: EluV1PreparedFlagConfig,
+        barrierGeneration: Int64
+    ) -> EluV1FlagAuthorization {
+        lock.lock()
+        defer { lock.unlock() }
+        guard barrierGeneration >= 0,
+              barrierGeneration <= 9_007_199_254_740_991,
+              !flagActivationCounter.isTerminal,
+              pendingFlagConfig == candidate,
+              candidate.activationGeneration == flagActivationCounter.value
+        else {
+            activeFlagAuthorization = nil
+            pendingFlagConfig = nil
+            return .restricted(.storageUnavailable)
+        }
+        pendingFlagConfig = nil
+        if let restriction = candidate.restriction {
+            activeFlagAuthorization = nil
+            return .restricted(restriction)
+        }
+        guard let siteId = candidate.siteId, let endpoint = candidate.endpoint else {
+            activeFlagAuthorization = nil
+            return .restricted(.malformed)
+        }
+        let snapshot = EluV1FlagAuthorizationSnapshot(
+            exactConstructorSiteKey: candidate.exactConstructorSiteKey,
+            siteNamespaceDigest: candidate.siteNamespaceDigest,
+            siteId: siteId,
+            endpoint: endpoint,
+            configRevision: candidate.configRevision,
+            configIssuedAt: candidate.issuedAt,
+            configSemanticHash: candidate.semanticHash,
+            activationGeneration: candidate.activationGeneration,
+            barrierGeneration: barrierGeneration,
+            configExpiresAt: candidate.expiresAt
+        )
+        activeFlagAuthorization = snapshot
+        return .allowed(snapshot)
+    }
+
+    func rejectPendingFlagConfig(_ candidate: EluV1PreparedFlagConfig?) {
+        lock.lock()
+        defer { lock.unlock() }
+        if candidate == nil || pendingFlagConfig == candidate {
+            pendingFlagConfig = nil
+        }
+        activeFlagAuthorization = nil
+    }
+
+    func currentFlagAuthorization(now: Date) -> EluV1FlagAuthorization {
+        lock.lock()
+        defer { lock.unlock() }
+        guard now.timeIntervalSinceReferenceDate.isFinite else {
+            activeFlagAuthorization = nil
+            return .restricted(.wallRollback)
+        }
+        guard let snapshot = activeFlagAuthorization else {
+            return .restricted(.missing)
+        }
+        guard !snapshot.configExpiresAt.isAtOrBefore(now) else {
+            activeFlagAuthorization = nil
+            _ = flagActivationCounter.advance()
+            return .restricted(.expired)
+        }
+        return .allowed(snapshot)
     }
 
     func update(configData: Data, now: Date) throws -> EluV1ConfigUpdateResult {
@@ -575,6 +933,54 @@ final class EluV1ConfigManager: @unchecked Sendable {
             },
             trustedEndpoints: trustedEndpoints
         )
+    }
+
+    /// Flags consume only their own endpoint role. Known unrelated channel
+    /// values remain part of the semantic document when present, but are not
+    /// required or interpreted and cannot grant or deny flag authority.
+    private static func prepareFlagProjection(_ data: Data) throws -> PreparedFlagProjection {
+        let (projection, strictDocument) = try decodeFlagProjection(data)
+        guard projection.issuedAt < projection.expiresAt else {
+            throw EluV1ConfigResolutionError.invalidConfigValidityWindow
+        }
+        let endpoint = try projection.flagsEndpoint.map {
+            try validateEndpoint($0, role: .flags)
+        }
+        return PreparedFlagProjection(
+            revision: projection.revision,
+            issuedAt: projection.issuedAt,
+            expiresAt: projection.expiresAt,
+            status: projection.status,
+            siteId: projection.siteId,
+            endpoint: endpoint,
+            flagsEnabled: projection.flagsEnabled,
+            semanticHash: EluV1StrictCanonicalJSON.hash(strictDocument.canonicalData),
+        )
+    }
+
+    private static func decodeFlagProjection(_ data: Data) throws
+        -> (FlagConfigProjection, EluV1StrictCanonicalJSON.Document)
+    {
+        guard data.count <= maximumConfigBytes else {
+            throw EluV1ConfigResolutionError.configPayloadTooLarge
+        }
+        do {
+            let strictDocument = try EluV1StrictCanonicalJSON.parse(data)
+            guard case .object = strictDocument.value else {
+                throw EluV1ConfigResolutionError.malformedConfig
+            }
+            return (
+                try JSONDecoder().decode(
+                    FlagConfigProjection.self,
+                    from: strictDocument.canonicalData
+                ),
+                strictDocument
+            )
+        } catch let error as EluV1ConfigResolutionError {
+            throw error
+        } catch {
+            throw EluV1ConfigResolutionError.malformedConfig
+        }
     }
 
     private static func decodeConfig(_ data: Data) throws
