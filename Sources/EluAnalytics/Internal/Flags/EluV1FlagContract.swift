@@ -362,7 +362,7 @@ struct EluV1FlagEvaluationWitness: Equatable, Sendable {
         }
 
         let person = try EluV1FlagJSON.fromLegacyObject(runtime.flagContext.personProperties)
-        let groupPairs = identity.groups.map { key, value in
+        let groupPairs = try identity.groups.map { key, value in
             (key, try EluV1FlagJSON.string(value))
         }
         let groups = try EluV1FlagJSON.object(groupPairs)

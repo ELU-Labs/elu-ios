@@ -3347,13 +3347,13 @@ actor EluSQLiteRuntimeQueue {
                             throw EluRuntimeQueueError.corruptStorage
                         }
                         if let expiry = requestState.effectiveExpiresAt,
-                           ((try expiry.validated()).isAtOrBefore(sample.wallDate)
-                               || (try flagCacheDeadlineExpired(
+                           try ((expiry.validated()).isAtOrBefore(sample.wallDate)
+                               || flagCacheDeadlineExpired(
                                    requestState,
                                    declaredBodyBytes: row.declaredBodyBytes,
                                    bodySha256: row.bodySha256,
                                    at: sample
-                               )))
+                               ))
                         {
                             try expireFlagCacheState(&requestState)
                             preservedBody = nil
@@ -3872,8 +3872,8 @@ actor EluSQLiteRuntimeQueue {
                 try connection.execute("COMMIT")
                 return .miss
             }
-            if (try effectiveExpiry.validated()).isAtOrBefore(sample.wallDate)
-                || (try flagCacheDeadlineExpired(
+            if try ((effectiveExpiry.validated()).isAtOrBefore(sample.wallDate)
+                || flagCacheDeadlineExpired(
                     requestState,
                     declaredBodyBytes: row.declaredBodyBytes,
                     bodySha256: row.bodySha256,
