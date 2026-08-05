@@ -463,6 +463,53 @@ final class EluIdentityCoreTests: XCTestCase {
         }
     }
 
+    func testOversizedBackupBlocksLoadAndWritesWithoutChangingEitherRecord() async throws {
+        try await withTemporaryDirectory { directory in
+            let store = try EluFileIdentityStateStore(directoryURL: directory)
+            let core = try self.makeCore(store: store)
+            try await core.identify("user-current")
+            guard case let .loaded(persisted) = try store.load() else {
+                return XCTFail("Expected a valid primary before installing the oversized backup")
+            }
+            let primaryBytes = try Data(contentsOf: store.stateFileURL)
+            let backupBytes = Data(
+                repeating: 0x41,
+                count: EluFileIdentityStateStore.maximumAggregateBytes + 1
+            )
+            try backupBytes.write(to: store.backupFileURL)
+
+            do {
+                _ = try EluIdentityCore(
+                    store: store,
+                    clock: { self.now },
+                    anonymousIdGenerator: { "must-not-run" },
+                    streamIdGenerator: { "must-not-run" },
+                    sessionIdGenerator: { "must-not-run" }
+                )
+                XCTFail("Expected the oversized backup to block loading")
+            } catch {
+                XCTAssertEqual(
+                    error as? EluIdentityStateStoreError,
+                    .recordTooLarge(.aggregate)
+                )
+            }
+
+            for mode in [EluStateWriteMode.normal, .recovery] {
+                do {
+                    try store.save(persisted, mode: mode)
+                    XCTFail("Expected the oversized backup to block \(mode)")
+                } catch {
+                    XCTAssertEqual(
+                        error as? EluIdentityStateStoreError,
+                        .recordTooLarge(.aggregate)
+                    )
+                }
+            }
+            XCTAssertEqual(try Data(contentsOf: store.stateFileURL), primaryBytes)
+            XCTAssertEqual(try Data(contentsOf: store.backupFileURL), backupBytes)
+        }
+    }
+
     func testResetPreservesAnExistingDurableStreamCursorWithoutAllocatingFromIt() async throws {
         let initialState = try EluPersistedState(
             identity: makeIdentity(),
