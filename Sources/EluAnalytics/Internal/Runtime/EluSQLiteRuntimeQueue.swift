@@ -3387,7 +3387,14 @@ actor EluSQLiteRuntimeQueue {
                 )
             }
 
-            if rotateEpoch || requestState.requestGeneration >= 9_007_199_254_740_991 {
+            if rotateEpoch {
+                // The missing/corrupt branch already minted exactly one fresh
+                // epoch. Do not consume a second generator value here: the
+                // cross-platform recovery contract exposes the first durable
+                // replacement epoch.
+                preservedBody = nil
+                flagCacheDeadline = nil
+            } else if requestState.requestGeneration >= 9_007_199_254_740_991 {
                 requestState = freshFlagRequestState(
                     barrierGeneration: authority.barrierGeneration
                 )

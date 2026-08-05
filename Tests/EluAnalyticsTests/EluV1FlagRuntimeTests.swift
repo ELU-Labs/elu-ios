@@ -2998,7 +2998,12 @@ final class EluV1FlagRuntimeTests: XCTestCase {
     func testFlagOnlyCurrentAndFutureCorruptionCannotRollBackCoreMutations() async throws {
         try await withTemporaryDirectory { root in
             let clock = FlagTestClock(self.initialWall)
-            let runtime = try await self.makeRuntime(root: root, clock: clock)
+            let anonymousIds = FlagTestAnonymousIds()
+            let runtime = try await self.makeRuntime(
+                root: root,
+                clock: clock,
+                anonymousIdGenerator: { anonymousIds.next() }
+            )
             let client = try await EluV1FlagClient.make(
                 runtime: runtime,
                 transport: ImmediateFlagTransport(),
@@ -3059,6 +3064,7 @@ final class EluV1FlagRuntimeTests: XCTestCase {
         root: URL,
         clock: FlagTestClock,
         continuousClock: FlagTestContinuousClock? = nil,
+        anonymousIdGenerator: @escaping @Sendable () -> String = { "anon_flags_1" },
         flagStoreEpochGenerator: @escaping @Sendable () -> String = {
             "flag_store_\(UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased())"
         },
@@ -3075,7 +3081,7 @@ final class EluV1FlagRuntimeTests: XCTestCase {
                 if continuousClock != nil { return nanoseconds }
                 return EluMachContinuousClock.floorTicks(forNanoseconds: nanoseconds)
             },
-            anonymousIdGenerator: { "anon_flags_1" },
+            anonymousIdGenerator: anonymousIdGenerator,
             streamIdGenerator: { "stream_flags_1" },
             sessionIdGenerator: { "session_flags_1" },
             flagStoreEpochGenerator: flagStoreEpochGenerator,
@@ -3550,7 +3556,10 @@ final class EluV1FlagRuntimeTests: XCTestCase {
         operation: (OpaquePointer) throws -> Value
     ) throws -> Value {
         var database: OpaquePointer?
-        guard sqlite3_open_v2(url.path, &database, SQLITE_OPEN_READONLY, nil) == SQLITE_OK,
+        // A clean close can remove WAL/SHM sidecars. READWRITE lets SQLite
+        // recreate those transient files while this helper still performs
+        // read-only assertions against the database contents.
+        guard sqlite3_open_v2(url.path, &database, SQLITE_OPEN_READWRITE, nil) == SQLITE_OK,
               let database
         else { throw FlagTestError.sqlite }
         defer { sqlite3_close_v2(database) }
@@ -4398,6 +4407,18 @@ private final class FlagTestStoreEpochs: @unchecked Sendable {
         defer { lock.unlock() }
         nextValue += 1
         return "store_epoch_\(nextValue)"
+    }
+}
+
+private final class FlagTestAnonymousIds: @unchecked Sendable {
+    private let lock = NSLock()
+    private var nextValue = 0
+
+    func next() -> String {
+        lock.lock()
+        defer { lock.unlock() }
+        nextValue += 1
+        return "anon_flags_\(nextValue)"
     }
 }
 
