@@ -190,7 +190,10 @@ final class EluIdentityCoreTests: XCTestCase {
                 sessionIdGenerator: { "unused-session" }
             )
             let after = await recovered.snapshot()
-            XCTAssertEqual(after.identity, before.identity)
+            var expectedIdentity = before.identity
+            expectedIdentity.contextRevision += 1
+            expectedIdentity.updatedAt = self.now
+            XCTAssertEqual(after.identity, expectedIdentity)
             XCTAssertEqual(after.streamId, before.streamId)
             XCTAssertEqual(after.nextSequence, 0)
             XCTAssertTrue(after.flagContext.personProperties.isEmpty)
@@ -199,12 +202,12 @@ final class EluIdentityCoreTests: XCTestCase {
             guard case let .loaded(rewritten) = try store.load() else {
                 return XCTFail("Expected corruption recovery to rewrite a valid aggregate")
             }
-            XCTAssertEqual(rewritten.identity, before.identity)
+            XCTAssertEqual(rewritten.identity, expectedIdentity)
             XCTAssertTrue(rewritten.flagContext.personProperties.isEmpty)
         }
     }
 
-    func testCorruptIdentityFailsClosedClearsFlagsAndPreservesValidStream() async throws {
+    func testCorruptIdentityUsesBackupIdentityFailClosedAndPreservesPrimaryStream() async throws {
         try await withTemporaryDirectory { directory in
             let store = try EluFileIdentityStateStore(directoryURL: directory)
             let first = try self.makeCore(store: store)
@@ -216,25 +219,30 @@ final class EluIdentityCoreTests: XCTestCase {
             var identity = try XCTUnwrap(aggregate["identity"] as? [String: Any])
             identity["anonymousId"] = ""
             aggregate["identity"] = identity
+            var stream = try XCTUnwrap(aggregate["streamMetadata"] as? [String: Any])
+            stream["streamId"] = "stream-primary-newer"
+            stream["nextSequence"] = 42
+            aggregate["streamMetadata"] = stream
             try self.writeJSONObject(aggregate, to: store.stateFileURL)
 
             let recovered = try EluIdentityCore(
                 store: store,
                 clock: { self.now },
-                anonymousIdGenerator: { "anon-recovered" },
-                streamIdGenerator: { "stream-must-not-replace-valid-state" },
+                anonymousIdGenerator: { "anon-must-not-replace-backup" },
+                streamIdGenerator: { "stream-must-not-replace-primary" },
                 sessionIdGenerator: { "session-recovered" }
             )
             let after = await recovered.snapshot()
-            XCTAssertEqual(after.identity.anonymousId, "anon-recovered")
-            XCTAssertNil(after.identity.userId)
-            XCTAssertEqual(after.identity.identityRevision, 0)
-            XCTAssertEqual(after.identity.contextRevision, 0)
+            XCTAssertEqual(after.identity.anonymousId, "anon-initial")
+            XCTAssertEqual(after.identity.userId, "user-before-corruption")
+            XCTAssertEqual(after.identity.identityRevision, 1)
+            XCTAssertEqual(after.identity.contextRevision, 1)
             XCTAssertTrue(after.identity.optedOut)
             XCTAssertTrue(after.flagContext.personProperties.isEmpty)
             XCTAssertTrue(after.flagContext.groupProperties.isEmpty)
-            XCTAssertEqual(after.streamId, before.streamId)
-            XCTAssertEqual(after.nextSequence, 0)
+            XCTAssertNotEqual(after.streamId, before.streamId)
+            XCTAssertEqual(after.streamId, "stream-primary-newer")
+            XCTAssertEqual(after.nextSequence, 42)
         }
     }
 
@@ -372,6 +380,64 @@ final class EluIdentityCoreTests: XCTestCase {
         }
     }
 
+    func testBackupReconciliationPreservesUnsupportedBackupBytes() async throws {
+        for unsupportedKind in ["version", "extension"] {
+            try await withTemporaryDirectory { directory in
+                let store = try EluFileIdentityStateStore(directoryURL: directory)
+                let core = try self.makeCore(store: store)
+                try await core.identify("user-current")
+                try await core.setFlagPersonProperties(["plan": .string("growth")])
+
+                var primary = try self.jsonObject(at: store.stateFileURL)
+                var identity = try XCTUnwrap(primary["identity"] as? [String: Any])
+                identity["anonymousId"] = ""
+                primary["identity"] = identity
+                let primaryBytes = try JSONSerialization.data(
+                    withJSONObject: primary,
+                    options: [.sortedKeys]
+                )
+                try primaryBytes.write(to: store.stateFileURL)
+
+                var backup = try self.jsonObject(at: store.backupFileURL)
+                if unsupportedKind == "version" {
+                    backup["schemaVersion"] = 99
+                } else {
+                    backup["futureField"] = true
+                }
+                let backupBytes = try JSONSerialization.data(
+                    withJSONObject: backup,
+                    options: [.sortedKeys]
+                )
+                try backupBytes.write(to: store.backupFileURL)
+
+                do {
+                    _ = try EluIdentityCore(
+                        store: store,
+                        clock: { self.now },
+                        anonymousIdGenerator: { "must-not-run" },
+                        streamIdGenerator: { "must-not-run" },
+                        sessionIdGenerator: { "must-not-run" }
+                    )
+                    XCTFail("Expected unsupported backup \(unsupportedKind)")
+                } catch {
+                    if unsupportedKind == "version" {
+                        XCTAssertEqual(
+                            error as? EluIdentityStateError,
+                            .unsupportedSchemaVersion
+                        )
+                    } else {
+                        XCTAssertEqual(
+                            error as? EluIdentityStateStoreError,
+                            .unsupportedRecordExtension(.aggregate)
+                        )
+                    }
+                }
+                XCTAssertEqual(try Data(contentsOf: store.stateFileURL), primaryBytes)
+                XCTAssertEqual(try Data(contentsOf: store.backupFileURL), backupBytes)
+            }
+        }
+    }
+
     func testResetPreservesAnExistingDurableStreamCursorWithoutAllocatingFromIt() async throws {
         let initialState = try EluPersistedState(
             identity: makeIdentity(),
@@ -423,6 +489,135 @@ final class EluIdentityCoreTests: XCTestCase {
             after.flagContext.groupProperties["organization"]?["tier"],
             .string("growth")
         )
+    }
+
+    func testDirectorySyncFailureAfterPrimaryCommitKeepsOptOutAcrossRestart() async throws {
+        try await withTemporaryDirectory { directory in
+            let synchronizer = ScriptedDirectorySynchronizer()
+            let store = try EluFileIdentityStateStore(
+                directoryURL: directory,
+                directorySynchronizer: synchronizer
+            )
+            let core = try self.makeCore(store: store)
+            XCTAssertEqual(synchronizer.callCount, 1)
+
+            // A normal save durably installs the backup first and the primary
+            // second. Fail only the directory sync after primary replacement.
+            synchronizer.fail(onCall: synchronizer.callCount + 2)
+            do {
+                try await core.setOptedOut(true)
+                XCTFail("Expected primary durability to remain unconfirmed")
+            } catch {
+                XCTAssertEqual(
+                    error as? EluIdentityStateStoreError,
+                    .primaryCommitDurabilityUnconfirmed
+                )
+            }
+
+            let afterFailure = await core.snapshot()
+            XCTAssertTrue(afterFailure.identity.optedOut)
+            guard case let .loaded(installedPrimary) = try store.load() else {
+                return XCTFail("Expected the installed primary to remain authoritative")
+            }
+            XCTAssertTrue(installedPrimary.identity.optedOut)
+
+            let restarted = try self.makeCore(store: store)
+            let afterRestart = await restarted.snapshot()
+            XCTAssertTrue(afterRestart.identity.optedOut)
+            try await restarted.registerSuperProperties(["afterFailure": .bool(true)])
+            let afterSubsequentMutation = await restarted.snapshot()
+            XCTAssertTrue(afterSubsequentMutation.identity.optedOut)
+            XCTAssertEqual(
+                afterSubsequentMutation.identity.superProperties["afterFailure"],
+                .bool(true)
+            )
+            XCTAssertEqual(synchronizer.callCount, 5)
+        }
+    }
+
+    func testBackupSyncFailureDoesNotPublishUninstalledPrimaryState() async throws {
+        try await withTemporaryDirectory { directory in
+            let synchronizer = ScriptedDirectorySynchronizer()
+            let store = try EluFileIdentityStateStore(
+                directoryURL: directory,
+                directorySynchronizer: synchronizer
+            )
+            let core = try self.makeCore(store: store)
+            synchronizer.fail(onCall: synchronizer.callCount + 1)
+
+            do {
+                try await core.identify("user-must-not-publish")
+                XCTFail("Expected backup durability to remain unconfirmed")
+            } catch {
+                XCTAssertEqual(
+                    error as? EluIdentityStateStoreError,
+                    .backupCommitDurabilityUnconfirmed
+                )
+            }
+
+            let afterFailure = await core.snapshot()
+            XCTAssertNil(afterFailure.identity.userId)
+            guard case let .loaded(primary) = try store.load() else {
+                return XCTFail("Expected the existing primary to remain authoritative")
+            }
+            XCTAssertNil(primary.identity.userId)
+            XCTAssertEqual(synchronizer.callCount, 2)
+        }
+    }
+
+    func testAggregateBudgetRejectsBeforeInvokingEncoder() async throws {
+        try await withTemporaryDirectory { directory in
+            let encoder = RecordingStateEncoder()
+            let store = try EluFileIdentityStateStore(
+                directoryURL: directory,
+                stateEncoder: encoder
+            )
+            let individuallyValidValue = EluJSONValue.string(
+                String(repeating: "x", count: 65_536)
+            )
+            XCTAssertNoThrow(try individuallyValidValue.validate())
+            let properties = Dictionary(
+                uniqueKeysWithValues: (0 ..< 17).map { ("property-\($0)", individuallyValidValue) }
+            )
+            let state = try EluPersistedState(
+                identity: self.makeIdentity(),
+                streamMetadata: EluStreamMetadata(streamId: "stream-budget"),
+                flagContext: EluPersistedFlagContext(personProperties: properties)
+            )
+
+            XCTAssertThrowsError(try store.save(state, mode: .recovery)) { error in
+                XCTAssertEqual(
+                    error as? EluIdentityStateStoreError,
+                    .recordTooLarge(.aggregate)
+                )
+            }
+            XCTAssertEqual(encoder.callCount, 0)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: store.stateFileURL.path))
+
+            let child = EluJSONValue.array([.null, .null, .null])
+            let individuallyNodeValidValue = EluJSONValue.array(
+                Array(repeating: child, count: 1_023)
+            )
+            XCTAssertNoThrow(try individuallyNodeValidValue.validate())
+            let nodeDenseProperties = Dictionary(
+                uniqueKeysWithValues: (0 ..< 17).map {
+                    ("node-property-\($0)", individuallyNodeValidValue)
+                }
+            )
+            let nodeDenseState = try EluPersistedState(
+                identity: self.makeIdentity(),
+                streamMetadata: EluStreamMetadata(streamId: "stream-node-budget"),
+                flagContext: EluPersistedFlagContext(personProperties: nodeDenseProperties)
+            )
+            XCTAssertThrowsError(try store.save(nodeDenseState, mode: .recovery)) { error in
+                XCTAssertEqual(
+                    error as? EluIdentityStateStoreError,
+                    .recordTooLarge(.aggregate)
+                )
+            }
+            XCTAssertEqual(encoder.callCount, 0)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: store.stateFileURL.path))
+        }
     }
 
     func testStringLimitsUseUnicodeScalarCounts() throws {
@@ -484,7 +679,7 @@ final class EluIdentityCoreTests: XCTestCase {
         }
     }
 
-    func testEligibleActivityClampsTimeoutAndRotatesAtExactIdleBoundary() async throws {
+    func testEligibleActivityUsesPriorTimeoutWhenRequestedTimeoutIncreases() async throws {
         let clock = LockedClock(now)
         let sessionIds = LockedIdentifierSequence(["session-1", "session-2"])
         let core = try EluIdentityCore(
@@ -511,6 +706,26 @@ final class EluIdentityCoreTests: XCTestCase {
         XCTAssertEqual(rotated.startedAt, clock.now())
         XCTAssertEqual(rotated.lastActivityAt, clock.now())
         XCTAssertEqual(rotated.timeoutSeconds, 36_000)
+    }
+
+    func testEligibleActivityUsesNewTimeoutWhenRequestedTimeoutDecreases() async throws {
+        let clock = LockedClock(now)
+        let sessionIds = LockedIdentifierSequence(["session-1", "session-2"])
+        let core = try EluIdentityCore(
+            store: LockedMemoryIdentityStore(),
+            clock: { clock.now() },
+            anonymousIdGenerator: { "anon-initial" },
+            streamIdGenerator: { "stream-initial" },
+            sessionIdGenerator: { sessionIds.next() }
+        )
+
+        let started = try await core.recordEligibleActivity(timeoutSeconds: 3_600)
+        clock.set(now.addingTimeInterval(60))
+        let rotated = try await core.recordEligibleActivity(timeoutSeconds: 60)
+        XCTAssertNotEqual(rotated.id, started.id)
+        XCTAssertEqual(rotated.id, "session-2")
+        XCTAssertEqual(rotated.timeoutSeconds, 60)
+        XCTAssertEqual(rotated.startedAt, clock.now())
     }
 
     func testEligibleActivityRotatesAtExactMaximumDurationBoundary() async throws {
@@ -651,6 +866,57 @@ final class EluIdentityCoreTests: XCTestCase {
 
 private enum TestStoreError: Error {
     case forcedFailure
+}
+
+private enum TestDirectorySyncError: Error, Equatable {
+    case forcedFailure
+}
+
+private final class ScriptedDirectorySynchronizer: EluDirectorySynchronizing, @unchecked Sendable {
+    private let lock = NSLock()
+    private var calls = 0
+    private var failingCalls: Set<Int> = []
+
+    var callCount: Int {
+        withLock { calls }
+    }
+
+    func fail(onCall call: Int) {
+        _ = withLock { failingCalls.insert(call) }
+    }
+
+    func synchronize(directoryURL _: URL) throws {
+        try withLock {
+            calls += 1
+            if failingCalls.remove(calls) != nil {
+                throw TestDirectorySyncError.forcedFailure
+            }
+        }
+    }
+
+    private func withLock<Value>(_ operation: () throws -> Value) rethrows -> Value {
+        lock.lock()
+        defer { lock.unlock() }
+        return try operation()
+    }
+}
+
+private final class RecordingStateEncoder: EluPersistedStateEncoding, @unchecked Sendable {
+    private let lock = NSLock()
+    private var calls = 0
+
+    var callCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return calls
+    }
+
+    func encode(_ state: EluPersistedState) throws -> Data {
+        lock.lock()
+        calls += 1
+        lock.unlock()
+        return try EluStateCoding.encoder().encode(state)
+    }
 }
 
 private final class LockedMemoryIdentityStore: EluIdentityStateStore, @unchecked Sendable {

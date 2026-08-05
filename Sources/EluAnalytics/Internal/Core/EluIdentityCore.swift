@@ -203,10 +203,11 @@ actor EluIdentityCore {
         if let previousSession {
             let idleSeconds = now.timeIntervalSince(previousSession.lastActivityAt)
             let durationSeconds = now.timeIntervalSince(previousSession.startedAt)
+            let effectiveExpiryTimeout = min(previousSession.timeoutSeconds, timeoutSeconds)
             let clockMovedBackward = now < previousSession.lastActivityAt
                 || now < previousSession.startedAt
             shouldRotate = clockMovedBackward
-                || idleSeconds >= Double(timeoutSeconds)
+                || idleSeconds >= Double(effectiveExpiryTimeout)
                 || durationSeconds >= Double(EluSessionState.requiredMaximumDurationSeconds)
         } else {
             shouldRotate = true
@@ -308,7 +309,18 @@ actor EluIdentityCore {
             streamMetadata: streamMetadata,
             flagContext: persistedFlagContext
         )
-        try store.save(state, mode: .normal)
+        do {
+            try store.save(state, mode: .normal)
+        } catch {
+            if error as? EluIdentityStateStoreError == .primaryCommitDurabilityUnconfirmed {
+                // The primary replacement is already visible and startup will
+                // prefer it. Publish the same state in memory before surfacing
+                // that its directory durability could not be confirmed.
+                identity = nextIdentity
+                flagContext = resolvedFlagContext
+            }
+            throw error
+        }
         identity = nextIdentity
         flagContext = resolvedFlagContext
     }
@@ -361,6 +373,8 @@ actor EluIdentityCore {
                 flagContext: identityIsValid ? components.flagContext : nil,
                 failClosed: !identityIsValid,
                 forceOptOut: components.forceOptOut,
+                advanceContextForClearedFlagContext: identityIsValid
+                    && components.flagContext == nil,
                 now: now,
                 anonymousIdGenerator: anonymousIdGenerator,
                 streamIdGenerator: streamIdGenerator
@@ -376,6 +390,7 @@ actor EluIdentityCore {
         flagContext existingFlagContext: EluPersistedFlagContext?,
         failClosed: Bool,
         forceOptOut: Bool = false,
+        advanceContextForClearedFlagContext: Bool = false,
         now: Date,
         anonymousIdGenerator: @Sendable () -> String,
         streamIdGenerator: @Sendable () -> String
@@ -384,6 +399,13 @@ actor EluIdentityCore {
         if var existingIdentity {
             if forceOptOut, !existingIdentity.optedOut {
                 existingIdentity.optedOut = true
+                existingIdentity.updatedAt = now
+            }
+            if advanceContextForClearedFlagContext {
+                guard existingIdentity.contextRevision < Int64.max else {
+                    throw EluIdentityStateError.counterExhausted
+                }
+                existingIdentity.contextRevision += 1
                 existingIdentity.updatedAt = now
             }
             identity = existingIdentity

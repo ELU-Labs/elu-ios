@@ -1,4 +1,5 @@
 import CoreFoundation
+import Darwin
 import Foundation
 
 enum EluStoredIdentityRecord: String, Sendable {
@@ -14,11 +15,43 @@ enum EluIdentityStateStoreError: Error, Equatable {
     case corrupted(EluStoredIdentityRecord)
     case recordTooLarge(EluStoredIdentityRecord)
     case unsupportedRecordExtension(EluStoredIdentityRecord)
+    case backupCommitDurabilityUnconfirmed
+    case primaryCommitDurabilityUnconfirmed
 }
 
 enum EluStateWriteMode: Equatable, Sendable {
     case normal
     case recovery
+}
+
+protocol EluDirectorySynchronizing: Sendable {
+    func synchronize(directoryURL: URL) throws
+}
+
+struct EluDarwinDirectorySynchronizer: EluDirectorySynchronizing {
+    func synchronize(directoryURL: URL) throws {
+        let descriptor = directoryURL.path.withCString { path in
+            Darwin.open(path, O_RDONLY)
+        }
+        guard descriptor >= 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        defer { _ = Darwin.close(descriptor) }
+
+        guard Darwin.fsync(descriptor) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+    }
+}
+
+protocol EluPersistedStateEncoding: Sendable {
+    func encode(_ state: EluPersistedState) throws -> Data
+}
+
+struct EluJSONPersistedStateEncoder: EluPersistedStateEncoding {
+    func encode(_ state: EluPersistedState) throws -> Data {
+        try EluStateCoding.encoder().encode(state)
+    }
 }
 
 struct EluStreamMetadata: Codable, Equatable, Sendable {
@@ -252,22 +285,164 @@ protocol EluIdentityStateStore: Sendable {
     func save(_ state: EluPersistedState, mode: EluStateWriteMode) throws
 }
 
+private struct EluPersistedStateBudget {
+    private static let maximumNodes = 65_536
+    private static let fixedEnvelopeBytes = 4_096
+
+    private var remainingBytes: Int
+    private var remainingNodes = Self.maximumNodes
+
+    init(maximumBytes: Int) throws {
+        guard maximumBytes >= Self.fixedEnvelopeBytes else {
+            throw EluIdentityStateStoreError.recordTooLarge(.aggregate)
+        }
+        remainingBytes = maximumBytes
+        try consume(bytes: Self.fixedEnvelopeBytes, nodes: 4)
+    }
+
+    static func validate(_ state: EluPersistedState, maximumBytes: Int) throws {
+        var budget = try Self(maximumBytes: maximumBytes)
+        try budget.consumeString(state.identity.anonymousId)
+        if let userId = state.identity.userId {
+            try budget.consumeString(userId)
+        }
+        try budget.consumeString(state.streamMetadata.streamId)
+
+        try budget.consumeStringMap(state.identity.groups)
+        try budget.consumeProperties(state.identity.superProperties)
+        if let session = state.identity.session {
+            try budget.consumeString(session.id)
+        }
+        if let migration = state.identity.migration {
+            try budget.consumeString(migration.sourceSchema)
+        }
+
+        try budget.consumeProperties(state.flagContext.personProperties)
+        try budget.consume(bytes: 2, nodes: 1)
+        for (type, properties) in state.flagContext.groupProperties {
+            try budget.consumeString(type, asKey: true)
+            try budget.consume(bytes: 2)
+            try budget.consumeProperties(properties)
+        }
+    }
+
+    private mutating func consumeStringMap(_ values: [String: String]) throws {
+        try consume(bytes: 2, nodes: 1)
+        for (key, value) in values {
+            try consumeString(key, asKey: true)
+            try consume(bytes: 2)
+            try consumeString(value)
+        }
+    }
+
+    private mutating func consumeProperties(_ properties: [String: EluJSONValue]) throws {
+        try consume(bytes: 2, nodes: 1)
+        for (key, value) in properties {
+            try consumeString(key, asKey: true)
+            try consume(bytes: 2)
+            try consume(value)
+        }
+    }
+
+    private mutating func consume(_ value: EluJSONValue) throws {
+        try consume(nodes: 1)
+        switch value {
+        case .null:
+            try consume(bytes: 4)
+        case .bool:
+            try consume(bytes: 5)
+        case .integer:
+            try consume(bytes: 32)
+        case .number:
+            try consume(bytes: 64)
+        case let .string(value):
+            try consumeString(value)
+        case let .array(values):
+            try consume(bytes: 2)
+            for value in values {
+                try consume(bytes: 1)
+                try consume(value)
+            }
+        case let .object(values):
+            try consume(bytes: 2)
+            for (key, value) in values {
+                try consumeString(key, asKey: true)
+                try consume(bytes: 2)
+                try consume(value)
+            }
+        }
+    }
+
+    private mutating func consumeString(_ value: String, asKey: Bool = false) throws {
+        try consume(bytes: 2, nodes: asKey ? 1 : 0)
+        for scalar in value.unicodeScalars {
+            let scalarValue = scalar.value
+            let encodedBytes: Int
+            if (0 ... 7).contains(scalarValue)
+                || scalarValue == 11
+                || (14 ... 31).contains(scalarValue)
+            {
+                encodedBytes = 6
+            } else if (8 ... 10).contains(scalarValue)
+                || (12 ... 13).contains(scalarValue)
+                || scalarValue == 34
+                || scalarValue == 47
+                || scalarValue == 92
+            {
+                encodedBytes = 2
+            } else if scalarValue == 0x2028 || scalarValue == 0x2029 {
+                encodedBytes = 6
+            } else if scalarValue <= 0x7F {
+                encodedBytes = 1
+            } else if scalarValue <= 0x7FF {
+                encodedBytes = 2
+            } else if scalarValue <= 0xFFFF {
+                encodedBytes = 3
+            } else {
+                encodedBytes = 4
+            }
+            try consume(bytes: encodedBytes)
+        }
+    }
+
+    private mutating func consume(bytes: Int = 0, nodes: Int = 0) throws {
+        guard bytes >= 0,
+              nodes >= 0,
+              bytes <= remainingBytes,
+              nodes <= remainingNodes
+        else {
+            throw EluIdentityStateStoreError.recordTooLarge(.aggregate)
+        }
+        remainingBytes -= bytes
+        remainingNodes -= nodes
+    }
+}
+
 final class EluFileIdentityStateStore: EluIdentityStateStore, @unchecked Sendable {
     static let stateFilename = "identity-state-v1.json"
     static let backupFilename = "identity-state-v1.backup.json"
 
-    private static let maximumAggregateBytes = 2 * 1_024 * 1_024
+    static let maximumAggregateBytes = 1_024 * 1_024
 
     let directoryURL: URL
     let stateFileURL: URL
     let backupFileURL: URL
 
     private let fileManager: FileManager
+    private let directorySynchronizer: any EluDirectorySynchronizing
+    private let stateEncoder: any EluPersistedStateEncoding
     private let lock = NSLock()
 
-    init(directoryURL: URL, fileManager: FileManager = .default) throws {
+    init(
+        directoryURL: URL,
+        fileManager: FileManager = .default,
+        directorySynchronizer: any EluDirectorySynchronizing = EluDarwinDirectorySynchronizer(),
+        stateEncoder: any EluPersistedStateEncoding = EluJSONPersistedStateEncoder()
+    ) throws {
         self.directoryURL = directoryURL
         self.fileManager = fileManager
+        self.directorySynchronizer = directorySynchronizer
+        self.stateEncoder = stateEncoder
         stateFileURL = directoryURL.appendingPathComponent(Self.stateFilename, isDirectory: false)
         backupFileURL = directoryURL.appendingPathComponent(Self.backupFilename, isDirectory: false)
         try fileManager.createDirectory(at: directoryURL, withIntermediateDirectories: true)
@@ -281,7 +456,7 @@ final class EluFileIdentityStateStore: EluIdentityStateStore, @unchecked Sendabl
                 case let .loaded(state):
                     return .loaded(state)
                 case let .recoverable(components):
-                    return .recoverable(components)
+                    return try reconcileRecoverablePrimary(components)
                 case .unreadable:
                     return try recoverFromBackupOrCorruption()
                 }
@@ -297,19 +472,30 @@ final class EluFileIdentityStateStore: EluIdentityStateStore, @unchecked Sendabl
     func save(_ state: EluPersistedState, mode: EluStateWriteMode) throws {
         try withLock {
             try state.validate()
-            let data = try EluStateCoding.encoder().encode(state)
+            try EluPersistedStateBudget.validate(
+                state,
+                maximumBytes: Self.maximumAggregateBytes
+            )
+            let data = try stateEncoder.encode(state)
             guard data.count <= Self.maximumAggregateBytes else {
                 throw EluIdentityStateStoreError.recordTooLarge(.aggregate)
             }
 
-            if mode == .normal,
-               let currentData = try readBoundedDataIfPresent(from: stateFileURL),
-               case .loaded = try decodeCandidate(currentData)
-            {
-                try install(currentData, at: backupFileURL)
+            let previousPrimary = try validDataIfPresent(at: stateFileURL)
+            if mode == .normal, let previousPrimary {
+                _ = try validDataIfPresent(at: backupFileURL)
+                try installDurably(
+                    previousPrimary,
+                    at: backupFileURL,
+                    durabilityError: .backupCommitDurabilityUnconfirmed
+                )
             }
 
-            try install(data, at: stateFileURL)
+            try installDurably(
+                data,
+                at: stateFileURL,
+                durabilityError: .primaryCommitDurabilityUnconfirmed
+            )
         }
     }
 
@@ -317,6 +503,39 @@ final class EluFileIdentityStateStore: EluIdentityStateStore, @unchecked Sendabl
         case loaded(EluPersistedState)
         case recoverable(EluRecoverablePersistedState)
         case unreadable
+    }
+
+    private func reconcileRecoverablePrimary(
+        _ primary: EluRecoverablePersistedState
+    ) throws -> EluPersistedStateLoadResult {
+        guard primary.identity == nil,
+              fileManager.fileExists(atPath: backupFileURL.path)
+        else {
+            return .recoverable(primary)
+        }
+
+        switch try readCandidate(from: backupFileURL) {
+        case let .loaded(backup):
+            return .recoverable(
+                EluRecoverablePersistedState(
+                    identity: backup.identity,
+                    streamMetadata: primary.streamMetadata ?? backup.streamMetadata,
+                    flagContext: backup.flagContext,
+                    forceOptOut: true
+                )
+            )
+        case let .recoverable(backup) where backup.identity != nil:
+            return .recoverable(
+                EluRecoverablePersistedState(
+                    identity: backup.identity,
+                    streamMetadata: primary.streamMetadata ?? backup.streamMetadata,
+                    flagContext: backup.flagContext,
+                    forceOptOut: true
+                )
+            )
+        case .recoverable, .unreadable:
+            return .recoverable(primary)
+        }
     }
 
     private func recoverFromBackupOrCorruption() throws -> EluPersistedStateLoadResult {
@@ -370,6 +589,12 @@ final class EluFileIdentityStateStore: EluIdentityStateStore, @unchecked Sendabl
         defer { try? handle.close() }
         let data = try handle.read(upToCount: Self.maximumAggregateBytes + 1) ?? Data()
         guard !data.isEmpty, data.count <= Self.maximumAggregateBytes else { return nil }
+        return data
+    }
+
+    private func validDataIfPresent(at url: URL) throws -> Data? {
+        guard let data = try readBoundedDataIfPresent(from: url) else { return nil }
+        guard case .loaded = try decodeCandidate(data) else { return nil }
         return data
     }
 
@@ -512,7 +737,27 @@ final class EluFileIdentityStateStore: EluIdentityStateStore, @unchecked Sendabl
         return try? EluStateCoding.decoder().decode(type, from: data)
     }
 
-    private func install(_ data: Data, at targetURL: URL) throws {
+    private func installDurably(
+        _ data: Data,
+        at targetURL: URL,
+        durabilityError: EluIdentityStateStoreError
+    ) throws {
+        try replaceWithoutDirectorySync(data, at: targetURL)
+        do {
+            try directorySynchronizer.synchronize(directoryURL: directoryURL)
+        } catch {
+            // The replacement is the visibility commit point. Never roll it
+            // back to older bytes after that point; the caller distinguishes
+            // an installed primary from an auxiliary backup failure.
+            throw durabilityError
+        }
+
+        // Tightening after the durable commit is best-effort so no post-commit
+        // error can make the caller believe an unpublished write occurred.
+        try? fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: targetURL.path)
+    }
+
+    private func replaceWithoutDirectorySync(_ data: Data, at targetURL: URL) throws {
         let stagedURL = directoryURL.appendingPathComponent(
             ".\(targetURL.lastPathComponent).\(UUID().uuidString).staged",
             isDirectory: false
@@ -546,10 +791,6 @@ final class EluFileIdentityStateStore: EluIdentityStateStore, @unchecked Sendabl
         } else {
             try fileManager.moveItem(at: stagedURL, to: targetURL)
         }
-
-        // Tightening after the atomic install is best-effort so no post-commit
-        // error can make the caller believe an unpublished write occurred.
-        try? fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: targetURL.path)
     }
 
     private func withLock<Value>(_ operation: () throws -> Value) rethrows -> Value {
