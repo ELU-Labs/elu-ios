@@ -2225,7 +2225,7 @@ actor EluSQLiteRuntimeQueue {
         }
         guard session.lastActivityAt >= session.startedAt,
               session.lastActivityAt.timeIntervalSince(session.startedAt)
-                  <= Double(EluSessionState.requiredMaximumDurationSeconds),
+                  < Double(EluSessionState.requiredMaximumDurationSeconds),
               identityUpdatedAt >= session.lastActivityAt
         else {
             throw EluRuntimeQueueError.invalidState

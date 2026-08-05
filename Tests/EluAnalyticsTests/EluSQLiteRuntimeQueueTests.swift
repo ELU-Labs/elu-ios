@@ -568,6 +568,65 @@ final class EluSQLiteRuntimeQueueTests: XCTestCase {
         }
     }
 
+    func testRetainedSessionRejectsTheExactMaximumDurationBoundary() async throws {
+        try await withTemporaryDirectory { directory in
+            let queue = try await makeQueue(directory: directory)
+            let currentLastActivityAt = now.addingTimeInterval(
+                Double(EluSessionState.requiredMaximumDurationSeconds - 1)
+            )
+            let current = try testSession(
+                id: "session_maximum_duration",
+                startedAt: now,
+                lastActivityAt: currentLastActivityAt
+            )
+            _ = try await queue.appendEvent(
+                eventDraft(
+                    index: 0,
+                    versions: testVersions(),
+                    occurredAt: currentLastActivityAt,
+                    expectedSessionId: current.id
+                ),
+                sessionUpdate: .replace(
+                    expectedCurrentSessionId: nil,
+                    session: current
+                )
+            )
+            let committed = try await queue.snapshot()
+
+            let exactBoundary = now.addingTimeInterval(
+                Double(EluSessionState.requiredMaximumDurationSeconds)
+            )
+            let proposed = try testSession(
+                id: current.id,
+                startedAt: current.startedAt,
+                lastActivityAt: exactBoundary
+            )
+            do {
+                _ = try await queue.appendEvent(
+                    eventDraft(
+                        index: 1,
+                        versions: testVersions(),
+                        occurredAt: exactBoundary,
+                        expectedSessionId: proposed.id
+                    ),
+                    sessionUpdate: .replace(
+                        expectedCurrentSessionId: current.id,
+                        session: proposed
+                    )
+                )
+                XCTFail("Expected exact maximum-duration rotation boundary rejection")
+            } catch let error as EluRuntimeQueueError {
+                XCTAssertEqual(error, .invalidState)
+            }
+
+            let afterRejected = try await queue.snapshot()
+            let records = try await queue.peek(maximumCount: 10, maximumBytes: 1_000_000)
+            XCTAssertEqual(afterRejected, committed)
+            XCTAssertEqual(records.count, 1)
+            await queue.close()
+        }
+    }
+
     func testEligibleActivityForegroundsAndPersistsABackgroundSession() async throws {
         try await withTemporaryDirectory { directory in
             let backgroundedAt = now.addingTimeInterval(-5)
