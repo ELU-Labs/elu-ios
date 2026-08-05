@@ -958,7 +958,7 @@ struct EluV1Timestamp: Comparable, Sendable {
     }
 }
 
-private extension KeyedDecodingContainer {
+extension KeyedDecodingContainer {
     func eluDecodeIfPresent<T: Decodable>(_ type: T.Type, forKey key: Key) throws -> T? {
         guard contains(key) else { return nil }
         // Unlike decodeIfPresent, an explicit null is invalid for every
