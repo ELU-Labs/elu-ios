@@ -823,7 +823,7 @@ final class EluV1CaptureRuntimeTests: XCTestCase {
         faultInjector: (any EluRuntimeQueueFaultInjecting)? = nil
     ) async throws -> EluSQLiteRuntimeQueue {
         let resolvedLimits = try limits ?? EluRuntimeQueueLimits()
-        try await EluSQLiteRuntimeQueue.openCaptureRuntime(
+        return try await EluSQLiteRuntimeQueue.openCaptureRuntime(
             rootDirectoryURL: root,
             exactConstructorSiteKey: "elu_pk_test_capture",
             limits: resolvedLimits,
