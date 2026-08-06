@@ -19,6 +19,8 @@ from typing import Any, NoReturn
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 SNAPSHOT = ROOT / "Conformance" / "V1"
 EXPECTED_SHA256 = {
+    "manifest.json": "98152d8725c286f29402ba3e420bda8dd364200fb6fdf1cfe49b2da9b8f63e54",
+    "schemas/identity.schema.json": "c41dee2d3693ece1c831a5adbfd7ee0d5660a9bb8c8e21005b34e1faea38d91d",
     "schemas/event.schema.json": "4a0deeb19b8406d31aa519bf1d3978294d6d06eb451d4588668cb6f67f4edee9",
     "schemas/mutation.schema.json": "8482af6b66c04701b014acd27e6d59aaef3f27864086c755f9abde498e5c8f5f",
     "schemas/version.schema.json": "3b4ca74e470efbf6610f2a1743f2bc78805882bd294a6984ef2c93fe42fea4ab",
@@ -26,6 +28,10 @@ EXPECTED_SHA256 = {
     "schemas/batch-ack.schema.json": "95ccd5e87001515b258fd2ea6a6e346ac265220708f8b1931d4f000276e0f3d9",
     "schemas/transport-error.schema.json": "67255aa898bb33fd75440e29573969c14b1d883f5b846865a3b3e5ba3051aaae",
     "schemas/transport-policy.schema.json": "16064cf3f7c513f3a05f57dbb4ad91386918dda4b0910c51aec544a492e2df6b",
+    "schemas/replay.schema.json": "1effbcf8defe59013b49cf6c586e601a2a6d4806c89aafb6efe4115b2c078623",
+    "schemas/replay-request.schema.json": "d3d8900d8f17b951bbfb3789b964a15ebeefe68fb0a816232ae67ab5a036a7c0",
+    "schemas/replay-ack.schema.json": "10a2e6bd6ce528fc8a2083c11e5dc69c12d08bfc7b12e690f8c629eb1350e17c",
+    "Fixtures/identity.json": "31da461a12b7f5f0d8a8bf7c8b66db8f7db91f6f1e6c9b51f8c0d0eba898d34b",
     "Fixtures/event.json": "44ea5d14646ec08aaa1805dffd8ea6403487ba7cb48e8ce7ea7f3752b241809d",
     "Fixtures/mutations.json": "a02a4db1d1ef0bf6b9eac0334fe83c3564526cbd21c79ccfe14aa303ff2ae3d4",
     "Fixtures/version.json": "61bf97e8eeea78df05df13434501a4bc9e81eaa3351fecaff2bdc06da9f1f8e2",
@@ -38,6 +44,10 @@ EXPECTED_SHA256 = {
     "Fixtures/transport-error-rate-limited.json": "c29a01e3dac3d12e2722a20240201838423c07457f50aca455ebc523bda7a9fd",
     "Fixtures/transport-error-service-unavailable.json": "b93f84f5ee3591a0723f393413a28a1bb85cd7863b39313251fe54d6034f9b9c",
     "Fixtures/transport-policy.json": "992900180683af04f69d5e459b7c0c9e68edf92c6ebf320136ed36dbae8b60ce",
+    "Fixtures/replay.json": "73ab61893bc8625f486345b69f2e527aa1ed1ceba05a0aefbd943ec314d75609",
+    "Fixtures/replay-request.json": "1fb8ea52be5891a7b140a2f37764c50294f8fc637db1254cb06061ca5165e910",
+    "Fixtures/replay-ack.json": "86fdcd571de4d5894bb572b06b6a96c5da653056b2bfb1ced62a5c968db09a63",
+    "readback-expectations.json": "4958ca487c1bd3ca6592e42ca28c7de3c2ae929fceae71d53df3e96bca1f7594",
 }
 RUNTIME_NAME = re.compile(r"^elu-[a-z0-9-]+$")
 FACADE_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9._-]+$")
@@ -118,11 +128,16 @@ def resolve_reference(
 
 
 def is_schema_type(value: Any, expected: str) -> bool:
+    is_number = isinstance(value, (int, float)) and not isinstance(value, bool)
+    is_finite_number = is_number and (
+        isinstance(value, int) or math.isfinite(value)
+    )
     checks = {
         "null": value is None,
         "boolean": isinstance(value, bool),
-        "integer": isinstance(value, int) and not isinstance(value, bool),
-        "number": isinstance(value, (int, float)) and not isinstance(value, bool),
+        "integer": is_finite_number
+        and (isinstance(value, int) or value.is_integer()),
+        "number": is_finite_number,
         "string": isinstance(value, str),
         "array": isinstance(value, list),
         "object": isinstance(value, dict),
@@ -264,7 +279,7 @@ def validate_schema_instance(
         maximum = schema.get("maxLength")
         if maximum is not None and len(value) > maximum:
             schema_violation(path, "string is too long")
-        if "pattern" in schema and re.fullmatch(schema["pattern"], value) is None:
+        if "pattern" in schema and re.search(schema["pattern"], value) is None:
             schema_violation(path, "string does not match pattern")
         if schema.get("format") == "date-time" and RFC3339.fullmatch(value) is None:
             schema_violation(path, "string is not RFC3339 date-time")
@@ -623,6 +638,44 @@ def validate_transport_error(value: Any, expected_status: int) -> None:
     require_string(value["message"], "transport error message", 1, 256)
 
 
+def native_manifest_path(relative: str) -> str:
+    if relative.startswith("fixtures/"):
+        return "Fixtures/" + relative.removeprefix("fixtures/")
+    return relative
+
+
+def validate_manifest_closure(manifest: Any) -> None:
+    manifest = require_keys(
+        manifest,
+        {
+            "contract",
+            "contractVersion",
+            "schemaVersion",
+            "status",
+            "statusScope",
+            "semanticContract",
+            "transport",
+            "compatibility",
+            "schemas",
+            "fixtures",
+            "gates",
+        },
+    )
+    routed = list(manifest["schemas"].values())
+    routed.append(manifest["transport"]["policy"])
+    routed.extend(manifest["fixtures"])
+    routed.extend(manifest["gates"].values())
+    actual = {
+        path.relative_to(SNAPSHOT).as_posix()
+        for path in SNAPSHOT.rglob("*")
+        if path.is_file()
+    }
+    for relative in routed:
+        native = native_manifest_path(relative)
+        if native not in actual:
+            fail(f"manifest dependency is missing or has wrong case: {native}")
+
+
 def main() -> int:
     pinned_schemas = {
         relative: load_pinned(relative)
@@ -640,6 +693,12 @@ def main() -> int:
     batch_ack = load_pinned("Fixtures/batch-ack.json")
     batch_retryable_ack = load_pinned("Fixtures/batch-ack-retryable-head.json")
     transport_policy = load_pinned("Fixtures/transport-policy.json")
+    manifest = load_pinned("manifest.json")
+    identity = load_pinned("Fixtures/identity.json")
+    replay = load_pinned("Fixtures/replay.json")
+    replay_request = load_pinned("Fixtures/replay-request.json")
+    replay_ack = load_pinned("Fixtures/replay-ack.json")
+    readback = load_pinned("readback-expectations.json")
     transport_errors = {
         401: load_pinned("Fixtures/transport-error-unauthorized.json"),
         403: load_pinned("Fixtures/transport-error-forbidden.json"),
@@ -664,7 +723,9 @@ def main() -> int:
         fail("mutation schema definitions drifted")
     if schemas["version.schema.json"].get("additionalProperties") is not False:
         fail("version schema must remain closed")
+    validate_manifest_closure(manifest)
 
+    validate_against_schema(identity, "identity.schema.json", schemas, "identity fixture")
     validate_against_schema(versions, "version.schema.json", schemas, "version fixture")
     validate_against_schema(event, "event.schema.json", schemas, "event fixture")
     validate_against_schema(
@@ -705,6 +766,28 @@ def main() -> int:
         schemas,
         "transport policy fixture",
     )
+    validate_against_schema(replay, "replay.schema.json", schemas, "replay fixture")
+    validate_against_schema(
+        replay_request,
+        "replay-request.schema.json",
+        schemas,
+        "replay request fixture",
+    )
+    validate_against_schema(
+        replay_ack,
+        "replay-ack.schema.json",
+        schemas,
+        "replay acknowledgement fixture",
+    )
+    if replay_request["chunk"] != replay:
+        fail("replay request does not contain the byte-pinned replay fixture")
+    for field in ("replayId", "chunkId", "sequence"):
+        if replay_ack[field] != replay[field]:
+            fail(f"replay acknowledgement {field} is not bound to its chunk")
+    if replay_ack["requestId"] != replay_request["requestId"]:
+        fail("replay acknowledgement requestId is not bound to its request")
+    if readback.get("orderedInput", {}).get("replayFixture") != "fixtures/replay.json":
+        fail("readback gate does not route the canonical replay fixture")
     validate_batch_ack(batch_request, batch_ack)
     validate_batch_ack(batch_request, batch_retryable_ack)
 
@@ -799,8 +882,8 @@ def main() -> int:
     )
 
     print(
-        "validated 19 pinned queue and batch-transport files against JSON schemas "
-        "and strict ordered acknowledgement semantics"
+        f"validated {len(EXPECTED_SHA256)} pinned v1 queue, replay, and transport files "
+        "against complete manifest routing and strict acknowledgement semantics"
     )
     return 0
 

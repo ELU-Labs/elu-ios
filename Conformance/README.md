@@ -10,5 +10,14 @@ Validate every checked-in baseline with:
 python3 Conformance/validate-baselines.py
 ```
 
+Validate the frozen config and replay contracts with:
+
+```sh
+python3 Conformance/validate-v1-config.py
+python3 Conformance/validate-v1-queue.py
+python3 Conformance/validate-v1-flags.py
+python3 Conformance/validate-v2-replay.py
+```
+
 Simulator and physical-device captures add evidence references to the existing
 case IDs rather than silently changing their expectations.
