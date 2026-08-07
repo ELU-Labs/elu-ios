@@ -4,6 +4,12 @@ ELU product intelligence for native iOS apps. One site key, no other
 configuration — behavior (privacy controls, kill switches, session replay)
 is managed from your ELU dashboard and delivered as remote config.
 
+ELU Analytics 0.1.0 exposes an ELU-owned API and currently uses PostHog's
+native runtime for managed capture and ingest. You do not need a PostHog
+account or key; application code should call only `Elu.*`.
+This provider-backed disclosure and dependency are temporary; both must be
+absent from a standalone ELU runtime release.
+
 - Swift Package, iOS 13+
 - Session replay, screen tracking, lifecycle events out of the box
 - All privacy controls act on-device at capture time: masked or blocked
@@ -16,7 +22,7 @@ add to your `Package.swift`:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/ELU-Labs/elu-ios.git", from: "0.1.0"),
+    .package(url: "https://github.com/ELU-Labs/elu-ios.git", exact: "0.1.0"),
 ]
 ```
 
@@ -27,6 +33,7 @@ Then add `EluAnalytics` to your target's dependencies.
 Call once, as early as possible:
 
 ```swift
+import UIKit
 import EluAnalytics
 
 @main
@@ -42,6 +49,9 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
 SwiftUI `App` lifecycle:
 
 ```swift
+import SwiftUI
+import EluAnalytics
+
 @main
 struct MyApp: App {
     init() {
@@ -112,15 +122,19 @@ Elu.setGroupPropertiesForFlags(_:properties:)
 
 Every method is safe to call at any time — before setup, while config is
 loading, or when analytics is disabled — it never throws and never blocks.
+When analytics is disabled or a device is EU-blocked, `Elu.*` event calls are
+no-ops and no analytics events or replay leave the device. ELU config checks
+continue so a re-enabled site can recover.
 
 ## Remote-controlled vs baked-in
 
-Controlled from the ELU dashboard (no app update needed, ~5 min propagation
-for new sessions):
+Controlled from the ELU dashboard without an app update. Changes apply after
+the next successful eligible config refresh; a fetch failure keeps the last
+known safe config until the device can refresh again:
 
 - Analytics on/off (kill switch)
 - EU visitor blocking (`blockEu` — on by default, timezone heuristic,
-  fail-closed: blocked devices initialize nothing and send nothing)
+  fail-closed: blocked devices send no analytics events or replay)
 - Replay text/input masking, image masking
 - Replay for new users only; per-session replay minute budget
 - Replay sampling and minimum duration (project settings)

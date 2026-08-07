@@ -5,6 +5,7 @@
   "strictReleaseRequirement": "zero findings",
   "findings": {
     "Package.swift": 4,
+    "README.md": 2,
     "Sources/EluAnalytics/EluState.swift": 8
   }
 }
