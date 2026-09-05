@@ -418,7 +418,7 @@ final class EluV1ConfigManagerTests: XCTestCase {
     }
 
     func testSchemaMajorsAndUnknownOrNullMembersFailClosed() throws {
-        let futureConfig = try configFixture { $0["schemaVersion"] = 2 }
+        let futureConfig = try configFixture { $0["schemaVersion"] = 3 }
         assertUpdateError(.unsupportedConfigSchemaVersion, config: futureConfig)
 
         let futurePolicy = try configFixture { object in

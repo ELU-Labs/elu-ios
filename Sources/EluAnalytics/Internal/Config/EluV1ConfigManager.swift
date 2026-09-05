@@ -81,6 +81,8 @@ enum EluV1ReplayAuthorization: Equatable, Sendable {
 /// map: a caller can receive only roles authorized by the currently installed
 /// config, effective privacy state, identity snapshot, and local capabilities.
 struct EluV1ConfigResolution: Equatable, Sendable {
+    /// Configuration document major that produced this authorization.
+    let configSchemaVersion: Int
     let configRevision: String
     let siteId: String
     let issuedAt: Date
@@ -93,6 +95,10 @@ struct EluV1ConfigResolution: Equatable, Sendable {
     let decisionContextRevision: Int64?
     let sessionIdleTimeoutSeconds: Int
     let sessionMaximumDurationSeconds: Int
+    /// Server-advertised ceilings; delivery enforces them alongside the frozen client maxima.
+    let limits: EluV1Limits
+    /// Bounded replay protocol generation advertised by a v2 document; nil under v1.
+    let replayProtocolGeneration: String?
     let endpoints: EluV1AuthorizedEndpointSet
     let captureAuthorization: EluV1CaptureAuthorization
     let replayAuthorization: EluV1ReplayAuthorization
@@ -190,6 +196,7 @@ final class EluV1ConfigManager: @unchecked Sendable {
     }
 
     private struct PreparedFlagProjection {
+        let schemaVersion: Int
         let revision: String
         let issuedAt: EluV1Timestamp
         let expiresAt: EluV1Timestamp
@@ -204,6 +211,7 @@ final class EluV1ConfigManager: @unchecked Sendable {
     /// unrelated channel members may be present, absent, or unauthorized, but
     /// they are never decoded into flag authority.
     private struct FlagConfigProjection: Decodable {
+        let schemaVersion: Int
         let revision: String
         let issuedAt: EluV1Timestamp
         let expiresAt: EluV1Timestamp
@@ -231,11 +239,11 @@ final class EluV1ConfigManager: @unchecked Sendable {
         init(from decoder: Decoder) throws {
             try EluClosedRecord.requireOnly(CodingKeys.self, from: decoder)
             let container = try decoder.container(keyedBy: CodingKeys.self)
-            guard try container.decode(Int.self, forKey: .schemaVersion)
-                == EluV1ConfigDocument.schemaVersion
-            else {
+            let schemaVersion = try container.decode(Int.self, forKey: .schemaVersion)
+            guard EluV1ConfigDocument.supportedSchemaVersions.contains(schemaVersion) else {
                 throw EluV1ConfigResolutionError.unsupportedConfigSchemaVersion
             }
+            self.schemaVersion = schemaVersion
             revision = try container.decode(String.self, forKey: .revision)
             guard EluV1Validation.validString(revision, minimum: 1, maximum: 128) else {
                 throw EluV1ConfigResolutionError.malformedConfig
@@ -587,6 +595,32 @@ final class EluV1ConfigManager: @unchecked Sendable {
         return lastValidatedCandidateIdentity
     }
 
+    /// The policy, feature gates, and capabilities of the active config. The
+    /// privacy-state producer projects these into the effective state that
+    /// `authorize(effectivePrivacyStateData:identity:now:)` verifies; exposing
+    /// them grants no endpoint or channel authority.
+    func activePrivacyProjectionContext(now: Date) throws -> EluV1PrivacyProjectionContext {
+        lock.lock()
+        defer { lock.unlock() }
+
+        try Self.validateClock(now)
+        expireActiveConfigIfNeeded(now: now)
+        guard let active = activeConfig else {
+            throw EluV1ConfigResolutionError.missingActiveConfig
+        }
+        guard let privacy = active.document.privacy,
+              let features = active.document.features,
+              let capabilities = active.document.capabilities
+        else {
+            throw EluV1ConfigResolutionError.malformedConfig
+        }
+        return EluV1PrivacyProjectionContext(
+            policy: privacy,
+            features: features,
+            capabilities: capabilities
+        )
+    }
+
     func authorize(
         effectivePrivacyStateData: Data?,
         identity: EluIdentitySnapshot,
@@ -606,6 +640,7 @@ final class EluV1ConfigManager: @unchecked Sendable {
               let features = config.features,
               let capabilities = config.capabilities,
               let session = config.session,
+              let limits = config.limits,
               let policySourceHash = active.policySourceHash,
               let trustedEndpoints = active.trustedEndpoints
         else {
@@ -633,6 +668,7 @@ final class EluV1ConfigManager: @unchecked Sendable {
                 authorized[.replay] = trustedEndpoints[.replay]
             }
             return EluV1ConfigResolution(
+                configSchemaVersion: config.schemaVersion,
                 configRevision: config.revision,
                 siteId: site.id,
                 issuedAt: config.issuedAt.date,
@@ -645,6 +681,8 @@ final class EluV1ConfigManager: @unchecked Sendable {
                 decisionContextRevision: decisionContextRevision,
                 sessionIdleTimeoutSeconds: session.idleTimeoutSeconds,
                 sessionMaximumDurationSeconds: session.maximumDurationSeconds,
+                limits: limits,
+                replayProtocolGeneration: capabilities.replay.replayProtocolGeneration,
                 endpoints: EluV1AuthorizedEndpointSet(authorized),
                 captureAuthorization: capture,
                 replayAuthorization: replay
@@ -725,10 +763,14 @@ final class EluV1ConfigManager: @unchecked Sendable {
 
         let selectedServerTransport: EluV1ReplayTransportSelection?
         var replayInvalidReason: EluV1PrivacyInvalidReason?
+        // Advertisement is exact-pair membership under both majors; v1 lists
+        // were expanded into pairs at decode time.
         if let transport = effectivePrivacy.replayTransport {
             if transport.advertised,
-               capabilities.replay.acceptedCodecs.contains(transport.codec),
-               capabilities.replay.acceptedCompressions.contains(transport.compression),
+               capabilities.replay.advertises(
+                   codec: transport.codec,
+                   compression: transport.compression
+               ),
                let selection = EluV1ReplayTransportSelection(
                    codec: transport.codec,
                    compression: transport.compression
@@ -920,7 +962,10 @@ final class EluV1ConfigManager: @unchecked Sendable {
             guard let endpoints = document.endpoints else {
                 throw EluV1ConfigResolutionError.malformedConfig
             }
-            trustedEndpoints = try validateAllEndpoints(endpoints)
+            trustedEndpoints = try validateAllEndpoints(
+                endpoints,
+                schemaVersion: document.schemaVersion
+            )
         } else {
             trustedEndpoints = nil
         }
@@ -944,9 +989,10 @@ final class EluV1ConfigManager: @unchecked Sendable {
             throw EluV1ConfigResolutionError.invalidConfigValidityWindow
         }
         let endpoint = try projection.flagsEndpoint.map {
-            try validateEndpoint($0, role: .flags)
+            try validateEndpoint($0, role: .flags, schemaVersion: projection.schemaVersion)
         }
         return PreparedFlagProjection(
+            schemaVersion: projection.schemaVersion,
             revision: projection.revision,
             issuedAt: projection.issuedAt,
             expiresAt: projection.expiresAt,
@@ -1034,22 +1080,30 @@ final class EluV1ConfigManager: @unchecked Sendable {
     }
 
     private static func validateAllEndpoints(
-        _ endpoints: EluV1RawEndpoints
+        _ endpoints: EluV1RawEndpoints,
+        schemaVersion: Int
     ) throws -> [EluV1EndpointRole: URL] {
         var validated: [EluV1EndpointRole: URL] = [
-            .events: try validateEndpoint(endpoints.events, role: .events),
-            .flags: try validateEndpoint(endpoints.flags, role: .flags),
+            .events: try validateEndpoint(endpoints.events, role: .events, schemaVersion: schemaVersion),
+            .flags: try validateEndpoint(endpoints.flags, role: .flags, schemaVersion: schemaVersion),
         ]
         if let replay = endpoints.replay {
-            validated[.replay] = try validateEndpoint(replay, role: .replay)
+            validated[.replay] = try validateEndpoint(replay, role: .replay, schemaVersion: schemaVersion)
         }
         if let assets = endpoints.assets {
-            validated[.assets] = try validateEndpoint(assets, role: .assets)
+            validated[.assets] = try validateEndpoint(assets, role: .assets, schemaVersion: schemaVersion)
         }
         return validated
     }
 
-    private static func validateEndpoint(_ value: String, role: EluV1EndpointRole) throws -> URL {
+    /// Replay is the only role whose path changes with the document major: the
+    /// standalone replay endpoint accepts replay v2 only, so a v2 document must
+    /// never advertise the v1 path and a v1 document must never advertise v2.
+    private static func validateEndpoint(
+        _ value: String,
+        role: EluV1EndpointRole,
+        schemaVersion: Int
+    ) throws -> URL {
         let expectedHost: String
         let expectedPath: String
         switch role {
@@ -1058,7 +1112,9 @@ final class EluV1ConfigManager: @unchecked Sendable {
             expectedPath = "/v1/events"
         case .replay:
             expectedHost = "ingest.elu.dev"
-            expectedPath = "/v1/replay"
+            expectedPath = schemaVersion == EluV1ConfigDocument.v2SchemaVersion
+                ? "/v2/replay"
+                : "/v1/replay"
         case .flags:
             expectedHost = "ingest.elu.dev"
             expectedPath = "/v1/flags"

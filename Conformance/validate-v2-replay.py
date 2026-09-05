@@ -786,12 +786,31 @@ def verify_public_contract_clean() -> None:
 
 
 def verify_unwired() -> None:
-    forbidden = ("elu-http-v2", "replayProtocolGeneration", "/v2/replay")
-    for path in (ROOT / "Sources").rglob("*.swift"):
+    # The internal config module may decode the frozen v2 document; it stays
+    # dark. Every other production source, including the public facade, must
+    # not know the v2 replay role or protocol generation until the facade
+    # cutover is reviewed.
+    forbidden = ("replayProtocolGeneration", "/v2/replay")
+    sources = ROOT / "Sources" / "EluAnalytics"
+    config_module = sources / "Internal" / "Config"
+    projection_found = False
+    for path in sources.rglob("*.swift"):
         source = path.read_text(encoding="utf-8")
+        if "elu-http-v2" in source:
+            fail(f"production source activates v2 transport token elu-http-v2: {path.relative_to(ROOT)}")
+        if config_module in path.parents:
+            if "/v2/replay" in source:
+                projection_found = True
+            continue
         for token in forbidden:
             if token in source:
                 fail(f"production source activates v2 transport token {token}: {path.relative_to(ROOT)}")
+    if not projection_found:
+        fail("the internal config module must project the frozen v2 replay role")
+    for facade in ("Elu.swift", "EluState.swift", "EluConfigClient.swift", "EluRemoteConfig.swift"):
+        source = (sources / facade).read_text(encoding="utf-8")
+        if "EluV1ConfigManager" in source or "EluV1ConfigDocument" in source:
+            fail(f"public facade references the internal config manager: Sources/EluAnalytics/{facade}")
 
 
 def main() -> int:
