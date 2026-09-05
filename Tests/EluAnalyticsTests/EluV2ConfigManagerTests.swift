@@ -7,7 +7,7 @@ final class EluV2ConfigManagerTests: XCTestCase {
     private let v2Now = Date(timeIntervalSince1970: 1_785_888_090) // 2026-08-05T00:01:30Z
 
     func testFrozenV2DocumentInstallsWithV2ReplayRoleExactPairsAndProtocolGeneration() throws {
-        let manager = manager(readbackProven: [browserPair])
+        let manager = self.manager(readbackProven: [browserPair])
         XCTAssertEqual(
             try manager.update(configData: v2Fixture("config-enabled.json"), now: v2Now),
             .enabled(
@@ -44,7 +44,7 @@ final class EluV2ConfigManagerTests: XCTestCase {
 
     func testV2PairsAreExactSoTheCodecIsNotAdvertisedWithAnotherCompression() throws {
         let uncompressed = EluV1ReplayTransportSelection(codec: browserPair.codec, compression: .none)!
-        let manager = manager(readbackProven: [uncompressed])
+        let manager = self.manager(readbackProven: [uncompressed])
         _ = try manager.update(configData: v2Fixture("config-enabled.json"), now: v2Now)
 
         let privacy = try v2AllowedPrivacy { object in
@@ -65,7 +65,7 @@ final class EluV2ConfigManagerTests: XCTestCase {
     }
 
     func testV1DocumentsStayOnTheV1ReplayRoleWithoutAProtocolGeneration() throws {
-        let manager = manager(readbackProven: [browserPair])
+        let manager = self.manager(readbackProven: [browserPair])
         _ = try manager.update(configData: v1Fixture("config-enabled.json"), now: v1Now)
 
         let result = try manager.authorize(
@@ -82,7 +82,7 @@ final class EluV2ConfigManagerTests: XCTestCase {
     }
 
     func testV2DisabledFixtureStaysInactive() throws {
-        let manager = manager()
+        let manager = self.manager()
         XCTAssertEqual(
             try manager.update(configData: v2Fixture("config-disabled.json"), now: v2Now),
             .disabled(revision: "config-v2-disabled-1")
@@ -99,7 +99,7 @@ final class EluV2ConfigManagerTests: XCTestCase {
     }
 
     func testMajorsOrderByIssuedAtLikeAnyRevision() throws {
-        let manager = manager(readbackProven: [browserPair])
+        let manager = self.manager(readbackProven: [browserPair])
         XCTAssertEqual(
             try manager.update(configData: v1Fixture("config-enabled.json"), now: v1Now),
             .enabled(
@@ -227,7 +227,7 @@ final class EluV2ConfigManagerTests: XCTestCase {
             first["codec"] = longestCodec
             replay["transports"] = [first]
         }
-        let manager = manager(
+        let manager = self.manager(
             readbackProven: [EluV1ReplayTransportSelection(codec: longestCodec, compression: .gzip)!]
         )
         XCTAssertNoThrow(try manager.update(configData: longest, now: v2Now))
