@@ -4426,7 +4426,9 @@ actor EluSQLiteRuntimeQueue {
     /// No authority token or detached resolution is returned to the caller.
     func capture(_ command: EluV1CaptureCommand) -> EluV1CaptureResult {
         let before = state.snapshot
-        guard command.kind == .capture || command.kind == .screen,
+        // Diagnostic events are runtime-internal and never admitted through a
+        // capture command.
+        guard command.kind != .diagnostic,
               validCaptureName(command.name),
               validateCaptureProperties(command.properties),
               let occurredAt = canonicalDate(command.occurredAt),
