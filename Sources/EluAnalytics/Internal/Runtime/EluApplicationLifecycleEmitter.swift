@@ -3,17 +3,37 @@ import Foundation
 import UIKit
 #endif
 
+/// Identifies the scene a lifecycle signal describes. Signals that carry no
+/// scene share the unidentified case, so a single-scene driver that leaves the
+/// scene out still describes one scene rather than a new one every time.
+enum EluSceneIdentity: Hashable, Sendable {
+    case unidentified
+    case scene(ObjectIdentifier)
+
+    init(_ scene: AnyObject?) {
+        guard let scene else {
+            self = .unidentified
+            return
+        }
+        self = .scene(ObjectIdentifier(scene))
+    }
+}
+
 /// Turns application and scene activation into foreground, background, and
 /// screen signals. Every entry point is serialized under one lock, so it may
 /// be driven from notification handlers on any queue or from a test.
 ///
-/// A foreground stretch is reported once. The system posts an activation
-/// again after a dismissed alert or control center, which is not a new
-/// foreground, and a multi-window app activates one scene at a time; both are
-/// folded into the single transition that actually crossed the boundary.
+/// A foreground stretch is reported once. The system posts an activation for a
+/// scene that is already in the foreground whenever it returns to active from
+/// control center, the app switcher, a system alert, or an authentication
+/// prompt, and none of those is a new foreground. A multi-window app also
+/// activates its scenes one at a time. Transitions therefore follow which
+/// scenes are currently active rather than how many activations arrived:
+/// foreground is reported when the first scene becomes active and background
+/// when the last one leaves.
 ///
-/// The first scene signal marks the process as scene-driven. Scene counting
-/// then owns the transitions and the application-wide notifications are
+/// The first scene signal marks the process as scene-driven. The scene signals
+/// then own the transitions and the application-wide notifications are
 /// ignored, because they describe the same boundary a second time.
 final class EluApplicationLifecycleTracker: @unchecked Sendable {
     private let sink: any EluRuntimeLifecycleSink
@@ -21,7 +41,7 @@ final class EluApplicationLifecycleTracker: @unchecked Sendable {
     private let lock = NSLock()
     private var isForeground = false
     private var everForegrounded = false
-    private var activeSceneCount = 0
+    private var activeSceneIdentities: Set<EluSceneIdentity> = []
     private var sceneDriven = false
 
     init(
@@ -46,23 +66,22 @@ final class EluApplicationLifecycleTracker: @unchecked Sendable {
         enterBackground()
     }
 
-    func sceneActivated() {
+    func sceneActivated(_ identity: EluSceneIdentity) {
         lock.lock()
         defer { lock.unlock() }
         sceneDriven = true
-        activeSceneCount += 1
-        guard activeSceneCount == 1 else { return }
+        let wasIdle = activeSceneIdentities.isEmpty
+        activeSceneIdentities.insert(identity)
+        guard wasIdle else { return }
         enterForeground()
     }
 
-    func sceneBackgrounded() {
+    func sceneBackgrounded(_ identity: EluSceneIdentity) {
         lock.lock()
         defer { lock.unlock() }
         sceneDriven = true
-        if activeSceneCount > 0 {
-            activeSceneCount -= 1
-        }
-        guard activeSceneCount == 0 else { return }
+        activeSceneIdentities.remove(identity)
+        guard activeSceneIdentities.isEmpty else { return }
         enterBackground()
     }
 
@@ -81,7 +100,7 @@ final class EluApplicationLifecycleTracker: @unchecked Sendable {
     var activeScenes: Int {
         lock.lock()
         defer { lock.unlock() }
-        return activeSceneCount
+        return activeSceneIdentities.count
     }
 
     private func enterForeground() {
@@ -130,17 +149,17 @@ final class EluApplicationLifecycleEmitter: @unchecked Sendable {
         guard observers.isEmpty else { return }
         let tracker = self.tracker
         observers = [
-            observe(UIApplication.didBecomeActiveNotification) {
+            observe(UIApplication.didBecomeActiveNotification) { _ in
                 tracker.applicationActivated()
             },
-            observe(UIApplication.didEnterBackgroundNotification) {
+            observe(UIApplication.didEnterBackgroundNotification) { _ in
                 tracker.applicationBackgrounded()
             },
-            observe(UIScene.didActivateNotification) {
-                tracker.sceneActivated()
+            observe(UIScene.didActivateNotification) { identity in
+                tracker.sceneActivated(identity)
             },
-            observe(UIScene.didEnterBackgroundNotification) {
-                tracker.sceneBackgrounded()
+            observe(UIScene.didEnterBackgroundNotification) { identity in
+                tracker.sceneBackgrounded(identity)
             },
         ]
     }
@@ -162,12 +181,16 @@ final class EluApplicationLifecycleEmitter: @unchecked Sendable {
         String(describing: type(of: viewController))
     }
 
+    /// Observes `name` and hands the handler the scene the notification is
+    /// about. Scene notifications carry their scene, which is what tells a
+    /// repeated activation of a scene already in the foreground apart from a
+    /// second scene becoming active; application notifications carry no scene.
     private func observe(
         _ name: Notification.Name,
-        _ handler: @escaping @Sendable () -> Void
+        _ handler: @escaping @Sendable (EluSceneIdentity) -> Void
     ) -> NSObjectProtocol {
-        notificationCenter.addObserver(forName: name, object: nil, queue: nil) { _ in
-            handler()
+        notificationCenter.addObserver(forName: name, object: nil, queue: nil) { notification in
+            handler(EluSceneIdentity(notification.object as? UIScene))
         }
     }
 }

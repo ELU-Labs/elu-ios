@@ -50,17 +50,20 @@ final class EluApplicationLifecycleEmitterTests: XCTestCase {
         XCTAssertFalse(tracker.isInForeground)
     }
 
-    func testSceneActivationsFoldIntoOneForegroundAndBackgroundPair() {
+    func testTwoSceneActivationsFoldIntoOneForegroundAndBackgroundPair() {
         let sink = RecordingLifecycleSink()
         let clock = SteppingClock()
         let tracker = EluApplicationLifecycleTracker(sink: sink, clock: { clock.next() })
+        let first = SceneStandIn()
+        let second = SceneStandIn()
 
-        tracker.sceneActivated()
-        tracker.sceneActivated()
+        tracker.sceneActivated(EluSceneIdentity(first))
+        tracker.sceneActivated(EluSceneIdentity(second))
         tracker.screenAppeared("CartViewController")
-        tracker.sceneBackgrounded()
-        tracker.sceneBackgrounded()
-        tracker.sceneActivated()
+        // The first window closing leaves the app in the foreground.
+        tracker.sceneBackgrounded(EluSceneIdentity(first))
+        tracker.sceneBackgrounded(EluSceneIdentity(second))
+        tracker.sceneActivated(EluSceneIdentity(first))
 
         XCTAssertEqual(
             sink.events,
@@ -75,16 +78,71 @@ final class EluApplicationLifecycleEmitterTests: XCTestCase {
         XCTAssertTrue(tracker.isInForeground)
     }
 
+    func testRepeatedActivationOfOneSceneKeepsTheNextBackgroundReportable() {
+        let sink = RecordingLifecycleSink()
+        let clock = SteppingClock()
+        let tracker = EluApplicationLifecycleTracker(sink: sink, clock: { clock.next() })
+        let scene = SceneStandIn()
+
+        // Control center, the app switcher, a system alert, and an
+        // authentication prompt each activate a scene that never left the
+        // foreground, with no background in between. The scene stays active
+        // once, so the background that follows is still reported.
+        tracker.sceneActivated(EluSceneIdentity(scene))
+        tracker.sceneActivated(EluSceneIdentity(scene))
+        tracker.sceneActivated(EluSceneIdentity(scene))
+        XCTAssertEqual(tracker.activeScenes, 1)
+
+        tracker.sceneBackgrounded(EluSceneIdentity(scene))
+        tracker.sceneActivated(EluSceneIdentity(scene))
+
+        XCTAssertEqual(
+            sink.events,
+            [
+                "foreground:false@2026-08-04T00:00:00.000Z",
+                "background@2026-08-04T00:00:01.000Z",
+                "foreground:true@2026-08-04T00:00:02.000Z",
+            ]
+        )
+        XCTAssertEqual(tracker.activeScenes, 1)
+        XCTAssertTrue(tracker.isInForeground)
+    }
+
+    func testARepeatedActivationDoesNotOutlastTheSceneItBelongsTo() {
+        let sink = RecordingLifecycleSink()
+        let clock = SteppingClock()
+        let tracker = EluApplicationLifecycleTracker(sink: sink, clock: { clock.next() })
+        let first = SceneStandIn()
+        let second = SceneStandIn()
+
+        tracker.sceneActivated(EluSceneIdentity(first))
+        tracker.sceneActivated(EluSceneIdentity(second))
+        tracker.sceneActivated(EluSceneIdentity(first))
+        tracker.sceneBackgrounded(EluSceneIdentity(second))
+        tracker.sceneBackgrounded(EluSceneIdentity(first))
+
+        XCTAssertEqual(
+            sink.events,
+            [
+                "foreground:false@2026-08-04T00:00:00.000Z",
+                "background@2026-08-04T00:00:01.000Z",
+            ]
+        )
+        XCTAssertEqual(tracker.activeScenes, 0)
+        XCTAssertFalse(tracker.isInForeground)
+    }
+
     func testTheFirstSceneSignalRetiresTheApplicationWideSignals() {
         let sink = RecordingLifecycleSink()
         let clock = SteppingClock()
         let tracker = EluApplicationLifecycleTracker(sink: sink, clock: { clock.next() })
+        let scene = SceneStandIn()
 
         tracker.applicationActivated()
-        tracker.sceneActivated()
+        tracker.sceneActivated(EluSceneIdentity(scene))
         tracker.applicationBackgrounded()
         tracker.applicationActivated()
-        tracker.sceneBackgrounded()
+        tracker.sceneBackgrounded(EluSceneIdentity(scene))
 
         XCTAssertEqual(
             sink.events,
@@ -167,6 +225,10 @@ final class EluApplicationLifecycleEmitterTests: XCTestCase {
 #if canImport(UIKit)
 private final class CheckoutViewController: UIViewController {}
 #endif
+
+/// Stands in for a scene. A scene identity only needs a reference to tell one
+/// scene from another, and UIKit owns the lifetime of the real ones.
+private final class SceneStandIn {}
 
 private final class RecordingLifecycleSink: EluRuntimeLifecycleSink, @unchecked Sendable {
     private let lock = NSLock()
