@@ -39,8 +39,16 @@ enum EluV1ConfigResolutionError: Error, Equatable, Sendable {
 }
 
 struct EluV1ConfigDocument: Decodable, Sendable {
+    /// The frozen semantic/configuration schema major. Nested privacy, flag,
+    /// event, and mutation records stay at this version under every document major.
     static let schemaVersion = 1
+    /// The owned standalone configuration major. Contract v1 froze replay at
+    /// `/v1/replay`; contract v2 moves replay to `/v2/replay` and advertises
+    /// exact transport pairs. Event, mutation, and flag channels remain v1.
+    static let v2SchemaVersion = 2
+    static let supportedSchemaVersions: Set<Int> = [schemaVersion, v2SchemaVersion]
 
+    let schemaVersion: Int
     let revision: String
     let issuedAt: EluV1Timestamp
     let expiresAt: EluV1Timestamp
@@ -74,9 +82,10 @@ struct EluV1ConfigDocument: Decodable, Sendable {
         try EluClosedRecord.requireOnly(CodingKeys.self, from: decoder)
         let container = try decoder.container(keyedBy: CodingKeys.self)
         let schemaVersion = try container.decode(Int.self, forKey: .schemaVersion)
-        guard schemaVersion == Self.schemaVersion else {
+        guard Self.supportedSchemaVersions.contains(schemaVersion) else {
             throw EluV1ConfigResolutionError.unsupportedConfigSchemaVersion
         }
+        self.schemaVersion = schemaVersion
 
         revision = try container.decode(String.self, forKey: .revision)
         guard EluV1Validation.validString(revision, minimum: 1, maximum: 128) else {
@@ -89,7 +98,19 @@ struct EluV1ConfigDocument: Decodable, Sendable {
         endpoints = try container.eluDecodeIfPresent(EluV1RawEndpoints.self, forKey: .endpoints)
         privacy = try container.eluDecodeIfPresent(EluV1PrivacyPolicy.self, forKey: .privacy)
         features = try container.eluDecodeIfPresent(EluV1Features.self, forKey: .features)
-        capabilities = try container.eluDecodeIfPresent(EluV1Capabilities.self, forKey: .capabilities)
+        // The capabilities record shape is selected by the document major:
+        // v1 lists independent codecs and compressions, v2 lists exact pairs.
+        if schemaVersion == Self.v2SchemaVersion {
+            capabilities = try container.eluDecodeIfPresent(
+                EluV2CapabilitiesRecord.self,
+                forKey: .capabilities
+            )?.capabilities
+        } else {
+            capabilities = try container.eluDecodeIfPresent(
+                EluV1CapabilitiesRecord.self,
+                forKey: .capabilities
+            )?.capabilities
+        }
         session = try container.eluDecodeIfPresent(EluV1SessionPolicy.self, forKey: .session)
         limits = try container.eluDecodeIfPresent(EluV1Limits.self, forKey: .limits)
         reason = try container.eluDecodeIfPresent(String.self, forKey: .reason)
@@ -122,10 +143,7 @@ struct EluV1ConfigDocument: Decodable, Sendable {
             if let endpoints, endpoints.replay == nil {
                 throw EluV1ConfigResolutionError.malformedConfig
             }
-            if let capabilities,
-               capabilities.replay.acceptedCodecs.isEmpty
-                   || capabilities.replay.acceptedCompressions.isEmpty
-            {
+            if let capabilities, capabilities.replay.advertisedTransports.isEmpty {
                 throw EluV1ConfigResolutionError.malformedConfig
             }
         }
@@ -203,45 +221,196 @@ struct EluV1Features: Decodable, Sendable {
     }
 }
 
-struct EluV1Capabilities: Decodable, Sendable {
+/// Capabilities projected from either document major into one shape.
+struct EluV1Capabilities: Equatable, Sendable {
     let replay: EluV1ReplayCapabilities
+}
+
+/// An exact `(codec, compression)` pair as advertised by config or selected by
+/// the effective privacy state.
+struct EluV1ReplayTransportPair: Hashable, Sendable {
+    let codec: String
+    let compression: EluV1Compression
+}
+
+/// Exact advertised replay pairs. Contract v1 advertised codec and compression
+/// lists whose Cartesian product is the advertised set; contract v2 advertises
+/// literal pairs plus a bounded protocol generation and never forms a product.
+/// A pair is advertised only when it is a member of this set.
+struct EluV1ReplayCapabilities: Equatable, Sendable {
+    static let maximumTransports = 32
+    static let v1ChannelContractVersion = "1.0.0"
+    static let v2ReplayContractVersion = "2.0.0"
+
+    let advertisedTransports: Set<EluV1ReplayTransportPair>
+    /// Bounded protocol generation advertised by a v2 document; nil under v1.
+    let replayProtocolGeneration: String?
+
+    func advertises(codec: String, compression: EluV1Compression) -> Bool {
+        advertisedTransports.contains(EluV1ReplayTransportPair(codec: codec, compression: compression))
+    }
+}
+
+/// Contract v1 capabilities: independent codec and compression lists.
+struct EluV1CapabilitiesRecord: Decodable, Sendable {
+    let capabilities: EluV1Capabilities
 
     private enum CodingKeys: String, CodingKey, CaseIterable {
         case replay
     }
 
-    init(from decoder: Decoder) throws {
-        try EluClosedRecord.requireOnly(CodingKeys.self, from: decoder)
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        replay = try container.decode(EluV1ReplayCapabilities.self, forKey: .replay)
-    }
-}
-
-struct EluV1ReplayCapabilities: Decodable, Sendable {
-    let acceptedCodecs: [String]
-    let acceptedCompressions: [EluV1Compression]
-
-    private enum CodingKeys: String, CodingKey, CaseIterable {
+    private enum ReplayCodingKeys: String, CodingKey, CaseIterable {
         case acceptedCodecs
         case acceptedCompressions
     }
 
+    private struct ReplayLists: Decodable {
+        let acceptedCodecs: [String]
+        let acceptedCompressions: [EluV1Compression]
+
+        init(from decoder: Decoder) throws {
+            try EluClosedRecord.requireOnly(ReplayCodingKeys.self, from: decoder)
+            let container = try decoder.container(keyedBy: ReplayCodingKeys.self)
+            acceptedCodecs = try container.decode([String].self, forKey: .acceptedCodecs)
+            acceptedCompressions = try container.decode(
+                [EluV1Compression].self,
+                forKey: .acceptedCompressions
+            )
+            guard acceptedCodecs.count <= EluV1ReplayCapabilities.maximumTransports,
+                  Set(acceptedCodecs).count == acceptedCodecs.count,
+                  acceptedCodecs.allSatisfy(EluV1Validation.validCapabilityIdentifier),
+                  acceptedCompressions.count <= 8,
+                  Set(acceptedCompressions).count == acceptedCompressions.count
+            else {
+                throw EluV1ConfigResolutionError.malformedConfig
+            }
+        }
+    }
+
     init(from decoder: Decoder) throws {
         try EluClosedRecord.requireOnly(CodingKeys.self, from: decoder)
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        acceptedCodecs = try container.decode([String].self, forKey: .acceptedCodecs)
-        acceptedCompressions = try container.decode(
-            [EluV1Compression].self,
-            forKey: .acceptedCompressions
-        )
-        guard acceptedCodecs.count <= 32,
-              Set(acceptedCodecs).count == acceptedCodecs.count,
-              acceptedCodecs.allSatisfy(EluV1Validation.validCapabilityIdentifier),
-              acceptedCompressions.count <= 8,
-              Set(acceptedCompressions).count == acceptedCompressions.count
-        else {
-            throw EluV1ConfigResolutionError.malformedConfig
+        let lists = try container.decode(ReplayLists.self, forKey: .replay)
+        var advertised: Set<EluV1ReplayTransportPair> = []
+        for codec in lists.acceptedCodecs {
+            for compression in lists.acceptedCompressions {
+                advertised.insert(EluV1ReplayTransportPair(codec: codec, compression: compression))
+            }
         }
+        capabilities = EluV1Capabilities(
+            replay: EluV1ReplayCapabilities(
+                advertisedTransports: advertised,
+                replayProtocolGeneration: nil
+            )
+        )
+    }
+}
+
+/// Contract v2 capabilities: exact v1 channel versions for events, mutations,
+/// and flags, plus literal replay pairs and a bounded protocol generation.
+struct EluV2CapabilitiesRecord: Decodable, Sendable {
+    let capabilities: EluV1Capabilities
+
+    private enum CodingKeys: String, CodingKey, CaseIterable {
+        case events
+        case mutations
+        case flags
+        case replay
+    }
+
+    private enum ChannelCodingKeys: String, CodingKey, CaseIterable {
+        case contractVersion
+        case schemaVersion
+    }
+
+    private enum ReplayCodingKeys: String, CodingKey, CaseIterable {
+        case replayContractVersion
+        case replaySchemaVersion
+        case replayProtocolGeneration
+        case transports
+    }
+
+    private enum TransportCodingKeys: String, CodingKey, CaseIterable {
+        case codec
+        case compression
+    }
+
+    private struct ChannelCapability: Decodable {
+        init(from decoder: Decoder) throws {
+            try EluClosedRecord.requireOnly(ChannelCodingKeys.self, from: decoder)
+            let container = try decoder.container(keyedBy: ChannelCodingKeys.self)
+            guard try container.decode(String.self, forKey: .contractVersion)
+                == EluV1ReplayCapabilities.v1ChannelContractVersion,
+                try container.decode(Int.self, forKey: .schemaVersion)
+                == EluV1ConfigDocument.schemaVersion
+            else {
+                throw EluV1ConfigResolutionError.malformedConfig
+            }
+        }
+    }
+
+    private struct TransportPair: Decodable {
+        let pair: EluV1ReplayTransportPair
+
+        init(from decoder: Decoder) throws {
+            try EluClosedRecord.requireOnly(TransportCodingKeys.self, from: decoder)
+            let container = try decoder.container(keyedBy: TransportCodingKeys.self)
+            let codec = try container.decode(String.self, forKey: .codec)
+            let compression = try container.decode(EluV1Compression.self, forKey: .compression)
+            guard EluV1Validation.validCapabilityIdentifier(codec) else {
+                throw EluV1ConfigResolutionError.malformedConfig
+            }
+            pair = EluV1ReplayTransportPair(codec: codec, compression: compression)
+        }
+    }
+
+    private struct ReplayCapability: Decodable {
+        let advertisedTransports: Set<EluV1ReplayTransportPair>
+        let replayProtocolGeneration: String
+
+        init(from decoder: Decoder) throws {
+            try EluClosedRecord.requireOnly(ReplayCodingKeys.self, from: decoder)
+            let container = try decoder.container(keyedBy: ReplayCodingKeys.self)
+            guard try container.decode(String.self, forKey: .replayContractVersion)
+                == EluV1ReplayCapabilities.v2ReplayContractVersion,
+                try container.decode(Int.self, forKey: .replaySchemaVersion)
+                == EluV1ConfigDocument.v2SchemaVersion
+            else {
+                throw EluV1ConfigResolutionError.malformedConfig
+            }
+            replayProtocolGeneration = try container.decode(
+                String.self,
+                forKey: .replayProtocolGeneration
+            )
+            let transports = try container.decode([TransportPair].self, forKey: .transports)
+            var advertised: Set<EluV1ReplayTransportPair> = []
+            for transport in transports {
+                guard advertised.insert(transport.pair).inserted else {
+                    throw EluV1ConfigResolutionError.malformedConfig
+                }
+            }
+            guard EluV1Validation.validString(replayProtocolGeneration, minimum: 1, maximum: 128),
+                  transports.count <= EluV1ReplayCapabilities.maximumTransports
+            else {
+                throw EluV1ConfigResolutionError.malformedConfig
+            }
+            advertisedTransports = advertised
+        }
+    }
+
+    init(from decoder: Decoder) throws {
+        try EluClosedRecord.requireOnly(CodingKeys.self, from: decoder)
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        _ = try container.decode(ChannelCapability.self, forKey: .events)
+        _ = try container.decode(ChannelCapability.self, forKey: .mutations)
+        _ = try container.decode(ChannelCapability.self, forKey: .flags)
+        let replay = try container.decode(ReplayCapability.self, forKey: .replay)
+        capabilities = EluV1Capabilities(
+            replay: EluV1ReplayCapabilities(
+                advertisedTransports: replay.advertisedTransports,
+                replayProtocolGeneration: replay.replayProtocolGeneration
+            )
+        )
     }
 }
 
@@ -270,7 +439,7 @@ struct EluV1SessionPolicy: Decodable, Sendable {
     }
 }
 
-struct EluV1Limits: Decodable, Sendable {
+struct EluV1Limits: Decodable, Equatable, Sendable {
     let eventBatchCount: Int
     let eventBatchBytes: Int
     let replayChunkBytes: Int
