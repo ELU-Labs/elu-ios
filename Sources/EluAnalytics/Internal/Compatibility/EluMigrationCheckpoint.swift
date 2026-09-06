@@ -451,6 +451,13 @@ struct EluMigrationCheckpoint: Codable, Equatable, Sendable {
 
     static let persistedKeys = Set(CodingKeys.allCases.map(\.stringValue))
 
+    /// The latest instant already stamped on the document. A later phase is
+    /// stamped at or after it, so the stamps stay in the order the phases
+    /// were reached even when the wall clock they come from moves backwards.
+    var latestStamp: Date {
+        [committedAt, verifiedAt, completedAt].compactMap { $0 }.reduce(importedAt, max)
+    }
+
     init(
         schemaVersion: Int = Self.schemaVersion,
         checkpointId: String,

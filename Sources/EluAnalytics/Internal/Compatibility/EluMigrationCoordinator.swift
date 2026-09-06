@@ -42,6 +42,7 @@ struct EluMigrationRunReport: Equatable, Sendable {
 enum EluMigrationMetric: Equatable, Sendable {
     case phaseEntered(EluMigrationPhase)
     case queuePrefixTruncated(retainedCount: Int)
+    case phaseStampClamped(EluMigrationPhase)
     case outcome(EluMigrationOutcome)
 }
 
@@ -210,7 +211,7 @@ actor EluMigrationCoordinator {
 
         var next = checkpoint
         next.phase = .committed
-        next.committedAt = clock()
+        next.committedAt = stamp(for: .committed, after: checkpoint)
         try write(next, into: &checkpoint)
         return nil
     }
@@ -238,7 +239,7 @@ actor EluMigrationCoordinator {
 
         var next = checkpoint
         next.phase = .verified
-        next.verifiedAt = clock()
+        next.verifiedAt = stamp(for: .verified, after: checkpoint)
         try write(next, into: &checkpoint)
         return nil
     }
@@ -248,8 +249,25 @@ actor EluMigrationCoordinator {
     ) throws {
         var next = checkpoint
         next.phase = .complete
-        next.completedAt = clock()
+        next.completedAt = stamp(for: .complete, after: checkpoint)
         try write(next, into: &checkpoint)
+    }
+
+    /// The instant to stamp `phase` with. The wall clock behind it can step
+    /// backwards at any moment — a time correction, or the device clock being
+    /// changed — and a stamp before the one the document already carries would
+    /// make the document invalid, leaving the migration unable to advance
+    /// until the clock caught up again. The stamp therefore never precedes the
+    /// last one on the document, and the clamp is reported rather than hidden.
+    private func stamp(
+        for phase: EluMigrationPhase,
+        after checkpoint: EluMigrationCheckpoint
+    ) -> Date {
+        let now = clock()
+        let earliest = checkpoint.latestStamp
+        guard now < earliest else { return now }
+        metrics?.record(.phaseStampClamped(phase))
+        return earliest
     }
 
     /// Persists `next` and only then publishes it as the current checkpoint.

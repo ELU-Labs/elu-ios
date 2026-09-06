@@ -721,12 +721,128 @@ final class EluMigrationCoordinatorTests: XCTestCase {
         XCTAssertEqual(EluFileMigrationCheckpointStore.decode(reordered), .unreadable(.invalid))
     }
 
+    func testBackwardsWallClockDoesNotStallAResumedMigration() async throws {
+        try await withTemporaryDirectory { directory in
+            let store = try EluFileMigrationCheckpointStore(directoryURL: directory)
+            let source = self.makeSource()
+            let target = RecordingMigrationTarget()
+
+            let interrupted = await self.makeCoordinator(
+                source: source,
+                target: target,
+                store: store,
+                faultInjector: OneShotMigrationFaultInjector(point: .afterCheckpointWrite(.importing))
+            ).run()
+            XCTAssertEqual(interrupted.outcome, .interrupted(atPhase: .importing))
+
+            // The device clock steps back an hour between the two runs, so
+            // every stamp the resumed run mints precedes the one on disk.
+            let rolledBack = self.now.addingTimeInterval(-3_600)
+            let metrics = RecordingMigrationMetrics()
+            let resumed = await self.makeCoordinator(
+                source: source, target: target, store: store, clock: { rolledBack }, metrics: metrics
+            ).run()
+            XCTAssertEqual(resumed.outcome, .completed(importedLegacyState: true))
+            XCTAssertEqual(resumed.phaseBefore, .importing)
+            XCTAssertEqual(resumed.phaseAfter, .complete)
+            XCTAssertEqual(resumed.sourceReadCount, 0)
+            XCTAssertEqual(target.adoptCount, 1)
+            XCTAssertEqual(target.importedRecordCount, 3)
+            XCTAssertFalse(try store.hasQuarantinedDocument())
+
+            guard case let .loaded(persisted) = try store.load() else {
+                return XCTFail("Expected the completed checkpoint to be readable")
+            }
+            XCTAssertEqual(persisted.phase, .complete)
+            XCTAssertNoThrow(try persisted.validate())
+            XCTAssertEqual(persisted.importedAt, self.now)
+            XCTAssertEqual(persisted.committedAt, self.now)
+            XCTAssertEqual(persisted.verifiedAt, self.now)
+            XCTAssertEqual(persisted.completedAt, self.now)
+            XCTAssertEqual(
+                metrics.recorded.filter { metric in
+                    if case .phaseStampClamped = metric { return true }
+                    return false
+                },
+                [
+                    .phaseStampClamped(.committed),
+                    .phaseStampClamped(.verified),
+                    .phaseStampClamped(.complete),
+                ]
+            )
+        }
+
+        // A clock that moves forward is still recorded as it is.
+        try await withTemporaryDirectory { directory in
+            let store = try EluFileMigrationCheckpointStore(directoryURL: directory)
+            let source = self.makeSource()
+            let target = RecordingMigrationTarget()
+
+            _ = await self.makeCoordinator(
+                source: source,
+                target: target,
+                store: store,
+                faultInjector: OneShotMigrationFaultInjector(point: .afterCheckpointWrite(.importing))
+            ).run()
+
+            let later = self.now.addingTimeInterval(90)
+            let metrics = RecordingMigrationMetrics()
+            let resumed = await self.makeCoordinator(
+                source: source, target: target, store: store, clock: { later }, metrics: metrics
+            ).run()
+            XCTAssertEqual(resumed.outcome, .completed(importedLegacyState: true))
+            XCTAssertFalse(
+                metrics.recorded.contains { metric in
+                    if case .phaseStampClamped = metric { return true }
+                    return false
+                }
+            )
+
+            guard case let .loaded(persisted) = try store.load() else {
+                return XCTFail("Expected the completed checkpoint to be readable")
+            }
+            XCTAssertEqual(persisted.importedAt, self.now)
+            XCTAssertEqual(persisted.committedAt, later)
+            XCTAssertEqual(persisted.verifiedAt, later)
+            XCTAssertEqual(persisted.completedAt, later)
+        }
+    }
+
+    func testStoredCheckpointWithReversedStampsIsQuarantined() async throws {
+        try await withTemporaryDirectory { directory in
+            let store = try EluFileMigrationCheckpointStore(directoryURL: directory)
+            var object = try self.jsonObject(for: self.makeCheckpoint(phase: .committed))
+            object["committedAt"] = EluRFC3339.string(from: self.now.addingTimeInterval(-60))
+            let reversed = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+            try reversed.write(to: store.checkpointFileURL)
+            let source = self.makeSource()
+            let target = RecordingMigrationTarget()
+
+            let report = await self.makeCoordinator(
+                source: source, target: target, store: store
+            ).run()
+            XCTAssertEqual(report.outcome, .quarantined(.invalidCheckpoint))
+            XCTAssertEqual(report.phaseAfter, .unseen)
+            XCTAssertEqual(source.readCount, 0)
+            XCTAssertEqual(target.adoptCount, 0)
+            XCTAssertEqual(try Data(contentsOf: store.quarantineFileURL), reversed)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: store.checkpointFileURL.path))
+
+            let later = await self.makeCoordinator(
+                source: source, target: target, store: store
+            ).run()
+            XCTAssertEqual(later.outcome, .quarantined(.priorQuarantine))
+            XCTAssertEqual(target.adoptCount, 0)
+        }
+    }
+
     // MARK: - Helpers
 
     private func makeCoordinator(
         source: ScriptedLegacyStateSource,
         target: RecordingMigrationTarget,
         store: EluFileMigrationCheckpointStore,
+        clock: (@Sendable () -> Date)? = nil,
         metrics: RecordingMigrationMetrics? = nil,
         faultInjector: OneShotMigrationFaultInjector? = nil
     ) -> EluMigrationCoordinator {
@@ -735,7 +851,7 @@ final class EluMigrationCoordinatorTests: XCTestCase {
             source: source,
             target: target,
             store: store,
-            clock: { self.now },
+            clock: clock ?? { self.now },
             checkpointIdGenerator: { checkpointIds.next() },
             streamIdGenerator: { "stream-minted" },
             metrics: metrics,
