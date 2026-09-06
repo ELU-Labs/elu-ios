@@ -4422,11 +4422,27 @@ actor EluSQLiteRuntimeQueue {
         return .activated(authority)
     }
 
+    /// Reads the current identity witness and submits the configuration
+    /// document in one actor operation, so a privacy state produced for that
+    /// witness can never lag behind a concurrent identity change.
+    func submitCaptureAuthority(
+        configData: Data,
+        projectingPrivacyState project: @Sendable (EluRuntimeQueueSnapshot) -> Data?
+    ) -> EluV1CaptureAuthorityUpdateResult {
+        let witness = try? snapshot()
+        return submitCaptureAuthority(
+            configData: configData,
+            effectivePrivacyStateData: witness.flatMap { project($0) }
+        )
+    }
+
     /// Creates and consumes admission entirely inside this actor operation.
     /// No authority token or detached resolution is returned to the caller.
     func capture(_ command: EluV1CaptureCommand) -> EluV1CaptureResult {
         let before = state.snapshot
-        guard command.kind == .capture || command.kind == .screen,
+        // Diagnostic events are runtime-internal and never admitted through a
+        // capture command.
+        guard command.kind != .diagnostic,
               validCaptureName(command.name),
               validateCaptureProperties(command.properties),
               let occurredAt = canonicalDate(command.occurredAt),
