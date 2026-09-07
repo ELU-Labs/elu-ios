@@ -120,6 +120,10 @@ actor EluStandaloneRuntime {
     private var lastSnapshot: EluRuntimeQueueSnapshot
     private var configurationTicket: UInt64 = 0
     private var appliedConfigurationTicket: UInt64 = 0
+    /// The newest document the owner submitted that was not superseded by a
+    /// newer one already held here. Identity changes resubmit it so authority
+    /// is rederived against the witness they produced.
+    private var configurationDocument: Data?
 
     private init(
         queue: EluSQLiteRuntimeQueue,
@@ -261,6 +265,21 @@ actor EluStandaloneRuntime {
 
     var hasDeliveryAuthorization: Bool { coordinator != nil }
 
+    /// The last identity, session, and queue state this runtime committed.
+    var currentSnapshot: EluRuntimeQueueSnapshot { lastSnapshot }
+
+    /// Composes the owned flag client over the same site-scoped store the
+    /// capture path writes to, so flag evaluation reads the identity, groups,
+    /// and flag context every capture is attributed to. The network transport
+    /// stays a caller-supplied boundary.
+    func flagClient(transport: any EluV1FlagTransport) async throws -> EluV1FlagClient {
+        try await EluV1FlagClient.make(
+            runtime: queue,
+            transport: transport,
+            versions: versions
+        )
+    }
+
     func queueSnapshot() async throws -> EluRuntimeQueueSnapshot {
         let snapshot = try await queue.snapshot()
         lastSnapshot = snapshot
@@ -274,6 +293,20 @@ actor EluStandaloneRuntime {
     /// and batch limits; anything else retires delivery.
     func applyConfiguration(_ configData: Data) async -> EluStandaloneConfigurationOutcome {
         guard phase != .closed else { return .closed }
+        let acceptedDocument = configurationDocument
+        configurationDocument = configData
+        let outcome = await submitConfiguration(configData)
+        // A document older than the newest validated one installs nothing, so
+        // the document the queue accepted stays the one every later renewal
+        // resubmits. Every other verdict fails closed and keeps the document
+        // that produced it.
+        if case let .blocked(terminal) = outcome, terminal.reason == .stale {
+            configurationDocument = acceptedDocument
+        }
+        return outcome
+    }
+
+    private func submitConfiguration(_ configData: Data) async -> EluStandaloneConfigurationOutcome {
         configurationTicket += 1
         let ticket = configurationTicket
         let now = clock()
@@ -358,6 +391,24 @@ actor EluStandaloneRuntime {
         )
     }
 
+    /// Records an exception whose fields the caller already serialized. The
+    /// facade serializes on its own queue so no `Error` reference crosses into
+    /// the runtime.
+    func captureException(
+        properties: [String: EluJSONValue],
+        occurredAt: Date? = nil
+    ) async -> EluV1CaptureResult {
+        await submit(
+            EluV1CaptureCommand(
+                kind: .exception,
+                name: EluExceptionSerializer.eventName,
+                occurredAt: occurredAt ?? clock(),
+                properties: properties,
+                versions: versions
+            )
+        )
+    }
+
     /// Serializes the error on the caller's side so only bounded, JSON-safe
     /// fields cross into the runtime.
     nonisolated func captureException(
@@ -372,6 +423,157 @@ actor EluStandaloneRuntime {
             explicitProperties: properties
         )
         return await submit(command)
+    }
+
+    // MARK: - Identity
+
+    /// Links this device's activity to a customer-supplied id and carries the
+    /// supplied properties into the person state flag evaluation reads.
+    @discardableResult
+    func identify(
+        _ userId: String,
+        properties: [String: EluJSONValue] = [:]
+    ) async -> EluRuntimeQueueSnapshot? {
+        await mutate(.identify(userId: userId, set: properties, setOnce: [:]))
+    }
+
+    /// Links a second id to the identified one. The queue rejects an alias
+    /// raised before an identity exists, because there is nothing to link to.
+    @discardableResult
+    func alias(_ aliasId: String) async -> EluRuntimeQueueSnapshot? {
+        await mutate(.linkAlias(aliasId: aliasId))
+    }
+
+    @discardableResult
+    func setPersonProperties(
+        _ properties: [String: EluJSONValue]
+    ) async -> EluRuntimeQueueSnapshot? {
+        guard !properties.isEmpty else { return nil }
+        return await mutate(.setPersonProperties(set: properties, setOnce: [:], unset: []))
+    }
+
+    /// Associates a group, and describes it in the same transition when
+    /// properties are supplied.
+    @discardableResult
+    func group(
+        type: String,
+        key: String,
+        properties: [String: EluJSONValue] = [:]
+    ) async -> EluRuntimeQueueSnapshot? {
+        if properties.isEmpty {
+            return await mutate(.associateGroup(groupType: type, groupKey: key))
+        }
+        return await mutate(
+            .group(groupType: type, groupKey: key, set: properties, setOnce: [:], unset: [])
+        )
+    }
+
+    @discardableResult
+    func registerSuperProperties(
+        _ properties: [String: EluJSONValue]
+    ) async -> EluRuntimeQueueSnapshot? {
+        guard phase == .capturing, !properties.isEmpty else { return nil }
+        guard let snapshot = try? await queue.registerStandaloneSuperProperties(properties) else {
+            return nil
+        }
+        return await commit(snapshot)
+    }
+
+    @discardableResult
+    func unregisterSuperProperty(_ key: String) async -> EluRuntimeQueueSnapshot? {
+        guard phase == .capturing else { return nil }
+        guard let snapshot = try? await queue.unregisterStandaloneSuperProperty(key) else {
+            return nil
+        }
+        return await commit(snapshot)
+    }
+
+    @discardableResult
+    func setFlagPersonProperties(
+        _ properties: [String: EluJSONValue]
+    ) async -> EluRuntimeQueueSnapshot? {
+        guard phase == .capturing, !properties.isEmpty else { return nil }
+        guard let generation = try? await queue.snapshot().generation,
+              let snapshot = try? await queue.setFlagPersonProperties(
+                  properties,
+                  versions: versions,
+                  expectedGeneration: generation
+              )
+        else {
+            return nil
+        }
+        return await commit(snapshot)
+    }
+
+    /// Group properties describe the group this device is currently
+    /// associated with, so a type with no association has nothing to describe.
+    @discardableResult
+    func setFlagGroupProperties(
+        type: String,
+        properties: [String: EluJSONValue]
+    ) async -> EluRuntimeQueueSnapshot? {
+        guard phase == .capturing, !properties.isEmpty else { return nil }
+        guard let snapshot = try? await queue.snapshot(),
+              let key = snapshot.identity.groups[type]
+        else {
+            return nil
+        }
+        return await mutate(
+            .setGroupProperties(
+                groupType: type,
+                groupKey: key,
+                set: properties,
+                setOnce: [:],
+                unset: []
+            )
+        )
+    }
+
+    /// Ends the current identity: a fresh anonymous id is minted and groups,
+    /// super properties, session, and flag context are cleared. Unlike every
+    /// other identity call this is allowed without capture authority, because
+    /// it only discards identity and enqueues nothing.
+    @discardableResult
+    func resetIdentity() async -> EluRuntimeQueueSnapshot? {
+        guard phase != .closed else { return nil }
+        guard let generation = try? await queue.snapshot().generation,
+              let snapshot = try? await queue.reset(expectedGeneration: generation)
+        else {
+            return nil
+        }
+        return await commit(snapshot)
+    }
+
+    /// An identity mutation is a durable write, so it needs the same capture
+    /// authority a captured event needs. A blocked, revoked, or expired
+    /// runtime stores no identity at all.
+    private func mutate(
+        _ transition: EluRuntimeMutationTransition
+    ) async -> EluRuntimeQueueSnapshot? {
+        guard phase == .capturing else { return nil }
+        guard let generation = try? await queue.snapshot().generation,
+              let snapshot = try? await queue.applyOwnedMutation(
+                  transition,
+                  versions: versions,
+                  expectedGeneration: generation
+              )
+        else {
+            return nil
+        }
+        return await commit(snapshot)
+    }
+
+    /// Identity, super-property, group, and flag-context changes each advance
+    /// the context revision capture authority is bound to, so the stored
+    /// document is resubmitted before the next capture can proceed.
+    private func commit(_ snapshot: EluRuntimeQueueSnapshot) async -> EluRuntimeQueueSnapshot? {
+        lastSnapshot = snapshot
+        guard let configurationDocument else { return snapshot }
+        _ = await submitConfiguration(configurationDocument)
+        if let renewed = try? await queue.snapshot() {
+            lastSnapshot = renewed
+        }
+        return lastSnapshot
     }
 
     /// Persists the background transition first, then hands one bounded
@@ -411,6 +613,7 @@ actor EluStandaloneRuntime {
     func close() async {
         guard phase != .closed else { return }
         phase = .closed
+        configurationDocument = nil
         flushTimer?.cancel()
         flushTimer = nil
         await retireDelivery()
@@ -422,6 +625,23 @@ actor EluStandaloneRuntime {
         guard phase != .closed else {
             return .rejected(.authorityAbsent, snapshot: lastSnapshot)
         }
+        var result = await record(command)
+        // Authority is bound to the identity witness it was derived from. If
+        // that witness moved under this call, one renewal decides whether the
+        // call proceeds or is discarded with the new reason.
+        if case .rejected(.authorityWitnessChanged, _) = result,
+           let configurationDocument
+        {
+            _ = await submitConfiguration(configurationDocument)
+            guard phase != .closed else {
+                return .rejected(.authorityAbsent, snapshot: lastSnapshot)
+            }
+            result = await record(command)
+        }
+        return result
+    }
+
+    private func record(_ command: EluV1CaptureCommand) async -> EluV1CaptureResult {
         let result = await queue.capture(command)
         switch result {
         case let .accepted(_, snapshot):

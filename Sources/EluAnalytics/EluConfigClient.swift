@@ -18,8 +18,10 @@ final class EluConfigClient {
     private let queue: DispatchQueue
     private let session: URLSession
 
-    /// Invoked on `queue` after every successful fetch+parse (already persisted).
-    var onConfig: ((EluRemoteConfig) -> Void)?
+    /// Invoked on `queue` after every successful fetch+parse (already
+    /// persisted). The exact response bytes travel with the decoded value:
+    /// the ELU runtime validates the document itself.
+    var onConfig: ((EluRemoteConfig, Data) -> Void)?
 
     private var lastSuccessAt: Date?
     private var attemptsThisForeground = 0
@@ -77,14 +79,14 @@ final class EluConfigClient {
         return dir.appendingPathComponent(Self.cacheFileName(siteKey: siteKey))
     }
 
-    func loadCached() -> EluRemoteConfig? {
+    func loadCached() -> (config: EluRemoteConfig, document: Data)? {
         guard let url = cacheFileURL,
               let data = try? Data(contentsOf: url),
               let cfg = try? EluRemoteConfig.parse(data)
         else {
             return nil
         }
-        return cfg
+        return (cfg, data)
     }
 
     private func persist(_ data: Data) {
@@ -130,7 +132,7 @@ final class EluConfigClient {
                 }
                 self.lastSuccessAt = Date()
                 self.persist(data)
-                self.onConfig?(cfg)
+                self.onConfig?(cfg, data)
             }
         }
         task.resume()

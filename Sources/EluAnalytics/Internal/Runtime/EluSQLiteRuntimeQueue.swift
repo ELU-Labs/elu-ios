@@ -4717,12 +4717,13 @@ actor EluSQLiteRuntimeQueue {
         ).records
     }
 
-    /// Applies flag evaluation context through the owner runtime so the
-    /// durable request barrier and the in-memory witness advance atomically.
-    /// This is separate from the legacy standalone mutation entrypoint above.
+    /// Applies one identity mutation through the owner runtime so the durable
+    /// flag request barrier and the in-memory witness advance atomically with
+    /// it. This is separate from the legacy standalone mutation entrypoint
+    /// above, which belongs to the unscoped runtime.
     @discardableResult
-    func setFlagPersonProperties(
-        _ properties: [String: EluJSONValue],
+    func applyOwnedMutation(
+        _ transition: EluRuntimeMutationTransition,
         versions: EluVersionContext,
         expectedGeneration: Int64
     ) throws -> EluRuntimeQueueSnapshot {
@@ -4739,7 +4740,7 @@ actor EluSQLiteRuntimeQueue {
         )
         do {
             prepared = try prepareMutationTransition(
-                .setPersonProperties(set: properties, setOnce: [:], unset: []),
+                transition,
                 occurredAt: clock(),
                 versions: versions
             )
@@ -4752,6 +4753,21 @@ actor EluSQLiteRuntimeQueue {
             flagContext: prepared.flagContext,
             drafts: prepared.drafts
         ).snapshot
+    }
+
+    /// Applies flag evaluation context through the owner runtime so the
+    /// durable request barrier and the in-memory witness advance atomically.
+    @discardableResult
+    func setFlagPersonProperties(
+        _ properties: [String: EluJSONValue],
+        versions: EluVersionContext,
+        expectedGeneration: Int64
+    ) throws -> EluRuntimeQueueSnapshot {
+        try applyOwnedMutation(
+            .setPersonProperties(set: properties, setOnce: [:], unset: []),
+            versions: versions,
+            expectedGeneration: expectedGeneration
+        )
     }
 
     @discardableResult

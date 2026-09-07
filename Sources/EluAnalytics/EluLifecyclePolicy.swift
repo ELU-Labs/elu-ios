@@ -16,6 +16,10 @@ enum EluDisabledReason: Equatable {
     case euBlocked
     /// Mid-session kill switch — runtime was live and has been opted out.
     case killSwitch
+    /// The selected analytics runtime could not be created. Fail closed for
+    /// the rest of the run rather than sit in a running state with nothing
+    /// behind it.
+    case runtimeUnavailable
 }
 
 struct EluStateDecision: Equatable {

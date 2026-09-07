@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Enforce the internal, injected, specified-not-wired flag boundary."""
+"""Enforce the injected flag boundary and the default runtime selection."""
 
 from __future__ import annotations
 
@@ -12,9 +12,10 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 PINNED = {
-    "Sources/EluAnalytics/Elu.swift": "e1eed0e739c4ef08972b3a9ced1f580f490906ac222687d4928272cb81297170",
-    "Sources/EluAnalytics/EluState.swift": "e5511949ec2f2e9eff228160f454fab7fa8c209d9c98f6a5c1ce9fe156bd0985",
-    "Sources/EluAnalytics/EluConfigClient.swift": "0f633cf989f7212ad4272684723089075792cfccc23dc11eefc7450c50fd55d3",
+    "Sources/EluAnalytics/Elu.swift": "66b5307fe79bf9f5df59cae123d960cab943df891b82648317cab7c3846ea146",
+    "Sources/EluAnalytics/EluState.swift": "f2cd3a047dd9166d891b32f4ecdafc848ea29db0e09bed6a0bd9f276a3414d95",
+    "Sources/EluAnalytics/EluConfigClient.swift": "152abfb01a6d0aa81e470d3185ecd4db3aeeef26d8626e67bab8f0a41e20d43d",
+    "Sources/EluAnalytics/Internal/Facade/EluRuntimeBackend.swift": "b12663ad30a96595c48a91aa842addea9950b08455fc7d886cc9353f6ac12bc9",
     "Package.swift": "fb7e4817911a75b2bd2ea0c173163f7a44dcf4c4356b31ac49c5ac13276a348b",
     "Conformance/V1/manifest.json": "98152d8725c286f29402ba3e420bda8dd364200fb6fdf1cfe49b2da9b8f63e54",
 }
@@ -25,6 +26,17 @@ NETWORK_TOKENS = (
     "import CFNetwork",
     "NWConnection",
 )
+# The flag client is reachable from exactly two files: the runtime that
+# composes it over the site-scoped store, and the facade projection that drives
+# it. Both are only reached when the runtime selection is standalone.
+FLAG_CLIENT_CALLERS = frozenset(
+    {
+        "Sources/EluAnalytics/Internal/Runtime/EluStandaloneRuntime.swift",
+        "Sources/EluAnalytics/Internal/Facade/EluStandaloneFacadeRuntime.swift",
+    }
+)
+# The shipped default. Changing it is the runtime cutover, not a refactor.
+DEFAULT_SELECTION = "    var runtimeSelection: EluRuntimeSelection = .provider\n"
 
 
 def scan_flag_source(text: str) -> list[str]:
@@ -42,9 +54,10 @@ def scan_flag_source(text: str) -> list[str]:
 
 def scan_outside_source(path: pathlib.Path, text: str) -> list[str]:
     errors: list[str] = []
-    if "EluV1FlagClient" in text:
-        errors.append(f"{path} references the unwired flag client")
-    if "EluV1FlagTransport" in text:
+    allowed_caller = path.as_posix() in FLAG_CLIENT_CALLERS
+    if "EluV1FlagClient" in text and not allowed_caller:
+        errors.append(f"{path} references the flag client outside the wired callers")
+    if "EluV1FlagTransport" in text and not allowed_caller:
         errors.append(f"{path} references the injected flag transport boundary")
     if "ensureFlagSchema" in text and path.name != "EluSQLiteRuntimeQueue.swift":
         errors.append(f"{path} invokes the lazy flag migration")
@@ -110,6 +123,12 @@ def verify(root: pathlib.Path = ROOT) -> list[str]:
     if any("ensureFlagSchema" in path.read_text(encoding="utf-8") for path in public_sources):
         errors.append("public startup invokes the lazy flag migration")
 
+    facade_text = (root / "Sources/EluAnalytics/Elu.swift").read_text(encoding="utf-8")
+    if DEFAULT_SELECTION not in facade_text:
+        errors.append("the default runtime selection is no longer the provider")
+    if "runtimeSelection" in facade_text and "public var runtimeSelection" in facade_text:
+        errors.append("the runtime selection escaped into the public API")
+
     return errors
 
 
@@ -120,7 +139,7 @@ def main() -> int:
         for error in errors:
             print(f"feature-flag boundary verification failed: {error}", file=sys.stderr)
         return 1
-    print("verified internal injected feature-flag boundary and pinned public wiring")
+    print("verified injected feature-flag boundary, pinned wiring, and default selection")
     return 0
 
 
