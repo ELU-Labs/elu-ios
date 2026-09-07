@@ -24,10 +24,15 @@ struct EluEventBuffer {
     static let capacity = 100
 
     private(set) var ops: [EluBufferedOp] = []
+    /// Calls the cap discarded, counted rather than reported: the facade never
+    /// tells the caller a call was dropped.
+    private(set) var droppedCount = 0
 
     mutating func push(_ op: EluBufferedOp) {
         if ops.count >= Self.capacity {
-            ops.removeFirst(ops.count - Self.capacity + 1)
+            let overflow = ops.count - Self.capacity + 1
+            ops.removeFirst(overflow)
+            droppedCount += overflow
         }
         ops.append(op)
     }
