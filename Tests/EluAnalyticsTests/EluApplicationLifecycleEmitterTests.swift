@@ -163,7 +163,7 @@ final class EluApplicationLifecycleEmitterTests: XCTestCase {
         let center = NotificationCenter()
         let emitter = EluApplicationLifecycleEmitter(
             tracker: EluApplicationLifecycleTracker(sink: sink, clock: { clock.next() }),
-            notificationCenter: center
+            notificationCenter: center, seedCurrentState: false
         )
 
         center.post(name: UIApplication.didBecomeActiveNotification, object: nil)
@@ -200,7 +200,7 @@ final class EluApplicationLifecycleEmitterTests: XCTestCase {
         let center = NotificationCenter()
         let emitter = EluApplicationLifecycleEmitter(
             tracker: EluApplicationLifecycleTracker(sink: sink, clock: { clock.next() }),
-            notificationCenter: center
+            notificationCenter: center, seedCurrentState: false
         )
         emitter.attach()
 

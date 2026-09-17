@@ -104,6 +104,32 @@ struct EluV1ConfigResolution: Equatable, Sendable {
     let replayAuthorization: EluV1ReplayAuthorization
 }
 
+/// Current policy permission for lawful sealed bytes. It is not fresh capture authority.
+struct EluV2SealedReplayDeliverySnapshot: Equatable, Sendable {
+    let configWitness: EluV2ReplayConfigWitness
+    let siteId: String
+    let expiresAt: EluV1Timestamp
+    let endpoint: URL
+    let transport: EluV1ReplayTransportSelection
+    let protocolGeneration: String
+    let maximumRequestBytes: Int
+    fileprivate init(configWitness: EluV2ReplayConfigWitness, siteId: String, expiresAt: EluV1Timestamp,
+        endpoint: URL, transport: EluV1ReplayTransportSelection, generation: String, maximumRequestBytes: Int) {
+        self.configWitness = configWitness; self.siteId = siteId; self.expiresAt = expiresAt
+        self.endpoint = endpoint; self.transport = transport; protocolGeneration = generation
+        self.maximumRequestBytes = maximumRequestBytes
+    }
+    fileprivate init(_ value: EluV1ConfigResolution, endpoint: URL, transport: EluV1ReplayTransportSelection, generation: String) {
+        configWitness = EluV2ReplayConfigWitness(issuedAt: value.exactIssuedAt, semanticHash: value.configSemanticHash)
+        siteId = value.siteId
+        expiresAt = value.exactExpiresAt
+        self.endpoint = endpoint
+        self.transport = transport
+        protocolGeneration = generation
+        maximumRequestBytes = value.limits.replayChunkBytes
+    }
+}
+
 enum EluV1ConfigUpdateResult: Equatable, Sendable {
     case enabled(revision: String, expiresAt: Date)
     case disabled(revision: String)
@@ -626,6 +652,64 @@ final class EluV1ConfigManager: @unchecked Sendable {
         identity: EluIdentitySnapshot,
         now: Date
     ) throws -> EluV1ConfigResolution {
+        try authorize(effectivePrivacyStateData: effectivePrivacyStateData, identity: identity, now: now, sealedDelivery: false)
+    }
+
+    func authorizeSealedReplayDelivery(
+        effectivePrivacyStateData: Data?, identity: EluIdentitySnapshot, now: Date
+    ) throws -> EluV2SealedReplayDeliverySnapshot? {
+        let value = try authorize(effectivePrivacyStateData: effectivePrivacyStateData, identity: identity, now: now, sealedDelivery: true)
+        guard value.configSchemaVersion == 2,
+              case let .authorized(pair) = value.replayAuthorization,
+              let endpoint = value.endpoints[.replay], let generation = value.replayProtocolGeneration else { return nil }
+        return EluV2SealedReplayDeliverySnapshot(value, endpoint: endpoint, transport: pair, generation: generation)
+    }
+
+    /// Sealed-only permission from current observed local policy. This never
+    /// constructs effective privacy bytes, a hash, or fresh capture authority.
+    func authorizeSealedReplayDelivery(policyObservation: EluProjectedSealedReplayPolicy,
+        identity: EluIdentitySnapshot, now: Date
+    ) throws -> EluV2SealedReplayDeliverySnapshot? {
+        lock.lock(); defer { lock.unlock() }
+        try Self.validateClock(now)
+        expireActiveConfigIfNeeded(now: now)
+        guard let active = activeConfig, active.document.schemaVersion == 2,
+              let policy = active.document.privacy, let features = active.document.features,
+              let capabilities = active.document.capabilities, let site = active.document.site,
+              let limit = active.document.limits, let endpoint = active.trustedEndpoints?[.replay],
+              let generation = capabilities.replay.replayProtocolGeneration,
+              policyObservation.configWitness == ValidatedCandidateIdentity(issuedAt: active.document.issuedAt,
+                  semanticHash: active.semanticHash, policySourceHash: active.policySourceHash),
+              policyObservation.policyRevision == policy.revision,
+              policyObservation.contextRevision == identity.identity.contextRevision,
+              policyObservation.identityOptedOut == identity.identity.optedOut else { return nil }
+        let decision = EluPrivacyStateProjector.onDeviceDecision(regionPolicy: policy.regionPolicy,
+            timeZoneIdentifier: policyObservation.timeZoneIdentifier, identityOptedOut: identity.identity.optedOut)
+        guard policyObservation.onDeviceDecision == decision,
+              policyObservation.profileCompatibility == .compatible,
+              policyObservation.profile.compatibility(with: policy.masking, platform: .ios) == .compatible else { return nil }
+        let selected = readbackProvenReplayTransports.first {
+            $0.codec == "elu-native-wireframe-v1" && $0.compression == .gzip &&
+                capabilities.replay.advertises(codec: $0.codec, compression: $0.compression)
+        }
+        guard Self.sealedPolicyAllows(features: features, policy: policy, decision: decision.decision,
+            optedOut: identity.identity.optedOut, maskingValidated: true, transportAdvertised: selected != nil),
+              let selected else { return nil }
+        return EluV2SealedReplayDeliverySnapshot(
+            configWitness: EluV2ReplayConfigWitness(issuedAt: active.document.issuedAt, semanticHash: active.semanticHash),
+            siteId: site.id, expiresAt: active.document.expiresAt, endpoint: endpoint,
+            transport: selected, generation: generation, maximumRequestBytes: limit.replayChunkBytes)
+    }
+
+    private static func sealedPolicyAllows(features: EluV1Features, policy: EluV1PrivacyPolicy,
+        decision: EluV1Decision, optedOut: Bool, maskingValidated: Bool, transportAdvertised: Bool) -> Bool {
+        features.capture && policy.capture.enabled && decision == .allow && !optedOut &&
+            features.replay && policy.replay.enabled && maskingValidated && transportAdvertised
+    }
+
+    private func authorize(
+        effectivePrivacyStateData: Data?, identity: EluIdentitySnapshot, now: Date, sealedDelivery: Bool
+    ) throws -> EluV1ConfigResolution {
         lock.lock()
         defer { lock.unlock() }
 
@@ -816,7 +900,11 @@ final class EluV1ConfigManager: @unchecked Sendable {
             replayAuthorization = .invalid(.claimedAuthorizationMismatch)
         } else if captureAuthorization != .authorized {
             replayAuthorization = .restricted(.captureUnavailable)
-        } else if !serverReplayAllowed {
+        } else if !(sealedDelivery
+            ? Self.sealedPolicyAllows(features: features, policy: privacyPolicy,
+                decision: effectivePrivacy.onDeviceDecision.decision, optedOut: identity.identity.optedOut,
+                maskingValidated: effectivePrivacy.maskingValidated, transportAdvertised: replayTransportAdvertised)
+            : serverReplayAllowed) {
             replayAuthorization = .restricted(
                 Self.replayRestrictionReason(
                     features: features,

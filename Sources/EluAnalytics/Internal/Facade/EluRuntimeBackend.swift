@@ -1,20 +1,9 @@
 import Foundation
 
-/// Which analytics runtime the facade drives for a run. The selection is fixed
-/// at `setup` and never changes for the lifetime of the process.
-///
-/// `.provider` is the shipped behavior: the embedded provider owns identity,
-/// events, delivery, flags, and replay. `.standalone` drives the ELU-owned
-/// runtime and the ELU-owned flag client instead, and never calls the
-/// provider.
-///
-/// The two selections do NOT share stored identity. Selecting `.standalone`
-/// starts a fresh ELU identity on the device; it does not read, import, or
-/// convert anything the provider stored. Identity continuity across the
-/// change is a separate, separately reviewed reader and must not be inferred
-/// from this selection.
+/// The single runtime construction path behind the facade. Kept internal so
+/// existing owned fixture factories can observe ordered initialization without
+/// exposing a customer runtime selector. This does not import legacy identity.
 enum EluRuntimeSelection: Equatable, Sendable {
-    case provider
     case standalone
 }
 
@@ -53,6 +42,11 @@ protocol EluRuntimeBackend: AnyObject {
     var replayControl: (any EluReplayControl)? { get }
     /// True once a flag snapshot has been published for the running identity.
     var flagsAreLoaded: Bool { get }
+    /// Captures the original projection for a callback that may run later.
+    func flagNotificationPredicate() -> (@Sendable () -> Bool)?
+    /// Synchronous intent before the core queue hop. Completion transfers
+    /// protection to execute's own ordered work, or releases a discarded call.
+    func beginPendingOperation(_ op: EluBufferedOp) -> (() -> Void)?
 
     /// Performs one facade operation. Operations reach the runtime in the
     /// order they are handed over, including operations replayed from the
@@ -79,7 +73,7 @@ protocol EluRuntimeBackend: AnyObject {
 /// the lifecycle state machine decides to run.
 struct EluRuntimeBackendContext {
     let siteKey: String
-    let config: EluRemoteConfig
+    let config: EluRemoteConfig?
     /// The exact configuration response bytes, as served. The ELU-owned
     /// runtime validates the document itself and derives its own capture
     /// authority from it; `config` carries the decoded values the lifecycle
@@ -89,10 +83,49 @@ struct EluRuntimeBackendContext {
     /// Invoked on every flag load so the facade can run its registered
     /// callbacks. Called from the backend's own execution context.
     let flagsDidLoad: () -> Void
+    let configHost: URL
+    let guardedFlagsDidLoad: @Sendable (@escaping @Sendable () -> Bool) -> Void
+    let initialConfigurationReady: @Sendable (@escaping @Sendable () -> Bool) -> Void
+
+    init(siteKey: String, config: EluRemoteConfig? = nil, configDocument: Data? = nil,
+         isNewUser: Bool, flagsDidLoad: @escaping () -> Void,
+         configHost: URL = URL(string: "https://elu.dev")!,
+         guardedFlagsDidLoad: (@Sendable (@escaping @Sendable () -> Bool) -> Void)? = nil,
+         initialConfigurationReady: @escaping @Sendable (@escaping @Sendable () -> Bool) -> Void = { _ in }) {
+        self.siteKey = siteKey
+        self.config = config
+        self.configDocument = configDocument
+        self.isNewUser = isNewUser
+        self.flagsDidLoad = flagsDidLoad
+        self.configHost = configHost
+        self.guardedFlagsDidLoad = guardedFlagsDidLoad ?? { predicate in
+            if predicate() { flagsDidLoad() }
+        }
+        self.initialConfigurationReady = initialConfigurationReady
+    }
 }
 
 /// Builds the backend a selection names. Held as a value so tests can observe
 /// exactly which runtime each selection reaches.
 struct EluRuntimeBackendFactory {
     let make: (EluRuntimeSelection, EluRuntimeBackendContext) -> (any EluRuntimeBackend)?
+}
+
+// Simple injected test backends have no retained projection. The owned
+// backend overrides both methods with original guards.
+extension EluRuntimeBackend {
+    func flagNotificationPredicate() -> (@Sendable () -> Bool)? {
+        guard flagsAreLoaded else { return nil }
+        return { [weak self] in self?.flagsAreLoaded == true }
+    }
+    func beginPendingOperation(_ op: EluBufferedOp) -> (() -> Void)? { nil }
+}
+
+extension EluBufferedOp {
+    var changesFlagContext: Bool {
+        switch self {
+        case .capture, .screen, .captureException: return false
+        default: return true
+        }
+    }
 }

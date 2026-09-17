@@ -6,14 +6,10 @@ public struct EluSetupOptions {
     /// ELU config endpoint origin. Default: `https://elu.dev`.
     public var configHost: URL
 
-    /// Which analytics runtime this run drives. Not part of the public API:
-    /// a build selects one runtime for its whole fleet, and the selection is
-    /// changed by changing this default, never by customer code.
-    ///
-    /// The two runtimes do not share stored identity, so changing the default
-    /// starts a fresh ELU identity on every device. Carrying an existing
-    /// identity across is a separate, separately reviewed step.
-    var runtimeSelection: EluRuntimeSelection = .provider
+    /// Internal construction marker for the owned runtime. Customer code
+    /// cannot select or construct another backend. Legacy identity import
+    /// remains a separate, explicitly validated compatibility operation.
+    var runtimeSelection: EluRuntimeSelection = .standalone
 
     public init(configHost: URL = URL(string: "https://elu.dev")!) {
         self.configHost = configHost
@@ -25,7 +21,7 @@ public struct EluSetupOptions {
 /// Every method is safe in every lifecycle state: before config arrives,
 /// capture-class calls buffer in memory; when analytics is disabled (kill
 /// switch, EU block) they are silent no-ops; while running they delegate to
-/// the embedded provider. Nothing here throws or blocks the caller on
+/// the ELU-owned runtime. Nothing here throws or blocks the caller on
 /// network. Customer code never touches the underlying provider directly.
 public enum Elu {
     // MARK: - Setup

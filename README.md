@@ -4,16 +4,17 @@ ELU product intelligence for native iOS apps. One site key, no other
 configuration — behavior (privacy controls, kill switches, session replay)
 is managed from your ELU dashboard and delivered as remote config.
 
-ELU Analytics 0.1.0 exposes an ELU-owned API and currently uses PostHog's
-native runtime for managed capture and ingest. You do not need a PostHog
-account or key; application code should call only `Elu.*`.
-This provider-backed disclosure and dependency are temporary; both must be
-absent from a standalone ELU runtime release.
+This source checkout uses the ELU-owned analytics runtime and has no external
+Swift package dependencies. Its standalone release is still undergoing
+qualification. The published 0.1.0 release uses the previous runtime; changing
+this checkout does not change that release. Application code continues to use
+`Elu.*` with an ELU site key.
 
 - Swift Package, iOS 13+
-- Session replay, screen tracking, lifecycle events out of the box
-- All privacy controls act on-device at capture time: masked or blocked
-  content never leaves the phone
+- Events, identity, feature flags, screen tracking, and lifecycle events
+- Remote configuration controls whether analytics may run
+- Standalone session replay remains disabled until capture, masking, stored
+  readback, and final device qualification pass
 
 ## Install (Swift Package Manager)
 
@@ -26,7 +27,10 @@ dependencies: [
 ]
 ```
 
-Then add `EluAnalytics` to your target's dependencies.
+Then add `EluAnalytics` to your target's dependencies. The version above refers
+to the previous published release. For development against this unreleased
+checkout, add it as a local Swift package instead; a qualified standalone
+version has not yet been published.
 
 ## Setup
 
@@ -61,13 +65,14 @@ struct MyApp: App {
 }
 ```
 
-That's it. Events are captured with `Elu.capture(...)`; everything else
-(replay, screen views, lifecycle events) is automatic per your dashboard
-settings.
+Use `Elu.capture(...)` for custom events. Screen and lifecycle tracking follow
+the behavior below. The standalone replay implementation is not yet enabled
+for customer use.
 
-On the very first launch of a fresh install the SDK fetches its config
-before initializing — calls made in that window are buffered in memory and
-sent once config arrives (session replay starts from the next launch).
+The SDK fetches an eligible configuration before sending analytics. Calls made
+while setup or configuration is pending are subject to the SDK's bounded
+buffering and privacy rules. A missing, disabled, expired, or ineligible
+configuration does not grant permission to send.
 
 ## Identity: you own it
 
@@ -85,6 +90,10 @@ Elu.reset()
 Do not identify with emails or other PII as the id; use your stable internal
 user id. Before `identify`, activity is tracked anonymously and linked on the
 first identify.
+
+The owned runtime uses separate storage. Installing it alone does not import
+the previous runtime's identity. Identity continuity is part of the migration
+qualification required before a standalone rollout.
 
 ## Screen tracking and SwiftUI
 
@@ -120,8 +129,8 @@ Elu.onFeatureFlagsLoaded(_:)             Elu.setPersonPropertiesForFlags(_:)
 Elu.setGroupPropertiesForFlags(_:properties:)
 ```
 
-Every method is safe to call at any time — before setup, while config is
-loading, or when analytics is disabled — it never throws and never blocks.
+The facade accepts calls before setup, while config is loading, and when
+analytics is disabled without throwing errors into application code.
 When analytics is disabled or a device is EU-blocked, `Elu.*` event calls are
 no-ops and no analytics events or replay leave the device. ELU config checks
 continue so a re-enabled site can recover.
@@ -129,27 +138,25 @@ continue so a re-enabled site can recover.
 ## Remote-controlled vs baked-in
 
 Controlled from the ELU dashboard without an app update. Changes apply after
-the next successful eligible config refresh; a fetch failure keeps the last
-known safe config until the device can refresh again:
+the SDK accepts the refreshed configuration. A previously accepted
+configuration can authorize work only within its validity window:
 
 - Analytics on/off (kill switch)
 - EU visitor blocking (`blockEu` — on by default, timezone heuristic,
   fail-closed: blocked devices send no analytics events or replay)
-- Replay text/input masking, image masking
-- Replay for new users only; per-session replay minute budget
-- Replay sampling and minimum duration (project settings)
+- Feature flag evaluation
+
+Replay privacy, sampling, and per-session limits are implemented in the owned
+runtime but remain subject to the replay qualification gate. They do not
+enable capture in this checkout.
 
 Baked into the binary (changes require an SDK update):
 
 - Screen tracking and application lifecycle events: on
-- Session replay screenshot mode: on (required by ELU's analysis pipeline)
+- Standalone replay: not enabled pending qualification
 - Element-interaction autocapture, surveys, push auto-capture: off
 - The facade surface itself (`elu_facade_version` super property tells ELU
   what each installed binary can do)
-
-Tightening a privacy setting takes effect immediately for live sessions
-(replay stops rather than continue with looser masking); loosening applies
-from the next app launch.
 
 ## Dev/staging
 
@@ -159,3 +166,7 @@ Elu.setup(siteKey: "YOUR_SITE_KEY",
 ```
 
 Production apps should always use the default host.
+
+## SDK development
+
+[SDK development status](docs/sdk-development-status.md) tracks validation gaps and related work.

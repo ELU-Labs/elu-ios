@@ -318,8 +318,9 @@ final class EluStandaloneRuntimeTests: XCTestCase {
             guard case .capturing = await second.applyConfiguration(fixture("config-enabled.json")) else {
                 return XCTFail("Expected capture authority after restart")
             }
-            let secondFlush = await second.flush()
-            XCTAssertEqual(secondFlush, .triggered(.resolved(delivered: 1, terminallyDiscarded: 0)))
+            // Installing source authority resumes the retained batch without
+            // another caller-triggered flush. Inspect only after its ACK commits.
+            try await awaitCondition { try await second.queueSnapshot().queuedCount == 0 }
 
             let failingRequests = await failing.recordedRequests()
             let acceptingRequests = await accepting.recordedRequests()

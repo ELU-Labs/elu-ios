@@ -248,7 +248,8 @@ final class EluStandaloneFacadeRuntimeTests: XCTestCase {
 
             let snapshot = try await harness.runtime.queueSnapshot()
             XCTAssertEqual(snapshot.queuedCount, 0)
-            XCTAssertNil(snapshot.identity.userId)
+            // Local identity survives without capture authority; no mutation is backfilled.
+            XCTAssertEqual(snapshot.identity.userId, "user-1")
             let flushed = await harness.runtime.flush()
             XCTAssertEqual(flushed, .unavailable)
             let records = try await harness.transport.recordedRecords()
@@ -307,7 +308,8 @@ final class EluStandaloneFacadeRuntimeTests: XCTestCase {
 
             let snapshot = try await harness.runtime.queueSnapshot()
             XCTAssertEqual(snapshot.queuedCount, 0)
-            XCTAssertNil(snapshot.identity.userId)
+            // Local identity survives without capture authority; no mutation is backfilled.
+            XCTAssertEqual(snapshot.identity.userId, "user-1")
             let records = try await harness.transport.recordedRecords()
             XCTAssertTrue(records.isEmpty)
             await harness.close()

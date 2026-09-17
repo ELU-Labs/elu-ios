@@ -21,7 +21,10 @@ enum EluRuntimeQueueError: Error, Equatable, Sendable {
     case ambiguousCommit
     case provenNotCommitted
     case captureAuthorityExpiredBeforeWrite
+    case sourceAuthorityUnavailable
+    case legacyMigrationRefused(EluLegacyStartupError)
     case standaloneLegacyEntryPointUnavailable
+    case nativeCaptureWorkPending
     case flagAuthorityTerminal
     case faultInjected(EluRuntimeQueueFaultPoint)
 }
@@ -31,6 +34,7 @@ enum EluRuntimeQueueFaultPoint: Equatable, Sendable {
     case beforeInitialInstall
     case afterInitialInstall
     case beforeBegin
+    case beforeNativeDenialRead
     case afterBegin
     case afterStateRead
     case afterRecordInsert(Int)
@@ -105,6 +109,17 @@ private struct EluStoredRuntimeState: Equatable, Sendable {
     }
 }
 
+private struct EluStoredReplayState {
+    var siteId: String?
+    var witness: EluV2ReplayConfigWitness?
+    var protocolGeneration: String?
+    var admissionEnabled: Bool
+    var nextOrdinal: Int64
+    var maximumQueueBytes: Int64
+    var observedWall: EluV1Timestamp?
+    var clockDenied: Bool
+}
+
 private struct EluStoredQueueRecord: Sendable {
     var record: EluQueuedRecord
     var payload: Data
@@ -116,6 +131,74 @@ private enum EluSQLiteRuntimeSchema {
     static let runtimeStateVersion: Int64 = 1
     static let initialDatabaseVersion: Int64 = 1
     static let flagDatabaseVersion: Int64 = 2
+    static let replayDatabaseVersion: Int64 = 3
+    static let flagReplayDatabaseVersion: Int64 = 4
+    // 17...24 preserve the eight existing schema combinations and add one
+    // immutable legacy Events ledger. 9...16 remain unsupported, not aliases.
+    static func hasLegacyEvents(_ version: Int64) -> Bool { (17...24).contains(version) }
+    static func baseVersion(_ version: Int64) -> Int64 { hasLegacyEvents(version) ? version - 16 : version }
+    static func preservingLegacyEvents(_ base: Int64, from version: Int64) -> Int64 { base + (hasLegacyEvents(version) ? 16 : 0) }
+    static func supports(_ version: Int64) -> Bool { (1...8).contains(version) || hasLegacyEvents(version) }
+    static func hasFlags(_ version: Int64) -> Bool { [2, 4, 6, 8].contains(baseVersion(version)) }
+    static func hasReplay(_ version: Int64) -> Bool { (3...8).contains(baseVersion(version)) }
+    static func hasReplayDelivery(_ version: Int64) -> Bool { (5...8).contains(baseVersion(version)) }
+    static func hasNativeReplayAuthority(_ version: Int64) -> Bool { [7, 8].contains(baseVersion(version)) }
+    static let createLegacyEvents = """
+    CREATE TABLE legacy_events_import (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        body BLOB NOT NULL,
+        body_sha256 TEXT NOT NULL
+    )
+    """
+    static let createNativeReplayAuthority = """
+    CREATE TABLE native_replay_authority (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        metadata BLOB NOT NULL CHECK (length(metadata) > 0 AND length(metadata) <= 16384)
+    )
+    """
+    static let nativeReplayAuthorityColumns = ["singleton": "INTEGER", "metadata": "BLOB"]
+    static let createReplayDelivery = """
+    CREATE TABLE replay_delivery (
+        ordinal INTEGER PRIMARY KEY CHECK (ordinal >= -1),
+        metadata BLOB NOT NULL CHECK (length(metadata) > 0 AND length(metadata) <= 16384)
+    )
+    """
+    static let replayDeliveryColumns = ["ordinal": "INTEGER", "metadata": "BLOB"]
+
+    static let createReplayState = """
+    CREATE TABLE replay_state (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        storage_schema INTEGER NOT NULL CHECK (storage_schema = 1),
+        site_id TEXT,
+        config_issued_at TEXT,
+        config_hash TEXT,
+        protocol_generation TEXT,
+        admission_enabled INTEGER NOT NULL CHECK (admission_enabled IN (0, 1)),
+        next_ordinal INTEGER NOT NULL CHECK (next_ordinal >= 0),
+        maximum_queue_bytes INTEGER NOT NULL CHECK (maximum_queue_bytes > 0 AND maximum_queue_bytes <= 268435456),
+        observed_wall TEXT,
+        clock_denied INTEGER NOT NULL DEFAULT 0 CHECK (clock_denied IN (0, 1))
+    )
+    """
+    static let createReplayChunks = """
+    CREATE TABLE replay_chunks (
+        ordinal INTEGER PRIMARY KEY CHECK (ordinal >= 0),
+        storage_schema INTEGER NOT NULL CHECK (storage_schema = 1),
+        site_id TEXT NOT NULL,
+        request_id TEXT NOT NULL,
+        replay_id TEXT NOT NULL,
+        chunk_id TEXT NOT NULL,
+        sequence INTEGER NOT NULL CHECK (sequence >= 0),
+        capture_generation TEXT NOT NULL,
+        body BLOB NOT NULL CHECK (length(body) > 0 AND length(body) <= 5242880),
+        masking_profile BLOB NOT NULL CHECK (length(masking_profile) > 0 AND length(masking_profile) <= 16384),
+        UNIQUE (site_id, request_id),
+        UNIQUE (site_id, replay_id, chunk_id),
+        UNIQUE (site_id, replay_id, sequence)
+    )
+    """
+    static let replayStateColumns = ["singleton": "INTEGER", "storage_schema": "INTEGER", "site_id": "TEXT", "config_issued_at": "TEXT", "config_hash": "TEXT", "protocol_generation": "TEXT", "admission_enabled": "INTEGER", "next_ordinal": "INTEGER", "maximum_queue_bytes": "INTEGER", "observed_wall": "TEXT", "clock_denied": "INTEGER"]
+    static let replayChunkColumns = ["ordinal": "INTEGER", "storage_schema": "INTEGER", "site_id": "TEXT", "request_id": "TEXT", "replay_id": "TEXT", "chunk_id": "TEXT", "sequence": "INTEGER", "capture_generation": "TEXT", "body": "BLOB", "masking_profile": "BLOB"]
     static let databaseFilename = "runtime-state-v1.sqlite3"
     static let lockFilename = ".runtime-state-v1.lock"
     static let maximumPayloadBytes = 10 * 1_024 * 1_024
@@ -258,6 +341,13 @@ private final class EluRuntimeOwnershipRegistry: @unchecked Sendable {
     }
 }
 
+/// Uncertain enrolled receipts retain occupancy until process exit.
+private enum EluReplayResourceQuarantine {
+    static let lock = NSLock()
+    static var retained: [EluRuntimeResources] = []
+    static func retain(_ value: EluRuntimeResources) { lock.lock(); retained.append(value); lock.unlock() }
+}
+
 private final class EluRuntimeResources: @unchecked Sendable {
     let canonicalDirectory: String
     let connection: EluSQLiteConnection
@@ -265,6 +355,66 @@ private final class EluRuntimeResources: @unchecked Sendable {
     private let lock = NSLock()
     private var lockDescriptor: Int32
     private var isClosed = false
+    private var closeRequested = false
+    private var replayEnrollments = 0
+    private var nativeCaptureEnrollments = 0
+    private var retainedNativeRequest: EluV2ReplayPreparedRequest?
+    private var replayQuarantined = false
+    func quarantineReplay() {
+        lock.lock()
+        guard replayEnrollments > 0, !replayQuarantined else { lock.unlock(); return }
+        replayQuarantined = true; lock.unlock()
+        EluReplayResourceQuarantine.retain(self)
+    }
+
+    /// A failed restrictive native denial write must not release the original
+    /// installation to a second owner before that denial is durable.
+    func quarantineNativeClockDenial() {
+        lock.lock()
+        guard !isClosed, !replayQuarantined else { lock.unlock(); return }
+        replayQuarantined = true; lock.unlock()
+        EluReplayResourceQuarantine.retain(self)
+    }
+
+    func enrollReplay() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard !isClosed, !closeRequested, replayEnrollments == 0 else { return false }
+        replayEnrollments = 1
+        return true
+    }
+    func settleReplay() {
+        lock.lock()
+        guard replayEnrollments == 1 else { lock.unlock(); return }
+        replayEnrollments = 0
+        let shouldClose = closeRequested
+        lock.unlock()
+        if shouldClose { close() }
+    }
+
+    func quarantineNativeCapture(retaining prepared: EluV2ReplayPreparedRequest?) {
+        lock.lock()
+        guard !isClosed, nativeCaptureEnrollments > 0 else { lock.unlock(); return }
+        if retainedNativeRequest == nil { retainedNativeRequest = prepared }
+        let first = !replayQuarantined
+        replayQuarantined = true
+        lock.unlock()
+        if first { EluReplayResourceQuarantine.retain(self) }
+    }
+
+    func enrollNativeCapture() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard !isClosed, !closeRequested, !replayQuarantined, nativeCaptureEnrollments == 0 else { return false }
+        nativeCaptureEnrollments = 1
+        return true
+    }
+    func settleNativeCapture() {
+        lock.lock()
+        guard nativeCaptureEnrollments == 1, !replayQuarantined else { lock.unlock(); return }
+        nativeCaptureEnrollments = 0
+        let shouldClose = closeRequested
+        lock.unlock()
+        if shouldClose { close() }
+    }
 
     init(
         canonicalDirectory: String,
@@ -278,6 +428,8 @@ private final class EluRuntimeResources: @unchecked Sendable {
 
     func close() {
         lock.lock()
+        closeRequested = true
+        if replayEnrollments > 0 || nativeCaptureEnrollments > 0 || replayQuarantined { lock.unlock(); return }
         guard !isClosed else {
             lock.unlock()
             return
@@ -501,7 +653,9 @@ private enum EluRuntimeQueueBootstrap {
         clock: @Sendable () -> Date,
         anonymousIdGenerator: @Sendable () -> String,
         streamIdGenerator: @Sendable () -> String,
-        faultInjector: (any EluRuntimeQueueFaultInjecting)?
+        faultInjector: (any EluRuntimeQueueFaultInjecting)?,
+        legacyStartupSource: EluLegacyStartupSource? = nil,
+        importLimits: EluRuntimeQueueLimits? = nil
     ) throws -> EluRuntimeBootstrapResult {
         try faultInjector?.hit(.open)
 
@@ -562,18 +716,25 @@ private enum EluRuntimeQueueBootstrap {
             )
             let databaseExists = fileManager.fileExists(atPath: databaseURL.path)
             if !databaseExists {
+                var legacyObservation: EluLegacyStartupSource.Observation?
                 let importedState = normalizeLegacyOptedOutSession(
                     try loadLegacyOrFreshState(
                         directoryURL: canonicalURL,
                         clock: clock,
                         anonymousIdGenerator: anonymousIdGenerator,
-                        streamIdGenerator: streamIdGenerator
+                        streamIdGenerator: streamIdGenerator,
+                        legacyStartupSource: legacyStartupSource,
+                        legacyObservation: &legacyObservation
                     )
                 )
+                let observedSource = legacyObservation
                 try installFreshDatabase(
                     at: databaseURL,
                     state: importedState,
-                    faultInjector: faultInjector
+                    eventsImport: observedSource?.eventsImport,
+                    importLimits: importLimits,
+                    faultInjector: faultInjector,
+                    beforeInstall: { try observedSource?.recheck() }
                 )
             }
 
@@ -656,8 +817,7 @@ private enum EluRuntimeQueueBootstrap {
         connection: EluSQLiteConnection
     ) throws -> EluRuntimeInspection {
         let userVersion = try connection.integerPragma("user_version")
-        guard userVersion == EluSQLiteRuntimeSchema.initialDatabaseVersion
-            || userVersion == EluSQLiteRuntimeSchema.flagDatabaseVersion
+        guard EluSQLiteRuntimeSchema.supports(userVersion)
         else {
             if userVersion == 0 {
                 _ = try EluRuntimeDatabase.schemaObjects(connection)
@@ -676,7 +836,10 @@ private enum EluRuntimeQueueBootstrap {
     private static func installFreshDatabase(
         at databaseURL: URL,
         state: EluStoredRuntimeState,
-        faultInjector: (any EluRuntimeQueueFaultInjecting)?
+        eventsImport: EluLegacyEventsImport?,
+        importLimits: EluRuntimeQueueLimits?,
+        faultInjector: (any EluRuntimeQueueFaultInjecting)?,
+        beforeInstall: () throws -> Void = {}
     ) throws {
         let fileManager = FileManager.default
         guard !fileManager.fileExists(atPath: databaseURL.path) else {
@@ -700,9 +863,11 @@ private enum EluRuntimeQueueBootstrap {
             try connection.execute(EluSQLiteRuntimeSchema.createRuntimeState)
             try connection.execute(EluSQLiteRuntimeSchema.createQueueRecords)
             try EluRuntimeDatabase.insertInitialState(connection, state: state)
-            try connection.execute(
-                "PRAGMA user_version = \(EluSQLiteRuntimeSchema.initialDatabaseVersion)"
-            )
+            if let eventsImport {
+                try EluRuntimeDatabase.installLegacyEvents(connection, manifest: eventsImport,
+                    state: state, limits: try importLimits ?? EluRuntimeQueueLimits(), faultInjector: faultInjector)
+            }
+            try connection.execute("PRAGMA user_version = \(eventsImport == nil ? 1 : 17)")
             try connection.execute("COMMIT")
             try connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             try connection.withStatement("PRAGMA journal_mode=DELETE") { statement in
@@ -721,6 +886,7 @@ private enum EluRuntimeQueueBootstrap {
         connection.close()
         try synchronizeFile(stagedURL)
         try faultInjector?.hit(.beforeInitialInstall)
+        try beforeInstall()
         try fileManager.moveItem(at: stagedURL, to: databaseURL)
         installed = true
         try EluDarwinDirectorySynchronizer().synchronize(
@@ -773,13 +939,20 @@ private enum EluRuntimeQueueBootstrap {
         directoryURL: URL,
         clock: @Sendable () -> Date,
         anonymousIdGenerator: @Sendable () -> String,
-        streamIdGenerator: @Sendable () -> String
+        streamIdGenerator: @Sendable () -> String,
+        legacyStartupSource: EluLegacyStartupSource?,
+        legacyObservation: inout EluLegacyStartupSource.Observation?
     ) throws -> EluStoredRuntimeState {
         let legacyStore = try EluFileIdentityStateStore(directoryURL: directoryURL)
         switch try legacyStore.load() {
         case let .loaded(state):
             return try storedState(from: state)
         case .missing:
+            if let legacyStartupSource {
+                let observed = try legacyStartupSource.read(now: clock(), streamIdGenerator: streamIdGenerator)
+                legacyObservation = observed
+                if let state = observed.state { return try storedState(from: state) }
+            }
             return try freshState(
                 now: clock(),
                 anonymousId: anonymousIdGenerator(),
@@ -937,6 +1110,7 @@ private enum EluRuntimeQueueBootstrap {
     }
 
     private static func mapOpenError(_ error: Error) -> EluRuntimeQueueError {
+        if let legacyError = error as? EluLegacyStartupError { return .legacyMigrationRefused(legacyError) }
         if let error = error as? EluRuntimeQueueError {
             return error
         }
@@ -1703,6 +1877,219 @@ private enum EluRuntimeDatabase {
             return nil
         }
     }
+    static func readReplayState(_ connection: EluSQLiteConnection) throws -> EluStoredReplayState {
+        try connection.withStatement("SELECT singleton,storage_schema,site_id,config_issued_at,config_hash,protocol_generation,admission_enabled,next_ordinal,maximum_queue_bytes,observed_wall,clock_denied FROM replay_state") { statement in
+            try connection.step(statement, expecting: SQLITE_ROW)
+            guard try connection.requiredInteger(statement, column: 0) == 1 else { throw EluRuntimeQueueError.corruptStorage }
+            let schema = try connection.requiredInteger(statement, column: 1)
+            guard schema == 1 else { throw EluRuntimeQueueError.unsupportedSchemaVersion(schema) }
+            func optional(_ column: Int32) throws -> String? {
+                sqlite3_column_type(statement, column) == SQLITE_NULL ? nil : try replayText(statement, column: column)
+            }
+            let site = try optional(2), issued = try optional(3), hash = try optional(4), generation = try optional(5)
+            let enabled = try connection.requiredInteger(statement, column: 6)
+            let ordinal = try connection.requiredInteger(statement, column: 7)
+            let maximumQueueBytes = try connection.requiredInteger(statement, column: 8)
+            let observedWall = try optional(9).map(EluV1Timestamp.init)
+            let clockDenied = try connection.requiredInteger(statement, column: 10)
+            guard (0...1).contains(clockDenied), clockDenied == 0 || enabled == 0, (1...268_435_456).contains(maximumQueueBytes), (0...1).contains(enabled), (0...EluV2ReplayDeliveryState.maximumSafeInteger).contains(ordinal), sqlite3_step(statement) == SQLITE_DONE else { throw EluRuntimeQueueError.corruptStorage }
+            let witness: EluV2ReplayConfigWitness?
+            if let issued, let hash {
+                guard hash.range(of: "^sha256:[a-f0-9]{64}$", options: .regularExpression) != nil else { throw EluRuntimeQueueError.corruptStorage }
+                witness = EluV2ReplayConfigWitness(issuedAt: try EluV1Timestamp(issued), semanticHash: hash)
+            } else {
+                guard issued == nil, hash == nil, site == nil, generation == nil, enabled == 0, ordinal == 0 else { throw EluRuntimeQueueError.corruptStorage }; witness = nil
+            }
+            if let site { guard EluV1Validation.validString(site, minimum: 1, maximum: 128) else { throw EluRuntimeQueueError.corruptStorage } }
+            if let generation { guard EluV1Validation.validString(generation, minimum: 1, maximum: 128) else { throw EluRuntimeQueueError.corruptStorage } }
+            guard witness == nil || observedWall != nil,
+                  enabled == 0 || (site != nil && generation != nil && witness != nil) else { throw EluRuntimeQueueError.corruptStorage }
+            return EluStoredReplayState(siteId: site, witness: witness, protocolGeneration: generation, admissionEnabled: enabled == 1, nextOrdinal: ordinal, maximumQueueBytes: maximumQueueBytes, observedWall: observedWall, clockDenied: clockDenied == 1)
+        }
+    }
+
+    static func writeReplayState(_ connection: EluSQLiteConnection, _ state: EluStoredReplayState) throws {
+        try connection.withStatement("UPDATE replay_state SET site_id=?,config_issued_at=?,config_hash=?,protocol_generation=?,admission_enabled=?,next_ordinal=?,maximum_queue_bytes=?,observed_wall=?,clock_denied=? WHERE singleton=1") { statement in
+            for (index, value) in [state.siteId, state.witness?.issuedAt.source, state.witness?.semanticHash, state.protocolGeneration].enumerated() {
+                if let value { try bindReplayText(connection, value, at: Int32(index + 1), to: statement) }
+                else { try connection.bindNull(at: Int32(index + 1), to: statement) }
+            }
+            try connection.bind(state.admissionEnabled ? Int64(1) : Int64(0), at: 5, to: statement)
+            try connection.bind(state.nextOrdinal, at: 6, to: statement)
+            try connection.bind(state.maximumQueueBytes, at: 7, to: statement)
+            if let observed = state.observedWall { try bindReplayText(connection, observed.source, at: 8, to: statement) }
+            else { try connection.bindNull(at: 8, to: statement) }
+            try connection.bind(state.clockDenied ? Int64(1) : Int64(0), at: 9, to: statement)
+            try connection.step(statement)
+            guard try connection.changes() == 1 else { throw EluRuntimeQueueError.corruptStorage }
+        }
+    }
+
+    static func readReplayChunks(_ connection: EluSQLiteConnection, ordinal: Int64) throws -> [EluV2ReplayStoredChunk] {
+        try connection.withStatement("SELECT ordinal,storage_schema,site_id,request_id,replay_id,chunk_id,sequence,capture_generation,body,masking_profile FROM replay_chunks WHERE ordinal=?") { statement in
+            try connection.bind(ordinal, at: 1, to: statement)
+            var rows: [EluV2ReplayStoredChunk] = []
+            var total: Int64 = 0
+            while true {
+                let result = sqlite3_step(statement)
+                if result == SQLITE_DONE { return rows }
+                guard result == SQLITE_ROW, rows.count < 10_000 else { throw EluRuntimeQueueError.corruptStorage }
+                let schema = try connection.requiredInteger(statement, column: 1)
+                guard schema == 1 else { throw EluRuntimeQueueError.unsupportedSchemaVersion(schema) }
+                let bytes = try connection.requiredData(statement, column: 8, maximumBytes: EluV2ReplayPreparedRequest.maximumBytes)
+                total += Int64(bytes.count)
+                guard total <= 268_435_456 else { throw EluRuntimeQueueError.corruptStorage }
+                let prepared = try EluV2ReplayPreparedRequest(bytes, captureProtocolGeneration: replayText(statement, column: 7))
+                guard prepared.body == bytes,
+                      EluV2ReplayText.equal(prepared.requestId, try replayText(statement, column: 3)),
+                      EluV2ReplayText.equal(prepared.replayId, try replayText(statement, column: 4)),
+                      EluV2ReplayText.equal(prepared.chunkId, try replayText(statement, column: 5)),
+                      prepared.sequence == (try connection.requiredInteger(statement, column: 6)) else { throw EluRuntimeQueueError.corruptStorage }
+                rows.append(try EluV2ReplayStoredChunk(ordinal: connection.requiredInteger(statement, column: 0),
+                    siteId: replayText(statement, column: 2), captureProtocolGeneration: replayText(statement, column: 7), prepared: prepared,
+                    maskingProfile: connection.requiredData(statement, column: 9, maximumBytes: 16_384)))
+            }
+        }
+    }
+
+    static func replayOrdinals(_ connection: EluSQLiteConnection) throws -> [Int64] {
+        try connection.withStatement("SELECT ordinal FROM replay_chunks ORDER BY ordinal") { statement in
+            var result: [Int64] = []
+            while true {
+                let status = sqlite3_step(statement)
+                if status == SQLITE_DONE { return result }
+                guard status == SQLITE_ROW, result.count < 10_000 else { throw EluRuntimeQueueError.corruptStorage }
+                let ordinal = try connection.requiredInteger(statement, column: 0)
+                guard ordinal >= 0, result.last.map({ $0 < ordinal }) ?? true else { throw EluRuntimeQueueError.corruptStorage }
+                result.append(ordinal)
+            }
+        }
+    }
+
+    static func visitReplayChunks(_ connection: EluSQLiteConnection, _ visit: (EluV2ReplayStoredChunk) throws -> Void) throws {
+        // The ordinal inventory is bounded; statements are closed before mutation
+        // and only one request/profile pair is materialized at a time.
+        var bytes: Int64 = 0
+        for ordinal in try replayOrdinals(connection) {
+            try autoreleasepool {
+                let rows = try readReplayChunks(connection, ordinal: ordinal)
+                guard rows.count == 1, let row = rows.first else { throw EluRuntimeQueueError.corruptStorage }
+                bytes += Int64(row.prepared.body.count)
+                guard bytes <= 268_435_456 else { throw EluRuntimeQueueError.corruptStorage }
+                try visit(row)
+            }
+        }
+    }
+
+    static func insertReplayChunk(_ connection: EluSQLiteConnection, _ row: EluV2ReplayStoredChunk) throws {
+        try connection.withStatement("INSERT INTO replay_chunks (ordinal,storage_schema,site_id,request_id,replay_id,chunk_id,sequence,capture_generation,body,masking_profile) VALUES (?,1,?,?,?,?,?,?,?,?)") { statement in
+            try connection.bind(row.ordinal, at: 1, to: statement)
+            for (index, text) in [row.siteId, row.prepared.requestId, row.prepared.replayId, row.prepared.chunkId].enumerated() {
+                try bindReplayText(connection, text, at: Int32(index + 2), to: statement)
+            }
+            try connection.bind(row.prepared.sequence, at: 6, to: statement)
+            try bindReplayText(connection, row.captureProtocolGeneration, at: 7, to: statement)
+            try connection.bind(row.prepared.body, at: 8, to: statement)
+            try connection.bind(row.maskingProfile, at: 9, to: statement)
+            try connection.step(statement)
+        }
+    }
+
+    static func deleteReplayChunk(_ connection: EluSQLiteConnection, ordinal: Int64) throws {
+        if EluSQLiteRuntimeSchema.hasReplayDelivery(try connection.integerPragma("user_version")) {
+            try connection.withStatement("DELETE FROM replay_delivery WHERE ordinal=?") { statement in
+                try connection.bind(ordinal, at: 1, to: statement); try connection.step(statement)
+            }
+        }
+        try connection.withStatement("DELETE FROM replay_chunks WHERE ordinal=?") { statement in
+            try connection.bind(ordinal, at: 1, to: statement); try connection.step(statement)
+        }
+    }
+
+    static func readNativeReplayAuthority(_ connection: EluSQLiteConnection) throws -> EluNativeReplaySessionState {
+        try connection.withStatement("SELECT singleton,metadata FROM native_replay_authority") { statement in
+            try connection.step(statement, expecting: SQLITE_ROW)
+            guard try connection.requiredInteger(statement, column: 0) == 1,
+                  sqlite3_column_type(statement, 1) == SQLITE_BLOB,
+                  (1...EluNativeReplaySessionState.maximumBytes).contains(Int(sqlite3_column_bytes(statement, 1))),
+                  let bytes = sqlite3_column_blob(statement, 1) else { throw EluRuntimeQueueError.corruptStorage }
+            let value: EluNativeReplaySessionState
+            do { value = try EluNativeReplaySessionState.decode(Data(bytes: bytes, count: Int(sqlite3_column_bytes(statement, 1)))) }
+            catch { throw EluRuntimeQueueError.corruptStorage }
+            guard sqlite3_step(statement) == SQLITE_DONE else { throw EluRuntimeQueueError.corruptStorage }
+            return value
+        }
+    }
+
+    static func writeNativeReplayAuthority(_ connection: EluSQLiteConnection, value: EluNativeReplaySessionState, inserting: Bool = false) throws {
+        let sql = inserting ? "INSERT INTO native_replay_authority (singleton,metadata) VALUES (1,?)"
+            : "UPDATE native_replay_authority SET metadata=? WHERE singleton=1"
+        try connection.withStatement(sql) { statement in
+            try connection.bind(value.encoded(), at: 1, to: statement); try connection.step(statement)
+        }
+        guard try readNativeReplayAuthority(connection).encoded() == value.encoded() else { throw EluRuntimeQueueError.corruptStorage }
+    }
+
+    static func readReplayDelivery(_ connection: EluSQLiteConnection, ordinal: Int64) throws -> EluV2ReplayDeliveryState {
+        try connection.withStatement("SELECT metadata FROM replay_delivery WHERE ordinal=?") { statement in
+            try connection.bind(ordinal, at: 1, to: statement)
+            try connection.step(statement, expecting: SQLITE_ROW)
+            guard sqlite3_column_type(statement, 0) == SQLITE_BLOB,
+                  (1...16_384).contains(Int(sqlite3_column_bytes(statement, 0))),
+                  let bytes = sqlite3_column_blob(statement, 0) else { throw EluRuntimeQueueError.corruptStorage }
+            let value = try EluV2ReplayDeliveryState.decode(Data(bytes: bytes, count: Int(sqlite3_column_bytes(statement, 0))))
+            guard sqlite3_step(statement) == SQLITE_DONE else { throw EluRuntimeQueueError.corruptStorage }
+            return value
+        }
+    }
+
+    static func writeReplayDelivery(_ connection: EluSQLiteConnection, ordinal: Int64, value: EluV2ReplayDeliveryState) throws {
+        try connection.withStatement("INSERT OR REPLACE INTO replay_delivery (ordinal,metadata) VALUES (?,?)") { statement in
+            try connection.bind(ordinal, at: 1, to: statement)
+            try connection.bind(value.encoded(), at: 2, to: statement); try connection.step(statement)
+        }
+    }
+
+    static func auditReplayDelivery(_ connection: EluSQLiteConnection) throws {
+        let expected = Set(try replayOrdinals(connection)).union([-1])
+        var actual = Set<Int64>()
+        try connection.withStatement("SELECT ordinal FROM replay_delivery ORDER BY ordinal") { statement in
+            while true {
+                let result = sqlite3_step(statement)
+                if result == SQLITE_DONE { break }
+                guard result == SQLITE_ROW, actual.count <= 10_000 else { throw EluRuntimeQueueError.corruptStorage }
+                let ordinal = try connection.requiredInteger(statement, column: 0)
+                guard expected.contains(ordinal), actual.insert(ordinal).inserted else { throw EluRuntimeQueueError.corruptStorage }
+                let value = try readReplayDelivery(connection, ordinal: ordinal)
+                if ordinal == -1 { guard value.attemptCount == 0, value.blocked == nil else { throw EluRuntimeQueueError.corruptStorage } }
+            }
+        }
+        guard actual == expected else { throw EluRuntimeQueueError.corruptStorage }
+    }
+
+    static func replayTotals(_ connection: EluSQLiteConnection) throws -> (count: Int64, bytes: Int64) {
+        guard EluSQLiteRuntimeSchema.hasReplay(try connection.integerPragma("user_version")) else { return (0, 0) }
+        return try connection.withStatement("SELECT count(*),coalesce(sum(length(body)),0) FROM replay_chunks") { statement in
+            try connection.step(statement, expecting: SQLITE_ROW)
+            let count = try connection.requiredInteger(statement, column: 0)
+            let bytes = try connection.requiredInteger(statement, column: 1)
+            guard (0...10_000).contains(count), (0...268_435_456).contains(bytes), sqlite3_step(statement) == SQLITE_DONE else { throw EluRuntimeQueueError.corruptStorage }
+            return (count, bytes)
+        }
+    }
+
+    // SQLite TEXT may contain NUL; use explicit byte lengths for exact wire identities.
+    static func bindReplayText(_ connection: EluSQLiteConnection, _ value: String, at index: Int32, to statement: OpaquePointer) throws {
+        let result = value.withCString { sqlite3_bind_text(statement, index, $0, Int32(value.utf8.count), unsafeBitCast(-1, to: sqlite3_destructor_type.self)) }
+        guard result == SQLITE_OK else { throw EluRuntimeQueueError.databaseUnavailable }
+    }
+    static func replayText(_ statement: OpaquePointer, column: Int32) throws -> String {
+        guard sqlite3_column_type(statement, column) == SQLITE_TEXT,
+              let pointer = sqlite3_column_text(statement, column),
+              let string = String(data: Data(bytes: pointer, count: Int(sqlite3_column_bytes(statement, column))), encoding: .utf8) else { throw EluRuntimeQueueError.corruptStorage }
+        return string
+    }
+
     static func schemaObjects(_ connection: EluSQLiteConnection) throws -> [String: String] {
         try connection.withStatement(
             "SELECT name, type FROM sqlite_master "
@@ -1735,8 +2122,41 @@ private enum EluRuntimeDatabase {
             "queue_records": "table",
             "runtime_state": "table",
         ]
-        if databaseVersion == EluSQLiteRuntimeSchema.flagDatabaseVersion {
+        if EluSQLiteRuntimeSchema.hasLegacyEvents(databaseVersion) {
+            expectedObjects["legacy_events_import"] = "table"
+            try verifyColumns(connection, table: "legacy_events_import",
+                expected: ["singleton": "INTEGER", "body": "BLOB", "body_sha256": "TEXT"])
+            try verifyCreateSQL(connection, table: "legacy_events_import", expected: EluSQLiteRuntimeSchema.createLegacyEvents)
+            _ = try legacyEventRecords(connection)
+        }
+        if EluSQLiteRuntimeSchema.hasFlags(databaseVersion) {
             expectedObjects["flag_cache_records"] = "table"
+        }
+        if EluSQLiteRuntimeSchema.hasReplay(databaseVersion) {
+            expectedObjects["replay_state"] = "table"
+            expectedObjects["replay_chunks"] = "table"
+            try verifyColumns(connection, table: "replay_state", expected: EluSQLiteRuntimeSchema.replayStateColumns)
+            try verifyColumns(connection, table: "replay_chunks", expected: EluSQLiteRuntimeSchema.replayChunkColumns)
+            try verifyCreateSQL(connection, table: "replay_state", expected: EluSQLiteRuntimeSchema.createReplayState)
+            try verifyCreateSQL(connection, table: "replay_chunks", expected: EluSQLiteRuntimeSchema.createReplayChunks)
+            let replayState = try readReplayState(connection)
+            try visitReplayChunks(connection) { row in
+                guard row.ordinal < replayState.nextOrdinal, EluV2ReplayText.equal(row.siteId, replayState.siteId) else { throw EluRuntimeQueueError.corruptStorage }
+            }
+        }
+        if EluSQLiteRuntimeSchema.hasReplayDelivery(databaseVersion) {
+            expectedObjects["replay_delivery"] = "table"
+            try verifyColumns(connection, table: "replay_delivery", expected: EluSQLiteRuntimeSchema.replayDeliveryColumns)
+            try verifyCreateSQL(connection, table: "replay_delivery", expected: EluSQLiteRuntimeSchema.createReplayDelivery)
+            try auditReplayDelivery(connection)
+        }
+        if EluSQLiteRuntimeSchema.hasNativeReplayAuthority(databaseVersion) {
+            expectedObjects["native_replay_authority"] = "table"
+            try verifyColumns(connection, table: "native_replay_authority", expected: EluSQLiteRuntimeSchema.nativeReplayAuthorityColumns)
+            try verifyCreateSQL(connection, table: "native_replay_authority", expected: EluSQLiteRuntimeSchema.createNativeReplayAuthority)
+            let metadata = try readNativeReplayAuthority(connection)
+            let disk = try loadState(connection, validateQueue: false)
+            guard EluNativeReplaySessionState.same(metadata.streamId, disk.streamId) else { throw EluRuntimeQueueError.corruptStorage }
         }
         guard try schemaObjects(connection) == expectedObjects else {
             throw EluRuntimeQueueError.corruptStorage
@@ -1761,7 +2181,7 @@ private enum EluRuntimeDatabase {
             table: "queue_records",
             expected: EluSQLiteRuntimeSchema.createQueueRecords
         )
-        if databaseVersion == EluSQLiteRuntimeSchema.flagDatabaseVersion {
+        if EluSQLiteRuntimeSchema.hasFlags(databaseVersion) {
             try verifyColumns(
                 connection,
                 table: "flag_cache_records",
@@ -1773,6 +2193,65 @@ private enum EluRuntimeDatabase {
                 expected: EluSQLiteRuntimeSchema.createFlagCacheRecords
             )
         }
+    }
+
+    static func installLegacyEvents(_ connection: EluSQLiteConnection, manifest: EluLegacyEventsImport,
+        state: EluStoredRuntimeState, limits: EluRuntimeQueueLimits,
+        faultInjector: (any EluRuntimeQueueFaultInjecting)?) throws {
+        let records = try manifest.records()
+        guard manifest.state.identity == state.identity,
+              manifest.state.flagContext == state.flagContext,
+              manifest.state.streamMetadata.streamId == state.streamId,
+              state.nextSequence == 0, state.liveCount == 0 else { throw EluRuntimeQueueError.invalidState }
+        guard records.count <= limits.maximumCount else { throw EluRuntimeQueueError.queueCountLimitExceeded }
+        let stored = try records.map { record -> EluStoredQueueRecord in
+            let payload = try EluQueueRecordCodec.encode(record)
+            let versions = try encodeStateValue(record.versions)
+            let wire = try EluQueueBatchCodec.encodeRecord(record)
+            guard payload.count <= EluSQLiteRuntimeSchema.maximumPayloadBytes,
+                  wire.count <= EluSQLiteRuntimeSchema.maximumPayloadBytes else { throw EluRuntimeQueueError.queueByteLimitExceeded }
+            return EluStoredQueueRecord(record: record, payload: payload, versionsPayload: versions,
+                                        accountedBytes: Int64(wire.count))
+        }
+        let bytes = stored.reduce(Int64(0)) { $0 + $1.accountedBytes }
+        guard bytes <= Int64(limits.maximumBytes) else { throw EluRuntimeQueueError.queueByteLimitExceeded }
+        let body = try manifest.encoded()
+        try connection.execute(EluSQLiteRuntimeSchema.createLegacyEvents)
+        try connection.withStatement("INSERT INTO legacy_events_import (singleton,body,body_sha256) VALUES (1,?,?)") { statement in
+            try connection.bind(body, at: 1, to: statement)
+            try connection.bind(EluV1StrictCanonicalJSON.hash(body), at: 2, to: statement)
+            try connection.step(statement)
+        }
+        for (index, record) in stored.enumerated() {
+            try insert(connection, storedRecord: record)
+            try faultInjector?.hit(.afterRecordInsert(index))
+        }
+        var next = state
+        next.nextSequence = Int64(stored.count); next.headSequence = 0
+        next.liveCount = Int64(stored.count); next.liveBytes = bytes
+        try faultInjector?.hit(.beforeStateUpdate)
+        try updateState(connection, from: state.generation, to: next)
+        try faultInjector?.hit(.beforeCommit)
+    }
+
+    // Reconstruct every imported record from immutable original bytes. A saved
+    // UUID is admitted only for its exact original prefix slot and payload.
+    static func legacyEventRecords(_ connection: EluSQLiteConnection) throws -> [Int64: EluQueuedRecord] {
+        guard EluSQLiteRuntimeSchema.hasLegacyEvents(try connection.integerPragma("user_version")) else { return [:] }
+        let manifest = try connection.withStatement("SELECT singleton,body,body_sha256 FROM legacy_events_import") { statement in
+            try connection.step(statement, expecting: SQLITE_ROW)
+            guard try connection.requiredInteger(statement, column: 0) == 1 else { throw EluRuntimeQueueError.corruptStorage }
+            let bytes = try connection.requiredData(statement, column: 1, maximumBytes: EluLegacyEventsImport.maximumEncodedBytes)
+            guard try connection.requiredString(statement, column: 2) == EluV1StrictCanonicalJSON.hash(bytes),
+                  sqlite3_step(statement) == SQLITE_DONE else { throw EluRuntimeQueueError.corruptStorage }
+            return try EluLegacyEventsImport.decode(bytes)
+        }
+        let state = try loadState(connection, validateQueue: false)
+        let records = try manifest.records()
+        guard manifest.state.streamMetadata.streamId == state.streamId,
+              manifest.state.identity.migration == state.identity.migration,
+              state.nextSequence >= Int64(records.count) else { throw EluRuntimeQueueError.corruptStorage }
+        return Dictionary(uniqueKeysWithValues: records.map { ($0.sequence, $0) })
     }
 
     static func insertInitialState(
@@ -1862,6 +2341,8 @@ private enum EluRuntimeDatabase {
 
         if validateQueue {
             try validateQueueRows(connection, state: state)
+            let replay = try replayTotals(connection)
+            guard state.liveCount + replay.count <= 10_000, state.liveBytes + replay.bytes <= 268_435_456 else { throw EluRuntimeQueueError.corruptStorage }
         }
         return state
     }
@@ -1871,7 +2352,8 @@ private enum EluRuntimeDatabase {
         maximumCount: Int,
         streamId: String
     ) throws -> [EluStoredQueueRecord] {
-        try connection.withStatement(
+        let legacyRecords = try legacyEventRecords(connection)
+        return try connection.withStatement(
             """
             SELECT sequence, kind, record_id, occurred_at, payload,
                    capture_versions, accounted_bytes
@@ -1893,7 +2375,8 @@ private enum EluRuntimeDatabase {
                     try decodeQueueRow(
                         connection,
                         statement: statement,
-                        streamId: streamId
+                        streamId: streamId,
+                        legacyRecords: legacyRecords
                     )
                 )
             }
@@ -2061,6 +2544,7 @@ private enum EluRuntimeDatabase {
         _ connection: EluSQLiteConnection,
         state: EluStoredRuntimeState
     ) throws {
+        let legacyRecords = try legacyEventRecords(connection)
         try connection.withStatement(
             """
             SELECT sequence, kind, record_id, occurred_at, payload,
@@ -2083,7 +2567,8 @@ private enum EluRuntimeDatabase {
                 let storedRecord = try decodeQueueRow(
                     connection,
                     statement: statement,
-                    streamId: state.streamId
+                    streamId: state.streamId,
+                    legacyRecords: legacyRecords
                 )
                 guard storedRecord.record.sequence == sequence else {
                     throw EluRuntimeQueueError.corruptStorage
@@ -2107,7 +2592,8 @@ private enum EluRuntimeDatabase {
     private static func decodeQueueRow(
         _ connection: EluSQLiteConnection,
         statement: OpaquePointer,
-        streamId: String
+        streamId: String,
+        legacyRecords: [Int64: EluQueuedRecord]
     ) throws -> EluStoredQueueRecord {
         let sequence = try connection.requiredInteger(statement, column: 0)
         let kindValue = try connection.requiredString(statement, column: 1)
@@ -2143,13 +2629,14 @@ private enum EluRuntimeDatabase {
         } catch {
             throw EluRuntimeQueueError.corruptStorage
         }
+        let idIsValid: Bool
+        if let original = legacyRecords[sequence] {
+            idIsValid = original == record
+        } else {
+            idIsValid = recordId == EluRuntimeIdentifier.recordId(kind: kind, streamId: streamId, sequence: sequence)
+        }
         guard record.sequence == sequence,
-              record.recordId == recordId,
-              recordId == EluRuntimeIdentifier.recordId(
-                  kind: kind,
-                  streamId: streamId,
-                  sequence: sequence
-              ),
+              record.recordId == recordId, idIsValid,
               EluRFC3339.string(from: record.occurredAt) == occurredAt,
               try EluQueueRecordCodec.encode(record) == payload,
               try encodeStateValue(record.versions) == versionsPayload,
@@ -2285,7 +2772,433 @@ struct EluV1FlagCacheDeadlineIdentity: Equatable, Sendable {
     }
 }
 
+/// Opaque authority exported with a cache or an immutable flag request. Only the
+/// SQLite owner can mint one. Retaining the raw snapshot does not retain authority.
+struct EluV1FlagSynchronousGuard: Sendable {
+    private let validate: @Sendable () -> Bool
+    fileprivate init(validate: @escaping @Sendable () -> Bool) { self.validate = validate }
+    func isCurrent() -> Bool { validate() }
+}
+
+/// A sealed event may outlive its capture identity/session, but not owner
+/// shutdown, consent withdrawal, or the source lease authorizing its dispatch.
+struct EluV1QueuedEventGuard: Sendable {
+    private let validate: @Sendable () -> Bool
+    fileprivate init(validate: @escaping @Sendable () -> Bool) { self.validate = validate }
+    func isCurrent() -> Bool { validate() }
+}
+
+struct EluV1FlagCacheProjection: Sendable {
+    let snapshot: EluV1FlagCacheSnapshot
+    let authority: EluV1FlagSynchronousGuard
+    fileprivate init(snapshot: EluV1FlagCacheSnapshot, authority: EluV1FlagSynchronousGuard) {
+        self.snapshot = snapshot
+        self.authority = authority
+    }
+    func lookup(_ key: String) -> EluV1FlagLookup {
+        authority.isCurrent() ? snapshot.lookup(key) : .missing
+    }
+}
+
+struct EluV1FlagProjectionIntent: Sendable {
+    fileprivate let owner: UUID
+    fileprivate let token: UUID
+    fileprivate init(owner: UUID, token: UUID) { self.owner = owner; self.token = token }
+}
+
+private final class EluV1FlagOwnerFence: @unchecked Sendable {
+    private let lock = NSLock()
+    private let owner = UUID()
+    private var generation = UUID()
+    private var pending: Set<UUID> = []
+    private var terminal = false
+    private var lastWall: Date?
+    private var lastContinuous: UInt64?
+    func token() -> UUID { lock.lock(); defer { lock.unlock() }; return generation }
+    func invalidate(terminal: Bool = false) {
+        lock.lock(); generation = UUID(); self.terminal = self.terminal || terminal; lock.unlock()
+    }
+    func beginIntent() -> EluV1FlagProjectionIntent {
+        lock.lock(); defer { lock.unlock() }
+        let token = UUID()
+        pending.insert(token)
+        generation = UUID()
+        return EluV1FlagProjectionIntent(owner: owner, token: token)
+    }
+    func finishIntent(_ intent: EluV1FlagProjectionIntent) {
+        lock.lock(); defer { lock.unlock() }
+        guard intent.owner == owner, pending.remove(intent.token) != nil else { return }
+        generation = UUID()
+    }
+    func check(_ token: UUID, validate: () -> Bool) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard !terminal, pending.isEmpty, token == generation else { return false }
+        return validate()
+    }
+    func check(_ token: UUID, wallNow: () -> Date, continuousNow: () -> UInt64, validate: (Date, UInt64) -> Bool) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard !terminal, pending.isEmpty, token == generation else { return false }
+        // Sampling and the rollback floor share one order across concurrent
+        // synchronous getters and transport-start checks.
+        let wall = wallNow()
+        let continuous = continuousNow()
+        guard (try? EluV1Timestamp.exactClock(wall)) != nil,
+              lastWall.map({ wall >= $0 }) ?? true,
+              lastContinuous.map({ continuous >= $0 }) ?? true else {
+            terminal = true
+            return false
+        }
+        lastWall = wall
+        lastContinuous = continuous
+        return validate(wall, continuous)
+    }
+}
+
+/// Only this SQLite owner can mint these values. Stored rows keep their original
+/// attribution; the current identity/context binds permission, never row identity.
+struct EluV2ReplayDeliveryAuthority: Sendable {
+    let siteKey: String
+    let policy: EluV2SealedReplayDeliverySnapshot
+    let credentialWitness: String
+    let scopeWitness: String
+    let authorizationWitness: String
+    fileprivate let source: EluV2ConfigAuthorityWitness
+    fileprivate let owner: UUID
+    fileprivate let validate: @Sendable () -> Bool
+    fileprivate let mayRetainProfile: @Sendable (Data) -> Bool
+    func isCurrent() -> Bool { validate() }
+    /// Adds only a caller's local revocation fence; it cannot replace or relax
+    /// this owner's original source, privacy, identity or retention proof.
+    func requiringCurrent(_ additional: @escaping @Sendable () -> Bool) -> Self {
+        let original = self
+        return Self(siteKey: siteKey, policy: policy, credentialWitness: credentialWitness,
+            scopeWitness: scopeWitness, authorizationWitness: authorizationWitness, source: source,
+            owner: owner, validate: { original.isCurrent() && additional() }, mayRetainProfile: mayRetainProfile)
+    }
+    func hasSameSource(as other: Self) -> Bool { owner == other.owner && source == other.source }
+}
+
+/// Issued and consumed within one queue operation. It carries original intent
+/// tokens through reconciliation without using fresh native capture scope.
+private struct EluSealedReplayPolicyObservation: Sendable {
+    let source: EluV2ConfigAuthorityWitness
+    let identity: EluIdentitySnapshot
+    let isCurrent: @Sendable () -> Bool
+}
+
+/// One enrollment, one physical user. A duplicate caller never receives the
+/// settlement capability belonging to the first user.
+final class EluV2ReplayDispatch: @unchecked Sendable {
+    let request: EluV1BatchHTTPRequest
+    private let lock = NSLock()
+    private var taken = false
+    private var physicalSettled = false
+    private var receiptSettled = false
+    private var settled = false
+    private let revalidate: @Sendable () async -> Bool
+    private let isCurrent: @Sendable () -> Bool
+    private let onSettlement: @Sendable () -> Void
+    fileprivate init(request: EluV1BatchHTTPRequest, revalidate: @escaping @Sendable () async -> Bool,
+        isCurrent: @escaping @Sendable () -> Bool, onSettlement: @escaping @Sendable () -> Void) {
+        self.request = request; self.revalidate = revalidate; self.isCurrent = isCurrent; self.onSettlement = onSettlement
+    }
+    fileprivate func allowsCurrentReceipt() -> Bool { isCurrent() }
+    func takePhysicalUse() -> EluV2ReplayPhysicalUse? {
+        lock.lock(); defer { lock.unlock() }
+        guard !taken, !physicalSettled, !settled else { return nil }
+        taken = true
+        return EluV2ReplayPhysicalUse(request: request, revalidate: revalidate, isCurrent: isCurrent, settle: { self.settleTaken() })
+    }
+    /// Abandonment before a worker takes ownership is safe. Once taken, only the
+    /// worker's physical-use capability can settle the enrollment.
+    func cancelUnused() {
+        lock.lock()
+        guard !taken, !settled else { lock.unlock(); return }
+        physicalSettled = true
+        let release = receiptSettled
+        settled = release
+        lock.unlock(); if release { onSettlement() }
+    }
+    fileprivate func finishReceipt() {
+        lock.lock()
+        receiptSettled = true
+        let release = physicalSettled && !settled
+        if release { settled = true }
+        lock.unlock(); if release { onSettlement() }
+    }
+    private func settleTaken() {
+        lock.lock()
+        guard taken, !settled else { lock.unlock(); return }
+        physicalSettled = true
+        let release = receiptSettled
+        settled = release
+        lock.unlock(); if release { onSettlement() }
+    }
+    deinit { cancelUnused() }
+}
+
+final class EluV2ReplayPhysicalUse: @unchecked Sendable {
+    let request: EluV1BatchHTTPRequest
+    private let lock = NSLock()
+    private var begun = false
+    private var settled = false
+    private let revalidation: @Sendable () async -> Bool
+    private let current: @Sendable () -> Bool
+    private let settlement: @Sendable () -> Void
+    fileprivate init(request: EluV1BatchHTTPRequest, revalidate: @escaping @Sendable () async -> Bool,
+        isCurrent: @escaping @Sendable () -> Bool, settle: @escaping @Sendable () -> Void) {
+        self.request = request; revalidation = revalidate; current = isCurrent; settlement = settle
+    }
+    func revalidate() async -> Bool { await revalidation() }
+    func beginOnce() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard !begun, !settled else { return false }
+        begun = true
+        return current()
+    }
+    /// Called only after physical task/session cleanup, never merely on cancel.
+    func settle() {
+        lock.lock()
+        guard !settled else { lock.unlock(); return }
+        settled = true; lock.unlock(); settlement()
+    }
+    deinit { settle() }
+}
+
+struct EluV2ReplayClaim: Sendable {
+    let row: EluV2ReplayStoredChunk
+    let attemptCount: Int64
+    fileprivate let claimedAt: EluV1Timestamp
+    let authority: EluV2ReplayDeliveryAuthority
+    fileprivate let owner: UUID
+    fileprivate let id: UUID
+    fileprivate let validate: @Sendable () -> Bool
+    func isCurrent() -> Bool { validate() && authority.isCurrent() && authority.mayRetainProfile(row.maskingProfile) }
+}
+
+enum EluV2ReplayClaimResult: Sendable {
+    case claimed(EluV2ReplayClaim)
+    case idle
+    case occupied
+    case deferred(afterNanoseconds: UInt64)
+}
+
+enum EluV2ReplayClaimCompletion: Sendable {
+    case response(EluV2ReplayResponseOutcome)
+    case networkFailure
+    case released
+}
+
+private struct EluReplayRetryDeadline {
+    let retry: EluV2ReplayDeliveryState.Retry
+    let start: UInt64
+    let budget: UInt64
+}
+
+enum EluNativeReplayCaptureFinish: Sendable, Equatable {
+    case settled, physicalWorkPending, accountingPending, stale
+}
+enum EluNativeReplayStopOutcome: Sendable, Equatable { case settled, physicalWorkPending }
+enum EluNativeReplayCaptureAppendResult: Sendable {
+    case committed(EluV2ReplayAppendResult)
+    case committedThenWithdrawn(EluV2ReplayAppendResult)
+}
+
+/// This owner-scoped capability retains the installation through both physical
+/// cleanup and the exact original accounting result. It grants no capture policy.
+final class EluNativeReplayCaptureEnrollment: @unchecked Sendable {
+    fileprivate let owner: UUID
+    private let lock = NSLock()
+    private let resources: EluRuntimeResources
+    private var taken = false
+    private var physicalFinished = false
+    private var accountingFinished = false
+    private var intakeClosed = false
+    private var released = false
+    private var quarantined = false
+    fileprivate init(owner: UUID, resources: EluRuntimeResources) {
+        self.owner = owner; self.resources = resources
+    }
+    func takePhysicalUse() -> EluNativeReplayCapturePhysicalUse? {
+        lock.lock(); defer { lock.unlock() }
+        guard !taken, !physicalFinished, !intakeClosed, !released, !quarantined else { return nil }
+        taken = true
+        return EluNativeReplayCapturePhysicalUse(enrollment: self)
+    }
+    func cancelUnused() {
+        lock.lock(); defer { lock.unlock() }
+        guard !taken, !released else { return }
+        physicalFinished = true; intakeClosed = true
+    }
+    func quarantine(retaining prepared: EluV2ReplayPreparedRequest? = nil) {
+        lock.lock()
+        guard !released else { lock.unlock(); return }
+        quarantined = true; intakeClosed = true; lock.unlock()
+        resources.quarantineNativeCapture(retaining: prepared)
+    }
+    fileprivate func invalidateIntake() { lock.lock(); intakeClosed = true; lock.unlock() }
+    fileprivate func isCurrent() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return taken && !physicalFinished && !intakeClosed && !released && !quarantined
+    }
+    fileprivate func physicalIsFinished() -> Bool {
+        lock.lock(); defer { lock.unlock() }; return physicalFinished
+    }
+    fileprivate func isQuarantined() -> Bool {
+        lock.lock(); defer { lock.unlock() }; return quarantined
+    }
+    fileprivate func settlePhysical() {
+        lock.lock(); defer { lock.unlock() }
+        guard taken else { return }
+        physicalFinished = true; intakeClosed = true
+    }
+    fileprivate func proveAccountingFinished() { lock.lock(); accountingFinished = true; lock.unlock() }
+    fileprivate func releaseIfFinished() -> Bool {
+        lock.lock()
+        guard physicalFinished, accountingFinished, !quarantined else { lock.unlock(); return false }
+        let first = !released; released = true; lock.unlock()
+        if first { resources.settleNativeCapture() }
+        return true
+    }
+    deinit {
+        // Dropping a handle does not prove worker cleanup or a durable stop.
+        if !released { resources.quarantineNativeCapture(retaining: nil) }
+    }
+}
+
+final class EluNativeReplayCapturePhysicalUse: @unchecked Sendable {
+    fileprivate let enrollment: EluNativeReplayCaptureEnrollment
+    fileprivate init(enrollment: EluNativeReplayCaptureEnrollment) { self.enrollment = enrollment }
+    func settle() { enrollment.settlePhysical() }
+    fileprivate func isCurrent() -> Bool { enrollment.isCurrent() }
+    deinit {
+        if !enrollment.physicalIsFinished() { enrollment.quarantine() }
+    }
+}
+
+/// Minted only from the original authority permit and queue observation. The
+/// exact source bytes and clocks remain bound for the whole encoder interval.
+struct EluNativeReplayCaptureAdmission: Sendable {
+    let minimumDurationSeconds: Int
+    let hasUnresolvedBlockRules: Bool
+    let originalSourceData: Data
+    fileprivate let input: EluNativeReplayProjectionInput
+    fileprivate let receipt: EluNativeReplayStartReceipt
+    fileprivate let permit: EluNativeReplayPermit
+    fileprivate let use: EluNativeReplayCapturePhysicalUse
+    func isCurrent() -> Bool { input.isCurrent() && permit.isCurrent() && use.isCurrent() }
+}
+
+/// An original SQLite/source observation, not recorder permission. Only this file can mint one.
+struct EluNativeReplaySessionObservation: Sendable {
+    let accounting: EluNativeReplaySessionState.Session
+    let currentSelected: Bool
+    fileprivate let owner: UUID
+    fileprivate let generation: Int64
+    fileprivate let source: EluV2ConfigAuthorityWitness
+    fileprivate let capture: EluV1CaptureAuthoritySnapshot
+    fileprivate let rate: Double
+}
+
+/// Only this queue can construct a projection tied to its original source and
+/// current capture/session witness. Copies never acquire a later source lease.
+struct EluNativeReplayProjectionInput: Sendable {
+    let identity: EluIdentitySnapshot
+    let accounting: EluNativeReplaySessionState.Session
+    let context: EluV1PrivacyProjectionContext
+    let source: EluV2ConfigAuthorityWitness
+    fileprivate let owner: UUID
+    fileprivate let observation: EluNativeReplaySessionObservation
+    fileprivate let guardValue: EluNativeReplaySynchronousGuard
+    func isCurrent() -> Bool { guardValue.isCurrent() }
+    var originalSampleDraw: Double? {
+        guard let numerator = UInt64(accounting.samplingHash.dropFirst(7).prefix(13), radix: 16) else { return nil }
+        return Double(numerator) / 4_503_599_627_370_496
+    }
+    var sessionEligible: Bool {
+        guard let session = identity.identity.session else { return false }
+        return session.lifecycle == .active && session.backgroundedAt == nil && isCurrent()
+    }
+}
+
+/// Restrictive accounting remains usable after source withdrawal; it cannot authorize intake.
+struct EluNativeReplayStartReceipt: Sendable {
+    let replayId: String
+    let firstStartAt: String
+    fileprivate let owner: UUID
+    fileprivate let namespace: String
+    fileprivate let stream: String
+    fileprivate let key: EluNativeReplaySessionState.Key
+    fileprivate let epoch: String
+    fileprivate let anchor: EluNativeReplayClockAnchor
+}
+
+fileprivate struct EluNativeReplayClockAnchor: Sendable {
+    let key: EluNativeReplaySessionState.Key
+    let firstStartAt: String
+    let continuousMicroseconds: UInt64
+    let consumedMicroseconds: Int64
+    private var lastContinuous: UInt64
+
+    init(key: EluNativeReplaySessionState.Key, firstStartAt: String,
+         continuousMicroseconds: UInt64, consumedMicroseconds: Int64) {
+        self.key = key; self.firstStartAt = firstStartAt
+        self.continuousMicroseconds = continuousMicroseconds
+        self.consumedMicroseconds = consumedMicroseconds
+        lastContinuous = continuousMicroseconds
+    }
+
+    mutating func observe(_ continuous: UInt64, floor: Int64) -> Int64? {
+        guard continuous >= lastContinuous else { return nil }
+        let delta = min(UInt64(EluNativeReplaySessionState.maximumMicroseconds), continuous - continuousMicroseconds)
+        let elapsed = min(EluNativeReplaySessionState.maximumMicroseconds, consumedMicroseconds + Int64(delta))
+        lastContinuous = continuous
+        // A wall-clock lead can raise the retained floor, but never rebases
+        // the original continuous-clock window while that clock catches up.
+        return max(floor, elapsed)
+    }
+}
+
+// Private diagnostic framing only; no authority, expiry, or row-retirement behavior.
+struct EluReplayClockDenialDiagnostic {
+    private(set) var attempted = false
+    mutating func encode(reason: String, values: [String: String]) -> Data? {
+        guard !attempted else { return nil }
+        attempted = true
+        let reasons: Set<String> = ["retry-continuous-rollback", "delivery-continuous-sandwich",
+            "delivery-continuous-rollback", "delivery-wall-elapsed-unrepresentable",
+            "delivery-wall-ticks-unrepresentable", "delivery-wall-exceeds-continuous",
+            "replay-stored-age-unrepresentable", "replay-already-clock-denied",
+            "replay-persisted-clock-denied", "replay-wall-invalid",
+            "replay-wall-memory-rollback", "replay-wall-persisted-rollback"]
+        let fields: Set<String> = ["lower", "upper", "priorLower", "wall", "priorWall",
+            "wallNanoseconds", "wallTicks", "allowedTicks", "retryStart", "continuousNow",
+            "rowStartedAt", "memoryWall", "persistedWall", "rawWallReferenceSeconds"]
+        guard reasons.contains(reason), values.count <= fields.count,
+              values.keys.allSatisfy({ fields.contains($0) }) else { return nil }
+        let bounded = values.mapValues { String($0.prefix(160)) }
+        let value: [String: Any] = ["kind": "elu-private-replay-first-clock-denial", "schemaVersion": 1,
+            "reason": reason, "sampledValues": bounded, "additionalClockReads": false]
+        guard var data = try? JSONSerialization.data(withJSONObject: value, options: [.sortedKeys]),
+              data.count <= 4095 else { return nil }
+        data.append(10)
+        return data
+    }
+}
+
 actor EluSQLiteRuntimeQueue {
+    deinit {
+        nativeScope.invalidate(terminal: true)
+        let held = resources ?? replayReceiptResources ?? nativeCaptureResources
+        // No database work or task may run here. An unresolved original denial
+        // retains resources only; exported guards must never keep this owner alive.
+        if nativeScope.retainedClockDenial() != nil { held?.quarantineNativeClockDenial() }
+        if replayDispatch != nil { held?.quarantineReplay() }
+        nativeCaptureEnrollment?.invalidateIntake()
+        nativeCaptureEnrollment?.quarantine()
+        held?.close()
+    }
+
     private struct FlagClockSample {
         let wallDate: Date
         let wall: EluV1Timestamp
@@ -2321,15 +3234,59 @@ actor EluSQLiteRuntimeQueue {
     private let continuousClock: @Sendable () -> UInt64
     private let continuousBudgetConverter: @Sendable (UInt64) -> UInt64?
     private let flagStoreEpochGenerator: @Sendable () -> String
+    private let nativeContinuousNanoseconds: @Sendable (UInt64) -> UInt64?
+    private nonisolated let nativeScope = EluNativeReplayScope()
+    private let nativeAccountingOwner = UUID()
+    private var nativeOwnedEpoch: String?
+    private var nativeCaptureEnrollment: EluNativeReplayCaptureEnrollment?
+    private var nativeCaptureReceipt: EluNativeReplayStartReceipt?
+    private var nativeCaptureResources: EluRuntimeResources?
+    private var nativeCaptureLogicallyClosed = false
+    private var nativeClockAnchor: EluNativeReplayClockAnchor?
+    private var nativeClockDeniedKey: EluNativeReplaySessionState.Key?
+    private var nativeDenialPersistenceInProgress = false
     private var pinnedConfigSiteId: String?
+    private let configurationGate: EluV2ConfigAuthorityGate?
+    private nonisolated let eventDeliveryFence = EluV1FlagOwnerFence()
+    private var captureSourceWitness: EluV2ConfigAuthorityWitness?
+    private var flagSourceWitness: EluV2ConfigAuthorityWitness?
+    private var flagRequestSource: (token: EluV1FlagBeginToken, witness: EluV2ConfigAuthorityWitness?)?
+    private var flagCacheSourceWitness: EluV2ConfigAuthorityWitness?
+    private let flagScopeFence = EluV1FlagOwnerFence()
+    private let flagRequestFence = EluV1FlagOwnerFence()
+    private let flagCacheFence = EluV1FlagOwnerFence()
     private var captureAuthority: EluV1CaptureAuthorityState = .absent
     private var authorityEpoch: UInt64 = 0
     private var databaseSchemaVersion: Int64
+    private var replayWallLatch: EluV1Timestamp?
+    private var replayClockDenied = false
+    private var replayClockDiagnostic = EluReplayClockDenialDiagnostic()
+    private let replayDeliveryOwner = UUID()
+    private let replayDispatchFence = EluV1FlagOwnerFence()
+    private var replayClaim: EluV2ReplayClaim?
+    private var replayEnrolledClaim: UUID?
+    private var replayDispatch: EluV2ReplayDispatch?
+    private var replayReceiptResources: EluRuntimeResources?
+    private var replayLogicallyClosed = false
+    private var replayRetryDeadlines: [Int64: EluReplayRetryDeadline] = [:]
+    private var replayDeliveryClockSample: (wall: EluV1Timestamp, lower: UInt64)?
     private var flagWallLatch: EluV1Timestamp?
     private var flagContinuousLatch: UInt64?
     private var flagClockPoisoned = false
-    private var flagConfigDeadline: FlagDeadline<EluV1FlagConfigDeadlineIdentity>?
-    private var flagCacheDeadline: FlagDeadline<EluV1FlagCacheDeadlineIdentity>?
+    private var flagConfigDeadline: FlagDeadline<EluV1FlagConfigDeadlineIdentity>? {
+        didSet {
+            if oldValue?.key != flagConfigDeadline?.key || oldValue?.startedAt != flagConfigDeadline?.startedAt || oldValue?.budget != flagConfigDeadline?.budget {
+                flagScopeFence.invalidate()
+            }
+        }
+    }
+    private var flagCacheDeadline: FlagDeadline<EluV1FlagCacheDeadlineIdentity>? {
+        didSet {
+            if oldValue?.key != flagCacheDeadline?.key || oldValue?.startedAt != flagCacheDeadline?.startedAt || oldValue?.budget != flagCacheDeadline?.budget {
+                flagCacheFence.invalidate()
+            }
+        }
+    }
     private var isPoisoned = false
 
     static func open(
@@ -2383,6 +3340,7 @@ actor EluSQLiteRuntimeQueue {
         continuousClock: @escaping @Sendable () -> UInt64 = EluMachContinuousClock.now,
         continuousBudgetConverter: @escaping @Sendable (UInt64) -> UInt64? =
             EluMachContinuousClock.floorTicks,
+        nativeContinuousNanoseconds: @escaping @Sendable (UInt64) -> UInt64? = EluV2ConfigClock.live.floorNanoseconds,
         anonymousIdGenerator: @escaping @Sendable () -> String = {
             "anon_\(EluRuntimeIdentifier.compactUUID())"
         },
@@ -2395,8 +3353,13 @@ actor EluSQLiteRuntimeQueue {
         flagStoreEpochGenerator: @escaping @Sendable () -> String = {
             "flag_store_\(EluRuntimeIdentifier.compactUUID())"
         },
-        faultInjector: (any EluRuntimeQueueFaultInjecting)? = nil
+        configurationGate: EluV2ConfigAuthorityGate? = nil,
+        faultInjector: (any EluRuntimeQueueFaultInjecting)? = nil,
+        legacyStartupSource: EluLegacyStartupSource? = nil
     ) async throws -> EluSQLiteRuntimeQueue {
+        guard configurationGate.map({ $0.siteKey == exactConstructorSiteKey }) ?? true else {
+            throw EluRuntimeQueueError.invalidState
+        }
         let namespaceHash = try EluV1SiteNamespace.digest(
             exactConstructorSiteKey: exactConstructorSiteKey
         )
@@ -2410,9 +3373,17 @@ actor EluSQLiteRuntimeQueue {
                 clock: clock,
                 anonymousIdGenerator: anonymousIdGenerator,
                 streamIdGenerator: streamIdGenerator,
-                faultInjector: faultInjector
+                faultInjector: faultInjector,
+                legacyStartupSource: legacyStartupSource,
+                importLimits: limits
             )
         }.value
+        if EluSQLiteRuntimeSchema.hasNativeReplayAuthority(opened.databaseSchemaVersion) {
+            do {
+                let native = try EluRuntimeDatabase.readNativeReplayAuthority(opened.resources.connection)
+                guard native.matches(namespace: namespaceHash, stream: opened.state.streamId) else { throw EluRuntimeQueueError.corruptStorage }
+            } catch { opened.resources.close(); throw error }
+        }
         return EluSQLiteRuntimeQueue(
             resources: opened.resources,
             state: opened.state,
@@ -2426,7 +3397,9 @@ actor EluSQLiteRuntimeQueue {
             ownerNamespaceHash: namespaceHash,
             continuousClock: continuousClock,
             continuousBudgetConverter: continuousBudgetConverter,
-            flagStoreEpochGenerator: flagStoreEpochGenerator
+            nativeContinuousNanoseconds: nativeContinuousNanoseconds,
+            flagStoreEpochGenerator: flagStoreEpochGenerator,
+            configurationGate: configurationGate
         )
     }
 
@@ -2437,6 +3410,7 @@ actor EluSQLiteRuntimeQueue {
         continuousClock: @escaping @Sendable () -> UInt64 = EluMachContinuousClock.now,
         continuousBudgetConverter: @escaping @Sendable (UInt64) -> UInt64? =
             EluMachContinuousClock.floorTicks,
+        nativeContinuousNanoseconds: @escaping @Sendable (UInt64) -> UInt64? = EluV2ConfigClock.live.floorNanoseconds,
         anonymousIdGenerator: @escaping @Sendable () -> String = {
             "anon_\(EluRuntimeIdentifier.compactUUID())"
         },
@@ -2449,7 +3423,9 @@ actor EluSQLiteRuntimeQueue {
         flagStoreEpochGenerator: @escaping @Sendable () -> String = {
             "flag_store_\(EluRuntimeIdentifier.compactUUID())"
         },
-        faultInjector: (any EluRuntimeQueueFaultInjecting)? = nil
+        configurationGate: EluV2ConfigAuthorityGate? = nil,
+        faultInjector: (any EluRuntimeQueueFaultInjecting)? = nil,
+        legacyStartupSource: EluLegacyStartupSource? = nil
     ) async throws -> EluSQLiteRuntimeQueue {
         try await openCaptureRuntime(
             rootDirectoryURL: rootDirectoryURL,
@@ -2458,11 +3434,14 @@ actor EluSQLiteRuntimeQueue {
             clock: clock,
             continuousClock: continuousClock,
             continuousBudgetConverter: continuousBudgetConverter,
+            nativeContinuousNanoseconds: nativeContinuousNanoseconds,
             anonymousIdGenerator: anonymousIdGenerator,
             streamIdGenerator: streamIdGenerator,
             sessionIdGenerator: sessionIdGenerator,
             flagStoreEpochGenerator: flagStoreEpochGenerator,
-            faultInjector: faultInjector
+            configurationGate: configurationGate,
+            faultInjector: faultInjector,
+            legacyStartupSource: legacyStartupSource
         )
     }
 
@@ -2504,10 +3483,13 @@ actor EluSQLiteRuntimeQueue {
         ownerNamespaceHash: String?,
         continuousClock: @escaping @Sendable () -> UInt64,
         continuousBudgetConverter: @escaping @Sendable (UInt64) -> UInt64?,
+        nativeContinuousNanoseconds: @escaping @Sendable (UInt64) -> UInt64? = EluV2ConfigClock.live.floorNanoseconds,
         flagStoreEpochGenerator: @escaping @Sendable () -> String = {
             "flag_store_\(EluRuntimeIdentifier.compactUUID())"
-        }
+        },
+        configurationGate: EluV2ConfigAuthorityGate? = nil
     ) {
+        self.configurationGate = configurationGate
         self.resources = resources
         self.state = state
         self.limits = limits
@@ -2523,13 +3505,37 @@ actor EluSQLiteRuntimeQueue {
         flagCacheDeadline = nil
         self.exactConstructorSiteKey = exactConstructorSiteKey
         self.ownerNamespaceHash = ownerNamespaceHash
-        captureConfigManager = ownerNamespaceHash == nil ? nil : EluV1ConfigManager()
+        captureConfigManager = ownerNamespaceHash == nil ? nil : EluV1ConfigManager(readbackProvenReplayTransports: EluStandaloneRuntime.readbackProvenReplayCapabilities.transports)
         flagConfigManager = exactConstructorSiteKey.flatMap {
-            try? EluV1ConfigManager(exactConstructorSiteKey: $0)
+            try? EluV1ConfigManager(exactConstructorSiteKey: $0, readbackProvenReplayTransports: EluStandaloneRuntime.readbackProvenReplayCapabilities.transports)
         }
         self.continuousClock = continuousClock
         self.continuousBudgetConverter = continuousBudgetConverter
+        self.nativeContinuousNanoseconds = nativeContinuousNanoseconds
         self.flagStoreEpochGenerator = flagStoreEpochGenerator
+    }
+
+    private func sourceIsCurrent(_ witness: EluV2ConfigAuthorityWitness?, data: Data? = nil) -> Bool {
+        configurationGate?.isCurrent(witness, data: data) ?? true
+    }
+
+    private func consumeSource(_ witness: EluV2ConfigAuthorityWitness?, data: Data? = nil, apply: () -> Void) -> Bool {
+        guard let configurationGate else { apply(); return true }
+        return configurationGate.consume(witness, data: data, apply: apply)
+    }
+
+    private func freshMutationSourceIsCurrent(_ witness: EluV2ConfigAuthorityWitness?, diskState: EluStoredRuntimeState) -> Bool {
+        guard sourceIsCurrent(witness), case let .authorized(authority) = captureAuthority else { return false }
+        return authorityWitnessMatches(authority, diskState: diskState) &&
+            authorityIsLive(authority, wallNow: clock(), monotonicNow: continuousClock())
+    }
+
+    private func sourceUnavailableCaptureResult() -> EluV1CaptureAuthorityUpdateResult {
+        // A source withdrawal is not a malformed/revoked config and must not latch a
+        // channel restriction that prevents recovery of the same still-live document.
+        .terminated(EluV1CaptureAuthorityTerminal(ownerEpoch: authorityEpoch,
+            trustedConfigBoundary: nil, candidateConfigBoundary: nil, policySourceHash: nil,
+            contextRevision: nil, reason: .stale))
     }
 
     func snapshot() throws -> EluRuntimeQueueSnapshot {
@@ -2550,7 +3556,7 @@ actor EluSQLiteRuntimeQueue {
         }
         let resources = try requireResources()
         let connection = resources.connection
-        if databaseSchemaVersion == EluSQLiteRuntimeSchema.flagDatabaseVersion {
+        if EluSQLiteRuntimeSchema.hasFlags(databaseSchemaVersion) {
             let row = try EluRuntimeDatabase.readFlagAuthority(connection)
             guard row.storageSchema == 1 else {
                 throw EluRuntimeQueueError.unsupportedSchemaVersion(row.storageSchema)
@@ -2564,33 +3570,1259 @@ actor EluSQLiteRuntimeQueue {
             }
             return
         }
-        guard databaseSchemaVersion == EluSQLiteRuntimeSchema.initialDatabaseVersion else {
+        let base = EluSQLiteRuntimeSchema.baseVersion(databaseSchemaVersion)
+        guard base == 1 || base == 3 || base == 5 || base == 7 else {
             throw EluRuntimeQueueError.unsupportedSchemaVersion(databaseSchemaVersion)
         }
-        do {
-            try connection.execute("BEGIN IMMEDIATE")
-            guard try connection.integerPragma("user_version")
-                == EluSQLiteRuntimeSchema.initialDatabaseVersion
-            else {
-                throw EluRuntimeQueueError.corruptStorage
-            }
-            try EluRuntimeDatabase.verifySchema(
-                connection,
-                databaseVersion: EluSQLiteRuntimeSchema.initialDatabaseVersion
-            )
+        let target = EluSQLiteRuntimeSchema.preservingLegacyEvents(base + 1, from: databaseSchemaVersion)
+        try replayStorageTransaction { connection, _ in
+            guard try connection.integerPragma("user_version") == databaseSchemaVersion else { throw EluRuntimeQueueError.corruptStorage }
+            try EluRuntimeDatabase.verifySchema(connection, databaseVersion: databaseSchemaVersion)
             try connection.execute(EluSQLiteRuntimeSchema.createFlagCacheRecords)
-            try EluRuntimeDatabase.insertUninitializedFlagAuthority(
-                connection,
-                exactConstructorSiteKey: exactConstructorSiteKey,
-                siteNamespaceDigest: ownerNamespaceHash
-            )
-            try connection.execute(
-                "PRAGMA user_version = \(EluSQLiteRuntimeSchema.flagDatabaseVersion)"
-            )
-            try connection.execute("COMMIT")
-            databaseSchemaVersion = EluSQLiteRuntimeSchema.flagDatabaseVersion
+            try EluRuntimeDatabase.insertUninitializedFlagAuthority(connection,
+                exactConstructorSiteKey: exactConstructorSiteKey, siteNamespaceDigest: ownerNamespaceHash)
+            try connection.execute("PRAGMA user_version = \(target)")
+        }
+        databaseSchemaVersion = target
+    }
+
+    /// Explicit storage activation only. No codec, recorder, or transport is constructed.
+    func ensureReplaySchema() throws {
+        guard exactConstructorSiteKey != nil, ownerNamespaceHash != nil else { throw EluRuntimeQueueError.invalidState }
+        if EluSQLiteRuntimeSchema.hasReplay(databaseSchemaVersion) {
+            let connection = try requireResources().connection
+            try EluRuntimeDatabase.verifySchema(connection, databaseVersion: databaseSchemaVersion)
+            return
+        }
+        let base = EluSQLiteRuntimeSchema.baseVersion(databaseSchemaVersion)
+        guard base == 1 || base == 2 else { throw EluRuntimeQueueError.unsupportedSchemaVersion(databaseSchemaVersion) }
+        let target = EluSQLiteRuntimeSchema.preservingLegacyEvents(base == 2 ? 4 : 3, from: databaseSchemaVersion)
+        try replayStorageTransaction { connection, _ in
+            guard try connection.integerPragma("user_version") == databaseSchemaVersion else { throw EluRuntimeQueueError.corruptStorage }
+            try EluRuntimeDatabase.verifySchema(connection, databaseVersion: databaseSchemaVersion)
+            try connection.execute(EluSQLiteRuntimeSchema.createReplayState)
+            try connection.execute(EluSQLiteRuntimeSchema.createReplayChunks)
+            try connection.execute("INSERT INTO replay_state (singleton,storage_schema,admission_enabled,next_ordinal,maximum_queue_bytes) VALUES (1,1,0,0,268435456)")
+            try connection.execute("PRAGMA user_version = \(target)")
+        }
+        databaseSchemaVersion = target
+    }
+
+    /// Explicit migration: schemas without attempt metadata are never send-ready.
+    func ensureReplayDeliverySchema() throws {
+        guard EluSQLiteRuntimeSchema.hasReplay(databaseSchemaVersion) else { throw EluRuntimeQueueError.invalidState }
+        if EluSQLiteRuntimeSchema.hasReplayDelivery(databaseSchemaVersion) {
+            try EluRuntimeDatabase.verifySchema(try requireResources().connection, databaseVersion: databaseSchemaVersion)
+            return
+        }
+        let target = EluSQLiteRuntimeSchema.preservingLegacyEvents(
+            EluSQLiteRuntimeSchema.baseVersion(databaseSchemaVersion) == 4 ? 6 : 5, from: databaseSchemaVersion)
+        try replayStorageTransaction { connection, _ in
+            try EluRuntimeDatabase.verifySchema(connection, databaseVersion: databaseSchemaVersion)
+            try connection.execute(EluSQLiteRuntimeSchema.createReplayDelivery)
+            try EluRuntimeDatabase.writeReplayDelivery(connection, ordinal: -1, value: .pending)
+            for ordinal in try EluRuntimeDatabase.replayOrdinals(connection) {
+                try EluRuntimeDatabase.writeReplayDelivery(connection, ordinal: ordinal, value: .pending)
+            }
+            try connection.execute("PRAGMA user_version = \(target)")
+            try EluRuntimeDatabase.verifySchema(connection, databaseVersion: target)
+        }
+        databaseSchemaVersion = target
+    }
+
+    /// Optional accounting schema only. This never constructs a native recorder or codec.
+    func ensureNativeReplayAuthoritySchema() throws {
+        guard let namespace = ownerNamespaceHash,
+              EluSQLiteRuntimeSchema.hasReplayDelivery(databaseSchemaVersion) else { throw EluRuntimeQueueError.invalidState }
+        if !EluSQLiteRuntimeSchema.hasNativeReplayAuthority(databaseSchemaVersion) {
+            let target = EluSQLiteRuntimeSchema.preservingLegacyEvents(
+                EluSQLiteRuntimeSchema.baseVersion(databaseSchemaVersion) == 6 ? 8 : 7, from: databaseSchemaVersion)
+            try replayStorageTransaction { connection, disk in
+                try EluRuntimeDatabase.verifySchema(connection, databaseVersion: databaseSchemaVersion)
+                try connection.execute(EluSQLiteRuntimeSchema.createNativeReplayAuthority)
+                try EluRuntimeDatabase.writeNativeReplayAuthority(connection,
+                    value: EluNativeReplaySessionState(namespaceHash: namespace, streamId: disk.streamId), inserting: true)
+                try connection.execute("PRAGMA user_version = \(target)")
+                try EluRuntimeDatabase.verifySchema(connection, databaseVersion: target)
+            }
+            databaseSchemaVersion = target
+        } else {
+            try EluRuntimeDatabase.verifySchema(try requireResources().connection, databaseVersion: databaseSchemaVersion)
+        }
+        try replayStorageTransaction { connection, disk in
+            var metadata = try nativeMetadata(connection, disk: disk)
+            if var session = metadata.session, let first = session.firstStartAt {
+                let retainsOriginalClock = nativeClockAnchor.map {
+                    $0.key == session.key && EluNativeReplaySessionState.same($0.firstStartAt, first)
+                } ?? false
+                let retainsOriginalEpoch = session.activeEpoch.map { epoch in
+                    nativeOwnedEpoch.map { EluNativeReplaySessionState.same($0, epoch) } ?? false
+                } ?? true
+                // Even a clean stop cannot prove time across a new owner's gap.
+                // Only this still-live owner may retain the original clock anchor.
+                if !retainsOriginalClock || !retainsOriginalEpoch {
+                    session.interrupted = true; metadata.session = session
+                    try EluRuntimeDatabase.writeNativeReplayAuthority(connection, value: metadata)
+                }
+            }
+        }
+    }
+
+    private func nativeMetadata(_ connection: EluSQLiteConnection, disk: EluStoredRuntimeState) throws -> EluNativeReplaySessionState {
+        guard EluSQLiteRuntimeSchema.hasNativeReplayAuthority(databaseSchemaVersion), let namespace = ownerNamespaceHash else {
+            throw EluRuntimeQueueError.invalidState
+        }
+        guard try connection.integerPragma("user_version") == databaseSchemaVersion else { throw EluRuntimeQueueError.corruptStorage }
+        let value = try EluRuntimeDatabase.readNativeReplayAuthority(connection)
+        guard value.matches(namespace: namespace, stream: disk.streamId) else { throw EluRuntimeQueueError.corruptStorage }
+        return value
+    }
+
+    private func nativeCurrentSource(_ source: EluV2ConfigAuthorityWitness, disk: EluStoredRuntimeState,
+                                     expected: EluV1CaptureAuthoritySnapshot? = nil) throws -> (EluV1CaptureAuthoritySnapshot, EluV1ReplayPolicy, EluNativeReplaySessionState.Key) {
+        guard configurationGate != nil, sourceIsCurrent(source),
+              case let .authorized(capture) = captureAuthority,
+              expected.map({ $0 == capture }) ?? true,
+              authorityWitnessMatches(capture, diskState: disk),
+              authorityIsLive(capture, wallNow: clock(), monotonicNow: continuousClock()),
+              !disk.identity.optedOut,
+              let session = disk.identity.session, session.lifecycle == .active, session.backgroundedAt == nil
+        else { throw EluRuntimeQueueError.sourceAuthorityUnavailable }
+        let raw = try EluV1StrictCanonicalJSON.parse(source.data)
+        let document = try JSONDecoder().decode(EluV1ConfigDocument.self, from: source.data)
+        let now = clock()
+        guard document.schemaVersion == 2, document.status == .enabled,
+              document.features?.replay == true, let replay = document.privacy?.replay, replay.enabled,
+              document.issuedAt == capture.configBoundary.issuedAt,
+              EluV1StrictCanonicalJSON.hash(raw.canonicalData) == capture.configBoundary.semanticHash,
+              EluV2ReplayText.equal(document.site?.id, capture.configSiteId),
+              now.timeIntervalSinceReferenceDate.isFinite, now >= session.startedAt, now >= session.lastActivityAt,
+              now.timeIntervalSince(session.lastActivityAt) < Double(min(session.timeoutSeconds, capture.idleTimeoutSeconds)),
+              now.timeIntervalSince(session.startedAt) < Double(capture.maximumDurationSeconds), sourceIsCurrent(source)
+        else { throw EluRuntimeQueueError.sourceAuthorityUnavailable }
+        return (capture, replay, EluNativeReplaySessionState.Key(siteId: capture.configSiteId,
+            sessionId: session.id, sessionStartedAt: EluRFC3339.string(from: session.startedAt)))
+    }
+
+    private func nativeContinuousSample() -> UInt64? {
+        nativeContinuousNanoseconds(continuousClock()).map { $0 / 1_000 }
+    }
+
+    /// Accounting clocks are session-local. This does not call the replay-age clock transaction.
+    private func accountNative(_ value: inout EluNativeReplaySessionState,
+                               key: EluNativeReplaySessionState.Key, policy: EluV1ReplayPolicy,
+                               ownedEpoch: String?, anchor: inout EluNativeReplayClockAnchor?) throws {
+        let wall = try? EluV1Timestamp.exactClock(clock())
+        let continuous = nativeContinuousSample()
+        if value.session?.key != key {
+            // A live owner must settle its exact old interval before replacing
+            // that ledger; otherwise its delayed stop would lose its target.
+            guard nativeOwnedEpoch == nil else { throw EluRuntimeQueueError.sourceAuthorityUnavailable }
+            anchor = nil
+        }
+        if let wall {
+            try value.observe(key: key, sampleRate: policy.sampleRate, maximumDurationSeconds: policy.maximumDurationSeconds,
+                wall: wall, ownedEpoch: ownedEpoch, continuousElapsed: nil)
+        } else if value.session?.key != key { throw EluRuntimeQueueError.sourceAuthorityUnavailable }
+        guard var session = value.session else { throw EluRuntimeQueueError.invalidState }
+        if wall == nil || continuous == nil { nativeClockDeniedKey = key }
+        if let first = session.firstStartAt, let continuous {
+            if anchor?.key != key || anchor.map({ !EluNativeReplaySessionState.same($0.firstStartAt, first) }) == true {
+                // Observation may be called without repeating optional schema setup.
+                // Never manufacture a new clock origin for an already-started session.
+                session.interrupted = true
+            } else if let elapsed = anchor?.observe(continuous, floor: session.elapsedFloorMicroseconds) {
+                session.elapsedFloorMicroseconds = max(session.elapsedFloorMicroseconds, elapsed)
+            } else { nativeClockDeniedKey = key }
+        }
+        if nativeClockDeniedKey == key || nativeScope.retainedClockDenial() == key { session.clockDenied = true }
+        value.session = session
+        try value.validate()
+    }
+
+    func observeNativeReplaySession(source: EluV2ConfigAuthorityWitness) throws -> EluNativeReplaySessionObservation {
+        let initial = try nativeCurrentSource(source, disk: state)
+        var anchor = nativeClockAnchor
+        try replayStorageTransaction(validate: { _ = try self.nativeCurrentSource(source, disk: self.state, expected: initial.0) },
+            beforeCommit: { connection in
+                var current = try self.nativeMetadata(connection, disk: self.state)
+                try self.accountNative(&current, key: initial.2, policy: initial.1, ownedEpoch: self.nativeOwnedEpoch, anchor: &anchor)
+                try EluRuntimeDatabase.writeNativeReplayAuthority(connection, value: current)
+            }) { connection, disk in
+                _ = try nativeCurrentSource(source, disk: disk, expected: initial.0)
+                var current = try nativeMetadata(connection, disk: disk)
+                try accountNative(&current, key: initial.2, policy: initial.1, ownedEpoch: nativeOwnedEpoch, anchor: &anchor)
+                try EluRuntimeDatabase.writeNativeReplayAuthority(connection, value: current)
+            }
+        nativeClockAnchor = anchor
+        _ = try nativeCurrentSource(source, disk: state, expected: initial.0)
+        let current = try nativeMetadata(try requireResources().connection, disk: state)
+        resolveNativeClockDenialFromCommittedRead(current)
+        guard let session = current.session, session.key == initial.2 else { throw EluRuntimeQueueError.generationMismatch }
+        return EluNativeReplaySessionObservation(accounting: session, currentSelected: session.selected(currentRate: initial.1.sampleRate),
+            owner: nativeAccountingOwner, generation: state.generation, source: source, capture: initial.0, rate: initial.1.sampleRate)
+    }
+
+    func enrollNativeReplayCapture() throws -> EluNativeReplayCaptureEnrollment? {
+        let held = try requireResources()
+        guard nativeCaptureEnrollment == nil, nativeOwnedEpoch == nil,
+              EluSQLiteRuntimeSchema.hasNativeReplayAuthority(databaseSchemaVersion),
+              held.enrollNativeCapture() else { return nil }
+        let value = EluNativeReplayCaptureEnrollment(owner: nativeAccountingOwner, resources: held)
+        nativeCaptureEnrollment = value
+        nativeCaptureReceipt = nil
+        return value
+    }
+
+    private func requireNativeCaptureUse(_ use: EluNativeReplayCapturePhysicalUse, intake: Bool = true) throws {
+        guard use.enrollment.owner == nativeAccountingOwner,
+              nativeCaptureEnrollment === use.enrollment,
+              !use.enrollment.isQuarantined(), (!intake || use.isCurrent())
+        else { throw EluNativeReplayAuthorityError.stale }
+    }
+
+    /// Only logical close permits this narrow connection use. An uncertain or
+    /// poisoned database never becomes writable through an accounting receipt.
+    private func nativeSettlementConnection() throws -> EluSQLiteConnection {
+        if nativeCaptureLogicallyClosed, let held = nativeCaptureResources { return held.connection }
+        return try requireResources().connection
+    }
+
+    func finishNativeReplayCapture(_ enrollment: EluNativeReplayCaptureEnrollment) throws -> EluNativeReplayCaptureFinish {
+        guard enrollment.owner == nativeAccountingOwner, nativeCaptureEnrollment === enrollment else { return .stale }
+        guard !enrollment.isQuarantined() else { return .accountingPending }
+        guard enrollment.physicalIsFinished() else { return .physicalWorkPending }
+        guard nativeCaptureReceipt == nil else { return .accountingPending }
+        // No begin (including a proven rollback) still needs an authoritative
+        // no-start read. Merely failing to return a receipt is not evidence.
+        do {
+            let connection = try nativeSettlementConnection()
+            let value = try nativeMetadata(connection, disk: state)
+            resolveNativeClockDenialFromCommittedRead(value)
+            guard value.session?.activeEpoch == nil, nativeOwnedEpoch == nil,
+                  nativeScope.retainedClockDenial() == nil else { return .accountingPending }
+            enrollment.proveAccountingFinished()
+            guard enrollment.releaseIfFinished() else { return .accountingPending }
+            nativeCaptureEnrollment = nil
+            nativeCaptureResources = nil
+            nativeCaptureLogicallyClosed = false
+            return .settled
+        } catch { enrollment.quarantine(); throw error }
+    }
+
+    func stopNativeReplayCaptureAccounting(_ use: EluNativeReplayCapturePhysicalUse) throws -> EluNativeReplayStopOutcome {
+        try requireNativeCaptureUse(use, intake: false)
+        guard use.enrollment.physicalIsFinished() else { return .physicalWorkPending }
+        if let receipt = nativeCaptureReceipt {
+            guard try stopNativeReplayAccounting(receipt) else {
+                use.enrollment.quarantine()
+                throw EluRuntimeQueueError.generationMismatch
+            }
+        } else if !nativeCaptureLogicallyClosed {
+            try persistNativeReplayClockDenial()
+        }
+        return .settled
+    }
+
+    func makeNativeReplayCaptureAdmission(input: EluNativeReplayProjectionInput,
+        receipt: EluNativeReplayStartReceipt, permit: EluNativeReplayPermit,
+        physicalUse: EluNativeReplayCapturePhysicalUse) throws -> EluNativeReplayCaptureAdmission {
+        try requireNativeCaptureUse(physicalUse)
+        guard input.owner == nativeAccountingOwner, receipt.owner == nativeAccountingOwner,
+              nativeCaptureReceipt?.epoch == receipt.epoch,
+              nativeCaptureReceipt?.replayId == receipt.replayId,
+              permit.replayId == receipt.replayId, input.isCurrent(), permit.isCurrent(),
+              permit.privacy.effectivePolicyHash == permit.resolution.decisionHash,
+              permit.profile.canonicalBytes == EluNativeMaskingProfile.blanketMask().canonicalBytes,
+              let policy = (try? JSONDecoder().decode(EluV1ConfigDocument.self, from: input.source.data))?.privacy
+        else { throw EluNativeReplayAuthorityError.stale }
+        let unresolved = permit.profile.compatibility(with: policy.masking, platform: .ios) != .compatible
+        guard !unresolved else { throw EluNativeReplayAuthorityError.incompatibleProfile }
+        return EluNativeReplayCaptureAdmission(minimumDurationSeconds: policy.replay.minimumDurationSeconds,
+            hasUnresolvedBlockRules: unresolved, originalSourceData: input.source.data,
+            input: input, receipt: receipt, permit: permit, use: physicalUse)
+    }
+
+    /// Provisional start accounting only. A later native owner must separately prove
+    /// source/privacy/scene/capability permission before any physical intake.
+    func beginNativeReplayStartAccounting(_ observation: EluNativeReplaySessionObservation) throws -> EluNativeReplayStartReceipt? {
+        guard nativeCaptureEnrollment == nil, observation.generation == state.generation else { return nil }
+        return try beginCurrentNativeReplayStartAccounting(observation)
+    }
+
+    private func beginCurrentNativeReplayStartAccounting(_ observation: EluNativeReplaySessionObservation, physicalUse: EluNativeReplayCapturePhysicalUse? = nil) throws -> EluNativeReplayStartReceipt? {
+        if let physicalUse { try requireNativeCaptureUse(physicalUse) }
+        else if nativeCaptureEnrollment != nil { return nil }
+        guard observation.owner == nativeAccountingOwner else { return nil }
+        let currentSource = try nativeCurrentSource(observation.source, disk: state, expected: observation.capture)
+        guard currentSource.2 == observation.accounting.key, nativeOwnedEpoch == nil else { return nil }
+        var anchor = nativeClockAnchor
+        let epoch = UUID().uuidString
+        var started = false
+        let receipt: EluNativeReplayStartReceipt?
+        do { receipt = try replayStorageTransaction(validate: {
+            if let physicalUse { try self.requireNativeCaptureUse(physicalUse) }
+            _ = try self.nativeCurrentSource(observation.source, disk: self.state, expected: observation.capture)
+        }, beforeCommit: { connection in
+            var value = try self.nativeMetadata(connection, disk: self.state)
+            try self.accountNative(&value, key: currentSource.2, policy: currentSource.1,
+                ownedEpoch: started ? epoch : self.nativeOwnedEpoch, anchor: &anchor)
+            try EluRuntimeDatabase.writeNativeReplayAuthority(connection, value: value)
+        }) { connection, disk in
+            _ = try nativeCurrentSource(observation.source, disk: disk, expected: observation.capture)
+            var value = try nativeMetadata(connection, disk: disk)
+            guard value.session?.key == observation.accounting.key else { return nil }
+            try accountNative(&value, key: currentSource.2, policy: currentSource.1, ownedEpoch: nativeOwnedEpoch, anchor: &anchor)
+            let wall = try EluV1Timestamp.exactClock(clock())
+            guard let continuous = nativeContinuousSample(), try value.begin(epoch: epoch, wall: wall, currentRate: currentSource.1.sampleRate) else {
+                try EluRuntimeDatabase.writeNativeReplayAuthority(connection, value: value); return nil
+            }
+            started = true
+            guard value.nextReplayOrdinal < EluNativeReplaySessionState.maximumOrdinal else { throw EluRuntimeQueueError.counterExhausted }
+            let replayId = try value.allocateReplayID()
+            // A restored/corrupt ordinal cannot overwrite an immutable previous replay.
+            var collision = false
+            try EluRuntimeDatabase.visitReplayChunks(connection) { row in
+                if EluNativeReplaySessionState.same(row.prepared.replayId, replayId) { collision = true }
+            }
+            guard !collision, let session = value.session, let first = session.firstStartAt else { throw EluRuntimeQueueError.corruptStorage }
+            if anchor?.key != session.key || anchor.map({ !EluNativeReplaySessionState.same($0.firstStartAt, first) }) == true {
+                anchor = EluNativeReplayClockAnchor(key: session.key, firstStartAt: first,
+                    continuousMicroseconds: continuous, consumedMicroseconds: session.elapsedFloorMicroseconds)
+            }
+            guard let receiptAnchor = anchor else { throw EluRuntimeQueueError.sourceAuthorityUnavailable }
+            let candidate = EluNativeReplayStartReceipt(replayId: replayId, firstStartAt: first, owner: nativeAccountingOwner,
+                namespace: value.namespaceHash, stream: disk.streamId, key: session.key, epoch: epoch, anchor: receiptAnchor)
+            // Bind the only original candidate before the first write/commit.
+            if physicalUse != nil { nativeCaptureReceipt = candidate }
+            try EluRuntimeDatabase.writeNativeReplayAuthority(connection, value: value)
+            return candidate
+        } } catch {
+            if physicalUse != nil {
+                if isPoisoned { nativeCaptureEnrollment?.quarantine() }
+                else { nativeCaptureReceipt = nil } // Proven rollback, no new receipt.
+            }
+            throw error
+        }
+        nativeClockAnchor = anchor
+        if let receipt {
+            nativeOwnedEpoch = receipt.epoch
+            do { _ = try nativeCurrentSource(observation.source, disk: state, expected: observation.capture) }
+            catch { if physicalUse == nil { _ = try stopNativeReplayAccounting(receipt) }; throw error }
+            let final = try nativeMetadata(try requireResources().connection, disk: state).session
+            if final?.clockDenied != false || final?.interrupted != false || (final?.remainingMicroseconds ?? 0) <= 0 {
+                if physicalUse == nil { _ = try stopNativeReplayAccounting(receipt) }; return nil
+            }
+        }
+        return receipt
+    }
+
+    @discardableResult
+    func stopNativeReplayAccounting(_ receipt: EluNativeReplayStartReceipt) throws -> Bool {
+        // Reject even restrictive foreign receipts before clock sampling or transaction work.
+        guard receipt.owner == nativeAccountingOwner, let namespace = ownerNamespaceHash,
+              EluNativeReplaySessionState.same(receipt.namespace, namespace),
+              EluNativeReplaySessionState.same(receipt.stream, state.streamId) else { return false }
+        let captureReceipt = nativeCaptureReceipt?.epoch == receipt.epoch && nativeCaptureReceipt?.replayId == receipt.replayId
+        if captureReceipt, nativeCaptureEnrollment?.physicalIsFinished() != true { throw EluRuntimeQueueError.nativeCaptureWorkPending }
+        let connection = captureReceipt ? try nativeSettlementConnection() : nil
+        var anchor = nativeClockAnchor ?? receipt.anchor
+        var matched = false
+        let result = try replayStorageTransaction(receiptConnection: connection, beforeCommit: { connection in
+            guard matched else { return }
+            var value = try self.nativeMetadata(connection, disk: self.state)
+            guard let session = value.session, session.key == receipt.key,
+                  session.firstStartAt.map({ EluNativeReplaySessionState.same($0, receipt.firstStartAt) }) == true,
+                  session.activeEpoch.map({ EluNativeReplaySessionState.same($0, receipt.epoch) }) == true
+            else { throw EluRuntimeQueueError.generationMismatch }
+            let wall = try? EluV1Timestamp.exactClock(self.clock())
+            let elapsed: Int64?
+            if let continuous = self.nativeContinuousSample(), anchor.key == receipt.key,
+               EluNativeReplaySessionState.same(anchor.firstStartAt, receipt.firstStartAt) {
+                elapsed = anchor.observe(continuous, floor: session.elapsedFloorMicroseconds)
+            } else { elapsed = nil }
+            guard try value.stop(key: receipt.key, firstStartAt: receipt.firstStartAt, epoch: receipt.epoch,
+                wall: wall, elapsedMicroseconds: elapsed) else { throw EluRuntimeQueueError.generationMismatch }
+            if self.nativeClockDeniedKey == receipt.key || self.nativeScope.retainedClockDenial() == receipt.key { value.session?.clockDenied = true }
+            try EluRuntimeDatabase.writeNativeReplayAuthority(connection, value: value)
+        }) { connection, disk in
+            let value = try nativeMetadata(connection, disk: disk)
+            guard let session = value.session, session.key == receipt.key,
+                  session.firstStartAt.map({ EluNativeReplaySessionState.same($0, receipt.firstStartAt) }) == true,
+                  session.activeEpoch.map({ EluNativeReplaySessionState.same($0, receipt.epoch) }) == true else { return false }
+            matched = true
+            nativeScope.invalidate()
+            return true
+        }
+        if result {
+            if nativeOwnedEpoch == receipt.epoch { nativeOwnedEpoch = nil }
+            nativeClockAnchor = anchor
+            nativeScope.resolveClockDenial(receipt.key)
+            if captureReceipt { nativeCaptureReceipt = nil; nativeCaptureEnrollment?.proveAccountingFinished() }
+        }
+        return result
+    }
+
+    /// Called only with an authoritative read outside a transaction. Provisional
+    /// before-commit state must never release a retained denial's resource fence.
+    private func resolveNativeClockDenialFromCommittedRead(_ value: EluNativeReplaySessionState) {
+        guard let denied = nativeScope.retainedClockDenial() else { return }
+        if value.session?.key != denied || value.session?.clockDenied == true {
+            nativeScope.resolveClockDenial(denied)
+        }
+    }
+
+    /// Restrictive-only flush: no clocks, source lease or current identity are
+    /// consulted. The retained exact original key may only deny its own ledger.
+    func persistNativeReplayClockDenial() throws {
+        guard let denied = nativeScope.retainedClockDenial(),
+              EluSQLiteRuntimeSchema.hasNativeReplayAuthority(databaseSchemaVersion) else { return }
+        let held = try requireResources()
+        nativeDenialPersistenceInProgress = true
+        defer { nativeDenialPersistenceInProgress = false }
+        do {
+            // A failed preflight read cannot prove that the retained denial belongs
+            // to another session. Keep the held installation lease on uncertainty.
+            try faultInjector?.hit(.beforeNativeDenialRead)
+            let initial = try nativeMetadata(held.connection, disk: state)
+            resolveNativeClockDenialFromCommittedRead(initial)
+            guard initial.session?.key == denied, initial.session?.clockDenied == false else { return }
+            var matched = false
+            try replayStorageTransaction(beforeCommit: { connection in
+                guard matched else { return }
+                var value = try self.nativeMetadata(connection, disk: self.state)
+                guard value.session?.key == denied else { throw EluRuntimeQueueError.generationMismatch }
+                value.session?.clockDenied = true
+                try EluRuntimeDatabase.writeNativeReplayAuthority(connection, value: value)
+            }) { connection, disk in
+                let value = try nativeMetadata(connection, disk: disk)
+                matched = value.session?.key == denied && value.session?.clockDenied == false
+            }
+            if matched { nativeScope.resolveClockDenial(denied) }
         } catch {
-            try? connection.execute("ROLLBACK")
+            // This includes proven rollback: losing the only retained denial
+            // would let a new local owner reopen a previously denied session.
+            held.quarantineNativeClockDenial()
+            poisonAndRelease()
+            throw error
+        }
+    }
+
+    nonisolated func nativeSourceIsCurrent(_ source: EluV2ConfigAuthorityWitness) -> Bool { configurationGate?.isCurrent(source) == true }
+    nonisolated func invalidateNativeProjection() { nativeScope.invalidate() }
+    nonisolated func beginNativeProjectionIntent() -> EluNativeReplayIntent { nativeScope.beginIntent() }
+    nonisolated func finishNativeProjectionIntent(_ intent: EluNativeReplayIntent) { nativeScope.finish(intent) }
+
+    func nativeReplayProjection(source: EluV2ConfigAuthorityWitness) throws -> EluNativeReplayProjectionInput {
+        let observation = try observeNativeReplaySession(source: source)
+        nativeScope.publishSession(state.identity.session)
+        let document = try JSONDecoder().decode(EluV1ConfigDocument.self, from: source.data)
+        guard let policy = document.privacy, let features = document.features, let capabilities = document.capabilities,
+              let guardValue = nativeGuard(observation: observation, receipt: nil)
+        else { throw EluNativeReplayAuthorityError.unavailable }
+        let identity = EluIdentitySnapshot(identity: state.identity, streamId: state.streamId,
+            nextSequence: state.nextSequence, flagContext: state.snapshot.flagContext)
+        return EluNativeReplayProjectionInput(identity: identity, accounting: observation.accounting,
+            context: EluV1PrivacyProjectionContext(policy: policy, features: features, capabilities: capabilities),
+            source: source, owner: nativeAccountingOwner, observation: observation, guardValue: guardValue)
+    }
+
+    /// Installs exactly this captured native privacy document. The returned
+    /// observation is from the new capture epoch, with the same original source.
+    func installNativeReplayPrivacy(_ input: EluNativeReplayProjectionInput,
+                                    privacy: EluProjectedPrivacyState) throws -> EluNativeReplayProjectionInput {
+        guard input.owner == nativeAccountingOwner, input.isCurrent() else { throw EluNativeReplayAuthorityError.stale }
+        _ = try nativeCurrentSource(input.source, disk: state, expected: input.observation.capture)
+        guard case let .activated(capture) = submitCaptureAuthority(configData: input.source.data,
+            effectivePrivacyStateData: privacy.stateData, sourceWitness: input.source),
+            capture.decisionHash == privacy.effectivePolicyHash,
+            sourceIsCurrent(input.source), state.identity.revision == input.identity.identity.revision,
+            state.identity.contextRevision == input.identity.identity.contextRevision,
+            state.identity.session.map({ EluNativeReplaySessionState.same($0.id, input.accounting.sessionId) }) == true,
+            state.identity.session.map({ EluNativeReplaySessionState.same(EluRFC3339.string(from: $0.startedAt), input.accounting.sessionStartedAt) }) == true
+        else { throw EluNativeReplayAuthorityError.stale }
+        return try nativeReplayProjection(source: input.source)
+    }
+
+    func beginNativeReplayStartAccounting(_ input: EluNativeReplayProjectionInput, physicalUse: EluNativeReplayCapturePhysicalUse) throws -> EluNativeReplayStartReceipt? {
+        try requireNativeCaptureUse(physicalUse)
+        guard input.owner == nativeAccountingOwner, input.isCurrent() else { return nil }
+        return try beginCurrentNativeReplayStartAccounting(input.observation, physicalUse: physicalUse)
+    }
+
+    func beginNativeReplayStartAccounting(_ input: EluNativeReplayProjectionInput) throws -> EluNativeReplayStartReceipt? {
+        guard nativeCaptureEnrollment == nil, input.owner == nativeAccountingOwner, input.isCurrent() else { return nil }
+        // This opaque guard binds the original source/capture/context/session.
+        // Ordinary event or ACK commits may advance only the generic queue counter.
+        return try beginCurrentNativeReplayStartAccounting(input.observation)
+    }
+
+    func nativeReplayPermitGuard(input: EluNativeReplayProjectionInput, receipt: EluNativeReplayStartReceipt,
+                                 resolution: EluV1ConfigResolution) throws -> EluNativeReplaySynchronousGuard? {
+        guard input.owner == nativeAccountingOwner, receipt.owner == nativeAccountingOwner,
+              input.source == input.observation.source, sourceIsCurrent(input.source),
+              case .authorized = resolution.replayAuthorization,
+              case let .authorized(capture) = captureAuthority,
+              capture.decisionHash == resolution.decisionHash,
+              capture.configBoundary.semanticHash == resolution.configSemanticHash,
+              capture.configBoundary.issuedAt == resolution.exactIssuedAt
+        else { return nil }
+        let value = try nativeMetadata(try requireResources().connection, disk: state)
+        guard let session = value.session, session.key == receipt.key,
+              session.activeEpoch.map({ EluNativeReplaySessionState.same($0, receipt.epoch) }) == true,
+              session.firstStartAt.map({ EluNativeReplaySessionState.same($0, receipt.firstStartAt) }) == true
+        else { return nil }
+        return nativeGuard(observation: input.observation, receipt: receipt)
+    }
+
+    private func nativeGuard(observation: EluNativeReplaySessionObservation,
+                             receipt: EluNativeReplayStartReceipt?) -> EluNativeReplaySynchronousGuard? {
+        guard sourceIsCurrent(observation.source), case let .authorized(capture) = captureAuthority,
+              capture == observation.capture, authorityWitnessMatches(capture, diskState: state),
+              !observation.accounting.clockDenied, !observation.accounting.interrupted else { return nil }
+        let scope = nativeScope, token = scope.token(), source = observation.source
+        let clock = clock, continuous = continuousClock, nanoseconds = nativeContinuousNanoseconds
+        let gate = configurationGate, key = observation.accounting.key
+        let anchor = nativeClockAnchor ?? receipt?.anchor
+        let cap = Int64(observation.accounting.maximumDurationSeconds) * 1_000_000
+        let guardValue = EluNativeReplaySynchronousGuard {
+            guard let (wall, ticks, session) = scope.sample(token, key: key, wall: clock, continuous: continuous),
+                  EluNativeReplaySessionState.same(session.id, key.sessionId),
+                  EluNativeReplaySessionState.same(EluRFC3339.string(from: session.startedAt), key.sessionStartedAt),
+                  session.lifecycle == .active, session.backgroundedAt == nil,
+                  wall >= session.startedAt, wall >= session.lastActivityAt,
+                  wall.timeIntervalSince(session.lastActivityAt) < Double(min(session.timeoutSeconds, capture.idleTimeoutSeconds)),
+                  wall.timeIntervalSince(session.startedAt) < Double(capture.maximumDurationSeconds),
+                  !capture.expiresAt.isAtOrBefore(wall), ticks >= capture.monotonicStartedAt,
+                  ticks - capture.monotonicStartedAt < capture.monotonicBudget,
+                  gate?.isCurrent(source) == true else { return false }
+            if let receipt {
+                guard let anchor, anchor.key == key,
+                      EluNativeReplaySessionState.same(anchor.firstStartAt, receipt.firstStartAt),
+                      let now = try? EluV1Timestamp.exactClock(wall),
+                      let first = try? EluV1Timestamp(receipt.firstStartAt),
+                      let wallElapsed = EluNativeReplaySessionState.elapsedCeilMicroseconds(from: first, to: now),
+                      let current = nanoseconds(ticks).map({ $0 / 1_000 }), current >= anchor.continuousMicroseconds
+                else { return false }
+                let delta = min(UInt64(EluNativeReplaySessionState.maximumMicroseconds), current - anchor.continuousMicroseconds)
+                let consumed = max(wallElapsed, anchor.consumedMicroseconds + Int64(delta))
+                guard consumed < cap else { return false }
+            }
+            return scope.current(token) && gate?.isCurrent(source) == true
+        }
+        return guardValue.isCurrent() ? guardValue : nil
+    }
+
+    /// A copy of accounting metadata is inspectable but never a portable intake permit.
+    func nativeReplaySessionState() throws -> EluNativeReplaySessionState {
+        try nativeMetadata(try requireResources().connection, disk: state)
+    }
+
+
+    /// Source/config reconciliation is independent of fresh capture and current identity.
+    /// The pure predicate compares capture-time profile bytes with a frozen required profile.
+    /// Supplying a supported generation is storage compatibility, never codec certification.
+    @discardableResult
+    func reconcileReplayConfiguration(
+        configData: Data, expectedConfigWitness: EluV2ReplayConfigWitness,
+        sourceWitness: EluV2ConfigAuthorityWitness? = nil,
+        supportedProtocolGeneration: String?,
+        mayRetainProfile: (Data) -> Bool
+    ) throws -> Int {
+        try reconcileReplayConfiguration(configData: configData, expectedConfigWitness: expectedConfigWitness,
+            sourceWitness: sourceWitness, supportedProtocolGeneration: supportedProtocolGeneration,
+            observation: nil, mayRetainProfile: mayRetainProfile)
+    }
+
+    private func reconcileReplayConfiguration(configData: Data, expectedConfigWitness: EluV2ReplayConfigWitness,
+        sourceWitness: EluV2ConfigAuthorityWitness?, supportedProtocolGeneration: String?,
+        observation: EluSealedReplayPolicyObservation?, mayRetainProfile: (Data) -> Bool
+    ) throws -> Int {
+        replayDispatchFence.invalidate()
+        guard EluSQLiteRuntimeSchema.hasReplay(databaseSchemaVersion), sourceIsCurrent(sourceWitness, data: configData) else { throw EluRuntimeQueueError.sourceAuthorityUnavailable }
+        let manager = EluV1ConfigManager(readbackProvenReplayTransports: EluStandaloneRuntime.readbackProvenReplayCapabilities.transports)
+        _ = try manager.update(configData: configData, now: clock())
+        guard let candidate = manager.validatedCandidateIdentity(), candidate.issuedAt == expectedConfigWitness.issuedAt,
+              candidate.semanticHash == expectedConfigWitness.semanticHash else { throw EluRuntimeQueueError.generationMismatch }
+        let document = try JSONDecoder().decode(EluV1ConfigDocument.self, from: configData)
+        let generation = document.schemaVersion == 2 ? document.capabilities?.replay.replayProtocolGeneration : nil
+        let allowed = document.status == .enabled && document.features?.capture == true
+            && document.features?.replay == true && document.privacy?.capture.enabled == true
+            && document.privacy?.replay.enabled == true && generation != nil && EluV2ReplayText.equal(generation, supportedProtocolGeneration)
+        return try replayClockTransaction(validate: {
+            guard self.sourceIsCurrent(sourceWitness, data: configData), observation?.isCurrent() ?? true
+            else { throw EluRuntimeQueueError.sourceAuthorityUnavailable }
+        }) { connection, disk, now in
+            var current = try EluRuntimeDatabase.readReplayState(connection)
+            if let old = current.witness {
+                guard expectedConfigWitness.issuedAt >= old.issuedAt,
+                      expectedConfigWitness.issuedAt != old.issuedAt || expectedConfigWitness.semanticHash == old.semanticHash else { throw EluRuntimeQueueError.generationMismatch }
+            }
+            if let pinned = current.siteId, let candidateSite = document.site?.id, !EluV2ReplayText.equal(pinned, candidateSite) { throw EluRuntimeQueueError.generationMismatch }
+            var removed = 0
+            try EluRuntimeDatabase.visitReplayChunks(connection) { row in
+                if !allowed || disk.identity.optedOut || !EluV2ReplayText.equal(row.captureProtocolGeneration, generation)
+                    || !EluV2ReplayText.equal(row.siteId, document.site?.id) || Self.replayExpired(row, now: now)
+                    || !mayRetainProfile(row.maskingProfile) {
+                    try EluRuntimeDatabase.deleteReplayChunk(connection, ordinal: row.ordinal); removed += 1
+                }
+            }
+            current.siteId = document.site?.id ?? current.siteId
+            current.witness = expectedConfigWitness
+            current.protocolGeneration = generation
+            current.admissionEnabled = allowed && !disk.identity.optedOut
+            if let configuredLimit = document.limits?.queueBytes { current.maximumQueueBytes = Int64(min(configuredLimit, 268_435_456)) }
+            try EluRuntimeDatabase.writeReplayState(connection, current)
+            return removed
+        }
+    }
+
+    func appendNativeReplay(_ prepared: EluV2ReplayPreparedRequest,
+        admission: EluNativeReplayCaptureAdmission, physicalUse: EluNativeReplayCapturePhysicalUse
+    ) throws -> EluNativeReplayCaptureAppendResult {
+        try requireNativeCaptureUse(physicalUse)
+        guard admission.use === physicalUse, admission.isCurrent() else { throw EluNativeReplayAuthorityError.stale }
+        do {
+            let value = try appendReplayCurrent(prepared, maskingProfile: admission.permit.profile.canonicalBytes,
+                authorization: admission.permit.resolution, sourceWitness: admission.input.source,
+                nativeAdmission: admission, isCurrentProfile: { $0 == admission.permit.profile.canonicalBytes })
+            // A known commit remains a durable immutable row after withdrawal.
+            // Never reinterpret this case as an ambiguous commit or delete it.
+            return admission.isCurrent() ? .committed(value) : .committedThenWithdrawn(value)
+        } catch {
+            if isPoisoned { physicalUse.enrollment.quarantine(retaining: prepared) }
+            throw error
+        }
+    }
+
+    private func validateNativeReplayAdmission(_ admission: EluNativeReplayCaptureAdmission,
+        prepared: EluV2ReplayPreparedRequest, connection: EluSQLiteConnection,
+        disk: EluStoredRuntimeState) throws {
+        try requireNativeCaptureUse(admission.use)
+        let receipt = admission.receipt
+        guard admission.input.owner == nativeAccountingOwner, receipt.owner == nativeAccountingOwner,
+              nativeCaptureReceipt?.epoch == receipt.epoch,
+              nativeCaptureReceipt?.replayId == receipt.replayId,
+              receipt.key == admission.input.accounting.key,
+              EluV2ReplayText.equal(receipt.replayId, prepared.replayId),
+              EluV2ReplayText.equal(receipt.stream, disk.streamId),
+              try EluNativeReplayCaptureClock.admits(startedAt: prepared.startedAt, endedAt: prepared.endedAt,
+                  after: EluV1Timestamp(receipt.firstStartAt)),
+              prepared.maskingProfileHash == admission.permit.profile.hash,
+              prepared.effectivePolicyHash == admission.permit.privacy.effectivePolicyHash,
+              admission.originalSourceData == admission.input.source.data,
+              admission.isCurrent() else { throw EluNativeReplayAuthorityError.stale }
+        let value = try nativeMetadata(connection, disk: disk)
+        guard let session = value.session, session.key == receipt.key,
+              session.activeEpoch.map({ EluV2ReplayText.equal($0, receipt.epoch) }) == true,
+              session.firstStartAt.map({ EluV2ReplayText.equal($0, receipt.firstStartAt) }) == true,
+              !session.clockDenied, !session.interrupted, session.remainingMicroseconds > 0,
+              admission.isCurrent() else { throw EluNativeReplayAuthorityError.stale }
+    }
+
+    func appendReplay(
+        _ prepared: EluV2ReplayPreparedRequest, maskingProfile: Data,
+        authorization: EluV1ConfigResolution, sourceWitness: EluV2ConfigAuthorityWitness? = nil,
+        isCurrentProfile: (Data) -> Bool
+    ) throws -> EluV2ReplayAppendResult {
+        try appendReplayCurrent(prepared, maskingProfile: maskingProfile, authorization: authorization,
+            sourceWitness: sourceWitness, nativeAdmission: nil, isCurrentProfile: isCurrentProfile)
+    }
+
+    private func appendReplayCurrent(
+        _ prepared: EluV2ReplayPreparedRequest, maskingProfile: Data,
+        authorization: EluV1ConfigResolution, sourceWitness: EluV2ConfigAuthorityWitness?,
+        nativeAdmission: EluNativeReplayCaptureAdmission?, isCurrentProfile: (Data) -> Bool
+    ) throws -> EluV2ReplayAppendResult {
+        // Native wire bytes require the original physical permit even when an
+        // internal caller already holds config and profile metadata.
+        if EluV2ReplayText.equal(prepared.codec, "elu-native-wireframe-v1"), nativeAdmission == nil {
+            throw EluNativeReplayAuthorityError.stale
+        }
+        guard EluSQLiteRuntimeSchema.hasReplay(databaseSchemaVersion),
+              authorization.configSchemaVersion == 2,
+              case let .authorized(pair) = authorization.replayAuthorization,
+              authorization.endpoints[.replay] != nil,
+              pair.codec == prepared.codec, pair.compression.rawValue == prepared.compression,
+              let generation = authorization.replayProtocolGeneration,
+              EluV2ReplayText.equal(generation, prepared.captureProtocolGeneration) else { throw EluRuntimeQueueError.invalidState }
+        guard let sourceWitness,
+              let sourceDocument = try? JSONDecoder().decode(EluV1ConfigDocument.self, from: sourceWitness.data),
+              EluV2ReplayText.equal(prepared.policyRevision, sourceDocument.privacy?.revision),
+              prepared.effectivePolicyHash == authorization.decisionHash else { throw EluRuntimeQueueError.sourceAuthorityUnavailable }
+        let expected = EluV2ReplayConfigWitness(issuedAt: authorization.exactIssuedAt, semanticHash: authorization.configSemanticHash)
+        func validate(_ disk: EluStoredRuntimeState) throws {
+            if let nativeAdmission {
+                try validateNativeReplayAdmission(nativeAdmission, prepared: prepared,
+                    connection: try requireResources().connection, disk: disk)
+            }
+            let wallNow = clock()
+            guard sourceIsCurrent(sourceWitness),
+                  case let .authorized(capture) = captureAuthority,
+                  capture.configBoundary.issuedAt == expected.issuedAt,
+                  capture.configBoundary.semanticHash == expected.semanticHash,
+                  EluV2ReplayText.equal(capture.configSiteId, authorization.siteId),
+                  capture.decisionHash == authorization.decisionHash,
+                  (try? EluV1StrictCanonicalJSON.parse(sourceWitness.data)).map({ EluV1StrictCanonicalJSON.hash($0.canonicalData) }) == expected.semanticHash,
+                  authorityWitnessMatches(capture, diskState: disk), authorityIsLive(capture, wallNow: clock(), monotonicNow: continuousClock()),
+                  !disk.identity.optedOut,
+                  EluV2ReplayText.equal(disk.identity.anonymousId, prepared.anonymousId), EluV2ReplayText.equal(disk.identity.userId, prepared.userId),
+                  disk.identity.revision == prepared.identityRevision, disk.identity.contextRevision == prepared.contextRevision,
+                  let session = disk.identity.session,
+                  EluV2ReplayText.equal(session.id, prepared.sessionId),
+                  session.lifecycle == .active, session.backgroundedAt == nil,
+                  wallNow.timeIntervalSinceReferenceDate.isFinite,
+                  wallNow >= session.lastActivityAt, wallNow >= session.startedAt,
+                  wallNow.timeIntervalSince(session.lastActivityAt) < Double(min(session.timeoutSeconds, capture.idleTimeoutSeconds)),
+                  wallNow.timeIntervalSince(session.startedAt) < Double(capture.maximumDurationSeconds),
+                  isCurrentProfile(maskingProfile),
+                  sourceIsCurrent(sourceWitness) else { throw EluRuntimeQueueError.sourceAuthorityUnavailable }
+        }
+        return try replayClockTransaction(validate: { try validate(self.state) }) { connection, disk, now in
+            try validate(disk)
+            var current = try EluRuntimeDatabase.readReplayState(connection)
+            guard current.admissionEnabled, current.witness == expected,
+                  EluV2ReplayText.equal(current.siteId, authorization.siteId), EluV2ReplayText.equal(current.protocolGeneration, generation) else { throw EluRuntimeQueueError.generationMismatch }
+            let row = try EluV2ReplayStoredChunk(ordinal: current.nextOrdinal, siteId: authorization.siteId,
+                captureProtocolGeneration: generation, prepared: prepared, maskingProfile: maskingProfile)
+            guard now.floorNanoseconds(since: prepared.startedAt) != nil, !Self.replayExpired(row, now: now), prepared.endedAt <= now,
+                  prepared.body.count <= min(authorization.limits.replayChunkBytes, EluV2ReplayPreparedRequest.maximumBytes) else { throw EluRuntimeQueueError.invalidRecord }
+            var duplicate: EluV2ReplayStoredChunk?
+            try EluRuntimeDatabase.visitReplayChunks(connection) { existing in
+                if EluV2ReplayText.equal(existing.siteId, row.siteId) && (EluV2ReplayText.equal(existing.prepared.requestId, prepared.requestId)
+                    || (EluV2ReplayText.equal(existing.prepared.replayId, prepared.replayId) && (EluV2ReplayText.equal(existing.prepared.chunkId, prepared.chunkId) || existing.prepared.sequence == prepared.sequence))) {
+                    guard existing.prepared.body == prepared.body, existing.maskingProfile == maskingProfile,
+                          EluV2ReplayText.equal(existing.captureProtocolGeneration, generation) else { throw EluRuntimeQueueError.acknowledgementMismatch }
+                    duplicate = existing
+                }
+            }
+            if let duplicate { return .duplicate(duplicate) }
+            let totals = try EluRuntimeDatabase.replayTotals(connection)
+            guard disk.liveCount + totals.count + 1 <= Int64(limits.maximumCount) else { throw EluRuntimeQueueError.queueCountLimitExceeded }
+            guard disk.liveBytes + totals.bytes + Int64(prepared.body.count) <= Int64(min(limits.maximumBytes, authorization.limits.queueBytes)) else { throw EluRuntimeQueueError.queueByteLimitExceeded }
+            guard current.nextOrdinal < EluV2ReplayDeliveryState.maximumSafeInteger else { throw EluRuntimeQueueError.counterExhausted }
+            try EluRuntimeDatabase.insertReplayChunk(connection, row)
+            if EluSQLiteRuntimeSchema.hasReplayDelivery(databaseSchemaVersion) {
+                try EluRuntimeDatabase.writeReplayDelivery(connection, ordinal: row.ordinal, value: .pending)
+            }
+            try faultInjector?.hit(.afterRecordInsert(0))
+            current.nextOrdinal += 1
+            try EluRuntimeDatabase.writeReplayState(connection, current)
+            return .inserted(row)
+        }
+    }
+
+    /// Current permission for already sealed native rows. This path neither reads
+    /// nor changes native session accounting and cannot issue capture authority.
+    func currentSealedReplayDelivery(source: EluV2ConfigAuthorityWitness,
+        capabilities: EluNativeReplayCapabilities, timeZoneIdentifier: String?
+    ) throws -> EluV2ReplayDeliveryAuthority? {
+        _ = try requireResources()
+        guard EluSQLiteRuntimeSchema.hasReplayDelivery(databaseSchemaVersion),
+              let gate = configurationGate, let siteKey = exactConstructorSiteKey,
+              gate.isCurrent(source, data: source.data) else { return nil }
+        let scope = flagScopeFence, scopeToken = scope.token()
+        let event = eventDeliveryFence, eventToken = event.token()
+        let observation = EluSealedReplayPolicyObservation(source: source, identity: identitySnapshot,
+            isCurrent: { scope.check(scopeToken) { event.check(eventToken) { gate.isCurrent(source, data: source.data) } } })
+        guard observation.isCurrent() else { return nil }
+        let manager = EluV1ConfigManager(readbackProvenReplayTransports: capabilities.transports)
+        let update = try manager.update(configData: source.data, now: clock())
+        guard let candidate = manager.validatedCandidateIdentity(), observation.isCurrent() else { return nil }
+        let configWitness = EluV2ReplayConfigWitness(issuedAt: candidate.issuedAt, semanticHash: candidate.semanticHash)
+        let document = try JSONDecoder().decode(EluV1ConfigDocument.self, from: source.data)
+        let supported = capabilities.supportedProtocolGeneration(document.capabilities?.replay.replayProtocolGeneration)
+        switch update {
+        case .enabled:
+            break
+        case .disabled, .revoked:
+            // A validated explicit restriction is different from absent authority.
+            _ = try reconcileReplayConfiguration(configData: source.data, expectedConfigWitness: configWitness,
+                sourceWitness: source, supportedProtocolGeneration: nil, observation: observation,
+                mayRetainProfile: { _ in false })
+            return nil
+        case .expired, .stale:
+            return nil
+        }
+        let context = try manager.activePrivacyProjectionContext(now: clock())
+        let local = try EluPrivacyStateProjector.projectSealedPolicy(context: context, configWitness: candidate,
+            identity: observation.identity, timeZoneIdentifier: timeZoneIdentifier)
+        // Retain the original validated policy. Missing policy never becomes a
+        // default-false predicate that could erase otherwise lawful bytes.
+        let requiredMasking = context.policy.masking
+        let retain: @Sendable (Data) -> Bool = {
+            EluNativeMaskingProfile.retention(of: $0, required: requiredMasking, platform: .ios) == .compatible
+        }
+        let policy = try manager.authorizeSealedReplayDelivery(policyObservation: local,
+            identity: observation.identity, now: clock())
+        _ = try reconcileReplayConfiguration(configData: source.data, expectedConfigWitness: configWitness,
+            sourceWitness: source, supportedProtocolGeneration: supported, observation: observation,
+            mayRetainProfile: retain)
+        guard let policy, let supported, EluV2ReplayText.equal(policy.protocolGeneration, supported),
+              observation.isCurrent() else { return nil }
+        let value = EluV2ReplayDeliveryAuthority(siteKey: siteKey, policy: policy,
+            credentialWitness: Self.replayDeliveryWitness(["elu-replay-credential-v2", siteKey]),
+            scopeWitness: Self.replayDeliveryWitness(["elu-replay-scope-v2", siteKey, policy.siteId]),
+            authorizationWitness: Self.replayDeliveryWitness(["elu-replay-endpoint-v2", siteKey, policy.siteId, policy.endpoint.absoluteString]),
+            source: source, owner: replayDeliveryOwner, validate: observation.isCurrent, mayRetainProfile: retain)
+        return value.isCurrent() ? value : nil
+    }
+
+    /// Reevaluate current global policy against the actual owner projection. The
+    /// original full privacy proof is never rewritten to simulate fresh eligibility.
+    func authorizeSealedReplayDelivery(configData: Data, effectivePrivacyStateData: Data,
+        sourceWitness: EluV2ConfigAuthorityWitness,
+        readbackProvenTransports: Set<EluV1ReplayTransportSelection>,
+        supportedProtocolGeneration: String,
+        mayRetainProfile: @escaping @Sendable (Data) -> Bool
+    ) throws -> EluV2ReplayDeliveryAuthority? {
+        guard EluSQLiteRuntimeSchema.hasReplayDelivery(databaseSchemaVersion), sourceIsCurrent(sourceWitness, data: configData) else { return nil }
+        let manager = EluV1ConfigManager(readbackProvenReplayTransports: readbackProvenTransports)
+        _ = try manager.update(configData: configData, now: clock())
+        guard let policy = try manager.authorizeSealedReplayDelivery(effectivePrivacyStateData: effectivePrivacyStateData, identity: identitySnapshot, now: clock()),
+              EluV2ReplayText.equal(policy.protocolGeneration, supportedProtocolGeneration),
+              let siteKey = exactConstructorSiteKey, let gate = configurationGate else { return nil }
+        let scopeFence = flagScopeFence, scopeToken = scopeFence.token()
+        let eventFence = eventDeliveryFence, eventToken = eventFence.token()
+        let value = EluV2ReplayDeliveryAuthority(siteKey: siteKey, policy: policy,
+            credentialWitness: Self.replayDeliveryWitness(["elu-replay-credential-v2", siteKey]),
+            scopeWitness: Self.replayDeliveryWitness(["elu-replay-scope-v2", siteKey, policy.siteId]),
+            authorizationWitness: Self.replayDeliveryWitness(["elu-replay-endpoint-v2", siteKey, policy.siteId, policy.endpoint.absoluteString]),
+            source: sourceWitness, owner: replayDeliveryOwner,
+            validate: { scopeFence.check(scopeToken) { eventFence.check(eventToken) { gate.isCurrent(sourceWitness) } } },
+            mayRetainProfile: mayRetainProfile)
+        _ = try reconcileReplayConfiguration(configData: configData, expectedConfigWitness: policy.configWitness,
+            sourceWitness: sourceWitness, supportedProtocolGeneration: supportedProtocolGeneration, mayRetainProfile: mayRetainProfile)
+        return value.isCurrent() ? value : nil
+    }
+
+    func claimNextReplay(_ authority: EluV2ReplayDeliveryAuthority) throws -> EluV2ReplayClaimResult {
+        guard EluSQLiteRuntimeSchema.hasReplayDelivery(databaseSchemaVersion), authority.owner == replayDeliveryOwner,
+              authority.isCurrent() else { throw EluRuntimeQueueError.sourceAuthorityUnavailable }
+        if replayClaim != nil { return .occupied }
+        let dispatchFence = replayDispatchFence, dispatchToken = dispatchFence.token()
+        let claimed: EluV2ReplayClaimResult = try replayClockTransaction(validate: {
+            try self.validateReplayDeliveryClock()
+            guard authority.isCurrent() else { throw EluRuntimeQueueError.sourceAuthorityUnavailable }
+        }) { connection, disk, now in
+            try validateReplayDeliveryClock()
+            try EluRuntimeDatabase.auditReplayDelivery(connection)
+            let ledger = try EluRuntimeDatabase.readReplayState(connection)
+            guard !disk.identity.optedOut, ledger.admissionEnabled, ledger.witness == authority.policy.configWitness,
+                  EluV2ReplayText.equal(ledger.protocolGeneration, authority.policy.protocolGeneration),
+                  EluV2ReplayText.equal(ledger.siteId, authority.policy.siteId) else { throw EluRuntimeQueueError.generationMismatch }
+            let endpoint = try EluRuntimeDatabase.readReplayDelivery(connection, ordinal: -1)
+            if try replayRetryIsPending(endpoint.retry, key: -1, authority: authority), let retry = endpoint.retry {
+                return .deferred(afterNanoseconds: UInt64(retry.delayMillis) * 1_000_000)
+            }
+            var heads: [String: EluV2ReplayStoredChunk] = [:]
+            try EluRuntimeDatabase.visitReplayChunks(connection) { row in
+                if Self.replayExpired(row, now: now) || !EluV2ReplayText.equal(row.captureProtocolGeneration, authority.policy.protocolGeneration)
+                    || !authority.mayRetainProfile(row.maskingProfile) {
+                    try EluRuntimeDatabase.deleteReplayChunk(connection, ordinal: row.ordinal)
+                    return
+                }
+                // Exact encoded key avoids Swift's canonical-equivalent String folding.
+                let key = Data(row.prepared.replayId.utf8).base64EncodedString()
+                if heads[key].map({ row.prepared.sequence < $0.prepared.sequence }) ?? true { heads[key] = row }
+            }
+            var deferred: UInt64?
+            for row in heads.values.sorted(by: { $0.ordinal < $1.ordinal }) {
+                var metadata = try EluRuntimeDatabase.readReplayDelivery(connection, ordinal: row.ordinal)
+                if metadata.blocked != nil { continue }
+                if try replayRetryIsPending(metadata.retry, key: row.ordinal, authority: authority), let retry = metadata.retry {
+                    let delay = UInt64(retry.delayMillis) * 1_000_000
+                    deferred = min(deferred ?? delay, delay); continue
+                }
+                guard row.prepared.body.count <= authority.policy.maximumRequestBytes,
+                      row.prepared.codec == authority.policy.transport.codec,
+                      row.prepared.compression == authority.policy.transport.compression.rawValue else { continue }
+                guard metadata.attemptCount < EluV2ReplayDeliveryState.maximumSafeInteger else { throw EluRuntimeQueueError.counterExhausted }
+                metadata.attemptCount += 1
+                metadata.retry = nil
+                try EluRuntimeDatabase.writeReplayDelivery(connection, ordinal: row.ordinal, value: metadata)
+                return .claimed(EluV2ReplayClaim(row: row, attemptCount: metadata.attemptCount, claimedAt: now, authority: authority,
+                    owner: replayDeliveryOwner, id: UUID(), validate: {
+                        dispatchFence.check(dispatchToken) { true }
+                    }))
+            }
+            return deferred.map { .deferred(afterNanoseconds: $0) } ?? .idle
+        }
+        guard authority.isCurrent() else { throw EluRuntimeQueueError.sourceAuthorityUnavailable }
+        if case let .claimed(claim) = claimed { replayClaim = claim }
+        return claimed
+    }
+
+    func enrollReplayDispatch(_ claim: EluV2ReplayClaim, dispatchAllowed: @escaping @Sendable () -> Bool) throws -> EluV2ReplayDispatch? {
+        guard dispatchAllowed(), replayClaimMatches(claim), replayEnrolledClaim != claim.id,
+              try revalidateReplayClaim(claim), claim.isCurrent(), dispatchAllowed() else { return nil }
+        let retained = try requireResources()
+        guard retained.enrollReplay() else { return nil }
+        replayEnrolledClaim = claim.id
+        let authority = claim.authority
+        let request = EluV1BatchHTTPRequest(url: authority.policy.endpoint,
+            headers: ["Authorization": "Bearer \(authority.siteKey)", "Content-Type": "application/json"],
+            body: claim.row.prepared.body, timeoutSeconds: 30, maximumResponseBytes: EluV2ReplayResponse.maximumBytes)
+        let dispatch = EluV2ReplayDispatch(request: request,
+            revalidate: { [weak self] in
+                guard let self, dispatchAllowed() else { return false }
+                let allowed = (try? await self.revalidateReplayClaim(claim)) == true
+                return allowed && dispatchAllowed()
+            }, isCurrent: { dispatchAllowed() && claim.isCurrent() }, onSettlement: { retained.settleReplay() })
+        replayDispatch = dispatch
+        return dispatch
+    }
+
+    func revalidateReplayClaim(_ claim: EluV2ReplayClaim) throws -> Bool {
+        guard replayClaimMatches(claim), claim.isCurrent() else { return false }
+        return try replayClockTransaction(validate: {
+            try self.validateReplayDeliveryClock()
+            guard claim.isCurrent() else { throw EluRuntimeQueueError.sourceAuthorityUnavailable }
+        }) { connection, disk, _ in
+            try validateReplayDeliveryClock()
+            let ledger = try EluRuntimeDatabase.readReplayState(connection)
+            let rows = try EluRuntimeDatabase.readReplayChunks(connection, ordinal: claim.row.ordinal)
+            return !disk.identity.optedOut && ledger.admissionEnabled && ledger.witness == claim.authority.policy.configWitness
+                && EluV2ReplayText.equal(ledger.protocolGeneration, claim.row.captureProtocolGeneration)
+                && rows == [claim.row] && claim.authority.mayRetainProfile(claim.row.maskingProfile)
+        }
+    }
+
+    /// A completion records the exact old attempt, including refusals after source
+    /// renewal. It grants no egress authority. Endpoint delays retain the old witness.
+    @discardableResult
+    func finishReplayClaim(_ claim: EluV2ReplayClaim, completion: EluV2ReplayClaimCompletion) throws -> Bool {
+        guard replayClaimMatches(claim) else { return false }
+        guard !isPoisoned || replayLogicallyClosed, let retained = resources ?? replayReceiptResources else { throw EluRuntimeQueueError.poisoned }
+        func finalized() {
+            replayDispatch?.finishReceipt()
+            replayDispatch = nil; replayClaim = nil; replayEnrolledClaim = nil
+            replayReceiptResources = nil
+        }
+        if case .released = completion { finalized(); return true }
+        let response: EluV2ReplayResponseOutcome
+        switch completion {
+        case let .response(value): response = value
+        case .networkFailure: response = .retry(afterSeconds: 0)
+        case .released: finalized(); return true
+        }
+        let permanentReason: String?
+        switch response {
+        case let .credentialBlocked(status):
+            guard status == 401 || status == 403 else { throw EluRuntimeQueueError.invalidState }
+            permanentReason = "credential-\(status)"
+        case .protocolBlocked: permanentReason = "protocol"
+        default: permanentReason = nil
+        }
+        do {
+            let result: Bool
+            if let permanentReason {
+                // A refusal is an original transport fact, not new privacy/time
+                // authority. Persist it even after logical close/source withdrawal.
+                // Its timestamp is the trusted original claim observation.
+                result = try replayStorageTransaction(receiptConnection: replayLogicallyClosed ? retained.connection : nil) { connection, _ in
+                    let rows = try EluRuntimeDatabase.readReplayChunks(connection, ordinal: claim.row.ordinal)
+                    guard rows == [claim.row] else { return false }
+                    var metadata = try EluRuntimeDatabase.readReplayDelivery(connection, ordinal: claim.row.ordinal)
+                    guard metadata.attemptCount == claim.attemptCount else { return false }
+                    metadata.blocked = replayBlock(permanentReason, claim: claim, now: claim.claimedAt)
+                    metadata.retry = nil
+                    try EluRuntimeDatabase.writeReplayDelivery(connection, ordinal: claim.row.ordinal, value: metadata)
+                    return true
+                }
+            } else {
+                // Success, loss, and transient retry never act after withdrawal.
+                guard !replayLogicallyClosed, claim.isCurrent(), replayDispatch?.allowsCurrentReceipt() ?? true else { finalized(); return false }
+                result = try replayClockTransaction(validate: {
+                    try self.validateReplayDeliveryClock()
+                    guard claim.isCurrent(), self.replayDispatch?.allowsCurrentReceipt() ?? true else { throw EluRuntimeQueueError.sourceAuthorityUnavailable }
+                }) { connection, _, now in
+                    let rows = try EluRuntimeDatabase.readReplayChunks(connection, ordinal: claim.row.ordinal)
+                    guard rows == [claim.row] else { return false }
+                    var metadata = try EluRuntimeDatabase.readReplayDelivery(connection, ordinal: claim.row.ordinal)
+                    guard metadata.attemptCount == claim.attemptCount else { return false }
+                    switch response {
+                    case .accepted, .rejectedTooLarge:
+                        try EluRuntimeDatabase.deleteReplayChunk(connection, ordinal: claim.row.ordinal)
+                    case let .retry(afterSeconds):
+                        let exponential = min(60.0, pow(2.0, Double(min(6, max(0, claim.attemptCount - 1)))))
+                        metadata.retry = try replayRetry(delay: max(exponential, afterSeconds), claim: claim, now: now)
+                        try EluRuntimeDatabase.writeReplayDelivery(connection, ordinal: claim.row.ordinal, value: metadata)
+                        try rememberReplayRetry(metadata.retry!, key: claim.row.ordinal)
+                    case let .endpointCooldown(seconds):
+                        let retry = try replayRetry(delay: seconds, claim: claim, now: now)
+                        var endpoint = try EluRuntimeDatabase.readReplayDelivery(connection, ordinal: -1)
+                        endpoint.retry = retry
+                        try EluRuntimeDatabase.writeReplayDelivery(connection, ordinal: -1, value: endpoint)
+                        try rememberReplayRetry(retry, key: -1)
+                    case .credentialBlocked, .protocolBlocked: throw EluRuntimeQueueError.invalidState
+                    }
+                    return true
+                }
+            }
+            finalized()
+            return result
+        } catch {
+            // Never hand an unrecorded permanent result to another sender, even
+            // after proven noncommit. A failed/ambiguous database remains unwritable.
+            retained.quarantineReplay()
+            replayLogicallyClosed = false
+            poisonAndRelease()
+            throw error
+        }
+    }
+
+    private func replayClaimMatches(_ claim: EluV2ReplayClaim) -> Bool {
+        claim.owner == replayDeliveryOwner && claim.id == replayClaim?.id && claim.row == replayClaim?.row
+    }
+    private func replayRetry(delay: TimeInterval, claim: EluV2ReplayClaim, now: EluV1Timestamp) throws -> EluV2ReplayDeliveryState.Retry {
+        guard delay.isFinite, delay >= 0 else { throw EluRuntimeQueueError.invalidState }
+        return .init(recordedAt: now.source, delayMillis: Int64(min(86_400_000, ceil(delay * 1_000))),
+            ownerEpoch: replayDeliveryOwner.uuidString, authorizationWitness: claim.authority.authorizationWitness)
+    }
+    private func replayBlock(_ reason: String, claim: EluV2ReplayClaim, now: EluV1Timestamp) -> EluV2ReplayDeliveryState.Block {
+        .init(reason: reason, recordedAt: now.source, credentialWitness: claim.authority.credentialWitness,
+            scopeWitness: claim.authority.scopeWitness, protocolGeneration: claim.row.captureProtocolGeneration)
+    }
+    private func rememberReplayRetry(_ retry: EluV2ReplayDeliveryState.Retry, key: Int64) throws {
+        guard let ticks = continuousBudgetConverter(UInt64(retry.delayMillis) * 1_000_000) else { throw EluRuntimeQueueError.invalidState }
+        replayRetryDeadlines[key] = EluReplayRetryDeadline(retry: retry, start: continuousClock(), budget: ticks)
+    }
+    private func replayRetryIsPending(_ retry: EluV2ReplayDeliveryState.Retry?, key: Int64, authority: EluV2ReplayDeliveryAuthority) throws -> Bool {
+        guard let retry, retry.authorizationWitness == authority.authorizationWitness else { return false }
+        if replayRetryDeadlines[key]?.retry != retry { try rememberReplayRetry(retry, key: key) }
+        guard let deadline = replayRetryDeadlines[key] else { throw EluRuntimeQueueError.corruptStorage }
+        let now = continuousClock()
+        guard now >= deadline.start else {
+            replayClockDenied = true
+            recordReplayClockDenial("retry-continuous-rollback", ["continuousNow": String(now), "retryStart": String(deadline.start)])
+            throw EluRuntimeQueueError.sourceAuthorityUnavailable
+        }
+        return now - deadline.start < deadline.budget
+    }
+    private func validateReplayDeliveryClock() throws {
+        let lower = continuousClock(), wall = try EluV1Timestamp.exactClock(clock()), upper = continuousClock()
+        guard upper >= lower else {
+            replayClockDenied = true
+            recordReplayClockDenial("delivery-continuous-sandwich", ["lower": String(lower), "upper": String(upper), "wall": wall.source])
+            throw EluRuntimeQueueError.sourceAuthorityUnavailable
+        }
+        if let sample = replayDeliveryClockSample {
+            func sampledValues() -> [String: String] {
+                ["lower": String(lower), "upper": String(upper), "wall": wall.source,
+                    "priorLower": String(sample.lower), "priorWall": sample.wall.source]
+            }
+            guard lower >= sample.lower else {
+                replayClockDenied = true
+                recordReplayClockDenial("delivery-continuous-rollback", sampledValues())
+                throw EluRuntimeQueueError.sourceAuthorityUnavailable
+            }
+            guard let nanoseconds = wall.floorNanoseconds(since: sample.wall) else {
+                replayClockDenied = true
+                recordReplayClockDenial("delivery-wall-elapsed-unrepresentable", sampledValues())
+                throw EluRuntimeQueueError.sourceAuthorityUnavailable
+            }
+            guard continuousBudgetConverter(nanoseconds) != nil else {
+                replayClockDenied = true
+                recordReplayClockDenial("delivery-wall-ticks-unrepresentable", sampledValues().merging(["wallNanoseconds": String(nanoseconds)]) { _, new in new })
+                throw EluRuntimeQueueError.sourceAuthorityUnavailable
+            }
+            // Wall time may slew independently of the raw continuous clock.
+            // Rollback/representability stay checked here; the source gate checks
+            // absolute wall expiry and its original, nonextending continuous lease.
+        }
+        replayDeliveryClockSample = (wall, lower)
+    }
+    private func recordReplayClockDenial(_ reason: String, _ values: [String: String]) {
+        #if ELU_REPLAY_CLOCK_DIAGNOSTICS
+        guard let data = replayClockDiagnostic.encode(reason: reason, values: values) else { return }
+        // One bounded write to the original app's already-owned stderr. No path,
+        // retry, queue mutation, timestamp sampling, or authority is introduced.
+        data.withUnsafeBytes { raw in
+            if let base = raw.baseAddress { _ = Darwin.write(STDERR_FILENO, base, raw.count) }
+        }
+        #endif
+    }
+    private static func replayDeliveryWitness(_ fields: [String]) -> String {
+        var data = Data()
+        for field in fields {
+            let bytes = Data(field.utf8); var length = UInt32(bytes.count).bigEndian
+            withUnsafeBytes(of: &length) { data.append(contentsOf: $0) }; data.append(bytes)
+        }
+        return EluV1StrictCanonicalJSON.hash(data)
+    }
+
+    /// Storage inspection for a future coordinator; never a send authorization.
+    func replayInventory() throws -> EluV2ReplayQueueInventory {
+        let connection = try requireResources().connection
+        let totals = try EluRuntimeDatabase.replayTotals(connection)
+        return EluV2ReplayQueueInventory(replayCount: totals.count, replayBytes: totals.bytes,
+            aggregateCount: state.liveCount + totals.count, aggregateBytes: state.liveBytes + totals.bytes)
+    }
+
+    func storedReplayChunks(afterOrdinal: Int64 = -1, maximumCount: Int = 128, maximumBytes: Int = 5_242_880) throws -> [EluV2ReplayStoredChunk] {
+        guard (-1...Int64.max).contains(afterOrdinal), (1...128).contains(maximumCount), (1...5_242_880).contains(maximumBytes) else { throw EluRuntimeQueueError.invalidState }
+        guard EluSQLiteRuntimeSchema.hasReplay(databaseSchemaVersion) else { return [] }
+        let connection = try requireResources().connection
+        var rows: [EluV2ReplayStoredChunk] = []
+        var bytes = 0
+        for ordinal in try EluRuntimeDatabase.replayOrdinals(connection) where ordinal > afterOrdinal {
+            guard rows.count < maximumCount else { break }
+            let found = try EluRuntimeDatabase.readReplayChunks(connection, ordinal: ordinal)
+            guard found.count == 1, let row = found.first else { throw EluRuntimeQueueError.corruptStorage }
+            guard bytes + row.prepared.body.count <= maximumBytes else {
+                if rows.isEmpty { throw EluRuntimeQueueError.headRecordExceedsPeekLimit(Int64(row.prepared.body.count)) }
+                break
+            }
+            bytes += row.prepared.body.count; rows.append(row)
+        }
+        return rows
+    }
+
+    /// Expiry/consent privacy purge. A newer source cannot be purged by an old callback.
+    @discardableResult
+    func purgeReplay(expectedConfigWitness: EluV2ReplayConfigWitness, sourceWitness: EluV2ConfigAuthorityWitness?,
+        matching: (EluV2ReplayStoredChunk) -> Bool) throws -> Int {
+        replayDispatchFence.invalidate()
+        guard EluSQLiteRuntimeSchema.hasReplay(databaseSchemaVersion) else { return 0 }
+        return try replayStorageTransaction(validate: {
+            guard self.sourceIsCurrent(sourceWitness) else { throw EluRuntimeQueueError.sourceAuthorityUnavailable }
+        }) { connection, _ in
+            guard try EluRuntimeDatabase.readReplayState(connection).witness == expectedConfigWitness else { throw EluRuntimeQueueError.generationMismatch }
+            var removed = 0
+            try EluRuntimeDatabase.visitReplayChunks(connection) { row in
+                if matching(row) { try EluRuntimeDatabase.deleteReplayChunk(connection, ordinal: row.ordinal); removed += 1 }
+            }
+            return removed
+        }
+    }
+
+    @discardableResult
+    func expireReplay(expectedConfigWitness: EluV2ReplayConfigWitness) throws -> Int {
+        replayDispatchFence.invalidate()
+        guard EluSQLiteRuntimeSchema.hasReplay(databaseSchemaVersion) else { return 0 }
+        // Age alone can delete expired bytes after source withdrawal. It cannot
+        // apply a stale policy predicate or export any authority/body for sending.
+        return try replayClockTransaction { connection, _, now in
+            guard try EluRuntimeDatabase.readReplayState(connection).witness == expectedConfigWitness else { throw EluRuntimeQueueError.generationMismatch }
+            var removed = 0
+            try EluRuntimeDatabase.visitReplayChunks(connection) { row in
+                if Self.replayExpired(row, now: now) { try EluRuntimeDatabase.deleteReplayChunk(connection, ordinal: row.ordinal); removed += 1 }
+            }
+            return removed
+        }
+    }
+
+    private static func replayExpired(_ row: EluV2ReplayStoredChunk, now: EluV1Timestamp) -> Bool {
+        guard let age = now.floorNanoseconds(since: row.prepared.startedAt) else { return false }
+        return age >= 604_800_000_000_000
+    }
+
+    /// Clock uncertainty is replay-only and never evidence that sealed bytes expired.
+    /// The floor and denial latch survive reopen. A denied transaction rolls back all
+    /// row changes before a separate, state-only transaction records the denial.
+    private func replayClockTransaction<T>(validate: () throws -> Void = {},
+        _ body: (EluSQLiteConnection, EluStoredRuntimeState, EluV1Timestamp) throws -> T) throws -> T {
+        do {
+            return try replayStorageTransaction(validate: validate, beforeCommit: { connection in
+                _ = try self.observeReplayClock(connection)
+            }) { connection, disk in
+                let now = try observeReplayClock(connection)
+                // Check every stored age before any policy or age deletion. An
+                // unrepresentable age is uncertainty, including a future start.
+                try EluRuntimeDatabase.visitReplayChunks(connection) { row in
+                    guard now.floorNanoseconds(since: row.prepared.startedAt) != nil else {
+                        replayClockDenied = true
+                        recordReplayClockDenial("replay-stored-age-unrepresentable", ["wall": now.source, "rowStartedAt": row.prepared.startedAt.source])
+                        throw EluRuntimeQueueError.sourceAuthorityUnavailable
+                    }
+                }
+                return try body(connection, disk, now)
+            }
+        } catch {
+            let original = error
+            if replayClockDenied { replayDispatchFence.invalidate(terminal: true) }
+            if replayClockDenied, resources != nil {
+                // requireResources preserves the existing poison policy if the
+                // preceding commit/rollback had an ambiguous outcome.
+                try replayStorageTransaction { connection, _ in
+                    var ledger = try EluRuntimeDatabase.readReplayState(connection)
+                    ledger.clockDenied = true
+                    ledger.admissionEnabled = false
+                    if let floor = replayWallLatch, ledger.observedWall.map({ $0 < floor }) ?? true {
+                        ledger.observedWall = floor
+                    }
+                    try EluRuntimeDatabase.writeReplayState(connection, ledger)
+                }
+            }
+            throw original
+        }
+    }
+
+    private func observeReplayClock(_ connection: EluSQLiteConnection) throws -> EluV1Timestamp {
+        var ledger = try EluRuntimeDatabase.readReplayState(connection)
+        guard !replayClockDenied else {
+            replayClockDenied = true
+            recordReplayClockDenial("replay-already-clock-denied", [:])
+            throw EluRuntimeQueueError.sourceAuthorityUnavailable
+        }
+        guard !ledger.clockDenied else {
+            replayClockDenied = true
+            recordReplayClockDenial("replay-persisted-clock-denied", ledger.observedWall.map { ["persistedWall": $0.source] } ?? [:])
+            throw EluRuntimeQueueError.sourceAuthorityUnavailable
+        }
+        let sampledWall = clock()
+        guard let now = try? EluV1Timestamp.exactClock(sampledWall) else {
+            replayClockDenied = true
+            recordReplayClockDenial("replay-wall-invalid", ["rawWallReferenceSeconds": String(sampledWall.timeIntervalSinceReferenceDate)])
+            throw EluRuntimeQueueError.sourceAuthorityUnavailable
+        }
+        guard !(replayWallLatch.map { now < $0 } ?? false) else {
+            replayClockDenied = true
+            recordReplayClockDenial("replay-wall-memory-rollback", ["wall": now.source, "memoryWall": replayWallLatch!.source])
+            throw EluRuntimeQueueError.sourceAuthorityUnavailable
+        }
+        guard !(ledger.observedWall.map { now < $0 } ?? false) else {
+            replayClockDenied = true
+            recordReplayClockDenial("replay-wall-persisted-rollback", ["wall": now.source, "persistedWall": ledger.observedWall!.source])
+            throw EluRuntimeQueueError.sourceAuthorityUnavailable
+        }
+        replayWallLatch = now
+        ledger.observedWall = now
+        try EluRuntimeDatabase.writeReplayState(connection, ledger)
+        return now
+    }
+
+    private func replayStorageTransaction<T>(receiptConnection: EluSQLiteConnection? = nil, validate: () throws -> Void = {},
+        beforeCommit: (EluSQLiteConnection) throws -> Void = { _ in },
+        _ body: (EluSQLiteConnection, EluStoredRuntimeState) throws -> T) throws -> T {
+        let connection = try receiptConnection ?? requireResources().connection
+        var began = false
+        var commitAttempted = false
+        do {
+            try validate()
+            try faultInjector?.hit(.beforeBegin)
+            try connection.execute("BEGIN IMMEDIATE"); began = true
+            try faultInjector?.hit(.afterBegin)
+            let disk = try EluRuntimeDatabase.loadState(connection, validateQueue: false)
+            guard disk == state else { throw EluRuntimeQueueError.generationMismatch }
+            try faultInjector?.hit(.afterStateRead)
+            try validate()
+            let result = try body(connection, disk)
+            try faultInjector?.hit(.beforeCommit)
+            try beforeCommit(connection)
+            try validate()
+            commitAttempted = true
+            try connection.execute("COMMIT")
+            try faultInjector?.hit(.afterCommit)
+            return result
+        } catch {
+            if commitAttempted { poisonAndRelease(); throw EluRuntimeQueueError.ambiguousCommit }
+            if began {
+                do { try faultInjector?.hit(.beforeRollback); try connection.execute("ROLLBACK") }
+                catch { poisonAndRelease(); throw EluRuntimeQueueError.databaseUnavailable }
+            }
+            if case .faultInjected = error as? EluRuntimeQueueError { throw EluRuntimeQueueError.provenNotCommitted }
             throw mapOperationError(error)
         }
     }
@@ -2627,6 +4859,7 @@ actor EluSQLiteRuntimeQueue {
     }
 
     private func poisonFlagClock() {
+        flagScopeFence.invalidate(terminal: true)
         flagClockPoisoned = true
         flagConfigDeadline = nil
         flagCacheDeadline = nil
@@ -2822,9 +5055,11 @@ actor EluSQLiteRuntimeQueue {
         return deadline.isExpired(at: sample.continuous)
     }
 
-    func submitFlagConfig(_ configData: Data) -> EluV1FlagAuthorization {
+    func submitFlagConfig(_ configData: Data, sourceWitness: EluV2ConfigAuthorityWitness? = nil) -> EluV1FlagAuthorization {
+        flagScopeFence.invalidate()
+        guard sourceIsCurrent(sourceWitness, data: configData) else { return .restricted(.missing) }
         guard let manager = flagConfigManager,
-              databaseSchemaVersion == EluSQLiteRuntimeSchema.flagDatabaseVersion,
+              EluSQLiteRuntimeSchema.hasFlags(databaseSchemaVersion),
               resources != nil
         else {
             return .restricted(flagClockPoisoned ? .wallRollback : .storageUnavailable)
@@ -2897,6 +5132,9 @@ actor EluSQLiteRuntimeQueue {
                 return .restricted(.storageUnavailable)
             }
             try installFlagConfigDeadline(authority: authority, sample: sample)
+            guard consumeSource(sourceWitness, data: configData, apply: {
+                flagSourceWitness = sourceWitness
+            }) else { return .restricted(.missing) }
             return authorization
         } catch EluRuntimeQueueError.generationMismatch {
             manager.rejectPendingFlagConfig(candidate)
@@ -3107,6 +5345,7 @@ actor EluSQLiteRuntimeQueue {
         } catch EluRuntimeQueueError.databaseUnavailable {
             throw EluRuntimeQueueError.databaseUnavailable
         } catch {
+            flagScopeFence.invalidate(terminal: true)
             throw EluRuntimeQueueError.flagAuthorityTerminal
         }
     }
@@ -3129,6 +5368,8 @@ actor EluSQLiteRuntimeQueue {
         _ connection: EluSQLiteConnection,
         barrierGeneration: Int64
     ) throws {
+        flagCacheFence.invalidate()
+        flagRequestFence.invalidate()
         guard let row = try EluRuntimeDatabase.readFlagRequest(connection),
               row.storageSchema == 1,
               let request = try? EluV1FlagStorageCodec.decodeRequestState(row.metadataBody)
@@ -3199,6 +5440,7 @@ actor EluSQLiteRuntimeQueue {
             return
         }
         guard row.storageSchema == 1 else {
+            flagScopeFence.invalidate(terminal: true)
             throw EluRuntimeQueueError.unsupportedSchemaVersion(row.storageSchema)
         }
         do {
@@ -3208,8 +5450,10 @@ actor EluSQLiteRuntimeQueue {
         } catch EluRuntimeQueueError.databaseUnavailable {
             throw EluRuntimeQueueError.databaseUnavailable
         } catch let EluRuntimeQueueError.unsupportedSchemaVersion(version) {
+            flagScopeFence.invalidate(terminal: true)
             throw EluRuntimeQueueError.unsupportedSchemaVersion(version)
         } catch {
+            flagCacheFence.invalidate()
             // A fully identified current-v1 body may be handled as corrupt by
             // begin/read after authority precedence has been established.
         }
@@ -3255,11 +5499,22 @@ actor EluSQLiteRuntimeQueue {
         }
     }
 
-    func beginFlagReload(
+    func beginFlagReload(requestId: String, versions: EluVersionContext) -> EluV1FlagBeginResult {
+        flagRequestFence.invalidate()
+        let witness = flagSourceWitness
+        guard sourceIsCurrent(witness) else { return .restricted(.missing) }
+        let result = beginFlagReloadWithStoredAuthority(requestId: requestId, versions: versions)
+        guard consumeSource(witness, apply: {
+            if case let .begun(request) = result { flagRequestSource = (request.token, witness) }
+        }) else { return .restricted(.missing) }
+        return result
+    }
+
+    private func beginFlagReloadWithStoredAuthority(
         requestId: String,
         versions: EluVersionContext
     ) -> EluV1FlagBeginResult {
-        guard databaseSchemaVersion == EluSQLiteRuntimeSchema.flagDatabaseVersion,
+        guard EluSQLiteRuntimeSchema.hasFlags(databaseSchemaVersion),
               EluV1FlagEvaluationWitness.validIdentifier(requestId, maximum: 256),
               let manager = flagConfigManager
         else {
@@ -3451,10 +5706,18 @@ actor EluSQLiteRuntimeQueue {
     /// store transaction from begin: suspension between begin and send must
     /// not let config expiry, identity/context changes, or a newer begin slip
     /// past the durable barrier.
-    func authorizeFlagSend(
+    func authorizeFlagSend(token: EluV1FlagBeginToken) -> EluV1FlagSendResult {
+        let witness = flagRequestSource?.token == token ? flagRequestSource?.witness : nil
+        guard sourceIsCurrent(witness) else { return .stale }
+        let result = authorizeFlagSendWithStoredAuthority(token: token)
+        guard consumeSource(witness, apply: {}) else { return .stale }
+        return result
+    }
+
+    private func authorizeFlagSendWithStoredAuthority(
         token: EluV1FlagBeginToken
     ) -> EluV1FlagSendResult {
-        guard databaseSchemaVersion == EluSQLiteRuntimeSchema.flagDatabaseVersion,
+        guard EluSQLiteRuntimeSchema.hasFlags(databaseSchemaVersion),
               let manager = flagConfigManager
         else {
             return .restricted(flagClockPoisoned ? .wallRollback : .storageUnavailable)
@@ -3600,11 +5863,23 @@ actor EluSQLiteRuntimeQueue {
         }
     }
 
-    func commitFlagReload(
+    func commitFlagReload(token: EluV1FlagBeginToken, response: EluV1FlagResponse) -> EluV1FlagCommitResult {
+        flagCacheFence.invalidate()
+        let witness = flagRequestSource?.token == token ? flagRequestSource?.witness : nil
+        guard sourceIsCurrent(witness) else { return .stale }
+        let result = commitFlagReloadWithStoredAuthority(token: token, response: response, sourceWitness: witness)
+        guard consumeSource(witness, apply: {
+            if result == .updated { flagCacheSourceWitness = witness }
+        }) else { return .stale }
+        return result
+    }
+
+    private func commitFlagReloadWithStoredAuthority(
         token: EluV1FlagBeginToken,
-        response: EluV1FlagResponse
+        response: EluV1FlagResponse,
+        sourceWitness: EluV2ConfigAuthorityWitness?
     ) -> EluV1FlagCommitResult {
-        guard databaseSchemaVersion == EluSQLiteRuntimeSchema.flagDatabaseVersion,
+        guard EluSQLiteRuntimeSchema.hasFlags(databaseSchemaVersion),
               let manager = flagConfigManager
         else {
             return .restricted(flagClockPoisoned ? .wallRollback : .storageUnavailable)
@@ -3745,14 +6020,19 @@ actor EluSQLiteRuntimeQueue {
                 sample: sample,
                 force: true
             )
+            guard sourceIsCurrent(sourceWitness) else { throw EluRuntimeQueueError.sourceAuthorityUnavailable }
             try EluRuntimeDatabase.replaceFlagRequest(
                 connection,
                 state: committed,
                 cacheBody: body
             )
             try EluRuntimeDatabase.updateFlagAuthority(connection, value: authority)
+            guard sourceIsCurrent(sourceWitness) else { throw EluRuntimeQueueError.sourceAuthorityUnavailable }
             try connection.execute("COMMIT")
             return .updated
+        } catch EluRuntimeQueueError.sourceAuthorityUnavailable {
+            try? connection.execute("ROLLBACK")
+            return .stale
         } catch EluRuntimeQueueError.generationMismatch {
             try? connection.execute("ROLLBACK")
             return flagClockPoisoned ? .restricted(.wallRollback) : .stale
@@ -3766,6 +6046,67 @@ actor EluSQLiteRuntimeQueue {
             try? connection.execute("ROLLBACK")
             return .restricted(.storageUnavailable)
         }
+    }
+
+    func queuedEventDeliveryGuard(sourceWitness: EluV2ConfigAuthorityWitness?) -> EluV1QueuedEventGuard? {
+        guard !isPoisoned, resources != nil, !state.identity.optedOut, sourceIsCurrent(sourceWitness) else { return nil }
+        let fence = eventDeliveryFence
+        let token = fence.token()
+        let gate = configurationGate
+        return EluV1QueuedEventGuard {
+            fence.check(token) { gate?.isCurrent(sourceWitness) ?? true }
+        }
+    }
+
+    nonisolated var requiresBoundFlagTransport: Bool { configurationGate != nil }
+
+    /// Invalidates existing guards without representing queued work (for close).
+    nonisolated func invalidateFlagProjection() { flagScopeFence.invalidate() }
+
+    /// Facade/config acceptance closes projection and send-guard export until all
+    /// corresponding queued owner operations settle. A reread cannot bypass it.
+    nonisolated func beginFlagProjectionIntent() -> EluV1FlagProjectionIntent { flagScopeFence.beginIntent() }
+    nonisolated func finishFlagProjectionIntent(_ intent: EluV1FlagProjectionIntent) { flagScopeFence.finishIntent(intent) }
+
+    func flagSendGuard(token: EluV1FlagBeginToken) -> EluV1FlagSynchronousGuard? {
+        guard authorizeFlagSend(token: token) == .allowed,
+              let deadline = flagConfigDeadline,
+              let expiry = try? deadline.key.configExpiresAt.validated() else { return nil }
+        let source = flagRequestSource?.token == token ? flagRequestSource?.witness : nil
+        return makeFlagGuard(source: source, domain: flagRequestFence,
+            bounds: [(expiry, deadline.startedAt, deadline.budget)])
+    }
+
+    func readFlagProjection(versions: EluVersionContext) -> EluV1FlagCacheProjection? {
+        guard case let .hit(snapshot) = readFlagCache(versions: versions),
+              let config = flagConfigDeadline, let cache = flagCacheDeadline,
+              let configExpiry = try? config.key.configExpiresAt.validated(),
+              let cacheExpiry = try? cache.key.effectiveExpiresAt.validated(),
+              let guardValue = makeFlagGuard(source: flagCacheSourceWitness, domain: flagCacheFence,
+                  bounds: [(configExpiry, config.startedAt, config.budget), (cacheExpiry, cache.startedAt, cache.budget)])
+        else { return nil }
+        return EluV1FlagCacheProjection(snapshot: snapshot, authority: guardValue)
+    }
+
+    private func makeFlagGuard(
+        source: EluV2ConfigAuthorityWitness?, domain: EluV1FlagOwnerFence,
+        bounds: [(EluV1Timestamp, UInt64, UInt64)]
+    ) -> EluV1FlagSynchronousGuard? {
+        let scope = flagScopeFence
+        let scopeToken = scope.token()
+        let domainToken = domain.token()
+        let clock = clock
+        let continuousClock = continuousClock
+        let gate = configurationGate
+        let result = EluV1FlagSynchronousGuard {
+            scope.check(scopeToken, wallNow: clock, continuousNow: continuousClock) { wall, continuous in
+                domain.check(domainToken) {
+                    guard bounds.allSatisfy({ !($0.0.isAtOrBefore(wall)) && continuous >= $0.1 && continuous - $0.1 < $0.2 }) else { return false }
+                    return gate?.isCurrent(source) ?? true
+                }
+            }
+        }
+        return result.isCurrent() ? result : nil
     }
 
     func readFlagCache(versions: EluVersionContext) -> EluV1FlagCacheReadResult {
@@ -3783,7 +6124,26 @@ actor EluSQLiteRuntimeQueue {
         versions: EluVersionContext,
         cleanupToken: EluV1FlagBeginToken?
     ) -> EluV1FlagCacheReadResult {
-        guard databaseSchemaVersion == EluSQLiteRuntimeSchema.flagDatabaseVersion,
+        let witness = flagSourceWitness
+        guard sourceIsCurrent(witness) else { return .restricted(.missing) }
+        let result = readFlagCacheWithStoredAuthority(versions: versions, cleanupToken: cleanupToken)
+        switch result {
+        case .terminal: flagScopeFence.invalidate(terminal: true)
+        case .restricted: flagCacheFence.invalidate()
+        default: break
+        }
+        guard consumeSource(witness, apply: {}) else { return .restricted(.missing) }
+        if case .hit = result, !consumeSource(flagCacheSourceWitness, apply: {}) {
+            return .restricted(.missing)
+        }
+        return result
+    }
+
+    private func readFlagCacheWithStoredAuthority(
+        versions: EluVersionContext,
+        cleanupToken: EluV1FlagBeginToken?
+    ) -> EluV1FlagCacheReadResult {
+        guard EluSQLiteRuntimeSchema.hasFlags(databaseSchemaVersion),
               let manager = flagConfigManager
         else {
             return .restricted(flagClockPoisoned ? .wallRollback : .storageUnavailable)
@@ -3957,6 +6317,14 @@ actor EluSQLiteRuntimeQueue {
     }
 
     func flagWitnessFingerprint(versions: EluVersionContext) -> String? {
+        let witness = flagSourceWitness
+        guard sourceIsCurrent(witness) else { return nil }
+        let result = flagWitnessFingerprintWithStoredAuthority(versions: versions)
+        guard consumeSource(witness, apply: {}) else { return nil }
+        return result
+    }
+
+    private func flagWitnessFingerprintWithStoredAuthority(versions: EluVersionContext) -> String? {
         guard let manager = flagConfigManager else {
             return nil
         }
@@ -4059,6 +6427,8 @@ actor EluSQLiteRuntimeQueue {
     private func expireFlagCacheState(
         _ request: inout EluV1FlagRequestCacheState
     ) throws {
+        flagCacheFence.invalidate()
+        flagRequestFence.invalidate()
         flagCacheDeadline = nil
         guard request.requestGeneration < 9_007_199_254_740_991 else {
             // Begin is the sole operation allowed to rotate the store epoch.
@@ -4159,8 +6529,11 @@ actor EluSQLiteRuntimeQueue {
     /// non-transferable executable authority or terminal latch.
     func submitCaptureAuthority(
         configData: Data,
-        effectivePrivacyStateData: Data?
+        effectivePrivacyStateData: Data?,
+        sourceWitness: EluV2ConfigAuthorityWitness? = nil
     ) -> EluV1CaptureAuthorityUpdateResult {
+        nativeScope.invalidate()
+        guard sourceIsCurrent(sourceWitness, data: configData) else { return sourceUnavailableCaptureResult() }
         // Lease time starts before any wall-clock read, decoding, hashing, or
         // policy validation. Validation latency must consume the lease.
         let monotonicOrigin = continuousClock()
@@ -4418,7 +6791,10 @@ actor EluSQLiteRuntimeQueue {
             idleTimeoutSeconds: resolution.sessionIdleTimeoutSeconds,
             maximumDurationSeconds: resolution.sessionMaximumDurationSeconds
         )
-        captureAuthority = .authorized(authority)
+        guard consumeSource(sourceWitness, data: configData, apply: {
+            captureSourceWitness = sourceWitness
+            captureAuthority = .authorized(authority)
+        }) else { return sourceUnavailableCaptureResult() }
         return .activated(authority)
     }
 
@@ -4427,19 +6803,23 @@ actor EluSQLiteRuntimeQueue {
     /// witness can never lag behind a concurrent identity change.
     func submitCaptureAuthority(
         configData: Data,
+        sourceWitness: EluV2ConfigAuthorityWitness? = nil,
         projectingPrivacyState project: @Sendable (EluRuntimeQueueSnapshot) -> Data?
     ) -> EluV1CaptureAuthorityUpdateResult {
         let witness = try? snapshot()
         return submitCaptureAuthority(
             configData: configData,
-            effectivePrivacyStateData: witness.flatMap { project($0) }
+            effectivePrivacyStateData: witness.flatMap { project($0) },
+            sourceWitness: sourceWitness
         )
     }
 
     /// Creates and consumes admission entirely inside this actor operation.
     /// No authority token or detached resolution is returned to the caller.
-    func capture(_ command: EluV1CaptureCommand) -> EluV1CaptureResult {
+    func capture(_ command: EluV1CaptureCommand, admissionGuard: (@Sendable () -> Bool)? = nil) -> EluV1CaptureResult {
         let before = state.snapshot
+        let sourceWitness = captureSourceWitness
+        guard sourceIsCurrent(sourceWitness), admissionGuard?() ?? true else { return .rejected(.authorityAbsent, snapshot: before) }
         // Diagnostic events are runtime-internal and never admitted through a
         // capture command.
         guard command.kind != .diagnostic,
@@ -4492,6 +6872,7 @@ actor EluSQLiteRuntimeQueue {
                     drafts: [.event(prepared.draft)],
                     surfaceProvenNotCommitted: true,
                     prewriteValidation: { diskState in
+                        guard self.sourceIsCurrent(sourceWitness), admissionGuard?() ?? true else { throw EluRuntimeQueueError.sourceAuthorityUnavailable }
                         guard self.authorityWitnessMatches(authority, diskState: diskState) else {
                             throw EluRuntimeQueueError.generationMismatch
                         }
@@ -4502,13 +6883,19 @@ actor EluSQLiteRuntimeQueue {
                         ) else {
                             throw EluRuntimeQueueError.captureAuthorityExpiredBeforeWrite
                         }
+                    },
+                    precommitValidation: {
+                        guard self.sourceIsCurrent(sourceWitness), admissionGuard?() ?? true else { throw EluRuntimeQueueError.sourceAuthorityUnavailable }
                     }
                 )
                 guard let record = result.records.first else {
                     return .rejected(.invalidEvent, snapshot: before)
                 }
                 return .accepted(record, snapshot: result.snapshot)
+            } catch EluRuntimeQueueError.sourceAuthorityUnavailable {
+                return .rejected(.authorityAbsent, snapshot: state.snapshot)
             } catch EluRuntimeQueueError.provenNotCommitted where attempt == 0 {
+                guard sourceIsCurrent(sourceWitness), admissionGuard?() ?? true else { return .rejected(.authorityAbsent, snapshot: state.snapshot) }
                 guard !isPoisoned, resources != nil else {
                     return .rejected(
                         .storageProvenNotCommitted,
@@ -4725,7 +7112,9 @@ actor EluSQLiteRuntimeQueue {
     func applyOwnedMutation(
         _ transition: EluRuntimeMutationTransition,
         versions: EluVersionContext,
-        expectedGeneration: Int64
+        expectedGeneration: Int64,
+        allowWire: Bool = true,
+        wireGuard: @escaping @Sendable () -> Bool = { true }
     ) throws -> EluRuntimeQueueSnapshot {
         guard ownerNamespaceHash != nil else {
             throw EluRuntimeQueueError.invalidState
@@ -4747,12 +7136,33 @@ actor EluSQLiteRuntimeQueue {
         } catch {
             throw mapOperationError(error)
         }
-        return try commitPrepared(
-            expectedGeneration: expectedGeneration,
-            identity: prepared.identity,
-            flagContext: prepared.flagContext,
-            drafts: prepared.drafts
-        ).snapshot
+        let witness = captureSourceWitness
+        let admitsWire = allowWire && wireGuard() && (configurationGate == nil || freshMutationSourceIsCurrent(witness, diskState: state))
+        do {
+            return try commitPrepared(
+                expectedGeneration: expectedGeneration,
+                identity: prepared.identity,
+                flagContext: prepared.flagContext,
+                drafts: admitsWire ? prepared.drafts : [],
+                prewriteValidation: { diskState in
+                    if admitsWire && !prepared.drafts.isEmpty &&
+                        (!wireGuard() || (self.configurationGate != nil &&
+                        !self.freshMutationSourceIsCurrent(witness, diskState: diskState))) {
+                        throw EluRuntimeQueueError.sourceAuthorityUnavailable
+                    }
+                },
+                precommitValidation: {
+                    if admitsWire && !prepared.drafts.isEmpty && (!wireGuard() || !self.sourceIsCurrent(witness)) {
+                        throw EluRuntimeQueueError.sourceAuthorityUnavailable
+                    }
+                }
+            ).snapshot
+        } catch EluRuntimeQueueError.sourceAuthorityUnavailable {
+            // The attempted wire transaction rolled back before COMMIT. Preserve
+            // the local identity/context transition without emitting stale activity.
+            return try commitPrepared(expectedGeneration: expectedGeneration,
+                identity: prepared.identity, flagContext: prepared.flagContext, drafts: []).snapshot
+        }
     }
 
     /// Applies flag evaluation context through the owner runtime so the
@@ -4910,8 +7320,25 @@ actor EluSQLiteRuntimeQueue {
         flagContext: EluPersistedFlagContext,
         drafts: [EluPreparedRecordDraft],
         surfaceProvenNotCommitted: Bool = false,
-        prewriteValidation: ((EluStoredRuntimeState) throws -> Void)? = nil
+        prewriteValidation: ((EluStoredRuntimeState) throws -> Void)? = nil,
+        precommitValidation: (() throws -> Void)? = nil
     ) throws -> (records: [EluQueuedRecord], snapshot: EluRuntimeQueueSnapshot) {
+        let sameNativeSessionID = identity.session.map { next in
+            state.identity.session.map { EluNativeReplaySessionState.same(next.id, $0.id) } ?? false
+        } ?? (state.identity.session == nil)
+        if identity.revision != state.identity.revision || identity.contextRevision != state.identity.contextRevision ||
+            identity.optedOut != state.identity.optedOut || !sameNativeSessionID ||
+            identity.session?.startedAt != state.identity.session?.startedAt ||
+            identity.session?.lifecycle != state.identity.session?.lifecycle ||
+            identity.session?.backgroundedAt != state.identity.session?.backgroundedAt {
+            nativeScope.invalidate()
+        }
+        if identity.revision != state.identity.revision || identity.contextRevision != state.identity.contextRevision ||
+            identity.anonymousId != state.identity.anonymousId || identity.userId != state.identity.userId ||
+            identity.groups != state.identity.groups || identity.optedOut != state.identity.optedOut || flagContext != state.flagContext {
+            flagScopeFence.invalidate()
+        }
+        if identity.optedOut != state.identity.optedOut { eventDeliveryFence.invalidate() }
         let resources = try requireResources()
         let canonicalIdentity: EluIdentityState
         let canonicalFlagContext: EluPersistedFlagContext
@@ -4959,9 +7386,17 @@ actor EluSQLiteRuntimeQueue {
             guard Int64(storedRecords.count) <= Int64.max - diskState.liveCount else {
                 throw EluRuntimeQueueError.counterExhausted
             }
+            if canonicalIdentity.optedOut, EluSQLiteRuntimeSchema.hasReplay(databaseSchemaVersion) {
+                try connection.execute("DELETE FROM replay_chunks")
+                if EluSQLiteRuntimeSchema.hasReplayDelivery(databaseSchemaVersion) {
+                    try connection.execute("DELETE FROM replay_delivery WHERE ordinal >= 0")
+                }
+                try connection.execute("UPDATE replay_state SET admission_enabled=0 WHERE singleton=1")
+            }
+            let replayTotals = try EluRuntimeDatabase.replayTotals(connection)
             let nextCount = diskState.liveCount + Int64(storedRecords.count)
             if !storedRecords.isEmpty,
-               nextCount > Int64(limits.maximumCount)
+               nextCount + replayTotals.count > Int64(limits.maximumCount)
             {
                 throw EluRuntimeQueueError.queueCountLimitExceeded
             }
@@ -4969,8 +7404,10 @@ actor EluSQLiteRuntimeQueue {
                 throw EluRuntimeQueueError.counterExhausted
             }
             let nextBytes = diskState.liveBytes + addedBytes
+            let replayQueueLimit = EluSQLiteRuntimeSchema.hasReplay(databaseSchemaVersion)
+                ? try EluRuntimeDatabase.readReplayState(connection).maximumQueueBytes : Int64(limits.maximumBytes)
             if !storedRecords.isEmpty,
-               nextBytes > Int64(limits.maximumBytes)
+               nextBytes + replayTotals.bytes > min(Int64(limits.maximumBytes), replayQueueLimit)
             {
                 throw EluRuntimeQueueError.queueByteLimitExceeded
             }
@@ -5006,7 +7443,7 @@ actor EluSQLiteRuntimeQueue {
                 || diskState.identity.groups != canonicalIdentity.groups
                 || diskState.identity.optedOut != canonicalIdentity.optedOut
                 || diskState.flagContext != canonicalFlagContext
-            if databaseSchemaVersion == EluSQLiteRuntimeSchema.flagDatabaseVersion,
+            if EluSQLiteRuntimeSchema.hasFlags(databaseSchemaVersion),
                flagWitnessChanged
             {
                 do {
@@ -5036,6 +7473,7 @@ actor EluSQLiteRuntimeQueue {
                 to: nextState
             )
             try faultInjector?.hit(.beforeCommit)
+            try precommitValidation?()
             commitAttempted = true
             do {
                 try connection.execute("COMMIT")
@@ -5051,6 +7489,7 @@ actor EluSQLiteRuntimeQueue {
             }
 
             state = nextState
+            nativeScope.publishSession(nextState.identity.session)
             runMaintenance(checkpoint: true, vacuum: false)
             return (storedRecords.map(\.record), nextState.snapshot)
         } catch {
@@ -5151,8 +7590,9 @@ actor EluSQLiteRuntimeQueue {
         if references.isEmpty {
             return try snapshot()
         }
-        try validateAcknowledgementReferences(references, streamId: state.streamId)
-
+        if !EluSQLiteRuntimeSchema.hasLegacyEvents(databaseSchemaVersion) {
+            try validateAcknowledgementReferences(references, streamId: state.streamId, legacyRecords: [:])
+        }
         let resources = try requireResources()
         let connection = resources.connection
         var commitAttempted = false
@@ -5168,6 +7608,10 @@ actor EluSQLiteRuntimeQueue {
             }
             try faultInjector?.hit(.afterStateRead)
 
+            if EluSQLiteRuntimeSchema.hasLegacyEvents(databaseSchemaVersion) {
+                try validateAcknowledgementReferences(references, streamId: diskState.streamId,
+                    legacyRecords: EluRuntimeDatabase.legacyEventRecords(connection))
+            }
             if try acknowledgementIsIdempotent(references, state: diskState) {
                 try connection.execute("COMMIT")
                 return state.snapshot
@@ -5256,6 +7700,7 @@ actor EluSQLiteRuntimeQueue {
             }
 
             state = nextState
+            nativeScope.publishSession(nextState.identity.session)
             runMaintenance(checkpoint: true, vacuum: true)
             return nextState.snapshot
         } catch {
@@ -5272,6 +7717,22 @@ actor EluSQLiteRuntimeQueue {
     }
 
     func close() {
+        nativeCaptureEnrollment?.invalidateIntake()
+        nativeScope.invalidate(terminal: true)
+        flagScopeFence.invalidate(terminal: true)
+        eventDeliveryFence.invalidate(terminal: true)
+        if !isPoisoned {
+            do { try persistNativeReplayClockDenial() }
+            catch { /* Failed denial persistence retains installation occupancy. */ }
+        }
+        if !isPoisoned, replayDispatch != nil {
+            replayLogicallyClosed = true
+            replayReceiptResources = resources
+        }
+        if !isPoisoned, nativeCaptureEnrollment != nil {
+            nativeCaptureLogicallyClosed = true
+            nativeCaptureResources = resources
+        }
         isPoisoned = true
         captureAuthority = .absent
         resources?.close()
@@ -6043,17 +8504,20 @@ actor EluSQLiteRuntimeQueue {
 
     private func validateAcknowledgementReferences(
         _ references: [EluQueueAcknowledgementReference],
-        streamId: String
+        streamId: String,
+        legacyRecords: [Int64: EluQueuedRecord]
     ) throws {
         var previous: Int64?
         for reference in references {
+            let idIsValid: Bool
+            if let original = legacyRecords[reference.sequence] {
+                idIsValid = reference.kind == original.kind && reference.recordId == original.recordId
+            } else {
+                idIsValid = reference.recordId == EluRuntimeIdentifier.recordId(
+                    kind: reference.kind, streamId: streamId, sequence: reference.sequence)
+            }
             guard reference.sequence >= 0,
-                  reference.streamId == streamId,
-                  reference.recordId == EluRuntimeIdentifier.recordId(
-                      kind: reference.kind,
-                      streamId: streamId,
-                      sequence: reference.sequence
-                  )
+                  reference.streamId == streamId, idIsValid
             else {
                 throw EluRuntimeQueueError.acknowledgementMismatch
             }
@@ -6127,9 +8591,20 @@ actor EluSQLiteRuntimeQueue {
     }
 
     private func poisonAndRelease() {
+        nativeScope.invalidate(terminal: true)
+        flagScopeFence.invalidate(terminal: true)
+        eventDeliveryFence.invalidate(terminal: true)
         isPoisoned = true
-        resources?.close()
+        replayLogicallyClosed = false
+        nativeCaptureLogicallyClosed = false
+        nativeCaptureEnrollment?.quarantine()
+        let held = resources ?? replayReceiptResources ?? nativeCaptureResources
+        if nativeDenialPersistenceInProgress { held?.quarantineNativeClockDenial() }
+        held?.quarantineReplay()
+        held?.close()
         resources = nil
+        replayReceiptResources = nil
+        nativeCaptureResources = nil
     }
 
     private func mapOperationError(_ error: Error) -> EluRuntimeQueueError {
