@@ -11,10 +11,13 @@ struct EluCallbackRegistry {
         callbacks.append(callback)
     }
 
-    func dispatch(on queue: DispatchQueue) {
+    func dispatch(on queue: DispatchQueue, ifCurrent: @escaping @Sendable () -> Bool = { true }) {
         let snapshot = callbacks
         queue.async {
-            snapshot.forEach { $0() }
+            for callback in snapshot {
+                guard ifCurrent() else { return }
+                callback()
+            }
         }
     }
 }

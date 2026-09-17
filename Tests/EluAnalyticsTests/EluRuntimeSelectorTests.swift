@@ -2,10 +2,8 @@ import Foundation
 import XCTest
 @testable import EluAnalytics
 
-/// The runtime selector decides, once per run, which analytics runtime the
-/// facade drives. These cases prove that the selection reaches exactly one
-/// runtime, that every facade method follows it, and that the other runtime is
-/// never built and never called.
+/// The provider-free facade constructs one owned runtime and retains its
+/// original ordered initialization, closed readiness and callback semantics.
 final class EluRuntimeSelectorTests: XCTestCase {
     private struct SelectorFailure: Error {}
 
@@ -13,27 +11,28 @@ final class EluRuntimeSelectorTests: XCTestCase {
     // always starts a config request, and no test here wants one to leave.
     private let inertConfigHost = URL(string: "http://127.0.0.1:9")!
 
-    func testSelectorDefaultsToTheProviderRuntime() {
-        XCTAssertEqual(EluSetupOptions().runtimeSelection, .provider)
+    func testSelectorDefaultsToTheOwnedRuntime() {
+        XCTAssertEqual(EluSetupOptions().runtimeSelection, .standalone)
         XCTAssertEqual(
             EluSetupOptions(configHost: inertConfigHost).runtimeSelection,
-            .provider
+            .standalone
         )
     }
 
-    func testSelectorOffSendsEveryFacadeMethodToTheProviderAndBuildsNoOwnedRuntime() throws {
+    func testRepeatedSetupKeepsTheOriginalBackendAndBufferedCalls() throws {
         let factory = SelectorSpy()
-        let core = try runningCore(selection: .provider, factory: factory)
-
-        exerciseEveryMethod(on: core)
-
-        XCTAssertEqual(factory.requestedSelections(), [.provider])
-        let backend = try XCTUnwrap(factory.backend(for: .provider))
-        XCTAssertNil(factory.backend(for: .standalone))
-        XCTAssertEqual(backend.recordedCalls(), Self.everyMethodInCallOrder)
+        let core = EluCore(backendFactory: factory.factory)
+        core.setup(siteKey: uniqueSiteKey(), options: EluSetupOptions(configHost: inertConfigHost))
+        core.dispatch(.capture(event: "original", properties: nil))
+        let original = try XCTUnwrap(core.backendForTesting())
+        core.setup(siteKey: uniqueSiteKey(), options: EluSetupOptions(configHost: inertConfigHost))
+        XCTAssertTrue(core.backendForTesting() === original)
+        XCTAssertEqual(factory.requestedSelections(), [.standalone])
+        try activate(core)
+        XCTAssertEqual(factory.backend(for: .standalone)?.recordedCalls(), ["capture(original)", "activate"])
     }
 
-    func testSelectorOnSendsEveryFacadeMethodToTheOwnedRuntimeAndBuildsNoProvider() throws {
+    func testEveryFacadeMethodReachesTheOwnedRuntimeInOrder() throws {
         let factory = SelectorSpy()
         let core = try runningCore(selection: .standalone, factory: factory)
 
@@ -41,7 +40,6 @@ final class EluRuntimeSelectorTests: XCTestCase {
 
         XCTAssertEqual(factory.requestedSelections(), [.standalone])
         let backend = try XCTUnwrap(factory.backend(for: .standalone))
-        XCTAssertNil(factory.backend(for: .provider))
         XCTAssertEqual(backend.recordedCalls(), Self.everyMethodInCallOrder)
     }
 
@@ -52,21 +50,26 @@ final class EluRuntimeSelectorTests: XCTestCase {
         )
         XCTAssertTrue(backend is EluStandaloneFacadeRuntime)
         XCTAssertEqual(backend.selection, .standalone)
-        // The owned runtime records no replay frames, so the replay budget has
-        // nothing to drive.
+        // Native capture uses its owned authority/occupancy lane; this legacy
+        // unguarded replay-control seam is never supplied.
         XCTAssertNil(backend.replayControl)
         backend.shutDown()
     }
 
-    func testDefaultFactoryBuildsTheProviderRuntimeForTheProviderSelection() throws {
-        let context = try context(siteKey: "elu_pk_selector_provider", replayNewUsersOnly: true)
-        let backend = try XCTUnwrap(
-            EluCore.defaultBackendFactory.make(.provider, context)
-        )
-        XCTAssertTrue(backend is EluProviderRuntime)
-        XCTAssertEqual(backend.selection, .provider)
-        XCTAssertNotNil(backend.replayControl)
-        backend.shutDown()
+    func testInvalidOriginalReadinessKeepsBufferClosedAndCurrentReadinessActivatesOnce() throws {
+        let factory = SelectorSpy()
+        let core = EluCore(backendFactory: factory.factory)
+        core.setup(siteKey: uniqueSiteKey(), options: EluSetupOptions(configHost: inertConfigHost))
+        core.dispatch(.identify(distinctId: "held", userProperties: nil))
+        let backend = try XCTUnwrap(core.backendForTesting() as? SelectorBackend)
+        backend.announceConfigurationReady(ifCurrent: { false })
+        drain(core)
+        XCTAssertEqual(backend.recordedCalls(), [])
+        XCTAssertNil(core.distinctId())
+        backend.announceConfigurationReady()
+        backend.announceConfigurationReady()
+        drain(core)
+        XCTAssertEqual(backend.recordedCalls(), ["identify(held)", "activate"])
     }
 
     func testPreConfigCallsReplayInCallOrderOnceTheRuntimeIsSelected() throws {
@@ -81,9 +84,11 @@ final class EluRuntimeSelectorTests: XCTestCase {
         core.dispatch(.identify(distinctId: "user-1", userProperties: nil))
         core.reset()
         core.dispatch(.capture(event: "before-two", properties: nil))
-        // Nothing may be built or called while the decision is outstanding.
-        XCTAssertNil(core.backendForTesting())
-        XCTAssertTrue(factory.requestedSelections().isEmpty)
+        // The owned source can start, but calls remain in the capped initial
+        // buffer until its first original, live document settles.
+        XCTAssertNotNil(core.backendForTesting())
+        XCTAssertEqual(factory.requestedSelections(), [.standalone])
+        XCTAssertEqual(factory.backend(for: .standalone)?.recordedCalls(), [])
 
         try activate(core)
         let backend = try XCTUnwrap(factory.backend(for: .standalone))
@@ -122,23 +127,20 @@ final class EluRuntimeSelectorTests: XCTestCase {
         XCTAssertEqual(replayed.last, "capture(event-\(total - 1))")
     }
 
-    func testDisabledConfigDropsTheBufferAndBuildsNoRuntime() throws {
+    func testPendingOwnedRuntimeDoesNotExposeGettersOrFlushBeforeReadiness() throws {
         let factory = SelectorSpy()
         let core = EluCore(backendFactory: factory.factory)
-        core.setup(
-            siteKey: uniqueSiteKey(),
-            options: options(selection: .standalone)
-        )
-        core.dispatch(.capture(event: "held", properties: nil))
-
-        let disabled = try TestConfigFactory.make(enabled: false)
-        core.deliverConfigForTesting(disabled, document: Data("{\"v\":1,\"enabled\":false}".utf8))
+        core.setup(siteKey: uniqueSiteKey(), options: EluSetupOptions(configHost: inertConfigHost))
+        let backend = try XCTUnwrap(core.backendForTesting() as? SelectorBackend)
+        backend.stubbedDistinctId = "not-yet-published"
+        backend.stubbedFlags = ["variant": "hidden"]
+        XCTAssertNil(core.distinctId())
+        XCTAssertNil(core.getFeatureFlag("variant"))
+        XCTAssertNil(core.getFeatureFlagPayload("variant"))
+        XCTAssertFalse(core.isFeatureEnabled("variant"))
+        core.flush()
         drain(core)
-
-        XCTAssertNil(core.backendForTesting())
-        XCTAssertTrue(factory.requestedSelections().isEmpty)
-        XCTAssertNil(core.getFeatureFlag("any"))
-        XCTAssertFalse(core.isFeatureEnabled("any"))
+        XCTAssertEqual(backend.recordedCalls(), [])
     }
 
     func testARuntimeThatCannotBeCreatedLeavesTheFacadeDisabled() throws {
@@ -161,33 +163,16 @@ final class EluRuntimeSelectorTests: XCTestCase {
         drain(core)
     }
 
-    func testGettersFollowTheSelectedRuntimeAndReportDefaultsWhileDisabled() throws {
+    func testOwnedGettersFollowTheOriginalReadyBackend() throws {
         let factory = SelectorSpy()
         let core = try runningCore(selection: .standalone, factory: factory)
         let backend = try XCTUnwrap(factory.backend(for: .standalone))
         backend.stubbedDistinctId = "anon_owned"
         backend.stubbedFlags = ["variant": "variant-a"]
-
         XCTAssertEqual(core.distinctId(), "anon_owned")
         XCTAssertEqual(core.getFeatureFlag("variant") as? String, "variant-a")
         XCTAssertTrue(core.isFeatureEnabled("variant"))
         XCTAssertFalse(core.isFeatureEnabled("absent"))
-
-        // A kill switch leaves the facade safe and silent: getters report
-        // their documented defaults and no further call reaches the runtime.
-        let killed = try TestConfigFactory.make(enabled: false)
-        core.deliverConfigForTesting(killed, document: Data("{\"v\":1,\"enabled\":false}".utf8))
-        drain(core)
-
-        XCTAssertEqual(backend.shutDownCount(), 1)
-        XCTAssertNil(core.distinctId())
-        XCTAssertNil(core.getFeatureFlag("variant"))
-        XCTAssertFalse(core.isFeatureEnabled("variant"))
-
-        let before = backend.recordedCalls().count
-        core.dispatch(.capture(event: "after-kill", properties: nil))
-        drain(core)
-        XCTAssertEqual(backend.recordedCalls().count, before)
     }
 
     func testFlagCallbacksRunInRegistrationOrderOnTheMainQueue() throws {
@@ -306,8 +291,7 @@ final class EluRuntimeSelectorTests: XCTestCase {
     /// `blockEu` is off so the region policy cannot change the outcome with
     /// the machine running the test.
     private func activate(_ core: EluCore) throws {
-        let config = try TestConfigFactory.make(blockEu: false)
-        core.deliverConfigForTesting(config, document: Self.enabledDocument)
+        (core.backendForTesting() as? SelectorBackend)?.announceConfigurationReady()
         drain(core)
     }
 
@@ -349,7 +333,8 @@ final class EluRuntimeSelectorTests: XCTestCase {
             config: try EluRemoteConfig.parse(Data(json.utf8)),
             configDocument: Data(json.utf8),
             isNewUser: false,
-            flagsDidLoad: {}
+            flagsDidLoad: {},
+            configHost: inertConfigHost
         )
     }
 
@@ -357,11 +342,7 @@ final class EluRuntimeSelectorTests: XCTestCase {
         "elu_pk_selector_" + UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
     }
 
-    private static let enabledDocument = Data(
-        """
-        {"v":1,"enabled":true,"publicToken":"fixture-token","host":"https://ingest.example.test"}
-        """.utf8
-    )
+
 }
 
 /// Records which selection the facade asked for and every call the runtime it
@@ -378,7 +359,8 @@ final class SelectorSpy: @unchecked Sendable {
             requested.append(selection)
             let backend = SelectorBackend(
                 selection: selection,
-                flagsDidLoad: context.flagsDidLoad
+                flagsDidLoad: context.flagsDidLoad,
+                configurationReady: context.initialConfigurationReady
             )
             backends[selection] = backend
             lock.unlock()
@@ -406,15 +388,22 @@ final class SelectorBackend: EluRuntimeBackend, @unchecked Sendable {
 
     private let lock = NSLock()
     private let flagsDidLoad: () -> Void
+    private let configurationReady: (@escaping @Sendable () -> Bool) -> Void
     private var calls: [String] = []
     private var shutDowns = 0
     private var loaded = false
     private var distinctIdValue: String?
     private var flags: [String: String] = [:]
 
-    init(selection: EluRuntimeSelection, flagsDidLoad: @escaping () -> Void) {
+    init(selection: EluRuntimeSelection, flagsDidLoad: @escaping () -> Void,
+         configurationReady: @escaping (@escaping @Sendable () -> Bool) -> Void = { _ in }) {
         self.selection = selection
         self.flagsDidLoad = flagsDidLoad
+        self.configurationReady = configurationReady
+    }
+
+    func announceConfigurationReady(ifCurrent: @escaping @Sendable () -> Bool = { true }) {
+        configurationReady(ifCurrent)
     }
 
     var flagsAreLoaded: Bool {

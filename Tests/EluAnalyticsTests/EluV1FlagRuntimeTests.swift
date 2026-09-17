@@ -2364,6 +2364,34 @@ final class EluV1FlagRuntimeTests: XCTestCase {
         }
     }
 
+    func testCloseReleasesLogicalWaitersWithoutRestartingNonCooperativeTransport() async throws {
+        try await withTemporaryDirectory { root in
+            let clock = FlagTestClock(self.initialWall)
+            let runtime = try await self.makeRuntime(root: root, clock: clock)
+            let transport = GatedFlagTransport()
+            let client = try await EluV1FlagClient.make(runtime: runtime, transport: transport, versions: try self.versions())
+            _ = await client.applyConfig(self.fixture("config-enabled.json"))
+            let active = Task { await client.reload() }
+            while await transport.callCount() != 1 { await Task.yield() }
+            await client.close()
+            let closedResult = await active.value
+            XCTAssertEqual(closedResult, .stale)
+            let reload = await client.reload()
+            XCTAssertEqual(reload, .stale)
+            let apply = await client.applyConfig(self.fixture("config-enabled.json"))
+            XCTAssertEqual(apply, .restricted(.missing))
+            let projection = await client.readProjection()
+            XCTAssertNil(projection)
+            let before = await transport.callCount()
+            XCTAssertEqual(before, 1)
+            await transport.completeCurrent()
+            for _ in 0 ..< 20 { await Task.yield() }
+            let after = await transport.callCount()
+            XCTAssertEqual(after, 1)
+            await runtime.close()
+        }
+    }
+
     func testCorruptGenerationRotatesEpochAndOldABATokenCannotCommit() async throws {
         try await withTemporaryDirectory { root in
             let clock = FlagTestClock(self.initialWall)
