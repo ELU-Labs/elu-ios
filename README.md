@@ -5,8 +5,8 @@ configuration — behavior (privacy controls, kill switches, session replay)
 is managed from your ELU dashboard and delivered as remote config.
 
 This source checkout uses the ELU-owned analytics runtime and has no external
-Swift package dependencies. Its standalone release is still undergoing
-qualification. The published 0.1.0 release uses the previous runtime; changing
+Swift package dependencies. Version 0.2.0 is still undergoing release
+qualification and is not yet published. The published 0.1.0 release uses the previous runtime; changing
 this checkout does not change that release. Application code continues to use
 `Elu.*` with an ELU site key.
 
@@ -23,14 +23,13 @@ add to your `Package.swift`:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/ELU-Labs/elu-ios.git", exact: "0.1.0"),
+    .package(url: "https://github.com/ELU-Labs/elu-ios.git", exact: "0.2.0"),
 ]
 ```
 
-Then add `EluAnalytics` to your target's dependencies. The version above refers
-to the previous published release. For development against this unreleased
-checkout, add it as a local Swift package instead; a qualified standalone
-version has not yet been published.
+Then add `EluAnalytics` to your target's dependencies. The version above is the
+next release and becomes available after publication. Until then, use this
+checkout as a local Swift package for development.
 
 ## Setup
 

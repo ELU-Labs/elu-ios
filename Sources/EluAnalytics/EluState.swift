@@ -6,7 +6,7 @@ import Foundation
 final class EluCore {
     static let shared = EluCore()
 
-    static let sdkVersion = "0.1.0"
+    static let sdkVersion = "0.2.0"
     static let facadeVersion = 1
 
     /// Constructs the owned runtime once for this core's original setup.
