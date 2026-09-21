@@ -13,9 +13,9 @@ import sys
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 PINNED = {
     "Sources/EluAnalytics/Elu.swift": "f7bda90f1e46157d409f64f68d402043a2e72ae843442347f421518616b1510a",
-    "Sources/EluAnalytics/EluState.swift": "4d47337fa70a063c83c2c2be097a94bb897c653a8b74afaf91457b38cdc43d20",
+    "Sources/EluAnalytics/EluState.swift": "a91954790e9e465b6fa9b03e2e78df5b6c0dab8947dfef52da764cf0bcd39537",
     "Sources/EluAnalytics/EluConfigClient.swift": "152abfb01a6d0aa81e470d3185ecd4db3aeeef26d8626e67bab8f0a41e20d43d",
-    "Sources/EluAnalytics/Internal/Facade/EluRuntimeBackend.swift": "5490b85eabf34d4a67b3e6db6a99c0450e9b89a9825ca16914dc41127fc5e5ec",
+    "Sources/EluAnalytics/Internal/Facade/EluRuntimeBackend.swift": "92382f1190daba81ac8bc469423787752aa39dff1171b80940c507c936bda865",
     "Package.swift": "86701aa42833ddfff4b928e8ed59608cfe46f54e2765656f8166a75633219398",
     "Conformance/V1/manifest.json": "98152d8725c286f29402ba3e420bda8dd364200fb6fdf1cfe49b2da9b8f63e54",
 }
@@ -226,6 +226,11 @@ def scan_outside_source(path: pathlib.Path, text: str) -> list[str]:
         )
         if normalized.count(selected_capabilities) != 2:
             errors.append(f"{path} changed the exact owned native capability selection")
+        if normalized.count("if let initialConsent = context.initialConsent { acceptConsent(initialConsent) }") != 2:
+            errors.append(f"{path} removed constructor consent projection before asynchronous startup")
+        if ("guard accepted, await self.persistStartupConsent(to: stack.runtime) else" not in normalized or
+                "guard accepted, await persistStartupConsent(to: runtime) else" not in normalized):
+            errors.append(f"{path} removed durable consent gating from startup")
         owned_factory = (
             "openStack: { try await EluStandaloneStack.make( "
             "rootDirectoryURL: rootDirectoryURL, siteKey: siteKey, "

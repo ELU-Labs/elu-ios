@@ -37,6 +37,61 @@ final class EluRuntimeSelectorTests: XCTestCase {
         XCTAssertEqual(backend.recordedCalls().last, "reset")
     }
 
+    func testSupersededDenialStillDiscardsEventsFromItsOrderedBufferWindow() throws {
+        let factory = SelectorSpy()
+        let core = EluCore(backendFactory: factory.factory)
+        core.setup(siteKey: uniqueSiteKey(), options: EluSetupOptions(configHost: inertConfigHost))
+        let backend = try XCTUnwrap(core.backendForTesting() as? SelectorBackend)
+        let entered = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        defer { release.signal() }
+        // Hold the core lane while all three calls are accepted. Configuration
+        // remains pending, so an incorrectly admitted event would be buffered.
+        backend.announceConfigurationReady(ifCurrent: {
+            entered.signal()
+            _ = release.wait(timeout: .now() + 10)
+            return false
+        })
+        XCTAssertEqual(entered.wait(timeout: .now() + 5), .success)
+        core.setConsent(optedOut: true)
+        core.dispatch(.capture(event: "private-window", properties: nil))
+        core.setConsent(optedOut: false)
+        release.signal()
+        drain(core)
+        backend.announceConfigurationReady()
+        drain(core)
+        XCTAssertFalse(backend.recordedCalls().contains("capture(private-window)"))
+        XCTAssertFalse(core.isOptedOut())
+    }
+
+    func testActivityKeepsItsCallTimeDenialWhenBackendConsentChangesBeforeBuffering() throws {
+        let factory = SelectorSpy()
+        let core = EluCore(backendFactory: factory.factory)
+        core.setup(siteKey: uniqueSiteKey(), options: EluSetupOptions(configHost: inertConfigHost))
+        let backend = try XCTUnwrap(core.backendForTesting() as? SelectorBackend)
+        backend.stubbedOptedOut = true // A reopened backend's saved consent.
+        let entered = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
+        defer { release.signal() }
+        backend.announceConfigurationReady(ifCurrent: {
+            entered.signal()
+            _ = release.wait(timeout: .now() + 10)
+            return false
+        })
+        XCTAssertEqual(entered.wait(timeout: .now() + 5), .success)
+        core.dispatch(.capture(event: "private", properties: nil))
+        core.dispatch(.screen(name: "private", properties: nil))
+        core.dispatch(.captureException(SelectorFailure(), properties: nil))
+        backend.stubbedOptedOut = false
+        release.signal()
+        drain(core)
+        backend.announceConfigurationReady()
+        drain(core)
+        XCTAssertEqual(backend.recordedCalls(), ["activate"])
+        core.dispatch(.capture(event: "allowed", properties: nil))
+        drain(core)
+        XCTAssertEqual(backend.recordedCalls(), ["activate", "capture(allowed)"])
+    }
+
     func testRepeatedSetupKeepsTheOriginalBackendAndBufferedCalls() throws {
         let factory = SelectorSpy()
         let core = EluCore(backendFactory: factory.factory)
@@ -412,6 +467,7 @@ final class SelectorBackend: EluRuntimeBackend, @unchecked Sendable {
     private var loaded = false
     private var distinctIdValue: String?
     private var flags: [String: String] = [:]
+    private var optedOut = false
 
     init(selection: EluRuntimeSelection, flagsDidLoad: @escaping () -> Void,
          configurationReady: @escaping (@escaping @Sendable () -> Bool) -> Void = { _ in }) {
@@ -462,6 +518,13 @@ final class SelectorBackend: EluRuntimeBackend, @unchecked Sendable {
             lock.unlock()
         }
     }
+
+    var stubbedOptedOut: Bool {
+        get { lock.lock(); defer { lock.unlock() }; return optedOut }
+        set { lock.lock(); defer { lock.unlock() }; optedOut = newValue }
+    }
+
+    func isOptedOut() -> Bool { stubbedOptedOut }
 
     func execute(_ op: EluBufferedOp) {
         switch op {

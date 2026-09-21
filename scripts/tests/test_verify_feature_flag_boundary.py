@@ -30,6 +30,17 @@ class FeatureFlagBoundaryScannerTests(unittest.TestCase):
             for token in ["readbackProvenTransports", "readbackProvenProtocolGenerations"]:
                 self.assertTrue(MODULE.scan_outside_source(pathlib.Path(relative), (ROOT / relative).read_text() + "\n" + token))
 
+    def test_both_startup_paths_require_initial_projection_and_durable_consent(self) -> None:
+        path = pathlib.Path(MODULE.STANDALONE_FACADE_SOURCE)
+        source = (ROOT / path).read_text()
+        for before in [
+            "if let initialConsent = context.initialConsent { acceptConsent(initialConsent) }",
+            "guard accepted, await self.persistStartupConsent(to: stack.runtime) else",
+            "guard accepted, await persistStartupConsent(to: runtime) else",
+        ]:
+            self.assertIn(before, source)
+            self.assertTrue(MODULE.scan_outside_source(path, source.replace(before, "removed_consent_gate", 1)))
+
     def test_native_capability_selection_is_exact_and_cannot_be_silently_disabled(self) -> None:
         path = pathlib.Path(MODULE.NATIVE_RUNTIME_SOURCE)
         source = (ROOT / path).read_text()

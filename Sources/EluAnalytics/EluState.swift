@@ -23,10 +23,12 @@ final class EluCore {
     private var backend: (any EluRuntimeBackend)?
     private let backendIntentLock = NSLock()
     private weak var intentBackend: (any EluRuntimeBackend)?
+    private var acceptedConsent: EluConsentOperation? // guarded by backendIntentLock
     private var performance = EluPerformanceOptions()
     private var configHost = URL(string: "https://elu.dev")!
     private var buffer = EluEventBuffer()
     private var pendingConsent: EluConsentOperation?
+    private var deliveredConsentId: UUID?
     private var isNewUser = false
     private var siteKey = ""
     private var selection: EluRuntimeSelection = .standalone
@@ -61,25 +63,34 @@ final class EluCore {
             // The owned source, including independent flags/privacy, decides
             // readiness. No legacy cache or v1 request participates.
             state = .pending
-            let context = backendContext(config: nil, document: nil)
+            // Construction starts asynchronous work. Transfer the latest accepted
+            // choice before that work exists, and publish the backend under the
+            // same lock so no consent call can fall between those two steps.
+            backendIntentLock.lock()
+            let initialConsent = acceptedConsent
+            let context = backendContext(config: nil, document: nil, initialConsent: initialConsent)
             guard let selected = backendFactory.make(.standalone, context) else {
+                backendIntentLock.unlock()
                 state = .disabled
                 disabledReason = .runtimeUnavailable
                 return
             }
             backend = selected
-            backendIntentLock.lock()
             intentBackend = selected
+            pendingConsent = initialConsent
             backendIntentLock.unlock()
-            if let pendingConsent { selected.execute(.consent(pendingConsent)) }
+            if let initialConsent {
+                deliveredConsentId = initialConsent.id
+                selected.execute(.consent(initialConsent))
+            }
         }
     }
 
-    private func backendContext(config: EluRemoteConfig?, document: Data?) -> EluRuntimeBackendContext {
+    private func backendContext(config: EluRemoteConfig?, document: Data?, initialConsent: EluConsentOperation?) -> EluRuntimeBackendContext {
         EluRuntimeBackendContext(siteKey: siteKey, config: config, configDocument: document,
             isNewUser: isNewUser, flagsDidLoad: { [weak self] in
                 self?.dispatchFlagNotification(ifCurrent: { true })
-            }, configHost: configHost, performance: performance, guardedFlagsDidLoad: { [weak self] predicate in
+            }, configHost: configHost, performance: performance, initialConsent: initialConsent, guardedFlagsDidLoad: { [weak self] predicate in
                 self?.dispatchFlagNotification(ifCurrent: predicate)
             }, initialConfigurationReady: { [weak self] predicate in
                 guard let self else { return }
@@ -101,21 +112,22 @@ final class EluCore {
         }
     }
 
-    private func beginPendingOperation(_ op: EluBufferedOp) -> (() -> Void)? {
+    private func beginPendingOperation(_ op: EluBufferedOp) -> (finish: (() -> Void)?, deniedAtCall: Bool) {
         backendIntentLock.lock()
+        defer { backendIntentLock.unlock() }
         let current = intentBackend
-        backendIntentLock.unlock()
-        return current?.beginPendingOperation(op)
+        let denied = acceptedConsent?.optedOut == true || current?.isOptedOut() == true
+        return (current?.beginPendingOperation(op), denied)
     }
 
     // MARK: - Facade dispatch
 
     /// Buffer-class ops: async, never blocks, safe in every state.
     func dispatch(_ op: EluBufferedOp) {
-        let finishIntent = beginPendingOperation(op)
+        let intent = beginPendingOperation(op)
         queue.async { [self] in
-            defer { finishIntent?() }
-            if pendingConsent?.optedOut == true {
+            defer { intent.finish?() }
+            if intent.deniedAtCall || pendingConsent?.optedOut == true {
                 switch op {
                 case .capture, .screen, .captureException: return
                 default: break
@@ -144,14 +156,24 @@ final class EluCore {
         // Acceptance and enqueueing share one linearization point. Concurrent
         // callers cannot enqueue an older grant after a newer denial.
         backendIntentLock.lock()
+        acceptedConsent = operation
         let finishIntent = intentBackend?.beginPendingOperation(.consent(operation))
         queue.async { [self] in
             defer { finishIntent?() }
+            // Preserve the ordered privacy window even when a later consent
+            // choice already superseded this operation's durable write.
             pendingConsent = operation
             if optedOut { buffer.dropAll() }
+            backendIntentLock.lock()
+            let isLatest = acceptedConsent?.id == operation.id
+            backendIntentLock.unlock()
+            guard isLatest, deliveredConsentId != operation.id else { return }
             // Consent is not a bounded event-buffer entry: persist it even
             // before configuration arrives, and never drop it on overflow.
-            backend?.execute(.consent(operation))
+            if let backend {
+                deliveredConsentId = operation.id
+                backend.execute(.consent(operation))
+            }
         }
         backendIntentLock.unlock()
     }

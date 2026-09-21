@@ -83,6 +83,28 @@ final class EluStandaloneFacadeRuntimeTests: XCTestCase {
         }
     }
 
+    func testInitialConsentPrecedesInjectedConfigurationAndPreservesSavedChoiceWhenAbsent() async throws {
+        try await withTemporaryDirectory { root in
+            let denied = try await makeHarness(root: root, initialConsent: EluConsentOperation(optedOut: true))
+            denied.backend.execute(.capture(event: "private", properties: nil))
+            await denied.backend.settled()
+            let saved = try await denied.runtime.queueSnapshot()
+            XCTAssertTrue(saved.identity.optedOut)
+            XCTAssertEqual(saved.queuedCount, 0)
+            await denied.close()
+            let reopened = try await makeHarness(root: root)
+            XCTAssertTrue(reopened.backend.isOptedOut(), "No pre-setup choice must preserve durable denial")
+            await reopened.close()
+            let granted = try await makeHarness(root: root, initialConsent: EluConsentOperation(optedOut: false))
+            granted.backend.execute(.capture(event: "allowed", properties: nil))
+            await granted.backend.settled()
+            let allowed = try await granted.runtime.queueSnapshot()
+            XCTAssertFalse(allowed.identity.optedOut)
+            XCTAssertEqual(allowed.queuedCount, 1)
+            await granted.close()
+        }
+    }
+
     func testNewOptOutIntentCannotBeReopenedByAnOlderOptInOrConfigRefresh() async throws {
         try await withTemporaryDirectory { root in
             let harness = try await makeHarness(root: root)
@@ -524,7 +546,8 @@ final class EluStandaloneFacadeRuntimeTests: XCTestCase {
     private func makeHarness(
         root: URL,
         document: Data? = nil,
-        flagTransport: (any EluV1FlagTransport)? = nil
+        flagTransport: (any EluV1FlagTransport)? = nil,
+        initialConsent: EluConsentOperation? = nil
     ) async throws -> Harness {
         let transport = FacadeBatchTransport()
         let clock = FacadeClock(wall: baseDate)
@@ -557,7 +580,8 @@ final class EluStandaloneFacadeRuntimeTests: XCTestCase {
             config: try TestConfigFactory.make(),
             configDocument: document ?? fixture("config-enabled.json"),
             isNewUser: true,
-            flagsDidLoad: { _ = announcements.next() }
+            flagsDidLoad: { _ = announcements.next() },
+            initialConsent: initialConsent
         )
         let backend = EluStandaloneFacadeRuntime(
             context: context,

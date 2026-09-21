@@ -4,17 +4,17 @@ ELU product intelligence for native iOS apps. One site key, no other
 configuration — behavior (privacy controls, kill switches, session replay)
 is managed from your ELU dashboard and delivered as remote config.
 
-This source checkout uses the ELU-owned analytics runtime and has no external
-Swift package dependencies. Version 0.2.0 is still undergoing release
-qualification and is not yet published. The published 0.1.0 release uses the previous runtime; changing
-this checkout does not change that release. Application code continues to use
-`Elu.*` with an ELU site key.
+This package uses the ELU-owned analytics runtime and has no external Swift
+package dependencies. Customer installation and support apply to the exact
+version and artifacts listed in a reviewed [GitHub release](https://github.com/ELU-Labs/elu-ios/releases)
+after its required release checks have passed. A source checkout alone does not
+establish release qualification. Application code uses `Elu.*` with an ELU site key.
 
 - Swift Package, iOS 13+
 - Events, identity, feature flags, screen tracking, and lifecycle events
 - Remote configuration controls whether analytics may run
 - Bounded UIKit replay, gated by current server qualification, configuration,
-  and on-device privacy; final package and service qualification is still pending
+  and on-device privacy, with package and service qualification required for release
 
 ## Install (Swift Package Manager)
 
@@ -27,9 +27,9 @@ dependencies: [
 ]
 ```
 
-Then add `EluAnalytics` to your target's dependencies. The version above is the
-next release and becomes available after publication. Until then, use this
-checkout as a local Swift package for development.
+Then add `EluAnalytics` to your target's dependencies. Install version 0.2.0 only
+when its reviewed release and matching tag are available at the link above.
+Use unpublished source as a local Swift package for development.
 
 ## Setup
 
@@ -65,7 +65,7 @@ struct MyApp: App {
 ```
 
 Use `Elu.capture(...)` for custom events. Screen and lifecycle tracking follow
-the behavior below. This candidate is not yet qualified for customer release.
+the behavior below.
 
 The SDK fetches an eligible configuration before sending analytics. Calls made
 while setup or configuration is pending are subject to the SDK's bounded
@@ -90,7 +90,7 @@ user id. Before `identify`, activity is tracked anonymously and linked on the
 first identify.
 
 The owned runtime uses separate storage. The unused 0.1.0 release is not a
-supported persisted-data import source: this candidate starts a fresh owned
+supported persisted-data import source: version 0.2.0 starts a fresh owned
 installation and leaves its old files untouched. Unpublished preview databases
 with import receipts are refused without deleting their database, WAL, or SHM
 files. Existing supported owned-store schemas retain identity, consent, queued
@@ -100,7 +100,7 @@ records, and their ordinary schema upgrades. See [storage compatibility](docs/st
 
 The owned runtime records application lifecycle events automatically. Call
 `Elu.screen(...)` when a logical screen appears in both UIKit and SwiftUI;
-this candidate does not intercept view controller methods. For SwiftUI:
+the SDK does not intercept view controller methods. For SwiftUI:
 
 ```swift
 struct CheckoutView: View {
@@ -151,8 +151,12 @@ context change is pending or collection is opted out.
 Call `Elu.optOut()` to persist consent withdrawal. Reset/logout preserves that
 choice. Call `Elu.optIn()` to restore collection subject to current remote
 policy; `Elu.optIn(captureEventName: nil)` suppresses the default `$opt_in` event.
-Consent set before setup takes effect when the runtime opens. Event calls made
-while opted out are discarded, and queued replay is removed.
+The latest valid choice made before setup is retained in memory, then saved
+before configuration or lifecycle work can authorize collection. It becomes
+durable when the runtime opens; a process ending before setup cannot persist it.
+The opt-in event is one normal capture attempt and is discarded if configuration
+is not eligible then; it is not backfilled later. Event calls made while opted
+out are discarded, and queued replay is removed.
 
 `flush()` requests a delivery attempt; it does not wait for acknowledgment or
 guarantee a send before termination. Unacknowledged durable events remain for a
@@ -199,14 +203,14 @@ Elu.setup(siteKey: "YOUR_SITE_KEY",
 
 Production apps should always use the default host.
 
-## Replay coverage in the candidate
+## UIKit replay coverage
 
-The unpublished candidate supports bounded UIKit wireframes. When policy allows
+The SDK supports bounded UIKit wireframes. When policy allows
 ordinary text, supported fully visible, single-line `UILabel` and `UIButton`
 text remains readable when it fits without wrapping or truncation. Transparent text, attachments, links, unsupported attributed content,
 and custom subclasses remain masked or opaque. All input values, including `UITextField` and `UITextView`, remain hidden. Images, web
 views, custom drawing, and SwiftUI content are represented by content-free
-placeholders. SwiftUI replay is not supported by this candidate.
+placeholders. SwiftUI replay is not supported.
 
 Apply additional restrictions on the main thread before content is presented:
 

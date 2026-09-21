@@ -1,6 +1,7 @@
 # SDK development status
 
-This branch is an implementation checkpoint, not a released SDK.
+This document records development evidence separately from published release status.
+Consult the [reviewed releases](https://github.com/ELU-Labs/elu-ios/releases) for customer artifacts.
 
 The clean candidate retired the unused preview import path under the dated
 [storage compatibility decision](storage-compatibility.md). Its current source
@@ -11,6 +12,10 @@ and SwiftUI consumer compilation. Its application-bundled privacy manifest was
 verified in the Lab UIKit fixture. Those source commits distinguish implementation
 qualification from later metadata/documentation and boundary-guard changes; they
 do not certify physical devices, installation, engine readback, or deployment.
+The startup-consent follow-on changes executable source: the latest pre-setup
+choice is persisted before startup authority, and events retain their original
+consent denial across a later opt-in. The earlier test counts above do not
+qualify that changed artifact; fresh package and Lab checks remain required.
 Immutable baseline definitions and strict scanning policy remain unchanged.
 
 Exact distribution installation, supported owned upgrades, Lab engine readback,

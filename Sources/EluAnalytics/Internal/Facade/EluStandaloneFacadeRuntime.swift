@@ -75,6 +75,7 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, @unchecked Sendable {
     ) {
         flagsDidLoad = context.flagsDidLoad
         self.flagTransport = flagTransport
+        if let initialConsent = context.initialConsent { acceptConsent(initialConsent) }
         let document = context.configDocument
         tail = Task { [weak self] in
             await self?.start(open: open, configDocument: document, observeApplicationLifecycle: observeApplicationLifecycle)
@@ -91,6 +92,7 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, @unchecked Sendable {
         flagsDidLoad = context.flagsDidLoad
         flagTransport = nil
         self.guardedFlagsDidLoad = guardedFlagsDidLoad
+        if let initialConsent = context.initialConsent { acceptConsent(initialConsent) }
         tail = Task { [weak self] in
             guard let self, let stack = try? await openStack() else { return }
             let accepted = self.withLock { () -> Bool in
@@ -100,7 +102,7 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, @unchecked Sendable {
                 self.bindPendingIntents(to: stack.runtime)
                 return true
             }
-            guard accepted else { stack.close(); return }
+            guard accepted, await self.persistStartupConsent(to: stack.runtime) else { stack.close(); return }
             stack.observe(onIntent: { [weak self] in self?.configurationIntent() },
                 onSettled: { [weak self] in self?.scheduleFlagReload() },
                 onReady: context.initialConfigurationReady)
@@ -173,27 +175,43 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, @unchecked Sendable {
         observeApplicationLifecycle: Bool
     ) async {
         guard let runtime = try? await open() else { return }
-        if let configDocument {
-            _ = await runtime.applyConfiguration(configDocument)
-        }
         var client: EluV1FlagClient?
         if let flagTransport {
             client = try? await runtime.flagClient(transport: flagTransport)
-            if let client, let configDocument {
-                _ = await client.applyConfig(configDocument)
-            }
         }
-        let snapshot = await runtime.currentSnapshot
         let accepted = withLock { () -> Bool in
             guard !isShutDown else { return false }
             started = Started(runtime: runtime, flags: client)
             bindPendingIntents(to: runtime)
             return true
         }
-        guard accepted else { await client?.close(); await runtime.close(); return }
+        guard accepted, await persistStartupConsent(to: runtime) else { await client?.close(); await runtime.close(); return }
+        if let configDocument {
+            _ = await runtime.applyConfiguration(configDocument)
+            _ = await client?.applyConfig(configDocument)
+        }
+        let snapshot = await runtime.currentSnapshot
         await runtime.installNativeReplayComposition(lifecycle: nativeLifecycle, capabilities: EluStandaloneRuntime.readbackProvenReplayCapabilities, deferredUntilActivation: true)
         syncIdentity(snapshot.identity)
         if observeApplicationLifecycle { attachLifecycle(to: runtime) }
+    }
+
+    /// The in-memory fence protects concurrent withdrawal, but it is not a
+    /// substitute for saving the choice before startup. A superseding intent
+    /// is retried; a storage failure closes startup instead of granting it.
+    private func persistStartupConsent(to runtime: EluStandaloneRuntime) async -> Bool {
+        while true {
+            let (stopped, choice) = withLock { (isShutDown, consentProjection) }
+            guard !stopped else { return false }
+            guard let choice else { return true }
+            let snapshot = await runtime.setOptedOut(choice.optedOut, intent: choice.id)
+            let current = withLock { !isShutDown && consentProjection?.id == choice.id }
+            if current {
+                guard let snapshot, snapshot.identity.optedOut == choice.optedOut else { return false }
+                syncIdentity(snapshot.identity)
+                return true
+            }
+        }
     }
 
     private func attachLifecycle(to runtime: EluStandaloneRuntime) {
@@ -493,8 +511,8 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, @unchecked Sendable {
     // MARK: - Getters
 
     private func acceptConsent(_ operation: EluConsentOperation) {
-        guard operation.acceptOnce() else { return }
         withLock {
+            guard operation.acceptOnce() else { return }
             consentProjection = (operation.id, operation.optedOut)
             started?.runtime.acceptConsentIntent(operation.id, optedOut: operation.optedOut)
         }

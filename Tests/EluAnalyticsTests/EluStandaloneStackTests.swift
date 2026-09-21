@@ -253,6 +253,129 @@ final class EluStandaloneStackTests: XCTestCase {
         }
     }
 
+    func testPreSetupDenialIsDurableBeforeFactoryReturnsOrConfigurationCanGrantCapture() async throws {
+        try await withHarness { h in
+            let handoff = StackPausedFactory()
+            defer { handoff.release.signal() }
+            let core = EluCore(backendFactory: EluRuntimeBackendFactory { _, context in
+                let facade = EluStandaloneFacadeRuntime(context: context, openStack: { h.stack },
+                    guardedFlagsDidLoad: context.guardedFlagsDidLoad)
+                handoff.publish(facade)
+                facade.setForeground(true)
+                // The constructor has started its asynchronous work, but core
+                // cannot deliver a later execute(.consent) until this returns.
+                _ = handoff.release.wait(timeout: .now() + 10)
+                return facade
+            })
+            core.setConsent(optedOut: false)
+            core.setConsent(optedOut: true)
+            core.setup(siteKey: StackHarness.siteKey, options: EluSetupOptions())
+            try await eventually { handoff.facade != nil }
+            let facade = try XCTUnwrap(handoff.facade)
+            await facade.settled()
+            try await eventually { await h.config.count == 1 }
+            let beforeConfiguration = try await h.stack.runtime.queueSnapshot()
+            XCTAssertTrue(beforeConfiguration.identity.optedOut,
+                "The denial must reach durable storage before configuration begins, not after the factory returns")
+            await h.config.resolve(try fixture())
+            await h.stack.settled()
+            let result = await h.stack.runtime.capture("constructor-window")
+            guard case .rejected = result else {
+                handoff.release.signal()
+                facade.shutDown(); await facade.settled()
+                return XCTFail("Configuration granted capture before pending consent was handed over")
+            }
+            _ = await h.stack.runtime.flush()
+            let sends = await h.events.count
+            XCTAssertEqual(sends, 0)
+            handoff.release.signal()
+            _ = core.backendForTesting()
+            await facade.settled()
+            XCTAssertTrue(core.isOptedOut())
+            facade.shutDown(); await facade.settled()
+            await h.close()
+            let reopened = try await StackHarness(root: h.root)
+            let restored = try await reopened.stack.runtime.queueSnapshot()
+            XCTAssertTrue(restored.identity.optedOut)
+            await reopened.close()
+        }
+    }
+
+    func testLatestConsentWhileOpenIsHeldPersistsBeforeStartupAndSurvivesReset() async throws {
+        try await withHarness { h in
+            let gate = StackOpenGate()
+            let core = EluCore(backendFactory: EluRuntimeBackendFactory { _, context in
+                EluStandaloneFacadeRuntime(context: context, openStack: {
+                    await gate.wait()
+                    return h.stack
+                }, guardedFlagsDidLoad: context.guardedFlagsDidLoad)
+            })
+            core.setConsent(optedOut: false, event: "obsolete-opt-in")
+            core.setup(siteKey: StackHarness.siteKey, options: EluSetupOptions())
+            let facade = try XCTUnwrap(core.backendForTesting() as? EluStandaloneFacadeRuntime)
+            try await eventually { await gate.isWaiting }
+            core.setConsent(optedOut: true)
+            _ = core.bufferDropCountForTesting()
+            facade.setForeground(true)
+            await gate.release()
+            await facade.settled()
+            let saved = try await h.stack.runtime.queueSnapshot()
+            XCTAssertTrue(saved.identity.optedOut)
+            XCTAssertEqual(saved.queuedCount, 0)
+            try await eventually { await h.config.count == 1 }
+            await h.config.resolve(try fixture())
+            try await eventually { core.distinctId() != nil }
+            core.reset()
+            _ = core.bufferDropCountForTesting()
+            await facade.settled()
+            let reset = try await h.stack.runtime.queueSnapshot()
+            XCTAssertTrue(reset.identity.optedOut)
+            XCTAssertEqual(reset.queuedCount, 0)
+            facade.shutDown(); await facade.settled()
+            await h.close()
+            let reopened = try await StackHarness(root: h.root)
+            let restored = try await reopened.stack.runtime.queueSnapshot()
+            XCTAssertTrue(restored.identity.optedOut)
+            await reopened.close()
+        }
+    }
+
+    func testLatestPreSetupGrantClearsSavedDenialBeforeStartupWithoutBackfilledOptIn() async throws {
+        try await withHarness { h in
+            let old = UUID()
+            h.stack.runtime.acceptConsentIntent(old, optedOut: true)
+            _ = await h.stack.runtime.setOptedOut(true, intent: old)
+            let core = EluCore(backendFactory: EluRuntimeBackendFactory { _, context in
+                EluStandaloneFacadeRuntime(context: context, openStack: { h.stack },
+                    guardedFlagsDidLoad: context.guardedFlagsDidLoad)
+            })
+            core.setConsent(optedOut: true)
+            core.setConsent(optedOut: false, event: "early-opt-in")
+            core.setup(siteKey: StackHarness.siteKey, options: EluSetupOptions())
+            let facade = try XCTUnwrap(core.backendForTesting() as? EluStandaloneFacadeRuntime)
+            await facade.settled()
+            let saved = try await h.stack.runtime.queueSnapshot()
+            XCTAssertFalse(saved.identity.optedOut)
+            XCTAssertEqual(saved.queuedCount, 0, "The opt-in event is a normal attempt, not a config-deferred event")
+            facade.setForeground(true)
+            try await eventually { await h.config.count == 1 }
+            await h.config.resolve(try fixture())
+            try await eventually { core.distinctId() != nil }
+            core.dispatch(.capture(event: "allowed", properties: nil))
+            _ = core.bufferDropCountForTesting()
+            await facade.settled()
+            _ = await h.stack.runtime.flush()
+            let names = await h.events.names
+            XCTAssertEqual(names, ["allowed"])
+            facade.shutDown(); await facade.settled()
+            await h.close()
+            let reopened = try await StackHarness(root: h.root)
+            let restored = try await reopened.stack.runtime.queueSnapshot()
+            XCTAssertFalse(restored.identity.optedOut)
+            await reopened.close()
+        }
+    }
+
     func testCoreOwnedBootstrapPropagatesHostAndPreservesInitialCallOrder() async throws {
         try await withHarness { h in
             let selectedHost = URL(string: "https://www.elu.dev")!
@@ -378,10 +501,12 @@ private func eventually(file: StaticString = #filePath, line: UInt = #line, _ pr
 private struct StackHarness: Sendable {
     static let siteKey = "elu_pk_test_" + String(repeating: "a", count: 22)
     let stack: EluStandaloneStack
+    let root: URL
     let config = StackConfigTransport()
     let events = StackEventTransport()
     let clock = StackClock()
     init(root: URL) async throws {
+        self.root = root
         stack = try await EluStandaloneStack.make(rootDirectoryURL: root, siteKey: Self.siteKey,
             configHost: URL(string: "https://elu.dev")!, configTransport: config,
             eventTransport: events, flagTransport: StackFlagTransport(), clock: clock.source,
@@ -496,4 +621,23 @@ private actor StackOpenBarrier {
         waiter?.resume()
         waiter = nil
     }
+}
+
+private final class StackPausedFactory: @unchecked Sendable {
+    let release = DispatchSemaphore(value: 0)
+    private let lock = NSLock()
+    private var value: EluStandaloneFacadeRuntime?
+    func publish(_ facade: EluStandaloneFacadeRuntime) {
+        lock.lock(); defer { lock.unlock() }; value = facade
+    }
+    var facade: EluStandaloneFacadeRuntime? {
+        lock.lock(); defer { lock.unlock() }; return value
+    }
+}
+
+private actor StackOpenGate {
+    private var continuation: CheckedContinuation<Void, Never>?
+    var isWaiting: Bool { continuation != nil }
+    func wait() async { await withCheckedContinuation { continuation = $0 } }
+    func release() { continuation?.resume(); continuation = nil }
 }
