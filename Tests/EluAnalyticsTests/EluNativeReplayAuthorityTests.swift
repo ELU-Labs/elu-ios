@@ -10,6 +10,19 @@ final class EluNativeReplayAuthorityTests: XCTestCase {
         .init(readbackProvenTransports: [EluV1ReplayTransportSelection(codec: "elu-native-wireframe-v1", compression: .gzip)!])
     }
 
+    func testViewPrivacyStrengtheningRetiresPreparedAuthority() async throws {
+        let h = try await make(); defer { h.base.remove() }
+        let owner = EluNativeReplayAuthority(queue: h.queue, clock: { h.base.now })
+        let source = try XCTUnwrap(h.base.witness)
+        let original = try await owner.prepare(source: source, capabilities: capability, timeZoneIdentifier: "America/Los_Angeles")
+        XCTAssertTrue(original.isCurrent())
+        EluNativeViewPrivacy.shared.strengthen()
+        XCTAssertFalse(original.isCurrent())
+        let fresh = try await owner.prepare(source: source, capabilities: capability, timeZoneIdentifier: "America/Los_Angeles")
+        XCTAssertTrue(fresh.isCurrent())
+        await owner.close(); await h.queue.close()
+    }
+
     func testDurableFalseRemainsFalseWhenCurrentRateBecomesOne() async throws {
         let h = try await make(rate: 0); defer { h.base.remove() }
         _ = try await h.queue.nativeReplayProjection(source: XCTUnwrap(h.base.witness))

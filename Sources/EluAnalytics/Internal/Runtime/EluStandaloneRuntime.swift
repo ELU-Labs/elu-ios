@@ -97,6 +97,10 @@ private final class EluStandaloneDeliveryFence: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         consentIntent = id; consentDenied = consentDenied || optedOut; value = UUID()
     }
+    func isLatestConsent(_ id: UUID) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return !closed && consentIntent == id
+    }
     func commitConsent(_ id: UUID, optedOut: Bool) {
         lock.lock(); defer { lock.unlock() }
         guard consentIntent == id else { return }
@@ -134,6 +138,7 @@ actor EluStandaloneRuntime {
     private nonisolated let nativeAuthority: EluNativeReplayAuthority
     private nonisolated let replayRelay = EluNativeReplayCompositionRelay()
     private var replayComposition: EluNativeReplayComposition?
+    private var viewPrivacyObserver: UUID?
     private var closeTask: Task<Void, Never>?
     private(set) var nativeReplayCompositionSettlement: EluNativeReplayComposition.CloseOutcome?
     private let nativeContinuousNow: @Sendable () -> UInt64?
@@ -292,6 +297,7 @@ actor EluStandaloneRuntime {
         // Original worker tasks retain physical/receipt cleanup independently.
         // Destruction only closes local intake; it creates no database task.
         deliveryFence.close()
+        if let viewPrivacyObserver { EluNativeViewPrivacy.shared.removeObserver(viewPrivacyObserver) }
         nativeAuthority.invalidateForOwnerDestruction()
         replayRelay.withdraw()
     }
@@ -358,9 +364,11 @@ actor EluStandaloneRuntime {
     /// Commit consent before reopening any transport. Reset preserves this bit.
     @discardableResult
     func setOptedOut(_ optedOut: Bool, intent: UUID) async -> EluRuntimeQueueSnapshot? {
-        guard phase != .closed else { return nil }
+        let fence = deliveryFence
+        guard phase != .closed, fence.isLatestConsent(intent) else { return nil }
         guard let generation = try? await queue.snapshot().generation,
-              let snapshot = try? await queue.setOptedOut(optedOut, expectedGeneration: generation) else {
+              let snapshot = try? await queue.setOptedOut(optedOut, expectedGeneration: generation,
+                  admissionGuard: { fence.isLatestConsent(intent) }) else {
             return nil
         }
         deliveryFence.commitConsent(intent, optedOut: optedOut)
@@ -426,6 +434,7 @@ actor EluStandaloneRuntime {
         transport: any EluV2ReplayHTTPTransport = EluV2URLSessionReplayTransport()) -> EluNativeReplayComposition? {
         guard phase != .closed else { return nil }
         if let replayComposition { return replayComposition }
+        viewPrivacyObserver = EluNativeViewPrivacy.shared.observe { [weak self] in self?.nativePrivacyContextChanged() }
         let delivery = EluV2ReplayDeliveryCoordinator(queue: queue, transport: transport,
             wallNow: clock, sleep: time.sleep)
         let composition = EluNativeReplayComposition(runtime: self, lifecycle: lifecycle,

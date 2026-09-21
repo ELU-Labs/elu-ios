@@ -139,7 +139,10 @@ final class EluCore {
     func setConsent(optedOut: Bool, event: String? = nil, properties: [String: Any]? = nil) {
         if let event, EluFacadeJSON.identifier(event, maximumLength: 512) == nil { return }
         let operation = EluConsentOperation(optedOut: optedOut, event: event, properties: properties)
-        let finishIntent = beginPendingOperation(.consent(operation))
+        // Acceptance and enqueueing share one linearization point. Concurrent
+        // callers cannot enqueue an older grant after a newer denial.
+        backendIntentLock.lock()
+        let finishIntent = intentBackend?.beginPendingOperation(.consent(operation))
         queue.async { [self] in
             defer { finishIntent?() }
             pendingConsent = operation
@@ -148,6 +151,7 @@ final class EluCore {
             // before configuration arrives, and never drop it on overflow.
             backend?.execute(.consent(operation))
         }
+        backendIntentLock.unlock()
     }
 
     func isOptedOut() -> Bool {

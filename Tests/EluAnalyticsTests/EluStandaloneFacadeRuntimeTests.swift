@@ -89,15 +89,20 @@ final class EluStandaloneFacadeRuntimeTests: XCTestCase {
             let oldOptIn = UUID(), newOptOut = UUID()
             harness.runtime.acceptConsentIntent(oldOptIn, optedOut: false)
             harness.runtime.acceptConsentIntent(newOptOut, optedOut: true)
-            _ = await harness.runtime.setOptedOut(false, intent: oldOptIn)
+            _ = await harness.runtime.setOptedOut(true, intent: newOptOut)
+            // Simulate a grant accepted before denial but dispatched after it.
+            let stale = await harness.runtime.setOptedOut(false, intent: oldOptIn)
+            XCTAssertNil(stale)
             let result = await harness.runtime.capture("must-not-capture")
             guard case .rejected = result else { return XCTFail("newer opt-out must fence admission") }
             guard case .unavailable = await harness.runtime.flush() else { return XCTFail("newer opt-out must fence delivery") }
-            _ = await harness.runtime.setOptedOut(true, intent: newOptOut)
             let snapshot = try await harness.runtime.queueSnapshot()
             XCTAssertTrue(snapshot.identity.optedOut)
             XCTAssertEqual(snapshot.queuedCount, 0)
             await harness.close()
+            let reopened = try await makeHarness(root: root)
+            XCTAssertTrue(reopened.backend.isOptedOut(), "latest denial must survive process restart")
+            await reopened.close()
         }
     }
 

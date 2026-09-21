@@ -9,13 +9,19 @@ extension Elu {
     /// This restriction lasts for the view's lifetime and cannot loosen remote policy.
     @MainActor
     public static func maskView(_ view: UIView) {
-        if view.eluReplayRestriction != .block { view.eluReplayRestriction = .mask }
+        guard view.eluReplayRestriction == nil else { return }
+        view.eluReplayRestriction = .mask
+        EluNativeViewPrivacy.shared.strengthen()
     }
 
     /// Exclude this view's content and descendants from replay collection.
     /// Only a content-free placeholder for its bounds may be recorded.
     @MainActor
-    public static func blockView(_ view: UIView) { view.eluReplayRestriction = .block }
+    public static func blockView(_ view: UIView) {
+        guard view.eluReplayRestriction != .block else { return }
+        view.eluReplayRestriction = .block
+        EluNativeViewPrivacy.shared.strengthen()
+    }
 }
 
 extension UIView {

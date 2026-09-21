@@ -73,8 +73,9 @@ final class EluUIKitReplayCollector {
                  restrictions: [EluUIKitReplayRestriction] = [],
                  profile: EluNativeMaskingProfile = .blanketMask(),
                  isCurrent: () -> Bool) throws -> EluNativeMaskedSnapshot {
+        let viewPrivacyRevision = EluNativeViewPrivacy.shared.snapshot()
         func check() throws {
-            guard fence.current(), isCurrent(), fence.current() else { throw EluUIKitReplayCollectionError.withdrawn }
+            guard EluNativeViewPrivacy.shared.isCurrent(viewPrivacyRevision), fence.current(), isCurrent(), fence.current() else { throw EluUIKitReplayCollectionError.withdrawn }
         }
         try check()
         guard !hasUnresolvedConfiguredBlockRules else { throw EluUIKitReplayCollectionError.unresolvedBlockRule }

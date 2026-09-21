@@ -119,7 +119,10 @@ struct EluNativeReplayPreparedAuthority: Sendable {
     fileprivate let owner: UUID
     fileprivate let invocation: UUID
     fileprivate let projection: EluNativeReplayProjectionInput
-    func isCurrent() -> Bool { projection.isCurrent() }
+    fileprivate let viewPrivacyRevision: UUID
+    func isCurrent() -> Bool {
+        EluNativeViewPrivacy.shared.isCurrent(viewPrivacyRevision) && projection.isCurrent()
+    }
 }
 
 /// An internal permit, not physical capture enrollment. N3c must acquire its own
@@ -179,10 +182,11 @@ actor EluNativeReplayAuthority {
         guard !closed, queue.nativeSourceIsCurrent(source) else { throw EluNativeReplayAuthorityError.stale }
         guard !capabilities.transports.isEmpty else { withdraw(); throw EluNativeReplayAuthorityError.unsupportedCapability }
         if let prepared, prepared.projection.source == source,
-           fence.current(prepared.invocation), prepared.projection.isCurrent(),
+           fence.current(prepared.invocation), prepared.isCurrent(),
            EluV2ReplayText.equal(prepared.supportedProtocolGeneration,
                capabilities.supportedProtocolGeneration(prepared.resolution.replayProtocolGeneration)) { return prepared }
         fence.invalidate(); let invocation = fence.token()
+        let viewPrivacyRevision = EluNativeViewPrivacy.shared.snapshot()
         prepared = nil
         try await settleActive()
         guard !closed, fence.current(invocation), queue.nativeSourceIsCurrent(source), unresolvedReceipt == nil, captureUse == nil else { throw EluNativeReplayAuthorityError.stale }
@@ -204,10 +208,11 @@ actor EluNativeReplayAuthority {
         let manager = EluV1ConfigManager(readbackProvenReplayTransports: capabilities.transports)
         _ = try manager.update(configData: source.data, now: clock())
         let resolution = try manager.authorize(effectivePrivacyStateData: privacy.stateData, identity: installed.identity, now: clock())
-        guard fence.current(invocation), installed.isCurrent(), resolution.decisionHash == privacy.effectivePolicyHash
+        guard fence.current(invocation), installed.isCurrent(), resolution.decisionHash == privacy.effectivePolicyHash,
+              EluNativeViewPrivacy.shared.isCurrent(viewPrivacyRevision)
         else { throw EluNativeReplayAuthorityError.stale }
         let value = EluNativeReplayPreparedAuthority(privacy: privacy, profile: profile, resolution: resolution,
-            supportedProtocolGeneration: capabilities.supportedProtocolGeneration(resolution.replayProtocolGeneration), owner: id, invocation: invocation, projection: installed)
+            supportedProtocolGeneration: capabilities.supportedProtocolGeneration(resolution.replayProtocolGeneration), owner: id, invocation: invocation, projection: installed, viewPrivacyRevision: viewPrivacyRevision)
         prepared = value
         return value
     }
@@ -225,7 +230,7 @@ actor EluNativeReplayAuthority {
     private func startCurrent(_ value: EluNativeReplayPreparedAuthority, selection: EluNativeReplaySelection,
                physicalUse: EluNativeReplayCapturePhysicalUse?) async throws -> EluNativeReplayPermit? {
         guard !closed, active == nil, unresolvedReceipt == nil, captureUse == nil, value.owner == id,
-              fence.current(value.invocation), value.projection.isCurrent(), selection.isCurrent(),
+              fence.current(value.invocation), value.isCurrent(), selection.isCurrent(),
               case .authorized = value.resolution.replayAuthorization else { return nil }
         if physicalUse != nil {
             guard let supported = value.supportedProtocolGeneration,
@@ -233,7 +238,7 @@ actor EluNativeReplayAuthority {
         }
         let selected = await selection.validateCurrent()
         guard selected, !closed, active == nil, unresolvedReceipt == nil, captureUse == nil,
-              fence.current(value.invocation), value.projection.isCurrent(), selection.isCurrent() else { return nil }
+              fence.current(value.invocation), value.isCurrent(), selection.isCurrent() else { return nil }
         // Retain the physical capability before crossing the queue boundary: a
         // begin may commit without returning its receipt to this actor.
         captureUse = physicalUse
@@ -242,7 +247,7 @@ actor EluNativeReplayAuthority {
         else { started = try await queue.beginNativeReplayStartAccounting(value.projection) }
         guard let receipt = started else { return nil }
         unresolvedReceipt = receipt
-        guard !closed, fence.current(value.invocation), value.projection.isCurrent(), selection.isCurrent() else {
+        guard !closed, fence.current(value.invocation), value.isCurrent(), selection.isCurrent() else {
             try await settleActive(); return nil
         }
         let guardValue = try await queue.nativeReplayPermitGuard(input: value.projection, receipt: receipt, resolution: value.resolution)
@@ -255,7 +260,9 @@ actor EluNativeReplayAuthority {
         }
         let ownerFence = fence, invocation = value.invocation
         let combined = EluNativeReplaySynchronousGuard {
-            ownerFence.current(invocation) && guardValue.isCurrent() && selection.isCurrent() && ownerFence.current(invocation)
+            EluNativeViewPrivacy.shared.isCurrent(value.viewPrivacyRevision) && ownerFence.current(invocation)
+                && guardValue.isCurrent() && selection.isCurrent() && ownerFence.current(invocation)
+                && EluNativeViewPrivacy.shared.isCurrent(value.viewPrivacyRevision)
         }
         let permit = EluNativeReplayPermit(replayId: receipt.replayId, privacy: value.privacy, profile: value.profile,
             resolution: value.resolution, identity: value.projection.identity, selection: selection,
@@ -304,7 +311,7 @@ actor EluNativeReplayAuthority {
     }
     private func settleWithdrawn() async {
         if let active, active.isCurrent() { return }
-        if let prepared, fence.current(prepared.invocation), prepared.projection.isCurrent(), unresolvedReceipt == nil { return }
+        if let prepared, fence.current(prepared.invocation), prepared.isCurrent(), unresolvedReceipt == nil { return }
         prepared = nil
         do { try await settleActive() } catch { /* No automatic retry or replacement interval. */ }
     }

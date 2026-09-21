@@ -7260,8 +7260,10 @@ actor EluSQLiteRuntimeQueue {
     @discardableResult
     func setOptedOut(
         _ optedOut: Bool,
-        expectedGeneration: Int64
+        expectedGeneration: Int64,
+        admissionGuard: @escaping @Sendable () -> Bool = { true }
     ) throws -> EluRuntimeQueueSnapshot {
+        guard admissionGuard() else { throw EluRuntimeQueueError.sourceAuthorityUnavailable }
         guard expectedGeneration == state.generation else {
             throw EluRuntimeQueueError.generationMismatch
         }
@@ -7285,7 +7287,13 @@ actor EluSQLiteRuntimeQueue {
             expectedGeneration: expectedGeneration,
             identity: identity,
             flagContext: state.flagContext,
-            drafts: []
+            drafts: [],
+            prewriteValidation: { _ in
+                guard admissionGuard() else { throw EluRuntimeQueueError.sourceAuthorityUnavailable }
+            },
+            precommitValidation: {
+                guard admissionGuard() else { throw EluRuntimeQueueError.sourceAuthorityUnavailable }
+            }
         ).snapshot
     }
 
