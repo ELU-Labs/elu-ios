@@ -100,6 +100,63 @@ final class EluUIKitReplayCollectorTests: XCTestCase {
         XCTAssertFalse(text.contains("HIDDEN_UNDERLYING_TITLE"))
     }
 
+    func testSensitiveProfileMasksTruncatedSuffixAndHiddenButtonLabel() throws {
+        let truncated = UILabel(frame: CGRect(x: 0, y: 0, width: 50, height: 30))
+        truncated.text = "Visible prefix with PRIVATE_UNRENDERED_SUFFIX"
+        truncated.numberOfLines = 1; truncated.lineBreakMode = .byTruncatingTail
+        let hiddenButton = UIButton(frame: CGRect(x: 0, y: 40, width: 250, height: 40))
+        hiddenButton.setTitle("PRIVATE_BUTTON_LABEL", for: .normal)
+        root.addSubview(truncated); root.addSubview(hiddenButton); settle()
+        hiddenButton.titleLabel?.alpha = 0
+        let snapshot = try EluUIKitReplayCollector().collect(root: root, ordinal: 0, timestamp: 100,
+            hasUnresolvedConfiguredBlockRules: false, profile: .sensitiveMask(), isCurrent: { true })
+        var encoder = try EluNativeWireframeEncoder()
+        let text = String(decoding: try encoder.encode([snapshot]).data, as: UTF8.self)
+        XCTAssertFalse(text.contains("PRIVATE_UNRENDERED_SUFFIX"))
+        XCTAssertFalse(text.contains("PRIVATE_BUTTON_LABEL"))
+    }
+
+    func testSensitiveProfileReadsCompleteIntrinsicSizeLabel() throws {
+        let label = UILabel()
+        label.text = "Ordinary native text"; label.textColor = .black
+        label.frame = CGRect(origin: .zero, size: label.intrinsicContentSize)
+        root.addSubview(label); settle()
+        let snapshot = try EluUIKitReplayCollector().collect(root: root, ordinal: 0, timestamp: 100,
+            hasUnresolvedConfiguredBlockRules: false, profile: .sensitiveMask(), isCurrent: { true })
+        XCTAssertTrue(snapshot.nodes.contains { $0.kind == .ordinaryText("Ordinary native text") })
+    }
+
+    func testSensitiveProfileReadsSystemSecondaryTextButMasksFaintGlyphColors() throws {
+        window.overrideUserInterfaceStyle = .light
+        let cases: [(String, UIColor, Bool, Bool)] = [
+            ("Secondary native text", .secondaryLabel, false, true),
+            ("Half opacity glyphs", UIColor.black.withAlphaComponent(0.5), true, true),
+            ("PRIVATE_FAINT", UIColor.black.withAlphaComponent(0.49), false, false),
+            ("PRIVATE_FAINT_RUN", UIColor.black.withAlphaComponent(0.49), true, false),
+            ("PRIVATE_CLEAR", .clear, false, false),
+            ("PRIVATE_CLEAR_RUN", .clear, true, false)
+        ]
+        for (index, item) in cases.enumerated() {
+            let label = UILabel(frame: CGRect(x: 0, y: index * 40, width: 280, height: 30))
+            if item.2 {
+                label.attributedText = NSAttributedString(string: item.0, attributes: [.foregroundColor: item.1])
+            } else {
+                label.text = item.0; label.textColor = item.1
+            }
+            root.addSubview(label)
+        }
+        settle()
+        let secondary = try XCTUnwrap(root.subviews.first as? UILabel)
+        let alpha = secondary.textColor.resolvedColor(with: secondary.traitCollection).cgColor.alpha
+        XCTAssertGreaterThanOrEqual(alpha, 0.5)
+        XCTAssertLessThan(alpha, 1, "The regression must exercise UIKit's translucent system text")
+        let snapshot = try EluUIKitReplayCollector().collect(root: root, ordinal: 0, timestamp: 100,
+            hasUnresolvedConfiguredBlockRules: false, profile: .sensitiveMask(), isCurrent: { true })
+        var encoder = try EluNativeWireframeEncoder()
+        let text = String(decoding: try encoder.encode([snapshot]).data, as: UTF8.self)
+        for item in cases { XCTAssertEqual(text.contains(item.0), item.3, item.0) }
+    }
+
     func testSensitiveProfilePreservesOrdinaryTextAndRejectsPrivateSubtreesBeforeReading() throws {
         let ordinary = UILabel(frame: CGRect(x: 0, y: 0, width: 250, height: 30))
         ordinary.text = "Welcome to ELU"

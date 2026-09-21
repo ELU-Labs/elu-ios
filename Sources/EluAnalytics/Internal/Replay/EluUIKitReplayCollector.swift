@@ -191,26 +191,43 @@ final class EluUIKitReplayCollector {
     }
 
     private func hasVisiblePlainText(_ label: UILabel) -> Bool {
+        guard !label.isHidden, label.alpha == 1, (try? validateGeometry(label)) != nil else { return false }
         let color = label.isHighlighted ? (label.highlightedTextColor ?? label.textColor) : label.textColor
         guard let color else { return false }
-        guard color.resolvedColor(with: label.traitCollection).cgColor.alpha == 1 else { return false }
+        // UIKit secondary text uses translucent glyph color on an opaque view.
+        // Keep faint/transparent glyphs private while admitting standard labels.
+        guard color.resolvedColor(with: label.traitCollection).cgColor.alpha >= 0.5 else { return false }
         // UILabel synthesizes attributedText even for .text assignments. Admit
         // only its ordinary presentation attributes; links, attachments, stroke,
         // custom attributes and transparent runs stay masked as one unit.
-        guard let attributed = label.attributedText else { return true }
+        guard let attributed = label.attributedText else { return label.text?.isEmpty ?? true }
         guard attributed.length <= 4_096 else { return false }
+        // A fully visible view can still truncate its underlying string. Keep
+        // the first text profile conservative: only complete single-line text
+        // that fits without wrapping or ellipsis may be serialized.
+        guard attributed.string.rangeOfCharacter(from: .newlines) == nil else { return false }
+        let fullSize = attributed.size()
+        guard fullSize.width.isFinite, fullSize.height.isFinite,
+              fullSize.width <= label.bounds.width,
+              fullSize.height <= label.bounds.height else { return false }
         let allowed: Set<NSAttributedString.Key> = [.font, .foregroundColor, .paragraphStyle, .shadow]
         var visible = true
         attributed.enumerateAttributes(in: NSRange(location: 0, length: attributed.length)) { attributes, _, stop in
             if !Set(attributes.keys).isSubset(of: allowed) { visible = false }
             if let raw = attributes[.foregroundColor] {
                 guard let color = raw as? UIColor,
-                      color.resolvedColor(with: label.traitCollection).cgColor.alpha == 1 else {
+                      color.resolvedColor(with: label.traitCollection).cgColor.alpha >= 0.5 else {
                     visible = false; stop.pointee = true; return
                 }
             }
             if let raw = attributes[.font], (raw as? UIFont).map({ $0.pointSize.isFinite && $0.pointSize > 0 }) != true {
                 visible = false
+            }
+            if let raw = attributes[.paragraphStyle] {
+                guard let paragraph = raw as? NSParagraphStyle,
+                      paragraph.firstLineHeadIndent == 0, paragraph.headIndent == 0, paragraph.tailIndent == 0,
+                      paragraph.minimumLineHeight == 0, paragraph.maximumLineHeight == 0,
+                      paragraph.lineHeightMultiple == 0 else { visible = false; stop.pointee = true; return }
             }
             if !visible { stop.pointee = true }
         }

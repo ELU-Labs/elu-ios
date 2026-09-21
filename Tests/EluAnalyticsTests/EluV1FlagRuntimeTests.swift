@@ -2287,7 +2287,9 @@ final class EluV1FlagRuntimeTests: XCTestCase {
                 expectedGeneration: initial.generation
             )
             let replacedPending = Task { await client.reload() }
-            await Task.yield()
+            // The old waiter is released only after the denied reload has
+            // actually replaced its logical authority; yielding is not a barrier.
+            let firstResult = await first.value
             _ = try await runtime.setOptedOut(
                 false,
                 expectedGeneration: optedOut.generation
@@ -2295,7 +2297,6 @@ final class EluV1FlagRuntimeTests: XCTestCase {
             let newestPending = Task { await client.reload() }
 
             let replacedResult = await replacedPending.value
-            let firstResult = await first.value
             let beforeReleaseCalls = await transport.callCount()
             let beforeReleaseMax = await transport.maxConcurrentCalls()
             XCTAssertEqual(replacedResult, .stale)

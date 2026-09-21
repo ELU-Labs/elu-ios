@@ -23,15 +23,15 @@ final class EluNativeReplayCaptureUIKitTests: XCTestCase {
         let h = try await make(textMasking: "sensitive")
         var setup = try await selected(h)
         defer { setup.root.removeFromSuperview(); h.base.remove() }
-        let label = UILabel(frame: CGRect(x: 4, y: 8, width: 200, height: 20))
+        let label = UILabel(frame: CGRect(x: 4, y: 8, width: 280, height: 30))
         label.text = "Welcome to ELU"; setup.root.addSubview(label)
         let field = UITextField(frame: CGRect(x: 4, y: 40, width: 200, height: 20))
         field.text = "PRIVATE_INPUT"; setup.root.addSubview(field)
         let secure = UITextField(frame: CGRect(x: 4, y: 70, width: 200, height: 20))
         secure.isSecureTextEntry = true; secure.text = "PRIVATE_PASSWORD"; setup.root.addSubview(secure)
-        let privateLabel = UILabel(frame: CGRect(x: 4, y: 100, width: 200, height: 20))
+        let privateLabel = UILabel(frame: CGRect(x: 4, y: 100, width: 280, height: 30))
         privateLabel.text = "PRIVATE_LABEL"; Elu.maskView(privateLabel); setup.root.addSubview(privateLabel)
-        let blocked = UILabel(frame: CGRect(x: 4, y: 130, width: 200, height: 20))
+        let blocked = UILabel(frame: CGRect(x: 4, y: 130, width: 280, height: 30))
         blocked.text = "BLOCKED_CONTENT"; Elu.blockView(blocked); setup.root.addSubview(blocked)
         setup.prepared = try await prepare(h, authority: setup.authority)
         let owner = try start(h, setup)
@@ -44,7 +44,7 @@ final class EluNativeReplayCaptureUIKitTests: XCTestCase {
                 XCTAssertFalse(first.contains(value))
             }
             label.text = "Order confirmed"
-            let inserted = UILabel(frame: CGRect(x: 4, y: 160, width: 200, height: 20))
+            let inserted = UILabel(frame: CGRect(x: 4, y: 160, width: 280, height: 30))
             inserted.text = "Continue shopping"; setup.root.addSubview(inserted)
             h.base.testClock.advance(10)
             try await wait { try await h.queue.storedReplayChunks().count >= 2 }
@@ -69,7 +69,7 @@ final class EluNativeReplayCaptureUIKitTests: XCTestCase {
         for block in [false, true] {
             let h = try await make(textMasking: "sensitive"), setup = try await selected(h)
             defer { setup.root.removeFromSuperview(); h.base.remove() }
-            let label = UILabel(frame: CGRect(x: 4, y: 8, width: 200, height: 20))
+            let label = UILabel(frame: CGRect(x: 4, y: 8, width: 280, height: 30))
             label.text = "PREVIOUSLY_READABLE"; setup.root.addSubview(label)
             let pending = try await h.queue.enrollNativeReplayCapture()
             let enrollment = try XCTUnwrap(pending), use = try XCTUnwrap(enrollment.takePhysicalUse())
@@ -105,7 +105,7 @@ final class EluNativeReplayCaptureUIKitTests: XCTestCase {
     @MainActor func testMaskingDiscardsBufferedUnsealedInitial() async throws {
         let h = try await make(minimum: 30, textMasking: "sensitive"), setup = try await selected(h)
         defer { setup.root.removeFromSuperview(); h.base.remove() }
-        let label = UILabel(frame: CGRect(x: 4, y: 8, width: 200, height: 20))
+        let label = UILabel(frame: CGRect(x: 4, y: 8, width: 280, height: 30))
         label.text = "BUFFERED_PRIVATE"; setup.root.addSubview(label)
         let owner = try start(h, setup)
         do {
