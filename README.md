@@ -204,9 +204,33 @@ Restrictions last for the view's lifetime and cannot weaken remote policy.
 Unknown native blocking rules disable replay. Replay remains subject to engine,
 player, privacy, and device qualification before release.
 
-`captureException` records errors explicitly supplied by your app. Automatic
-fatal-crash capture and native performance monitoring are not currently supplied.
+`captureException` records errors explicitly supplied by your app, including
+bounded cause chains. Automatic fatal-crash capture is not currently supplied.
 Browser DOM, Web Vitals, and browser long-task APIs do not apply to native apps.
+
+## Native performance
+
+Native performance sampling is disabled by default. To opt in:
+
+```swift
+let performance = EluPerformanceOptions(enabled: true,
+    sampleIntervalMilliseconds: 30_000,
+    mainThreadStallThresholdMilliseconds: 250)
+Elu.setup(siteKey: "YOUR_SITE_KEY", options: EluSetupOptions(performance: performance))
+```
+
+Server policy must also enable these measurements. While the app is foregrounded,
+`$performance_sample` contains process physical memory footprint and completed
+main-thread response stalls above the configured threshold. These are native
+measurements, not JavaScript heap size or browser long tasks. A stall is counted
+after the main thread recovers; no stack traces, messages, URLs, or view content
+are collected. Unavailable memory readings are omitted.
+
+Consent, identity, configuration, and lifecycle changes discard pending samples.
+Intervals must be 5,000–2,147,483,647 milliseconds; the effective interval is the
+slower of local and server settings. Stall thresholds must be 100–60,000
+milliseconds. Invalid options disable sampling. This does not measure full app
+launch time or automatically report fatal crashes.
 
 ## SDK development
 

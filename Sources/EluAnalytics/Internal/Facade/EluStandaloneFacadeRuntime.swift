@@ -116,6 +116,7 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, @unchecked Sendable {
         withLock {
             guard !isShutDown else { return }
             foregroundIntent = foreground
+            started?.runtime.performanceLifecycleIntent(foreground: foreground)
             foregroundGeneration = UUID()
         }
         applyForegroundIntent()
@@ -141,6 +142,7 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, @unchecked Sendable {
                     rootDirectoryURL: rootDirectoryURL,
                     siteKey: siteKey,
                     configHost: context.configHost,
+                    performance: context.performance,
                     legacyStartupSource: legacyStartupSource
                 )
             },
@@ -827,6 +829,7 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, @unchecked Sendable {
 
     /// Called only while the facade lock is held; no database work occurs.
     private func bindPendingIntents(to runtime: EluStandaloneRuntime) {
+        runtime.performanceLifecycleIntent(foreground: foregroundIntent)
         runtime.bindNativeLifecycle(nativeLifecycle)
         for intent in pendingFlagIntents.values { intent.bind(runtime) }
         if let consentProjection { runtime.acceptConsentIntent(consentProjection.id, optedOut: consentProjection.optedOut) }
@@ -928,7 +931,7 @@ private final class EluFacadeCallback: @unchecked Sendable {
 private final class EluStandaloneFacadePendingIntent: @unchecked Sendable {
     let id = UUID()
     private var runtime: EluStandaloneRuntime?
-    private var token: EluV1FlagProjectionIntent?
+    private var token: EluStandaloneFlagProjectionIntent?
     private var nativeToken: EluNativeReplayIntent?
     func bind(_ owner: EluStandaloneRuntime) {
         guard runtime == nil else { return }

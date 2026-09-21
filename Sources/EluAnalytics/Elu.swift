@@ -1,10 +1,11 @@
 import Foundation
 
-/// Options for `Elu.setup(siteKey:options:)`. Dev/staging only — production
-/// apps use the plain `Elu.setup(siteKey:)`.
+/// Options for `Elu.setup(siteKey:options:)`. Production uses the default host.
 public struct EluSetupOptions {
     /// ELU config endpoint origin. Default: `https://elu.dev`.
     public var configHost: URL
+    /// Native performance collection is disabled unless explicitly enabled.
+    public var performance = EluPerformanceOptions()
 
     /// Internal construction marker for the owned runtime. Customer code
     /// cannot select or construct another backend. Legacy identity import
@@ -13,6 +14,10 @@ public struct EluSetupOptions {
 
     public init(configHost: URL = URL(string: "https://elu.dev")!) {
         self.configHost = configHost
+    }
+
+    public init(configHost: URL = URL(string: "https://elu.dev")!, performance: EluPerformanceOptions) {
+        self.configHost = configHost; self.performance = performance
     }
 }
 
@@ -33,7 +38,7 @@ public enum Elu {
         setup(siteKey: siteKey, options: EluSetupOptions())
     }
 
-    /// Initialize with explicit options (dev/staging config host only).
+    /// Initialize with explicit options. Alternate config hosts are for development only.
     public static func setup(siteKey: String, options: EluSetupOptions) {
         EluCore.shared.setup(siteKey: siteKey, options: options)
     }

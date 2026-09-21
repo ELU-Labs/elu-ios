@@ -23,6 +23,7 @@ final class EluCore {
     private var backend: (any EluRuntimeBackend)?
     private let backendIntentLock = NSLock()
     private weak var intentBackend: (any EluRuntimeBackend)?
+    private var performance = EluPerformanceOptions()
     private var configHost = URL(string: "https://elu.dev")!
     private var buffer = EluEventBuffer()
     private var pendingConsent: EluConsentOperation?
@@ -55,6 +56,7 @@ final class EluCore {
             self.siteKey = siteKey
             selection = options.runtimeSelection
             configHost = options.configHost
+            performance = options.performance
 
             // The owned source, including independent flags/privacy, decides
             // readiness. No legacy cache or v1 request participates.
@@ -77,7 +79,7 @@ final class EluCore {
         EluRuntimeBackendContext(siteKey: siteKey, config: config, configDocument: document,
             isNewUser: isNewUser, flagsDidLoad: { [weak self] in
                 self?.dispatchFlagNotification(ifCurrent: { true })
-            }, configHost: configHost, guardedFlagsDidLoad: { [weak self] predicate in
+            }, configHost: configHost, performance: performance, guardedFlagsDidLoad: { [weak self] predicate in
                 self?.dispatchFlagNotification(ifCurrent: predicate)
             }, initialConfigurationReady: { [weak self] predicate in
                 guard let self else { return }

@@ -86,12 +86,14 @@ struct EluRuntimeBackendContext {
     /// callbacks. Called from the backend's own execution context.
     let flagsDidLoad: () -> Void
     let configHost: URL
+    let performance: EluPerformanceOptions
     let guardedFlagsDidLoad: @Sendable (@escaping @Sendable () -> Bool) -> Void
     let initialConfigurationReady: @Sendable (@escaping @Sendable () -> Bool) -> Void
 
     init(siteKey: String, config: EluRemoteConfig? = nil, configDocument: Data? = nil,
          isNewUser: Bool, flagsDidLoad: @escaping () -> Void,
          configHost: URL = URL(string: "https://elu.dev")!,
+         performance: EluPerformanceOptions = .init(),
          guardedFlagsDidLoad: (@Sendable (@escaping @Sendable () -> Bool) -> Void)? = nil,
          initialConfigurationReady: @escaping @Sendable (@escaping @Sendable () -> Bool) -> Void = { _ in }) {
         self.siteKey = siteKey
@@ -100,6 +102,7 @@ struct EluRuntimeBackendContext {
         self.isNewUser = isNewUser
         self.flagsDidLoad = flagsDidLoad
         self.configHost = configHost
+        self.performance = performance
         self.guardedFlagsDidLoad = guardedFlagsDidLoad ?? { predicate in
             if predicate() { flagsDidLoad() }
         }

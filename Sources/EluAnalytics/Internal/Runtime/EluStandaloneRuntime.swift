@@ -113,6 +113,11 @@ private final class EluStandaloneDeliveryFence: @unchecked Sendable {
     func close() { lock.lock(); closed = true; value = UUID(); lock.unlock() }
 }
 
+struct EluStandaloneFlagProjectionIntent: Sendable {
+    let flags: EluV1FlagProjectionIntent
+    let performance: UUID
+}
+
 actor EluStandaloneRuntime {
     // Locally qualified recorder, stored readback, and playback support.
     // Remote configuration must still pass the independent admission gates.
@@ -143,6 +148,9 @@ actor EluStandaloneRuntime {
     private(set) var nativeReplayCompositionSettlement: EluNativeReplayComposition.CloseOutcome?
     private let nativeContinuousNow: @Sendable () -> UInt64?
     private nonisolated let deliveryFence = EluStandaloneDeliveryFence()
+    private nonisolated let performanceMonitor = EluNativePerformanceMonitor()
+    private let performanceOptions: EluPerformanceOptions
+    private var performanceForeground = false
     private let configurationGate: EluV2ConfigAuthorityGate?
     private let siteKey: String
     private let versions: EluVersionContext
@@ -182,8 +190,10 @@ actor EluStandaloneRuntime {
         replaySampleDraw: @escaping @Sendable () -> Double,
         flushDelayNanoseconds: UInt64,
         configurationGate: EluV2ConfigAuthorityGate?,
-        nativeContinuousNow: @escaping @Sendable () -> UInt64?
+        nativeContinuousNow: @escaping @Sendable () -> UInt64?,
+        performance: EluPerformanceOptions
     ) {
+        self.performanceOptions = performance
         self.nativeContinuousNow = nativeContinuousNow
         self.configurationGate = configurationGate
         self.queue = queue
@@ -232,7 +242,8 @@ actor EluStandaloneRuntime {
         sessionIdGenerator: @escaping @Sendable () -> String = {
             "session_\(EluStandaloneRuntime.compactUUID())"
         },
-        legacyStartupSource: EluLegacyStartupSource? = nil
+        legacyStartupSource: EluLegacyStartupSource? = nil,
+        performance: EluPerformanceOptions = .init()
     ) async throws -> EluStandaloneRuntime {
         guard isHeaderSafeSiteKey(siteKey) else {
             throw EluStandaloneRuntimeError.invalidSiteKey
@@ -289,7 +300,8 @@ actor EluStandaloneRuntime {
             replaySampleDraw: replaySampleDraw,
             flushDelayNanoseconds: flushDelayNanoseconds,
             configurationGate: configurationGate,
-            nativeContinuousNow: { nativeContinuousNanoseconds(continuousClock()) }
+            nativeContinuousNow: { nativeContinuousNanoseconds(continuousClock()) },
+            performance: performance
         )
     }
 
@@ -297,6 +309,7 @@ actor EluStandaloneRuntime {
         // Original worker tasks retain physical/receipt cleanup independently.
         // Destruction only closes local intake; it creates no database task.
         deliveryFence.close()
+        performanceMonitor.invalidate()
         if let viewPrivacyObserver { EluNativeViewPrivacy.shared.removeObserver(viewPrivacyObserver) }
         nativeAuthority.invalidateForOwnerDestruction()
         replayRelay.withdraw()
@@ -375,9 +388,18 @@ actor EluStandaloneRuntime {
         return await commit(snapshot)
     }
 
-    nonisolated func beginFlagProjectionIntent() -> EluV1FlagProjectionIntent { queue.beginFlagProjectionIntent() }
-    nonisolated func finishFlagProjectionIntent(_ intent: EluV1FlagProjectionIntent) { queue.finishFlagProjectionIntent(intent); replayRelay.request() }
+    nonisolated func beginFlagProjectionIntent() -> EluStandaloneFlagProjectionIntent {
+        let performance = performanceMonitor.beginMutation()
+        return .init(flags: queue.beginFlagProjectionIntent(), performance: performance)
+    }
+    nonisolated func finishFlagProjectionIntent(_ intent: EluStandaloneFlagProjectionIntent) {
+        queue.finishFlagProjectionIntent(intent.flags)
+        performanceMonitor.finishMutation(intent.performance)
+        replayRelay.request()
+        Task { await self.refreshPerformance() }
+    }
     nonisolated func invalidateAuthority() {
+        performanceMonitor.invalidate()
         replayRelay.withdraw()
         nativeAuthority.withdraw()
         _ = deliveryFence.advance()
@@ -421,6 +443,7 @@ actor EluStandaloneRuntime {
         Task { await self.refreshNativePrivacyContext() }
     }
     private func refreshNativePrivacyContext() async {
+        defer { refreshPerformance() }
         guard phase != .closed, let data = configurationDocument, let source = configurationWitness,
               data == source.data, configurationGate?.isCurrent(source) == true else { return }
         _ = await submitConfiguration(data)
@@ -479,7 +502,8 @@ actor EluStandaloneRuntime {
     func stopNativeReplay() async throws { try await nativeAuthority.stop() }
 
     func applyConfiguration(_ configData: Data, sourceWitness: EluV2ConfigAuthorityWitness? = nil) async -> EluStandaloneConfigurationOutcome {
-        defer { replayRelay.request() }
+        performanceMonitor.invalidate()
+        defer { replayRelay.request(); refreshPerformance() }
         guard phase != .closed else { return .closed }
         guard configurationGate?.isCurrent(sourceWitness, data: configData) ?? true else {
             return .blocked(sourceUnavailable())
@@ -777,7 +801,8 @@ actor EluStandaloneRuntime {
     /// the context revision capture authority is bound to, so the stored
     /// document is resubmitted before the next capture can proceed.
     private func commit(_ snapshot: EluRuntimeQueueSnapshot) async -> EluRuntimeQueueSnapshot? {
-        defer { replayRelay.request() }
+        performanceMonitor.invalidate()
+        defer { replayRelay.request(); refreshPerformance() }
         lastSnapshot = snapshot
         guard let configurationDocument else { return snapshot }
         _ = await submitConfiguration(configurationDocument)
@@ -790,6 +815,7 @@ actor EluStandaloneRuntime {
     /// Persists the background transition first, then hands one bounded
     /// delivery pass to the background execution window.
     func markBackgrounded(at occurredAt: Date? = nil) async -> EluV1BackgroundResult? {
+        performanceForeground = false; performanceMonitor.invalidate()
         defer { replayRelay.request() }
         guard phase != .closed else { return nil }
         let result = try? await queue.markStandaloneBackgrounded(at: occurredAt ?? clock())
@@ -806,9 +832,53 @@ actor EluStandaloneRuntime {
     /// Foreground starts a fresh pass from durable storage; an in-flight
     /// background pass is coalesced by the coordinator rather than duplicated.
     func markForegrounded() {
-        defer { replayRelay.request() }
+        performanceForeground = true
+        defer { replayRelay.request(); refreshPerformance() }
         guard phase != .closed else { return }
         scheduleFlush()
+    }
+
+    /// Synchronous lifecycle withdrawal before the ordered runtime lane catches up.
+    nonisolated func performanceLifecycleIntent(foreground: Bool) {
+        performanceMonitor.setForeground(foreground)
+    }
+
+    private func refreshPerformance() {
+        performanceMonitor.invalidate()
+        guard phase == .capturing, performanceForeground, !lastSnapshot.identity.optedOut,
+              let session = lastSnapshot.identity.session, session.lifecycle == .active,
+              let data = configurationDocument,
+              let document = try? JSONDecoder().decode(EluV1ConfigDocument.self, from: data),
+              let settings = EluNativePerformanceSettings.resolve(performanceOptions, remote: document.capturePerformance)
+        else { return }
+        let fence = deliveryFence, decision = fence.token(), source = configurationWitness
+        let gate = configurationGate, monitor = performanceMonitor
+        let sampleClock = clock
+        let idleDeadline = session.lastActivityAt.addingTimeInterval(Double(session.timeoutSeconds))
+        let identityRevision = lastSnapshot.identity.revision
+        let contextRevision = lastSnapshot.identity.contextRevision
+        let sessionID = session.id
+        let current: @Sendable () -> Bool = {
+            let now = sampleClock()
+            return now >= session.lastActivityAt && now < idleDeadline && fence.isCurrent(decision)
+                && (gate?.isCurrent(source, data: data) ?? true)
+        }
+        performanceMonitor.start(settings: settings, authority: current) { [weak self] id, fields in
+            Task { await self?.capturePerformance(fields, id: id, identityRevision: identityRevision,
+                contextRevision: contextRevision, sessionID: sessionID, isCurrent: {
+                    monitor.isCurrent(id) && current()
+                }) }
+        }
+    }
+
+    private func capturePerformance(_ fields: [String: EluJSONValue], id: UUID, identityRevision: Int64,
+                                    contextRevision: Int64, sessionID: String?,
+                                    isCurrent: @escaping @Sendable () -> Bool) async {
+        guard phase == .capturing, performanceForeground,
+              lastSnapshot.identity.revision == identityRevision,
+              lastSnapshot.identity.contextRevision == contextRevision,
+              lastSnapshot.identity.session?.id == sessionID, isCurrent() else { return }
+        _ = await capture("$performance_sample", properties: fields, admissionGuard: isCurrent)
     }
 
     /// Triggers delivery now; without an activated authority nothing is sent.
@@ -829,6 +899,7 @@ actor EluStandaloneRuntime {
         nativeAuthority.withdraw()
         replayRelay.withdraw()
         phase = .closed
+        performanceMonitor.invalidate()
         deliveryFence.close()
         configurationDocument = nil
         configurationWitness = nil
@@ -1052,6 +1123,7 @@ final class EluStandaloneLifecycleSink: EluRuntimeLifecycleSink, @unchecked Send
     }
 
     func applicationForegrounded(at occurredAt: Date, fromBackground: Bool) {
+        runtime.performanceLifecycleIntent(foreground: true)
         enqueue { runtime in
             _ = await runtime.capture(
                 EluStandaloneRuntime.applicationOpenedEvent,
@@ -1063,6 +1135,7 @@ final class EluStandaloneLifecycleSink: EluRuntimeLifecycleSink, @unchecked Send
     }
 
     func applicationBackgrounded(at occurredAt: Date) {
+        runtime.performanceLifecycleIntent(foreground: false)
         // The event is ordered before the background transition so it lands
         // in the session being suspended; the same-instant transition then
         // records the background state.
