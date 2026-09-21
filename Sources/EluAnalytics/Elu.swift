@@ -70,8 +70,8 @@ public enum Elu {
         EluCore.shared.dispatch(.capture(event: event, properties: properties))
     }
 
-    /// Record a screen view (`$screen`). UIKit view controllers are captured
-    /// automatically; SwiftUI navigation needs manual calls — see README.
+    /// Record a logical screen view. Call explicitly from UIKit and SwiftUI
+    /// when the application presents a screen — see README.
     public static func screen(_ name: String, properties: [String: Any]? = nil) {
         EluCore.shared.dispatch(.screen(name: name, properties: properties))
     }
@@ -86,6 +86,12 @@ public enum Elu {
     /// `unregister` or `reset`).
     public static func register(_ properties: [String: Any]) {
         EluCore.shared.dispatch(.register(properties))
+    }
+
+    /// Set each super property only when absent, or equal to `defaultValue`.
+    /// Explicit null values count as present unless `defaultValue` is `NSNull()`.
+    public static func registerOnce(_ properties: [String: Any], defaultValue: Any? = "None") {
+        EluCore.shared.dispatch(.registerOnce(properties, defaultValue: defaultValue))
     }
 
     public static func unregister(_ key: String) {
@@ -106,6 +112,12 @@ public enum Elu {
 
     public static func getFeatureFlagPayload(_ key: String) -> Any? {
         EluCore.shared.getFeatureFlagPayload(key)
+    }
+
+    /// Read one identity-bound flag snapshot, including its variant and payload.
+    /// Returns nil while unavailable or when the key is absent.
+    public static func getFeatureFlagResult(_ key: String) -> EluFeatureFlagResult? {
+        EluCore.shared.getFeatureFlagResult(key)
     }
 
     public static func isFeatureEnabled(_ key: String) -> Bool {
@@ -129,9 +141,25 @@ public enum Elu {
         EluCore.shared.dispatch(.setGroupPropertiesForFlags(type: type, properties: properties))
     }
 
+    // MARK: - Consent
+
+    /// Persistently stop capture, replay, and delivery for this installation.
+    /// Calls made while opted out are not backfilled when consent is restored.
+    public static func optOut() { EluCore.shared.setConsent(optedOut: true) }
+
+    /// Restore capture when current remote privacy policy also permits it.
+    /// Pass nil to suppress the optional opt-in event.
+    public static func optIn(captureEventName: String? = "$opt_in", properties: [String: Any]? = nil) {
+        EluCore.shared.setConsent(optedOut: false, event: captureEventName, properties: properties)
+    }
+
+    public static func isOptedOut() -> Bool { EluCore.shared.isOptedOut() }
+
     // MARK: - Delivery
 
-    /// Force-send queued events now (e.g. right before expected termination).
+    /// Request a delivery attempt for queued events. This does not wait for a
+    /// server acknowledgment or guarantee delivery before process termination.
+    /// Unacknowledged durable events are retried on a later eligible launch.
     public static func flush() {
         EluCore.shared.flush()
     }

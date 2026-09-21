@@ -19,6 +19,7 @@ struct EluNativeReplaySealer: Sendable {
     private let versions: JSON
     private let protocolGeneration: String
     private let maximumRequestBytes: Int
+    private let allowsOrdinaryText: Bool
     private var encoder: EluNativeWireframeEncoder
 
     init(replayId: String, identity snapshot: EluIdentitySnapshot,
@@ -53,10 +54,13 @@ struct EluNativeReplaySealer: Sendable {
               original.replayTransport?.codec == pair.codec, original.replayTransport?.compression == pair.compression,
               original.effectiveMasking.secureInputsMasked,
               original.effectiveMasking.platformFallbackApplied == projected.platformFallbackApplied,
-              profile == .blanketMask(), versions.platform == "ios"
+              original.effectiveMasking.text == profile.textMasking,
+              original.effectiveMasking.inputs == .all, original.effectiveMasking.images == .block,
+              versions.platform == "ios"
         else { throw EluNativeReplaySealingError.invalidBinding }
         // Validate the existing version context before explicitly projecting its v2 wire wrapper.
         _ = try JSONEncoder().encode(versions)
+        allowsOrdinaryText = profile.allowsOrdinaryText
         self.replayId = replayId; sessionId = session.id
         identity = Self.object([
             ("anonymousId", Self.string(snapshot.identity.anonymousId)),
@@ -85,6 +89,9 @@ struct EluNativeReplaySealer: Sendable {
 
     /// Serial value operation: only a fully prepared request advances this encoder history.
     mutating func seal(_ snapshots: [EluNativeMaskedSnapshot]) throws -> EluV2ReplayPreparedRequest {
+        if !allowsOrdinaryText && snapshots.contains(where: { frame in
+            frame.nodes.contains { node in if case .ordinaryText = node.kind { return true }; return false }
+        }) { throw EluNativeReplaySealingError.invalidBinding }
         var next = encoder
         let chunk = try next.encode(snapshots)
         let chunkIdentity = Self.object([

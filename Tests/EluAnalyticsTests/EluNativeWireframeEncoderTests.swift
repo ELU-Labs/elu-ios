@@ -8,6 +8,28 @@ final class EluNativeWireframeEncoderTests: XCTestCase {
     private let third = UUID(uuidString: "00000000-0000-4000-8000-000000000003")!
     private let time: Int64 = 1_788_883_200_000
 
+    func testOrdinaryTextSurvivesInitialChangedAndInsertedFrames() throws {
+        var encoder = try EluNativeWireframeEncoder()
+        let initial = try encoder.encode([frame(0, nodes: [node(first, .ordinaryText("Welcome to ELU"))])])
+        let changed = try encoder.encode([frame(1, nodes: [node(first, .ordinaryText("Order confirmed")),
+                                                            node(second, .ordinaryText("Continue shopping"))])])
+        XCTAssertTrue(String(decoding: initial.data, as: UTF8.self).contains("Welcome to ELU"))
+        let text = String(decoding: changed.data, as: UTF8.self)
+        XCTAssertTrue(text.contains("Order confirmed"))
+        XCTAssertTrue(text.contains("Continue shopping"))
+        XCTAssertFalse(text.contains("Welcome to ELU"))
+    }
+
+    func testOrdinaryTextUsesUtf8ByteLimitAndFailedEncodingDoesNotAdvanceState() throws {
+        var encoder = try EluNativeWireframeEncoder()
+        let original = encoder.state
+        XCTAssertThrowsError(try encoder.encode([frame(0, nodes: [node(first, .ordinaryText(String(repeating: "é", count: 2_049)))])])) {
+            XCTAssertEqual($0 as? EluNativeEncodingError, .invalidText)
+        }
+        XCTAssertEqual(encoder.state, original)
+        _ = try encoder.encode([frame(0, nodes: [node(first, .ordinaryText(String(repeating: "é", count: 2_048)))])])
+    }
+
     func testInitialCanonicalFixedTokensAndNoLocalIdentityOnWire() throws {
         var encoder = try EluNativeWireframeEncoder()
         let nodes = try [node(first, .text), node(second, .input(secure: true)), node(third, .placeholder)]

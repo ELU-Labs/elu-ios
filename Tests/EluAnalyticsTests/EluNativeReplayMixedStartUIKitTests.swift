@@ -27,8 +27,7 @@ final class EluNativeReplayMixedStartUIKitTests: XCTestCase {
         config["issuedAt"] = EluRFC3339.string(from: h.base.now)
         h.base.config = try JSONSerialization.data(withJSONObject: config)
         try await h.publish()
-        let window = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
-            .filter { $0.activationState == .foregroundActive }.flatMap { $0.windows }.first { !$0.isHidden })
+        let window = try EluUIKitTestHost.window()
         let root = NativeMixedStartRoot(frame: window.bounds)
         window.addSubview(root); root.layoutIfNeeded(); window.layoutIfNeeded()
         defer { gate.releaseAll(); root.removeFromSuperview() }

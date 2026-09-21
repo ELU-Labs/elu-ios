@@ -105,9 +105,20 @@ struct EluNativeReplayFrameBuffer: Sendable {
                 }
                 nodes += snapshot.nodes.count
             }
-            // Typed nodes contain fixed-size geometry/style/UUID values, no
-            // customer strings or images. Charge conservatively before retention.
-            guard nodes * 512 + candidate.count * 256 <= Self.maximumEstimatedBytes else {
+            // Charge geometry/style plus bounded UTF-8 text before retaining it.
+            var estimatedBytes = nodes * 512 + candidate.count * 256
+            for snapshot in candidate {
+                for node in snapshot.nodes {
+                    if case let .ordinaryText(text) = node.kind {
+                        let count = text.utf8.count
+                        guard count <= 4_096, count <= Self.maximumEstimatedBytes - estimatedBytes else {
+                            throw EluNativeReplayCaptureError.bufferLimit
+                        }
+                        estimatedBytes += count
+                    }
+                }
+            }
+            guard estimatedBytes <= Self.maximumEstimatedBytes else {
                 throw EluNativeReplayCaptureError.bufferLimit
             }
             frames = candidate
@@ -293,6 +304,7 @@ private final class EluNativeReplayCaptureRun: @unchecked Sendable {
                     let frame = try self.selection.consumeRoot { root in
                         try collector.collect(root: root, ordinal: ordinal, timestamp: timestamp,
                             hasUnresolvedConfiguredBlockRules: admission.hasUnresolvedBlockRules,
+                            profile: permit.profile,
                             isCurrent: {
                                 self.fence.isCurrent() && permit.isCurrentForCollection()
                                     && admission.isCurrent() && self.fence.isCurrent()

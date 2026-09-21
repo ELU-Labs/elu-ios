@@ -25,6 +25,7 @@ final class EluCore {
     private weak var intentBackend: (any EluRuntimeBackend)?
     private var configHost = URL(string: "https://elu.dev")!
     private var buffer = EluEventBuffer()
+    private var pendingConsent: EluConsentOperation?
     private var isNewUser = false
     private var siteKey = ""
     private var selection: EluRuntimeSelection = .standalone
@@ -68,6 +69,7 @@ final class EluCore {
             backendIntentLock.lock()
             intentBackend = selected
             backendIntentLock.unlock()
+            if let pendingConsent { selected.execute(.consent(pendingConsent)) }
         }
     }
 
@@ -111,6 +113,12 @@ final class EluCore {
         let finishIntent = beginPendingOperation(op)
         queue.async { [self] in
             defer { finishIntent?() }
+            if pendingConsent?.optedOut == true {
+                switch op {
+                case .capture, .screen, .captureException: return
+                default: break
+                }
+            }
             switch state {
             case .running:
                 execute(op)
@@ -127,6 +135,24 @@ final class EluCore {
     }
 
     // MARK: - Non-buffered facade paths
+
+    func setConsent(optedOut: Bool, event: String? = nil, properties: [String: Any]? = nil) {
+        if let event, EluFacadeJSON.identifier(event, maximumLength: 512) == nil { return }
+        let operation = EluConsentOperation(optedOut: optedOut, event: event, properties: properties)
+        let finishIntent = beginPendingOperation(.consent(operation))
+        queue.async { [self] in
+            defer { finishIntent?() }
+            pendingConsent = operation
+            if optedOut { buffer.dropAll() }
+            // Consent is not a bounded event-buffer entry: persist it even
+            // before configuration arrives, and never drop it on overflow.
+            backend?.execute(.consent(operation))
+        }
+    }
+
+    func isOptedOut() -> Bool {
+        queue.sync { pendingConsent?.optedOut ?? backend?.isOptedOut() ?? false }
+    }
 
     func reset() {
         dispatch(.reset)
@@ -156,6 +182,13 @@ final class EluCore {
         queue.sync {
             guard state == .running else { return nil }
             return backend?.featureFlagPayload(key)
+        }
+    }
+
+    func getFeatureFlagResult(_ key: String) -> EluFeatureFlagResult? {
+        queue.sync {
+            guard state == .running else { return nil }
+            return backend?.featureFlagResult(key)
         }
     }
 

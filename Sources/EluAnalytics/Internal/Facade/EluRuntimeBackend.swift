@@ -59,8 +59,10 @@ protocol EluRuntimeBackend: AnyObject {
     func activate()
 
     func distinctId() -> String?
+    func isOptedOut() -> Bool
     func featureFlag(_ key: String) -> Any?
     func featureFlagPayload(_ key: String) -> Any?
+    func featureFlagResult(_ key: String) -> EluFeatureFlagResult?
     func isFeatureEnabled(_ key: String) -> Bool
     func reloadFeatureFlags(_ completion: (() -> Void)?)
     func flush()
@@ -114,6 +116,8 @@ struct EluRuntimeBackendFactory {
 // Simple injected test backends have no retained projection. The owned
 // backend overrides both methods with original guards.
 extension EluRuntimeBackend {
+    func isOptedOut() -> Bool { false }
+    func featureFlagResult(_ key: String) -> EluFeatureFlagResult? { nil }
     func flagNotificationPredicate() -> (@Sendable () -> Bool)? {
         guard flagsAreLoaded else { return nil }
         return { [weak self] in self?.flagsAreLoaded == true }

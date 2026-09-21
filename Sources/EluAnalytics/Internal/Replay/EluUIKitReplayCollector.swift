@@ -33,8 +33,8 @@ private final class EluUIKitCollectionFence: @unchecked Sendable {
     }
 }
 
-/// A synchronous main-thread collector of blanket-masked geometry. It never
-/// installs observers, reads values, captures pixels, or authorizes queue admission.
+/// A synchronous main-thread collector of policy-filtered geometry and native text.
+/// Input values, images, web views, and opaque drawing never enter snapshots.
 @MainActor
 final class EluUIKitReplayCollector {
     private struct Projection {
@@ -71,6 +71,7 @@ final class EluUIKitReplayCollector {
     func collect(root: UIView, ordinal: Int64, timestamp: Int64,
                  hasUnresolvedConfiguredBlockRules: Bool,
                  restrictions: [EluUIKitReplayRestriction] = [],
+                 profile: EluNativeMaskingProfile = .blanketMask(),
                  isCurrent: () -> Bool) throws -> EluNativeMaskedSnapshot {
         func check() throws {
             guard fence.current(), isCurrent(), fence.current() else { throw EluUIKitReplayCollectionError.withdrawn }
@@ -86,14 +87,15 @@ final class EluUIKitReplayCollector {
         let rootBounds = root.bounds
         let viewport = try EluNativeViewport(width: Double(rootBounds.width), height: Double(rootBounds.height))
         let viewportRect = CGRect(x: 0, y: 0, width: viewport.width, height: viewport.height)
-        var inheritedClip = viewportRect, rootBlocked = false
+        var inheritedClip = viewportRect, rootBlocked = false, rootMasked = !profile.allowsOrdinaryText
         var ancestor = root.superview, ancestorCount = 0
         while let current = ancestor {
             try check(); ancestorCount += 1
             guard ancestorCount <= maximumDepth else { throw EluUIKitReplayCollectionError.treeLimit }
             guard !current.isHidden, current.alpha == 1 else { throw EluUIKitReplayCollectionError.invalidRoot }
             try validateGeometry(current)
-            if restrictions.contains(where: { $0.view === current && $0.action == .block }) { rootBlocked = true }
+            if current.eluReplayRestriction == .block || restrictions.contains(where: { $0.view === current && $0.action == .block }) { rootBlocked = true }
+            if current.eluReplayRestriction == .mask || restrictions.contains(where: { $0.view === current && $0.action == .mask }) { rootMasked = true }
             if current === window || current.clipsToBounds || current.layer.masksToBounds || current is UIScrollView {
                 let bounds = current.convert(current.bounds, to: root).offsetBy(dx: -rootBounds.minX, dy: -rootBounds.minY)
                 _ = try rect(bounds)
@@ -101,7 +103,7 @@ final class EluUIKitReplayCollector {
             }
             ancestor = current.superview
         }
-        var stack = [Visit(view: root, depth: 1, inheritedClip: inheritedClip, masked: true, blocked: rootBlocked)]
+        var stack = [Visit(view: root, depth: 1, inheritedClip: inheritedClip, masked: rootMasked, blocked: rootBlocked)]
         var nodes: [EluNativeMaskedNode] = [], nextProjections: [ObjectIdentifier: Projection] = [:]
         var nextIssued = issued, visited = 0
         while let visit = stack.popLast() {
@@ -116,7 +118,9 @@ final class EluUIKitReplayCollector {
             let converted = view.convert(view.bounds, to: root)
                 .offsetBy(dx: -rootBounds.minX, dy: -rootBounds.minY)
             let bounds = try rect(converted)
-            var blocked = visit.blocked, masked = visit.masked
+            let visible = intersection(converted, visit.inheritedClip, viewport: viewportRect)
+            var blocked = visit.blocked || view.eluReplayRestriction == .block
+            var masked = visit.masked || view.eluReplayRestriction == .mask
             for restriction in restrictions where restriction.view === view {
                 switch restriction.action { case .block: blocked = true; case .mask: masked = true }
             }
@@ -131,8 +135,21 @@ final class EluUIKitReplayCollector {
                 kind = .input(secure: field.isSecureTextEntry); traversable = false
             } else if let text = view as? UITextView {
                 kind = .input(secure: text.isSecureTextEntry); traversable = false
-            } else if view is UILabel {
-                kind = .text; traversable = false
+            } else if let label = view as? UILabel {
+                // Subclasses can expose custom-sensitive state through getters.
+                // Only exact system controls are eligible for ordinary text.
+                kind = !masked && type(of: label) == UILabel.self && visible == converted
+                    && hasVisiblePlainText(label)
+                    ? ordinaryText(label.text ?? "") : .text
+                traversable = false
+            } else if let button = view as? UIButton, type(of: button) == UIButton.self {
+                // Read the actually rendered label, never a stale underlying
+                // plain title overridden by an attributed/configured title.
+                let titleLabel = button.titleLabel
+                kind = !masked && visible == converted
+                    && titleLabel.map({ !$0.isHidden && hasVisiblePlainText($0) }) == true
+                    ? ordinaryText(titleLabel?.text ?? "") : .text
+                traversable = false
             } else if type(of: view) == UIView.self || type(of: view) == UIWindow.self
                         || type(of: view) == UIStackView.self || type(of: view) == UIScrollView.self {
                 kind = .rectangle; traversable = true
@@ -150,9 +167,8 @@ final class EluUIKitReplayCollector {
                 projection = Projection(view: view, identity: value)
             }
             guard nextProjections.updateValue(projection, forKey: key) == nil else { throw EluUIKitReplayCollectionError.invalidRoot }
-            let visible = intersection(converted, visit.inheritedClip, viewport: viewportRect)
-            // Scalar shape only. No text/attributedText/accessibility/title/font,
-            // image/URL/layer contents, description, screenshot or pixel access.
+            // No attributed strings, accessibility, image/URL/layer contents,
+            // descriptions, screenshots, or pixel access enter the snapshot.
             let style = try EluNativeStyle(color: kind == .placeholder ? .init(red: 255, green: 255, blue: 255) : nil)
             nodes.append(.init(identity: projection.identity, kind: kind, bounds: bounds, clip: try rect(visible), style: style))
             if traversable {
@@ -171,6 +187,38 @@ final class EluUIKitReplayCollector {
         let result = EluNativeMaskedSnapshot(ordinal: ordinal, timestamp: timestamp, viewport: viewport, nodes: nodes)
         guard fence.commit({ projections = nextProjections; issued = nextIssued }) else { throw EluUIKitReplayCollectionError.withdrawn }
         return result
+    }
+
+    private func hasVisiblePlainText(_ label: UILabel) -> Bool {
+        let color = label.isHighlighted ? (label.highlightedTextColor ?? label.textColor) : label.textColor
+        guard let color else { return false }
+        guard color.resolvedColor(with: label.traitCollection).cgColor.alpha == 1 else { return false }
+        // UILabel synthesizes attributedText even for .text assignments. Admit
+        // only its ordinary presentation attributes; links, attachments, stroke,
+        // custom attributes and transparent runs stay masked as one unit.
+        guard let attributed = label.attributedText else { return true }
+        guard attributed.length <= 4_096 else { return false }
+        let allowed: Set<NSAttributedString.Key> = [.font, .foregroundColor, .paragraphStyle, .shadow]
+        var visible = true
+        attributed.enumerateAttributes(in: NSRange(location: 0, length: attributed.length)) { attributes, _, stop in
+            if !Set(attributes.keys).isSubset(of: allowed) { visible = false }
+            if let raw = attributes[.foregroundColor] {
+                guard let color = raw as? UIColor,
+                      color.resolvedColor(with: label.traitCollection).cgColor.alpha == 1 else {
+                    visible = false; stop.pointee = true; return
+                }
+            }
+            if let raw = attributes[.font], (raw as? UIFont).map({ $0.pointSize.isFinite && $0.pointSize > 0 }) != true {
+                visible = false
+            }
+            if !visible { stop.pointee = true }
+        }
+        return visible
+    }
+
+    private func ordinaryText(_ text: String) -> EluNativeMaskedKind {
+        // Refuse oversized content as one unit rather than retaining a prefix.
+        text.utf8.count <= 4_096 ? .ordinaryText(text) : .placeholder
     }
 
     private func validateGeometry(_ view: UIView) throws {

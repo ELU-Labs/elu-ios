@@ -195,7 +195,7 @@ actor EluNativeReplayAuthority {
         guard fence.current(invocation), queue.nativeSourceIsCurrent(source) else { throw EluNativeReplayAuthorityError.stale }
         let original = try await queue.nativeReplayProjection(source: source)
         guard fence.current(invocation), original.source == source, original.isCurrent() else { throw EluNativeReplayAuthorityError.stale }
-        let profile = EluNativeMaskingProfile.blanketMask()
+        let profile = EluNativeMaskingProfile.select(for: original.context.policy.masking, platform: .ios)
         let privacy = try EluPrivacyStateProjector.projectNative(observation: original, profile: profile,
             capabilities: capabilities, evaluatedAt: clock(), timeZoneIdentifier: timeZoneIdentifier)
         guard fence.current(invocation), original.isCurrent() else { throw EluNativeReplayAuthorityError.stale }

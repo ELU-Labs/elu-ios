@@ -176,7 +176,7 @@ enum EluPrivacyStateProjector {
         let result = try project(context: observation.context,
             input: EluPrivacyProjectionInput(contextRevision: observation.identity.identity.contextRevision,
                 identityOptedOut: observation.identity.identity.optedOut, timeZoneIdentifier: timeZoneIdentifier,
-                evaluatedAt: evaluatedAt, appliedMasking: .init(text: .all, inputs: .all, images: .block),
+                evaluatedAt: evaluatedAt, appliedMasking: .init(text: profile.textMasking, inputs: .all, images: .block),
                 replaySampleDraw: originalDraw, replaySessionEligible: observation.sessionEligible,
                 replayBudgetRemainingSeconds: observation.accounting.remainingWholeSeconds,
                 localReplayTransports: capabilities.pairs), originalNativeSample: sampled)

@@ -163,7 +163,7 @@ final class EluNativeReplaySealerTests: XCTestCase {
         let repositoryRoot = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
             .deletingLastPathComponent().deletingLastPathComponent()
         let fixtureURL = ProcessInfo.processInfo.environment["ELU_SEALER_CONFIG"].map { URL(fileURLWithPath: $0) }
-            ?? repositoryRoot.appendingPathComponent("Conformance/V2/Fixtures/config-enabled.json")
+            ?? repositoryRoot.appendingPathComponent("Conformance/V2/fixtures/config-enabled.json")
         let data = try Data(contentsOf: fixtureURL)
         var config = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
         var capabilities = config["capabilities"] as! [String: Any], replay = capabilities["replay"] as! [String: Any]

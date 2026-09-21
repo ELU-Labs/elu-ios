@@ -41,6 +41,8 @@ final class EluEventBufferTests: XCTestCase {
             case .screen: "screen"
             case .alias: "alias"
             case .register: "register"
+            case .registerOnce: "registerOnce"
+            case .consent: "consent"
             case .unregister: "unregister"
             case .group: "group"
             case .setPersonProperties: "setPersonProperties"

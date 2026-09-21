@@ -5,6 +5,23 @@ import XCTest
 final class EluNativeMaskingProfileTests: XCTestCase {
     private let expectedHash = "sha256:fdb4151f4d1525b0bcf95d16099278b9d82a1e13e5eba381a1d19c4f35084d77"
 
+    func testSensitiveProfileIsClosedAndRequiresSensitivePolicyWithoutNativeRules() throws {
+        let profile = EluNativeMaskingProfile.sensitiveMask()
+        XCTAssertEqual(try EluNativeMaskingProfile.parse(profile.canonicalBytes), profile)
+        XCTAssertEqual(profile.canonicalBytes.count, 387)
+        XCTAssertTrue(profile.allowsOrdinaryText)
+        XCTAssertEqual(profile.compatibility(with: try policy(text: "sensitive"), platform: .ios), .compatible)
+        XCTAssertEqual(profile.compatibility(with: try policy(text: "all"), platform: .ios), .restrictivePolicy)
+        let configured = try policy(text: "sensitive", rules: [rule("ios", "mask", "elu-unknown-native-v9")])
+        XCTAssertEqual(profile.compatibility(with: configured, platform: .ios), .restrictivePolicy)
+        XCTAssertEqual(EluNativeMaskingProfile.select(for: configured, platform: .ios), .blanketMask())
+        XCTAssertEqual(EluNativeMaskingProfile.select(for: try policy(text: "sensitive"), platform: .ios), profile)
+        XCTAssertEqual(EluNativeMaskingProfile.retention(of: profile.canonicalBytes,
+            required: try policy(text: "all"), platform: .ios), .restrictivePolicy)
+        XCTAssertEqual(EluNativeMaskingProfile.retention(of: EluNativeMaskingProfile.blanketMask().canonicalBytes,
+            required: try policy(text: "sensitive"), platform: .ios), .compatible)
+    }
+
     func testGoldenCanonicalBytesAndHash() throws {
         let profile = EluNativeMaskingProfile.blanketMask()
         XCTAssertEqual(profile.canonicalBytes.count, 372)

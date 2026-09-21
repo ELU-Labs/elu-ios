@@ -27,10 +27,9 @@ struct EluV2ReplayStoredChunk: Equatable, Sendable {
         self.maskingProfile = maskingProfile
     }
     /// Both closed profiles are retained descriptions, never admission authority.
-    /// The native branch accepts only the exact shared blanket-mask document.
+    /// The native branch accepts only the two exact shared native documents.
     private static func validateFrozenProfile(_ data: Data) throws {
-        if data == EluNativeMaskingProfile.blanketMask().canonicalBytes {
-            _ = try EluNativeMaskingProfile.parse(data)
+        if (try? EluNativeMaskingProfile.parse(data)) != nil {
             return
         }
         let root = try EluV1FlagJSON.parse(data, maximumBytes: 16_384)

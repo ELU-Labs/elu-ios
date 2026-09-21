@@ -15,6 +15,7 @@ enum EluNativeEncodingError: Error, Equatable, Sendable {
     case byteLimit
     case counterExhausted
     case invalidLimits
+    case invalidText
 }
 
 struct EluNativeRect: Equatable, Sendable {
@@ -88,6 +89,7 @@ struct EluNativeStyle: Equatable, Sendable {
 enum EluNativeMaskedKind: Equatable, Sendable {
     case rectangle
     case text
+    case ordinaryText(String)
     case input(secure: Bool)
     case placeholder
 }

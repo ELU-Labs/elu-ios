@@ -125,7 +125,7 @@ struct EluNativeWireframeEncoder: Sendable {
 
     private func generatedNodeCost(_ kind: EluNativeMaskedKind) -> Int {
         switch kind {
-        case .text, .placeholder: return 1
+        case .text, .ordinaryText, .placeholder: return 1
         case .rectangle, .input: return 0
         }
     }
@@ -138,6 +138,9 @@ struct EluNativeWireframeEncoder: Sendable {
         guard frame.nodes.count < limits.liveNodes else { throw EluNativeEncodingError.nodeLimit }
         var seen: Set<UUID> = []
         for node in frame.nodes {
+            if case let .ordinaryText(text) = node.kind {
+                guard text.utf8.count <= 4_096 else { throw EluNativeEncodingError.invalidText }
+            }
             guard seen.insert(node.identity).inserted else { throw EluNativeEncodingError.duplicateIdentity }
             let c = node.clip, b = node.bounds
             guard c.x >= 0, c.y >= 0, c.x + c.width <= Double(frame.viewport.width),
@@ -167,6 +170,7 @@ struct EluNativeWireframeEncoder: Sendable {
         switch n.kind {
         case .rectangle: fields.append(member("type", string("rectangle")))
         case .text: fields += [member("type", string("text")), member("text", string(Self.mask))]
+        case let .ordinaryText(text): fields += [member("type", string("text")), member("text", string(text))]
         case let .input(secure): fields += [member("type", string("input")), member("inputType", string(secure ? "password" : "text")), member("disabled", .bool(true)), member("value", string(Self.mask))]
         case .placeholder: fields += [member("type", string("placeholder")), member("label", string(Self.placeholder))]
         }

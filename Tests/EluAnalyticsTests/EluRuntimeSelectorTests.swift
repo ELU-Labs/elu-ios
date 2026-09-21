@@ -19,6 +19,24 @@ final class EluRuntimeSelectorTests: XCTestCase {
         )
     }
 
+    func testConsentBeforeSetupIsRetainedOutsideTheBoundedEventBuffer() throws {
+        let factory = SelectorSpy()
+        let core = EluCore(backendFactory: factory.factory)
+        core.setConsent(optedOut: true)
+        core.setup(siteKey: uniqueSiteKey(), options: EluSetupOptions(configHost: inertConfigHost))
+        for index in 0 ..< 150 { core.dispatch(.capture(event: "private-\(index)", properties: nil)) }
+        XCTAssertTrue(core.isOptedOut())
+        let backend = try XCTUnwrap(core.backendForTesting() as? SelectorBackend)
+        XCTAssertEqual(backend.recordedCalls(), ["optOut"])
+        backend.announceConfigurationReady()
+        drain(core)
+        XCTAssertEqual(backend.recordedCalls(), ["optOut", "activate"])
+        core.reset()
+        drain(core)
+        XCTAssertTrue(core.isOptedOut())
+        XCTAssertEqual(backend.recordedCalls().last, "reset")
+    }
+
     func testRepeatedSetupKeepsTheOriginalBackendAndBufferedCalls() throws {
         let factory = SelectorSpy()
         let core = EluCore(backendFactory: factory.factory)
@@ -453,6 +471,8 @@ final class SelectorBackend: EluRuntimeBackend, @unchecked Sendable {
         case let .identify(distinctId, _): record("identify(\(distinctId))")
         case let .alias(alias): record("alias(\(alias))")
         case .register: record("register")
+        case .registerOnce: record("registerOnce")
+        case let .consent(operation): record(operation.optedOut ? "optOut" : "optIn")
         case let .unregister(key): record("unregister(\(key))")
         case let .group(type, key, _): record("group(\(type)/\(key))")
         case .setPersonProperties: record("setPersonProperties")

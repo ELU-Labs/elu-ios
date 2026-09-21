@@ -120,6 +120,17 @@ final class EluNativeReplayCaptureOwnerTests: XCTestCase {
         XCTAssertTrue(snapshots.frames.isEmpty)
     }
 
+    func testOrdinaryTextBytesCountTowardRetainedBufferLimit() throws {
+        var buffer = try EluNativeReplayFrameBuffer(minimumDurationSeconds: 30)
+        XCTAssertThrowsError(try buffer.append(frame(0, nodeCount: 2_000,
+            kind: .ordinaryText(String(repeating: "a", count: 4_096))), continuous: 0))
+        XCTAssertTrue(buffer.frames.isEmpty)
+        var oversized = try EluNativeReplayFrameBuffer(minimumDurationSeconds: 30)
+        XCTAssertThrowsError(try oversized.append(frame(0, nodeCount: 1,
+            kind: .ordinaryText(String(repeating: "é", count: 2_049))), continuous: 0))
+        XCTAssertTrue(oversized.frames.isEmpty)
+    }
+
     func testPendingSealingCannotAdmitOrCaptureASuffix() throws {
         var buffer = try EluNativeReplayFrameBuffer(minimumDurationSeconds: 0)
         try buffer.append(frame(0), continuous: 0)
@@ -130,11 +141,11 @@ final class EluNativeReplayCaptureOwnerTests: XCTestCase {
         XCTAssertEqual(original.map(\.ordinal), [0])
     }
 
-    private func frame(_ ordinal: Int64, timestamp: Int64 = 100, nodeCount: Int = 0) throws -> EluNativeMaskedSnapshot {
+    private func frame(_ ordinal: Int64, timestamp: Int64 = 100, nodeCount: Int = 0, kind: EluNativeMaskedKind = .rectangle) throws -> EluNativeMaskedSnapshot {
         let rect = try EluNativeRect(x: 0, y: 0, width: 10, height: 10)
         let style = try EluNativeStyle()
         let nodes = (0 ..< nodeCount).map { _ in
-            EluNativeMaskedNode(identity: UUID(), kind: .rectangle, bounds: rect, clip: rect, style: style)
+            EluNativeMaskedNode(identity: UUID(), kind: kind, bounds: rect, clip: rect, style: style)
         }
         return EluNativeMaskedSnapshot(ordinal: ordinal, timestamp: timestamp,
             viewport: try EluNativeViewport(width: 100, height: 100), nodes: nodes)

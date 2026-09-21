@@ -13,6 +13,94 @@ final class EluStandaloneFacadeRuntimeTests: XCTestCase {
         var errorDescription: String? { "checkout failed" }
     }
 
+    func testRegisterOncePreservesValuesAndUsesExplicitDefaultAtomically() async throws {
+        try await withTemporaryDirectory { root in
+            let harness = try await makeHarness(root: root)
+            harness.backend.execute(.register(["tier": "gold", "empty": NSNull(), "sentinel": "None"]))
+            harness.backend.execute(.registerOnce(["tier": "silver", "empty": "changed", "new": 42,
+                                                  "sentinel": "filled"], defaultValue: "None"))
+            await harness.backend.settled()
+            var snapshot = try await harness.runtime.queueSnapshot()
+            XCTAssertEqual(snapshot.identity.superProperties["tier"], .string("gold"))
+            XCTAssertEqual(snapshot.identity.superProperties["empty"], .null)
+            XCTAssertEqual(snapshot.identity.superProperties["sentinel"], .string("filled"))
+            XCTAssertEqual(snapshot.identity.superProperties["new"], .integer(42))
+            harness.backend.execute(.registerOnce(["empty": "present"], defaultValue: NSNull()))
+            await harness.backend.settled()
+            snapshot = try await harness.runtime.queueSnapshot()
+            XCTAssertEqual(snapshot.identity.superProperties["empty"], .string("present"))
+            await harness.close()
+            let reopened = try await makeHarness(root: root)
+            let restored = try await reopened.runtime.queueSnapshot()
+            XCTAssertEqual(restored.identity.superProperties, snapshot.identity.superProperties)
+            await reopened.close()
+        }
+    }
+
+    func testFlagResultUsesOneCurrentSnapshotAndClearsOnIdentityIntent() async throws {
+        try await withTemporaryDirectory { root in
+            let harness = try await makeHarness(root: root, flagTransport: FacadeFlagTransport())
+            XCTAssertNil(harness.backend.featureFlagResult("variant"))
+            harness.backend.activate()
+            await harness.backend.settled()
+            let result = try XCTUnwrap(harness.backend.featureFlagResult("variant"))
+            XCTAssertEqual(result.key, "variant")
+            XCTAssertTrue(result.enabled)
+            XCTAssertEqual(result.variant, "variant-a")
+            XCTAssertEqual((result.payload as? [String: Any])?["color"] as? String, "violet")
+            XCTAssertFalse(try XCTUnwrap(harness.backend.featureFlagResult("enabled")).enabled)
+            XCTAssertNil(harness.backend.featureFlagResult("absent"))
+            let finish = harness.backend.beginPendingOperation(.reset)
+            XCTAssertNil(harness.backend.featureFlagResult("variant"))
+            finish?()
+            await harness.close()
+        }
+    }
+
+    func testConsentPersistsAcrossResetAndRestartAndRestoresCaptureExplicitly() async throws {
+        try await withTemporaryDirectory { root in
+            let harness = try await makeHarness(root: root)
+            harness.backend.execute(.consent(EluConsentOperation(optedOut: true)))
+            XCTAssertTrue(harness.backend.isOptedOut())
+            harness.backend.execute(.capture(event: "private", properties: nil))
+            harness.backend.execute(.reset)
+            await harness.backend.settled()
+            let beforeRestart = try await harness.runtime.queueSnapshot()
+            XCTAssertTrue(beforeRestart.identity.optedOut)
+            XCTAssertNil(beforeRestart.identity.session)
+            XCTAssertEqual(beforeRestart.queuedCount, 0)
+            await harness.close()
+            let reopened = try await makeHarness(root: root)
+            XCTAssertTrue(reopened.backend.isOptedOut())
+            reopened.backend.execute(.consent(EluConsentOperation(optedOut: false, event: "$opt_in")))
+            reopened.backend.execute(.capture(event: "allowed", properties: nil))
+            await reopened.backend.settled()
+            XCTAssertFalse(reopened.backend.isOptedOut())
+            _ = await reopened.runtime.flush()
+            let events = try await reopened.transport.recordedEvents()
+            XCTAssertEqual(events.compactMap { $0["name"] as? String }, ["$opt_in", "allowed"])
+            await reopened.close()
+        }
+    }
+
+    func testNewOptOutIntentCannotBeReopenedByAnOlderOptInOrConfigRefresh() async throws {
+        try await withTemporaryDirectory { root in
+            let harness = try await makeHarness(root: root)
+            let oldOptIn = UUID(), newOptOut = UUID()
+            harness.runtime.acceptConsentIntent(oldOptIn, optedOut: false)
+            harness.runtime.acceptConsentIntent(newOptOut, optedOut: true)
+            _ = await harness.runtime.setOptedOut(false, intent: oldOptIn)
+            let result = await harness.runtime.capture("must-not-capture")
+            guard case .rejected = result else { return XCTFail("newer opt-out must fence admission") }
+            guard case .unavailable = await harness.runtime.flush() else { return XCTFail("newer opt-out must fence delivery") }
+            _ = await harness.runtime.setOptedOut(true, intent: newOptOut)
+            let snapshot = try await harness.runtime.queueSnapshot()
+            XCTAssertTrue(snapshot.identity.optedOut)
+            XCTAssertEqual(snapshot.queuedCount, 0)
+            await harness.close()
+        }
+    }
+
     func testEveryFacadeMethodRecordsThroughTheOwnedRuntimeInCallOrder() async throws {
         try await withTemporaryDirectory { root in
             let harness = try await makeHarness(root: root)

@@ -3833,7 +3833,7 @@ actor EluSQLiteRuntimeQueue {
               nativeCaptureReceipt?.replayId == receipt.replayId,
               permit.replayId == receipt.replayId, input.isCurrent(), permit.isCurrent(),
               permit.privacy.effectivePolicyHash == permit.resolution.decisionHash,
-              permit.profile.canonicalBytes == EluNativeMaskingProfile.blanketMask().canonicalBytes,
+              (try? EluNativeMaskingProfile.parse(permit.profile.canonicalBytes)) == permit.profile,
               let policy = (try? JSONDecoder().decode(EluV1ConfigDocument.self, from: input.source.data))?.privacy
         else { throw EluNativeReplayAuthorityError.stale }
         let unresolved = permit.profile.compatibility(with: policy.masking, platform: .ios) != .compatible
@@ -6952,7 +6952,9 @@ actor EluSQLiteRuntimeQueue {
 
     @discardableResult
     func registerStandaloneSuperProperties(
-        _ properties: [String: EluJSONValue]
+        _ properties: [String: EluJSONValue],
+        onlyIfAbsent: Bool = false,
+        defaultValue: EluJSONValue? = nil
     ) throws -> EluRuntimeQueueSnapshot {
         guard !properties.isEmpty,
               validateCaptureProperties(properties),
@@ -6964,7 +6966,13 @@ actor EluSQLiteRuntimeQueue {
             throw EluRuntimeQueueError.invalidRecord
         }
         var identity = state.identity
-        for (key, value) in properties { identity.superProperties[key] = value }
+        for (key, value) in properties {
+            let existing = identity.superProperties[key]
+            if !onlyIfAbsent || existing == nil || (defaultValue != nil && existing == defaultValue) {
+                identity.superProperties[key] = value
+            }
+        }
+        guard identity.superProperties != state.identity.superProperties else { return state.snapshot }
         guard identity.superProperties.count <= EluIdentityState.maximumSuperProperties else {
             throw EluRuntimeQueueError.invalidRecord
         }

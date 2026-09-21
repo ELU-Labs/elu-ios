@@ -91,9 +91,20 @@ private final class EluStandaloneDeliveryFence: @unchecked Sendable {
     private let lock = NSLock()
     private var value = UUID()
     private var closed = false
+    private var consentIntent: UUID?
+    private var consentDenied = false
+    func acceptConsent(_ id: UUID, optedOut: Bool) {
+        lock.lock(); defer { lock.unlock() }
+        consentIntent = id; consentDenied = consentDenied || optedOut; value = UUID()
+    }
+    func commitConsent(_ id: UUID, optedOut: Bool) {
+        lock.lock(); defer { lock.unlock() }
+        guard consentIntent == id else { return }
+        consentDenied = optedOut; value = UUID()
+    }
     func advance() -> UUID { lock.lock(); defer { lock.unlock() }; value = UUID(); return value }
     func token() -> UUID { lock.lock(); defer { lock.unlock() }; return value }
-    func isCurrent(_ token: UUID) -> Bool { lock.lock(); defer { lock.unlock() }; return !closed && token == value }
+    func isCurrent(_ token: UUID) -> Bool { lock.lock(); defer { lock.unlock() }; return !closed && !consentDenied && token == value }
     func invalidate(_ token: UUID) { lock.lock(); if value == token { value = UUID() }; lock.unlock() }
     func close() { lock.lock(); closed = true; value = UUID(); lock.unlock() }
 }
@@ -339,6 +350,23 @@ actor EluStandaloneRuntime {
     /// activates or terminates capture authority. An activated authority also
     /// installs a delivery coordinator bound to that config's endpoint, expiry,
     /// and batch limits; anything else retires delivery.
+    nonisolated func acceptConsentIntent(_ id: UUID, optedOut: Bool) {
+        deliveryFence.acceptConsent(id, optedOut: optedOut)
+        if optedOut { invalidateAuthority() }
+    }
+
+    /// Commit consent before reopening any transport. Reset preserves this bit.
+    @discardableResult
+    func setOptedOut(_ optedOut: Bool, intent: UUID) async -> EluRuntimeQueueSnapshot? {
+        guard phase != .closed else { return nil }
+        guard let generation = try? await queue.snapshot().generation,
+              let snapshot = try? await queue.setOptedOut(optedOut, expectedGeneration: generation) else {
+            return nil
+        }
+        deliveryFence.commitConsent(intent, optedOut: optedOut)
+        return await commit(snapshot)
+    }
+
     nonisolated func beginFlagProjectionIntent() -> EluV1FlagProjectionIntent { queue.beginFlagProjectionIntent() }
     nonisolated func finishFlagProjectionIntent(_ intent: EluV1FlagProjectionIntent) { queue.finishFlagProjectionIntent(intent); replayRelay.request() }
     nonisolated func invalidateAuthority() {
@@ -648,10 +676,12 @@ actor EluStandaloneRuntime {
 
     @discardableResult
     func registerSuperProperties(
-        _ properties: [String: EluJSONValue]
+        _ properties: [String: EluJSONValue],
+        onlyIfAbsent: Bool = false,
+        defaultValue: EluJSONValue? = nil
     ) async -> EluRuntimeQueueSnapshot? {
         guard phase != .closed, !properties.isEmpty else { return nil }
-        guard let snapshot = try? await queue.registerStandaloneSuperProperties(properties) else {
+        guard let snapshot = try? await queue.registerStandaloneSuperProperties(properties, onlyIfAbsent: onlyIfAbsent, defaultValue: defaultValue) else {
             return nil
         }
         return await commit(snapshot)
@@ -774,6 +804,7 @@ actor EluStandaloneRuntime {
 
     /// Triggers delivery now; without an activated authority nothing is sent.
     func flush() async -> EluStandaloneDeliveryOutcome {
+        guard deliveryFence.isCurrent(deliveryFence.token()) else { return .unavailable }
         guard let coordinator else { return .unavailable }
         return .triggered(await coordinator.trigger())
     }

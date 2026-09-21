@@ -473,9 +473,7 @@ final class EluNativeReplayAuthorityTests: XCTestCase {
     }
 
     @MainActor private func selectedWindow() throws -> UIWindow {
-        let active = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
-            .filter { $0.activationState == .foregroundActive }.flatMap { $0.windows }.filter { !$0.isHidden }
-        return try XCTUnwrap(active.first)
+        try EluUIKitTestHost.window()
     }
     #endif
 

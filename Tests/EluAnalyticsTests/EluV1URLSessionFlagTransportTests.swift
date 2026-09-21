@@ -184,7 +184,7 @@ final class EluV1URLSessionFlagTransportTests: XCTestCase {
     private func fixture(_ name: String) throws -> Data {
         let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
             .deletingLastPathComponent().deletingLastPathComponent()
-        return try Data(contentsOf: root.appendingPathComponent("Conformance/V1/fixtures/\(name)"))
+        return try Data(contentsOf: root.appendingPathComponent("Conformance/V1/Fixtures/\(name)"))
     }
     private static func response(_ request: URLRequest, status: Int, headers: [String: String] = [:]) -> HTTPURLResponse {
         HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: "HTTP/1.1", headerFields: headers)!

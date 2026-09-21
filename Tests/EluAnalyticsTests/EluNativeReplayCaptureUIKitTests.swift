@@ -2,6 +2,7 @@ import Foundation
 import XCTest
 #if canImport(UIKit)
 import UIKit
+import zlib
 @testable import EluAnalytics
 
 @MainActor private final class CaptureRoot: UIView {
@@ -18,6 +19,73 @@ import UIKit
 }
 
 final class EluNativeReplayCaptureUIKitTests: XCTestCase {
+    @MainActor func testSensitiveCaptureStoresReadableTextAndExcludesPrivateContent() async throws {
+        let h = try await make(textMasking: "sensitive"), setup = try await selected(h)
+        defer { setup.root.removeFromSuperview(); h.base.remove() }
+        let label = UILabel(frame: CGRect(x: 4, y: 8, width: 200, height: 20))
+        label.text = "Welcome to ELU"; setup.root.addSubview(label)
+        let field = UITextField(frame: CGRect(x: 4, y: 40, width: 200, height: 20))
+        field.text = "PRIVATE_INPUT"; setup.root.addSubview(field)
+        let secure = UITextField(frame: CGRect(x: 4, y: 70, width: 200, height: 20))
+        secure.isSecureTextEntry = true; secure.text = "PRIVATE_PASSWORD"; setup.root.addSubview(secure)
+        let privateLabel = UILabel(frame: CGRect(x: 4, y: 100, width: 200, height: 20))
+        privateLabel.text = "PRIVATE_LABEL"; Elu.maskView(privateLabel); setup.root.addSubview(privateLabel)
+        let blocked = UILabel(frame: CGRect(x: 4, y: 130, width: 200, height: 20))
+        blocked.text = "BLOCKED_CONTENT"; Elu.blockView(blocked); setup.root.addSubview(blocked)
+        let owner = try start(h, setup)
+        do {
+            try await wait { try await h.queue.storedReplayChunks().count == 1 }
+            var rows = try await h.queue.storedReplayChunks()
+            let first = try decodedText(rows[0].prepared)
+            XCTAssertTrue(first.contains("Welcome to ELU"))
+            for value in ["PRIVATE_INPUT", "PRIVATE_PASSWORD", "PRIVATE_LABEL", "BLOCKED_CONTENT"] {
+                XCTAssertFalse(first.contains(value))
+            }
+            label.text = "Order confirmed"
+            let inserted = UILabel(frame: CGRect(x: 4, y: 160, width: 200, height: 20))
+            inserted.text = "Continue shopping"; setup.root.addSubview(inserted)
+            h.base.testClock.advance(10)
+            try await wait { try await h.queue.storedReplayChunks().count >= 2 }
+            guard case .settled = await owner.stop() else { return XCTFail("capture did not settle") }
+            rows = try await h.queue.storedReplayChunks()
+            let changed = try decodedText(rows[1].prepared)
+            XCTAssertTrue(changed.contains("Order confirmed"))
+            XCTAssertTrue(changed.contains("Continue shopping"))
+            XCTAssertTrue(rows.allSatisfy { $0.maskingProfile == EluNativeMaskingProfile.sensitiveMask().canonicalBytes })
+            await h.queue.close(); try await h.reopen()
+            let restored = try await h.queue.storedReplayChunks()
+            XCTAssertEqual(restored, rows)
+            await h.queue.close()
+        } catch {
+            _ = await owner.stop()
+            await h.queue.close()
+            throw error
+        }
+    }
+
+    private func decodedText(_ request: EluV2ReplayPreparedRequest) throws -> String {
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: request.body) as? [String: Any])
+        let chunk = try XCTUnwrap(object["chunk"] as? [String: Any])
+        let data = try XCTUnwrap(Data(base64Encoded: XCTUnwrap(chunk["payload"] as? String)))
+        var stream = z_stream()
+        guard inflateInit2_(&stream, 31, ZLIB_VERSION, Int32(MemoryLayout<z_stream>.size)) == Z_OK else {
+            throw EluNativeReplaySealingError.compression
+        }
+        defer { inflateEnd(&stream) }
+        var output = [UInt8](repeating: 0, count: 65_536)
+        let result = data.withUnsafeBytes { source in
+            output.withUnsafeMutableBytes { destination in
+                stream.next_in = UnsafeMutablePointer(mutating: source.bindMemory(to: UInt8.self).baseAddress)
+                stream.avail_in = uInt(source.count)
+                stream.next_out = destination.bindMemory(to: UInt8.self).baseAddress
+                stream.avail_out = uInt(destination.count)
+                return inflate(&stream, Z_FINISH)
+            }
+        }
+        guard result == Z_STREAM_END else { throw EluNativeReplaySealingError.compression }
+        return String(decoding: output.prefix(Int(stream.total_out)), as: UTF8.self)
+    }
+
     @MainActor func testUIKitPairOnlyOrWrongGenerationCannotStartPhysicalCapture() async throws {
         for generations: Set<String> in [[], ["unproved-other-generation"]] {
             let h = try await make(), setup = try await selected(h, generations: generations)
@@ -192,7 +260,7 @@ final class EluNativeReplayCaptureUIKitTests: XCTestCase {
     }
 
     @MainActor func testUIKitExplicitCollectorSealerAndNativeAdmission() async throws {
-        let h = try await make(), setup = try await selected(h)
+        let h = try await make(textMasking: "sensitive"), setup = try await selected(h)
         defer { setup.root.removeFromSuperview(); h.base.remove() }
         let pending = try await h.queue.enrollNativeReplayCapture()
         let enrollment = try XCTUnwrap(pending), use = try XCTUnwrap(enrollment.takePhysicalUse())
@@ -205,14 +273,13 @@ final class EluNativeReplayCaptureUIKitTests: XCTestCase {
                 try collector.collect(root: root, ordinal: 0,
                     timestamp: EluNativeReplayCaptureClock.milliseconds(h.base.now),
                     hasUnresolvedConfiguredBlockRules: admission.hasUnresolvedBlockRules,
+                    profile: permit.profile,
                     isCurrent: { permit.isCurrentForCollection() && admission.isCurrent() })
             }
             let versions = try EluVersionContext(runtime: .init(name: "elu-ios", version: "0.1.0"), facade: .init(name: "elu-ios", version: "0.1.0"))
             var sealer = try EluNativeReplaySealer(replayId: permit.replayId, identity: permit.identity,
                 authorization: permit.resolution, privacy: permit.privacy, profile: permit.profile, versions: versions)
             let request = try sealer.seal([frame])
-            let state = try await h.queue.nativeReplaySessionState()
-            print("native-time-boundary", String(reflecting: request.startedAt), String(reflecting: state.session?.firstStartAt))
             _ = try await h.queue.appendNativeReplay(request, admission: admission, physicalUse: use)
             let rows = try await h.queue.storedReplayChunks(); XCTAssertEqual(rows.count, 1)
             collector.withdraw(); use.settle()
@@ -234,9 +301,7 @@ final class EluNativeReplayCaptureUIKitTests: XCTestCase {
         let selection: EluNativeReplaySelection
     }
     @MainActor private func selected(_ h: NativeSessionHarness, generations: Set<String>? = nil) async throws -> Selection {
-        let windows = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
-            .filter { $0.activationState == .foregroundActive }.flatMap { $0.windows }.filter { !$0.isHidden }
-        let window = try XCTUnwrap(windows.first), root = UIView(frame: window.bounds)
+        let window = try EluUIKitTestHost.window(), root = UIView(frame: window.bounds)
         window.addSubview(root)
         let probe = CaptureRoot(frame: CGRect(x: 0, y: 0, width: 2, height: 2)); root.addSubview(probe)
         let authority = EluNativeReplayAuthority(queue: h.queue, clock: { h.base.now })
@@ -257,7 +322,7 @@ final class EluNativeReplayCaptureUIKitTests: XCTestCase {
             prepared: setup.prepared, selection: setup.selection, versions: versions,
             wallClock: { h.base.now }, continuousNanoseconds: { h.base.testClock.ticks() })
     }
-    private func make(minimum: Int = 0, fault: DeliveryFault? = nil) async throws -> NativeSessionHarness {
+    private func make(minimum: Int = 0, textMasking: String = "all", fault: DeliveryFault? = nil) async throws -> NativeSessionHarness {
         let h = try await NativeSessionHarness.make(fault: fault)
         h.base.testClock.advance(0.001)
         var body = try JSONSerialization.jsonObject(with: h.base.config) as! [String: Any]
@@ -265,6 +330,8 @@ final class EluNativeReplayCaptureUIKitTests: XCTestCase {
         replay["transports"] = [["codec": "elu-native-wireframe-v1", "compression": "gzip"]]
         capabilities["replay"] = replay; body["capabilities"] = capabilities
         var privacy = body["privacy"] as! [String: Any], policy = privacy["replay"] as! [String: Any]
+        var masking = privacy["masking"] as! [String: Any]
+        masking["text"] = textMasking; privacy["masking"] = masking
         policy["minimumDurationSeconds"] = minimum; privacy["replay"] = policy; body["privacy"] = privacy
         body["issuedAt"] = EluRFC3339.string(from: h.base.now)
         h.base.config = try JSONSerialization.data(withJSONObject: body); try await h.publish()

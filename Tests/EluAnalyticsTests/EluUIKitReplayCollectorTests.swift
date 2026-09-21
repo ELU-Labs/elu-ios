@@ -70,6 +70,91 @@ final class EluUIKitReplayCollectorTests: XCTestCase {
         XCTAssertThrowsError(try body()) { XCTAssertEqual($0 as? EluUIKitReplayCollectionError, expected) }
     }
 
+    func testSensitiveProfileDoesNotReadAttributedTransparentOrClippedUnderlyingText() throws {
+        let attributed = UILabel(frame: CGRect(x: 0, y: 0, width: 100, height: 20))
+        attributed.attributedText = NSAttributedString(string: "PRIVATE_ATTRIBUTED", attributes: [.foregroundColor: UIColor.clear])
+        let transparent = UILabel(frame: CGRect(x: 0, y: 25, width: 100, height: 20))
+        transparent.text = "PRIVATE_TRANSPARENT"; transparent.textColor = .clear
+        let clipped = UILabel(frame: CGRect(x: -100, y: 50, width: 100, height: 20))
+        clipped.text = "PRIVATE_OFFSCREEN"
+        root.addSubview(attributed); root.addSubview(transparent); root.addSubview(clipped); settle()
+        let collector = try EluUIKitReplayCollector()
+        let frame = try collector.collect(root: root, ordinal: 0, timestamp: 100,
+            hasUnresolvedConfiguredBlockRules: false, profile: .sensitiveMask(), isCurrent: { true })
+        XCTAssertFalse(frame.nodes.contains { if case .ordinaryText = $0.kind { return true }; return false })
+    }
+
+    func testSensitiveButtonUsesRenderedTitleAndMasksAttributedPrivateTitle() throws {
+        let ordinary = UIButton(frame: CGRect(x: 0, y: 0, width: 200, height: 40))
+        ordinary.setTitle("Continue checkout", for: .normal)
+        let privateButton = UIButton(frame: CGRect(x: 0, y: 50, width: 200, height: 40))
+        privateButton.setTitle("HIDDEN_UNDERLYING_TITLE", for: .normal)
+        privateButton.setAttributedTitle(NSAttributedString(string: "PRIVATE_TITLE", attributes: [.foregroundColor: UIColor.clear]), for: .normal)
+        root.addSubview(ordinary); root.addSubview(privateButton); settle()
+        let snapshot = try EluUIKitReplayCollector().collect(root: root, ordinal: 0, timestamp: 100,
+            hasUnresolvedConfiguredBlockRules: false, profile: .sensitiveMask(), isCurrent: { true })
+        var encoder = try EluNativeWireframeEncoder()
+        let text = String(decoding: try encoder.encode([snapshot]).data, as: UTF8.self)
+        XCTAssertTrue(text.contains("Continue checkout"))
+        XCTAssertFalse(text.contains("PRIVATE_TITLE"))
+        XCTAssertFalse(text.contains("HIDDEN_UNDERLYING_TITLE"))
+    }
+
+    func testSensitiveProfilePreservesOrdinaryTextAndRejectsPrivateSubtreesBeforeReading() throws {
+        let ordinary = UILabel(frame: CGRect(x: 0, y: 0, width: 250, height: 30))
+        ordinary.text = "Welcome to ELU"
+        let privateContainer = UIView(frame: CGRect(x: 0, y: 40, width: 250, height: 40))
+        let privateLabel = GetterLabel(frame: privateContainer.bounds)
+        privateLabel.text = "PRIVATE_PROFILE_TEXT"
+        privateContainer.addSubview(privateLabel)
+        Elu.maskView(privateContainer)
+        let blocked = OpaqueView(frame: CGRect(x: 0, y: 90, width: 250, height: 50))
+        let blockedLabel = UILabel(frame: blocked.bounds)
+        blockedLabel.text = "BLOCKED_CONTENT"
+        blocked.addSubview(blockedLabel)
+        Elu.blockView(blocked)
+        let input = GetterField(frame: CGRect(x: 0, y: 150, width: 250, height: 30))
+        input.text = "PRIVATE_INPUT_VALUE"
+        root.addSubview(ordinary); root.addSubview(privateContainer); root.addSubview(blocked); root.addSubview(input)
+        settle()
+        privateLabel.reads = 0; input.reads = 0; blocked.reads = 0
+        let collector = try EluUIKitReplayCollector()
+        let initial = try collector.collect(root: root, ordinal: 0, timestamp: 1_700_000_000_123,
+            hasUnresolvedConfiguredBlockRules: false, profile: .sensitiveMask(), isCurrent: { true })
+        XCTAssertEqual(privateLabel.reads, 0)
+        XCTAssertEqual(input.reads, 0)
+        XCTAssertEqual(blocked.reads, 0)
+        var encoder = try EluNativeWireframeEncoder()
+        let initialBytes = try encoder.encode([initial]).data
+        let initialText = String(decoding: initialBytes, as: UTF8.self)
+        XCTAssertTrue(initialText.contains("Welcome to ELU"))
+        for secret in ["PRIVATE_PROFILE_TEXT", "BLOCKED_CONTENT", "PRIVATE_INPUT_VALUE"] {
+            XCTAssertFalse(initialText.contains(secret))
+        }
+        ordinary.text = "Order confirmed"
+        let inserted = UILabel(frame: CGRect(x: 0, y: 190, width: 250, height: 30))
+        inserted.text = "Continue shopping"; root.addSubview(inserted); settle()
+        let next = try collector.collect(root: root, ordinal: 1, timestamp: 1_700_000_000_124,
+            hasUnresolvedConfiguredBlockRules: false, profile: .sensitiveMask(), isCurrent: { true })
+        let changed = String(decoding: try encoder.encode([next]).data, as: UTF8.self)
+        XCTAssertTrue(changed.contains("Order confirmed"))
+        XCTAssertTrue(changed.contains("Continue shopping"))
+        XCTAssertFalse(changed.contains("Welcome to ELU"))
+    }
+
+    func testMaskAboveCollectionRootRemainsHiddenAndBlockCannotBeWeakened() throws {
+        let label = UILabel(frame: CGRect(x: 0, y: 0, width: 200, height: 30))
+        label.text = "ANCESTOR_PRIVATE"; root.addSubview(label); settle()
+        Elu.maskView(try XCTUnwrap(root.superview))
+        let masked = try EluUIKitReplayCollector().collect(root: root, ordinal: 0, timestamp: 1_700_000_000_123,
+            hasUnresolvedConfiguredBlockRules: false, profile: .sensitiveMask(), isCurrent: { true })
+        var encoder = try EluNativeWireframeEncoder()
+        XCTAssertFalse(String(decoding: try encoder.encode([masked]).data, as: UTF8.self).contains("ANCESTOR_PRIVATE"))
+        Elu.blockView(root)
+        Elu.maskView(root)
+        XCTAssertEqual(root.eluReplayRestriction, .block, "mask cannot weaken a prior block")
+    }
+
     private func export(_ stream: String, _ values: [(EluNativeEncodedChunk, [EluNativeMaskedSnapshot])]) throws {
         guard ProcessInfo.processInfo.environment["ELU_UIKIT_FIXTURE_EXPORT"] == "1" else { return }
         guard ["secure", "clip", "scroll", "paint"].contains(stream), values.count <= 2 else { throw EluNativeEncodingError.invalidLimits }
