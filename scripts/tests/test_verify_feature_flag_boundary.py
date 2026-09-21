@@ -19,7 +19,7 @@ SPEC.loader.exec_module(MODULE)
 
 
 class FeatureFlagBoundaryScannerTests(unittest.TestCase):
-    def test_public_composition_defers_until_initial_calls_and_keeps_proof_disabled(self) -> None:
+    def test_public_composition_defers_until_initial_calls_and_uses_owned_capabilities(self) -> None:
         path = pathlib.Path(MODULE.STANDALONE_FACADE_SOURCE)
         source = (ROOT / path).read_text()
         self.assertEqual([], MODULE.scan_outside_source(path, source))
@@ -29,6 +29,23 @@ class FeatureFlagBoundaryScannerTests(unittest.TestCase):
         for relative in [MODULE.STACK_SOURCE, MODULE.STANDALONE_FACADE_SOURCE]:
             for token in ["readbackProvenTransports", "readbackProvenProtocolGenerations"]:
                 self.assertTrue(MODULE.scan_outside_source(pathlib.Path(relative), (ROOT / relative).read_text() + "\n" + token))
+
+    def test_native_capability_selection_is_exact_and_cannot_be_silently_disabled(self) -> None:
+        path = pathlib.Path(MODULE.NATIVE_RUNTIME_SOURCE)
+        source = (ROOT / path).read_text()
+        for before, after in [
+            ('codec: "elu-native-wireframe-v1", compression: .gzip', 'codec: "other", compression: .gzip'),
+            ('codec: "elu-native-wireframe-v1", compression: .gzip', 'codec: "elu-native-wireframe-v1", compression: .none'),
+            ('readbackProvenProtocolGenerations: ["protocol-generation-v1"]', 'readbackProvenProtocolGenerations: []'),
+            ('readbackProvenProtocolGenerations: ["protocol-generation-v1"]', 'readbackProvenProtocolGenerations: ["protocol-generation-v1", "other"]'),
+        ]:
+            self.assertIn(before, source)
+            self.assertTrue(MODULE.scan_replay_storage_source(path, source.replace(before, after, 1)))
+        path = pathlib.Path(MODULE.STANDALONE_FACADE_SOURCE)
+        source = (ROOT / path).read_text()
+        before = "capabilities: EluStandaloneRuntime.readbackProvenReplayCapabilities"
+        for after in ["capabilities: EluNativeReplayCapabilities()", "capabilities: other"]:
+            self.assertTrue(MODULE.scan_outside_source(path, source.replace(before, after, 1)))
 
     def test_native_composition_exceptions_are_exact(self) -> None:
         for relative in [MODULE.NATIVE_RUNTIME_SOURCE, MODULE.NATIVE_COMPOSITION_SOURCE]:
@@ -246,7 +263,7 @@ class FeatureFlagBoundaryScannerTests(unittest.TestCase):
         with verification_root() as root:
             runtime = root / "Sources/EluAnalytics/Internal/Runtime/EluStandaloneRuntime.swift"
             runtime.write_text(runtime.read_text() + "\nlet accidental = EluV1URLSessionFlagTransport(siteKey: key)\n")
-            self.assertTrue(any("unconstructed concrete" in error for error in MODULE.verify(root)))
+            self.assertTrue(any("owned concrete" in error for error in MODULE.verify(root)))
 
     def test_stack_exception_is_exact_and_keeps_platform_networking_in_transports(self) -> None:
         path = pathlib.Path(MODULE.STACK_SOURCE)

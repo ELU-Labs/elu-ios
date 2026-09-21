@@ -86,8 +86,9 @@ final class EluNativeReplaySynchronousGuard: @unchecked Sendable {
     func isCurrent() -> Bool { validate() }
 }
 
-/// Explicit trusted local proof input. The public stack never constructs one.
-/// A remote advertisement or masking profile cannot produce this value.
+/// Binary-supported native formats selected by the owned runtime. Empty defaults
+/// deny unsupported/injected compositions. A remote advertisement or masking
+/// profile cannot add support, and this value does not certify a release.
 struct EluNativeReplayCapabilities: Sendable {
     let transports: Set<EluV1ReplayTransportSelection>
     let readbackProvenProtocolGenerations: Set<String>

@@ -94,7 +94,7 @@ def scan_replay_storage_source(path: pathlib.Path, text: str) -> list[str]:
             if re.search(rf"\b{token}\b", text): errors.append(f"{path} bypasses original native composition ownership")
     if exact == NATIVE_COMPOSITION_SOURCE and "actor EluNativeReplayComposition" in text:
         if "!capabilities.transports.isEmpty" not in text or "!capabilities.readbackProvenProtocolGenerations.isEmpty" not in text or re.search(r"\bEluNativeReplayCaptureOwner\s*\(", text):
-            errors.append(f"{path} bypasses the qualified runtime capture construction")
+            errors.append(f"{path} bypasses the supported runtime capture construction")
     if re.search(r"\bEluNativeReplayComposition\w*\b", text) and exact not in {NATIVE_COMPOSITION_SOURCE, NATIVE_RUNTIME_SOURCE}:
         errors.append(f"{path} references native composition outside its exact runtime")
     if "requiringCurrent" in text and exact not in {NATIVE_RUNTIME_SOURCE, "Sources/EluAnalytics/Internal/Runtime/EluSQLiteRuntimeQueue.swift"}:
@@ -116,17 +116,26 @@ def scan_replay_storage_source(path: pathlib.Path, text: str) -> list[str]:
     if re.search(r"\bEluNativeReplaySealer\b", text) and exact not in {NATIVE_SEALER_SOURCE, NATIVE_CAPTURE_SOURCE}:
         errors.append(f"{path} references the native sealer outside its exact physical owner")
     if (re.search(r"\bEluV2(?:Replay|SealedReplay)\w*\b", text) or "ensureReplaySchema" in text or "ensureReplayDeliverySchema" in text) and exact not in allowed:
-        errors.append(f"{path} references unconstructed replay storage outside its exact files")
+        errors.append(f"{path} references owned replay storage outside its exact files")
     if exact in allowed and "/Replay/" in exact:
         permitted = {"URLSession", "URLRequest"} if exact == REPLAY_TRANSPORT_SOURCE else ({"import UIKit"} if exact == NATIVE_CAPTURE_SOURCE else set())
         for token in (*NETWORK_TOKENS, "import UIKit"):
             if token in text and token not in permitted:
                 errors.append(f"{path} adds capture/network/provider behavior to opaque replay storage")
     if re.search(rf"\b{REPLAY_TRANSPORT_NAME}\b", text) and exact not in {REPLAY_TRANSPORT_SOURCE, NATIVE_RUNTIME_SOURCE}:
-        errors.append(f"{path} references the unconstructed concrete replay transport")
+        errors.append(f"{path} references the owned concrete replay transport")
     if re.search(rf"\b{REPLAY_TRANSPORT_NAME}\s*\(", text) and exact != NATIVE_RUNTIME_SOURCE:
         errors.append(f"{path} constructs the replay transport outside its exact runtime")
     if exact == NATIVE_RUNTIME_SOURCE and "installNativeReplayComposition" in text:
+        normalized = re.sub(r"\s+", " ", text)
+        exact_capability = (
+            "static let readbackProvenReplayCapabilities = EluNativeReplayCapabilities( "
+            "readbackProvenTransports: [EluV1ReplayTransportSelection( "
+            'codec: "elu-native-wireframe-v1", compression: .gzip)!], '
+            'readbackProvenProtocolGenerations: ["protocol-generation-v1"])'
+        )
+        if normalized.count(exact_capability) != 1 or text.count("static let readbackProvenReplayCapabilities") != 1:
+            errors.append(f"{path} changed the exact binary-supported native capabilities")
         required = ["capabilities: EluNativeReplayCapabilities = EluNativeReplayCapabilities()",
                     "nativeAuthority.ownsPrepared(prepared)", "prepared.supportedProtocolGeneration != nil",
                     "value?.requiringCurrent", "configurationWitness == source", "readZone() == zone"]
@@ -204,13 +213,19 @@ def scan_outside_source(path: pathlib.Path, text: str) -> list[str]:
         if re.search(r"\bEluV1FlagClient\s*[.(]", text):
             errors.append(f"{path} bypasses the runtime-owned flag client activation")
     elif re.search(rf"\b{FLAG_TRANSPORT_NAME}\b", text):
-        errors.append(f"{path} references the unconstructed concrete flag transport")
+        errors.append(f"{path} references the owned concrete flag transport")
     if exact_path in {STACK_SOURCE, STANDALONE_FACADE_SOURCE} and any(token in text for token in ["readbackProvenTransports", "readbackProvenProtocolGenerations"]):
-        errors.append(f"{path} enables native proof in the public composition")
+        errors.append(f"{path} constructs native capability sets outside the owned runtime")
     if exact_path == STANDALONE_FACADE_SOURCE:
         if "installNativeReplayComposition" in text and (text.count("deferredUntilActivation: true") != 2 or "await runtime.activateNativeReplayComposition()" not in text):
             errors.append(f"{path} bypasses ordered native composition activation")
         normalized = re.sub(r"\s+", " ", text)
+        selected_capabilities = (
+            "capabilities: EluStandaloneRuntime.readbackProvenReplayCapabilities, "
+            "deferredUntilActivation: true"
+        )
+        if normalized.count(selected_capabilities) != 2:
+            errors.append(f"{path} changed the exact owned native capability selection")
         owned_factory = (
             "openStack: { try await EluStandaloneStack.make( "
             "rootDirectoryURL: rootDirectoryURL, siteKey: siteKey, "
@@ -259,13 +274,13 @@ def verify(root: pathlib.Path = ROOT) -> list[str]:
         for path in source_root.rglob("*.swift") if "ensureReplaySchema" in path.read_text(encoding="utf-8")
     }
     if replay_activation != {"Sources/EluAnalytics/Internal/Runtime/EluSQLiteRuntimeQueue.swift": 1, NATIVE_AUTHORITY_SOURCE: 1}:
-        errors.append("replay schema activation escaped its unconstructed storage definition")
+        errors.append("replay schema activation escaped its owned storage definition")
     delivery_activation = {
         path.relative_to(root).as_posix(): path.read_text(encoding="utf-8").count("ensureReplayDeliverySchema")
         for path in source_root.rglob("*.swift") if "ensureReplayDeliverySchema" in path.read_text(encoding="utf-8")
     }
     if delivery_activation != {"Sources/EluAnalytics/Internal/Runtime/EluSQLiteRuntimeQueue.swift": 1, NATIVE_AUTHORITY_SOURCE: 1}:
-        errors.append("replay delivery schema activation escaped its unconstructed definition")
+        errors.append("replay delivery schema activation escaped its owned definition")
     flag_root = source_root / "Internal/Flags"
     for path in flag_root.rglob("*.swift"):
         errors.extend(scan_flag_source(path.read_text(encoding="utf-8"), path.relative_to(root)))

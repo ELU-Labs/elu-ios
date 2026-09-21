@@ -119,8 +119,9 @@ struct EluStandaloneFlagProjectionIntent: Sendable {
 }
 
 actor EluStandaloneRuntime {
-    // Locally qualified recorder, stored readback, and playback support.
-    // Remote configuration must still pass the independent admission gates.
+    // Exact native formats implemented by this binary, not a release certification.
+    // Current server qualification/configuration and local privacy, identity,
+    // lifecycle, source, and budget authority must independently permit capture.
     static let readbackProvenReplayCapabilities = EluNativeReplayCapabilities(
         readbackProvenTransports: [EluV1ReplayTransportSelection(
             codec: "elu-native-wireframe-v1", compression: .gzip)!],
@@ -131,8 +132,8 @@ actor EluStandaloneRuntime {
     static let applicationOpenedEvent = "Application Opened"
     static let applicationBackgroundedEvent = "Application Backgrounded"
     static let fromBackgroundProperty = "from_background"
-    /// This runtime renders no replay frames, so every masking axis the policy
-    /// can require is satisfied by construction.
+    /// Conservative analytics projection. Native replay independently derives its
+    /// actual masking profile from current source policy before collecting views.
     static let appliedMasking = EluPrivacyMaskingCapability(
         text: .all,
         inputs: .all,

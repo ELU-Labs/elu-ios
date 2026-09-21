@@ -13,8 +13,8 @@ this checkout does not change that release. Application code continues to use
 - Swift Package, iOS 13+
 - Events, identity, feature flags, screen tracking, and lifecycle events
 - Remote configuration controls whether analytics may run
-- Standalone session replay remains disabled until capture, masking, stored
-  readback, and final device qualification pass
+- Bounded UIKit replay, gated by current server qualification, configuration,
+  and on-device privacy; final package and service qualification is still pending
 
 ## Install (Swift Package Manager)
 
@@ -65,8 +65,7 @@ struct MyApp: App {
 ```
 
 Use `Elu.capture(...)` for custom events. Screen and lifecycle tracking follow
-the behavior below. The standalone replay implementation is not yet enabled
-for customer use.
+the behavior below. This candidate is not yet qualified for customer release.
 
 The SDK fetches an eligible configuration before sending analytics. Calls made
 while setup or configuration is pending are subject to the SDK's bounded
@@ -177,13 +176,16 @@ configuration can authorize work only within its validity window:
 - Feature flag evaluation
 
 Replay privacy, sampling, and per-session limits are implemented in the owned
-runtime but remain subject to the replay qualification gate. They do not
-enable capture in this checkout.
+runtime. The binary supports `elu-native-wireframe-v1` with gzip and
+`protocol-generation-v1`; current server qualification must advertise that exact
+support before configuration can authorize capture. Local consent, region,
+identity, lifecycle, masking, and budget gates also apply. Source support does
+not establish package, engine readback, or customer-player qualification.
 
 Baked into the binary (changes require an SDK update):
 
 - Application lifecycle events: on; screen names: explicit `Elu.screen` calls
-- Standalone replay: not enabled pending qualification
+- Native replay formats and the supported UIKit view coverage described below
 - Element-interaction autocapture, surveys, push auto-capture: off
 - The facade surface itself (`elu_facade_version` super property tells ELU
   what each installed binary can do)

@@ -16,8 +16,9 @@ struct EluV1AuthorizedEndpointSet: Equatable, Sendable {
     }
 }
 
-/// A platform transport pair that has passed the external replay readback gate.
-/// Merely appearing in server config does not make a codec usable on this runtime.
+/// A locally supported platform transport pair. Construction alone does not
+/// certify readback; usable pairs must be selected by the owned composition and
+/// separately authorized by current server configuration and privacy state.
 struct EluV1ReplayTransportSelection: Equatable, Hashable, Sendable {
     let codec: String
     let compression: EluV1Compression
