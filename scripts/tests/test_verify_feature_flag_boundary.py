@@ -283,6 +283,8 @@ class FeatureFlagBoundaryScannerTests(unittest.TestCase):
         self.assertEqual(MODULE.scan_outside_source(path, source), [])
         for mutation in [
             source.replace("configHost: context.configHost", "configHost: otherHost", 1),
+            source.replace("performance: context.performance", "performance: otherPerformance", 1),
+            source.replace("legacyStartupSource: legacyStartupSource", "legacyStartupSource: nil", 1),
             source.replace("guardedFlagsDidLoad: context.guardedFlagsDidLoad", "guardedFlagsDidLoad: unchecked", 1),
             source.replace("try await EluStandaloneStack.make(", "try await EluStandaloneRuntime.make(", 1),
         ]:
@@ -317,6 +319,17 @@ class FeatureFlagBoundaryScannerTests(unittest.TestCase):
                 path = root / "Package.swift"
                 path.write_text(path.read_text() + "\n" + token)
                 self.assertIn("standalone package adds an external source or binary dependency", MODULE.verify(root))
+
+    def test_legacy_provenance_exception_does_not_allow_live_provider_or_copy(self) -> None:
+        for token in ["import PostHog", "let value = PostHogSDK.self", "import PHPLCrashReporter"]:
+            with verification_root() as root:
+                path = root / MODULE.LEGACY_SOURCE
+                path.write_text(path.read_text() + "\n" + token)
+                self.assertTrue(any("removed provider source dependency" in error for error in MODULE.verify(root)))
+        with verification_root() as root:
+            path = root / MODULE.LEGACY_SOURCE
+            path.with_name("CopiedLegacyReader.swift").write_text(path.read_text())
+            self.assertTrue(any("removed provider source dependency" in error for error in MODULE.verify(root)))
 
     def test_verifier_recursively_scans_nested_flag_sources(self) -> None:
         with verification_root() as root:

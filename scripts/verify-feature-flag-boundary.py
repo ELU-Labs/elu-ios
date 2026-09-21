@@ -12,13 +12,18 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 PINNED = {
-    "Sources/EluAnalytics/Elu.swift": "5f88ecd264bf3658db1e94c2132f9c4e682070ef1af9bd3f7a7aeeda97f00586",
-    "Sources/EluAnalytics/EluState.swift": "a1b2c56a5bd49128a0151c44b268868844efe4ba90aeee2dd4c34c020629b0c6",
+    "Sources/EluAnalytics/Elu.swift": "26a14ad95b577c513dcca6499a443d65b6665249c8b5393fc7b47f1d9f87d628",
+    "Sources/EluAnalytics/EluState.swift": "098b5cbcca6842868338f658c6f7ef15ed4f0b5d00d92b1cc0c44204cec1fcc5",
     "Sources/EluAnalytics/EluConfigClient.swift": "152abfb01a6d0aa81e470d3185ecd4db3aeeef26d8626e67bab8f0a41e20d43d",
-    "Sources/EluAnalytics/Internal/Facade/EluRuntimeBackend.swift": "e7e7a4cc0badb7c88e4295fca5fb2fd7d675714b3526ce56676aa59545d0cd9f",
+    "Sources/EluAnalytics/Internal/Facade/EluRuntimeBackend.swift": "5490b85eabf34d4a67b3e6db6a99c0450e9b89a9825ca16914dc41127fc5e5ec",
     "Package.swift": "86701aa42833ddfff4b928e8ed59608cfe46f54e2765656f8166a75633219398",
     "Conformance/V1/manifest.json": "98152d8725c286f29402ba3e420bda8dd364200fb6fdf1cfe49b2da9b8f63e54",
+    "Sources/EluAnalytics/Internal/Compatibility/EluLegacyStartupSource.swift": "566fad27cdcf641b74844ac563d2b96630881fb9d08ade9e35b423bc6aeb4e13",
 }
+LEGACY_SOURCE = "Sources/EluAnalytics/Internal/Compatibility/EluLegacyStartupSource.swift"
+# Exact provenance comment only. No provider import, type, or live implementation
+# is permitted, including in this reader. Lab upgrade/adoption gates still apply.
+LEGACY_PROVENANCE = "// PostHog 3.69.0 source (1c9b3178...). See this overlay's source provenance."
 NETWORK_TOKENS = (
     "URLSession",
     "URLRequest",
@@ -138,7 +143,7 @@ def scan_replay_storage_source(path: pathlib.Path, text: str) -> list[str]:
     return errors
 
 
-# The candidate standalone-only default remains internal; native proof stays empty.
+# The candidate standalone-only default remains internal; proof is gated separately.
 DEFAULT_SELECTION = "    var runtimeSelection: EluRuntimeSelection = .standalone\n"
 
 
@@ -210,7 +215,8 @@ def scan_outside_source(path: pathlib.Path, text: str) -> list[str]:
         owned_factory = (
             "openStack: { try await EluStandaloneStack.make( "
             "rootDirectoryURL: rootDirectoryURL, siteKey: siteKey, "
-            "configHost: context.configHost ) }, "
+            "configHost: context.configHost, performance: context.performance, "
+            "legacyStartupSource: legacyStartupSource ) }, "
             "guardedFlagsDidLoad: context.guardedFlagsDidLoad"
         )
         if normalized.count(owned_factory) != 1:
@@ -245,7 +251,8 @@ def verify(root: pathlib.Path = ROOT) -> list[str]:
     source_root = root / "Sources/EluAnalytics"
     for path in source_root.rglob("*.swift"):
         text = path.read_text(encoding="utf-8")
-        if re.search(r"\b(?:PostHog\w*|phlibwebp|PHPLCrashReporter|EluProviderRuntime)\b", text):
+        dependency_text = text.replace(LEGACY_PROVENANCE, "", 1) if path.relative_to(root).as_posix() == LEGACY_SOURCE else text
+        if re.search(r"\b(?:PostHog\w*|phlibwebp|PHPLCrashReporter|EluProviderRuntime)\b", dependency_text):
             errors.append(f"{path.relative_to(root)} restores a removed provider source dependency")
         errors.extend(scan_replay_storage_source(path.relative_to(root), text))
     replay_activation = {
