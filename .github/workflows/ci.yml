@@ -95,11 +95,9 @@ jobs:
       - name: Generate source archive and release evidence
         run: |
           mkdir -p "$PWD/.build/artifacts"
-          git archive \
-            --format=zip \
-            --prefix=elu-ios-source/ \
-            --output="$PWD/.build/artifacts/elu-ios-source.zip" \
-            HEAD
+          python3 scripts/create-source-archive.py \
+            --ref HEAD \
+            --output "$PWD/.build/artifacts/elu-ios-source.zip"
           python3 scripts/generate-release-evidence.py \
             --output "$PWD/.build/release-evidence" \
             --artifact "$PWD/.build/artifacts/elu-ios-source.zip" \
