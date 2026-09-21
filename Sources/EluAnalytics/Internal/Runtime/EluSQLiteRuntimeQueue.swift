@@ -22,7 +22,6 @@ enum EluRuntimeQueueError: Error, Equatable, Sendable {
     case provenNotCommitted
     case captureAuthorityExpiredBeforeWrite
     case sourceAuthorityUnavailable
-    case legacyMigrationRefused(EluLegacyStartupError)
     case standaloneLegacyEntryPointUnavailable
     case nativeCaptureWorkPending
     case flagAuthorityTerminal
@@ -133,23 +132,14 @@ private enum EluSQLiteRuntimeSchema {
     static let flagDatabaseVersion: Int64 = 2
     static let replayDatabaseVersion: Int64 = 3
     static let flagReplayDatabaseVersion: Int64 = 4
-    // 17...24 preserve the eight existing schema combinations and add one
-    // immutable legacy Events ledger. 9...16 remain unsupported, not aliases.
-    static func hasLegacyEvents(_ version: Int64) -> Bool { (17...24).contains(version) }
-    static func baseVersion(_ version: Int64) -> Int64 { hasLegacyEvents(version) ? version - 16 : version }
-    static func preservingLegacyEvents(_ base: Int64, from version: Int64) -> Int64 { base + (hasLegacyEvents(version) ? 16 : 0) }
-    static func supports(_ version: Int64) -> Bool { (1...8).contains(version) || hasLegacyEvents(version) }
-    static func hasFlags(_ version: Int64) -> Bool { [2, 4, 6, 8].contains(baseVersion(version)) }
-    static func hasReplay(_ version: Int64) -> Bool { (3...8).contains(baseVersion(version)) }
-    static func hasReplayDelivery(_ version: Int64) -> Bool { (5...8).contains(baseVersion(version)) }
-    static func hasNativeReplayAuthority(_ version: Int64) -> Bool { [7, 8].contains(baseVersion(version)) }
-    static let createLegacyEvents = """
-    CREATE TABLE legacy_events_import (
-        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-        body BLOB NOT NULL,
-        body_sha256 TEXT NOT NULL
-    )
-    """
+    // Only owned schemas 1...8 are supported. Unpublished import-ledger
+    // schemas 17...24 remain unsupported; opening never rewrites them.
+    static func baseVersion(_ version: Int64) -> Int64 { version }
+    static func supports(_ version: Int64) -> Bool { (1...8).contains(version) }
+    static func hasFlags(_ version: Int64) -> Bool { [2, 4, 6, 8].contains(version) }
+    static func hasReplay(_ version: Int64) -> Bool { (3...8).contains(version) }
+    static func hasReplayDelivery(_ version: Int64) -> Bool { (5...8).contains(version) }
+    static func hasNativeReplayAuthority(_ version: Int64) -> Bool { [7, 8].contains(version) }
     static let createNativeReplayAuthority = """
     CREATE TABLE native_replay_authority (
         singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -653,9 +643,7 @@ private enum EluRuntimeQueueBootstrap {
         clock: @Sendable () -> Date,
         anonymousIdGenerator: @Sendable () -> String,
         streamIdGenerator: @Sendable () -> String,
-        faultInjector: (any EluRuntimeQueueFaultInjecting)?,
-        legacyStartupSource: EluLegacyStartupSource? = nil,
-        importLimits: EluRuntimeQueueLimits? = nil
+        faultInjector: (any EluRuntimeQueueFaultInjecting)?
     ) throws -> EluRuntimeBootstrapResult {
         try faultInjector?.hit(.open)
 
@@ -716,25 +704,18 @@ private enum EluRuntimeQueueBootstrap {
             )
             let databaseExists = fileManager.fileExists(atPath: databaseURL.path)
             if !databaseExists {
-                var legacyObservation: EluLegacyStartupSource.Observation?
                 let importedState = normalizeLegacyOptedOutSession(
-                    try loadLegacyOrFreshState(
+                    try loadOwnedOrFreshState(
                         directoryURL: canonicalURL,
                         clock: clock,
                         anonymousIdGenerator: anonymousIdGenerator,
-                        streamIdGenerator: streamIdGenerator,
-                        legacyStartupSource: legacyStartupSource,
-                        legacyObservation: &legacyObservation
+                        streamIdGenerator: streamIdGenerator
                     )
                 )
-                let observedSource = legacyObservation
                 try installFreshDatabase(
                     at: databaseURL,
                     state: importedState,
-                    eventsImport: observedSource?.eventsImport,
-                    importLimits: importLimits,
-                    faultInjector: faultInjector,
-                    beforeInstall: { try observedSource?.recheck() }
+                    faultInjector: faultInjector
                 )
             }
 
@@ -836,10 +817,7 @@ private enum EluRuntimeQueueBootstrap {
     private static func installFreshDatabase(
         at databaseURL: URL,
         state: EluStoredRuntimeState,
-        eventsImport: EluLegacyEventsImport?,
-        importLimits: EluRuntimeQueueLimits?,
-        faultInjector: (any EluRuntimeQueueFaultInjecting)?,
-        beforeInstall: () throws -> Void = {}
+        faultInjector: (any EluRuntimeQueueFaultInjecting)?
     ) throws {
         let fileManager = FileManager.default
         guard !fileManager.fileExists(atPath: databaseURL.path) else {
@@ -863,11 +841,7 @@ private enum EluRuntimeQueueBootstrap {
             try connection.execute(EluSQLiteRuntimeSchema.createRuntimeState)
             try connection.execute(EluSQLiteRuntimeSchema.createQueueRecords)
             try EluRuntimeDatabase.insertInitialState(connection, state: state)
-            if let eventsImport {
-                try EluRuntimeDatabase.installLegacyEvents(connection, manifest: eventsImport,
-                    state: state, limits: try importLimits ?? EluRuntimeQueueLimits(), faultInjector: faultInjector)
-            }
-            try connection.execute("PRAGMA user_version = \(eventsImport == nil ? 1 : 17)")
+            try connection.execute("PRAGMA user_version = 1")
             try connection.execute("COMMIT")
             try connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             try connection.withStatement("PRAGMA journal_mode=DELETE") { statement in
@@ -886,7 +860,6 @@ private enum EluRuntimeQueueBootstrap {
         connection.close()
         try synchronizeFile(stagedURL)
         try faultInjector?.hit(.beforeInitialInstall)
-        try beforeInstall()
         try fileManager.moveItem(at: stagedURL, to: databaseURL)
         installed = true
         try EluDarwinDirectorySynchronizer().synchronize(
@@ -935,24 +908,17 @@ private enum EluRuntimeQueueBootstrap {
         try connection.execute("PRAGMA foreign_keys=ON")
     }
 
-    private static func loadLegacyOrFreshState(
+    private static func loadOwnedOrFreshState(
         directoryURL: URL,
         clock: @Sendable () -> Date,
         anonymousIdGenerator: @Sendable () -> String,
-        streamIdGenerator: @Sendable () -> String,
-        legacyStartupSource: EluLegacyStartupSource?,
-        legacyObservation: inout EluLegacyStartupSource.Observation?
+        streamIdGenerator: @Sendable () -> String
     ) throws -> EluStoredRuntimeState {
         let legacyStore = try EluFileIdentityStateStore(directoryURL: directoryURL)
         switch try legacyStore.load() {
         case let .loaded(state):
             return try storedState(from: state)
         case .missing:
-            if let legacyStartupSource {
-                let observed = try legacyStartupSource.read(now: clock(), streamIdGenerator: streamIdGenerator)
-                legacyObservation = observed
-                if let state = observed.state { return try storedState(from: state) }
-            }
             return try freshState(
                 now: clock(),
                 anonymousId: anonymousIdGenerator(),
@@ -1110,7 +1076,6 @@ private enum EluRuntimeQueueBootstrap {
     }
 
     private static func mapOpenError(_ error: Error) -> EluRuntimeQueueError {
-        if let legacyError = error as? EluLegacyStartupError { return .legacyMigrationRefused(legacyError) }
         if let error = error as? EluRuntimeQueueError {
             return error
         }
@@ -2122,13 +2087,6 @@ private enum EluRuntimeDatabase {
             "queue_records": "table",
             "runtime_state": "table",
         ]
-        if EluSQLiteRuntimeSchema.hasLegacyEvents(databaseVersion) {
-            expectedObjects["legacy_events_import"] = "table"
-            try verifyColumns(connection, table: "legacy_events_import",
-                expected: ["singleton": "INTEGER", "body": "BLOB", "body_sha256": "TEXT"])
-            try verifyCreateSQL(connection, table: "legacy_events_import", expected: EluSQLiteRuntimeSchema.createLegacyEvents)
-            _ = try legacyEventRecords(connection)
-        }
         if EluSQLiteRuntimeSchema.hasFlags(databaseVersion) {
             expectedObjects["flag_cache_records"] = "table"
         }
@@ -2193,65 +2151,6 @@ private enum EluRuntimeDatabase {
                 expected: EluSQLiteRuntimeSchema.createFlagCacheRecords
             )
         }
-    }
-
-    static func installLegacyEvents(_ connection: EluSQLiteConnection, manifest: EluLegacyEventsImport,
-        state: EluStoredRuntimeState, limits: EluRuntimeQueueLimits,
-        faultInjector: (any EluRuntimeQueueFaultInjecting)?) throws {
-        let records = try manifest.records()
-        guard manifest.state.identity == state.identity,
-              manifest.state.flagContext == state.flagContext,
-              manifest.state.streamMetadata.streamId == state.streamId,
-              state.nextSequence == 0, state.liveCount == 0 else { throw EluRuntimeQueueError.invalidState }
-        guard records.count <= limits.maximumCount else { throw EluRuntimeQueueError.queueCountLimitExceeded }
-        let stored = try records.map { record -> EluStoredQueueRecord in
-            let payload = try EluQueueRecordCodec.encode(record)
-            let versions = try encodeStateValue(record.versions)
-            let wire = try EluQueueBatchCodec.encodeRecord(record)
-            guard payload.count <= EluSQLiteRuntimeSchema.maximumPayloadBytes,
-                  wire.count <= EluSQLiteRuntimeSchema.maximumPayloadBytes else { throw EluRuntimeQueueError.queueByteLimitExceeded }
-            return EluStoredQueueRecord(record: record, payload: payload, versionsPayload: versions,
-                                        accountedBytes: Int64(wire.count))
-        }
-        let bytes = stored.reduce(Int64(0)) { $0 + $1.accountedBytes }
-        guard bytes <= Int64(limits.maximumBytes) else { throw EluRuntimeQueueError.queueByteLimitExceeded }
-        let body = try manifest.encoded()
-        try connection.execute(EluSQLiteRuntimeSchema.createLegacyEvents)
-        try connection.withStatement("INSERT INTO legacy_events_import (singleton,body,body_sha256) VALUES (1,?,?)") { statement in
-            try connection.bind(body, at: 1, to: statement)
-            try connection.bind(EluV1StrictCanonicalJSON.hash(body), at: 2, to: statement)
-            try connection.step(statement)
-        }
-        for (index, record) in stored.enumerated() {
-            try insert(connection, storedRecord: record)
-            try faultInjector?.hit(.afterRecordInsert(index))
-        }
-        var next = state
-        next.nextSequence = Int64(stored.count); next.headSequence = 0
-        next.liveCount = Int64(stored.count); next.liveBytes = bytes
-        try faultInjector?.hit(.beforeStateUpdate)
-        try updateState(connection, from: state.generation, to: next)
-        try faultInjector?.hit(.beforeCommit)
-    }
-
-    // Reconstruct every imported record from immutable original bytes. A saved
-    // UUID is admitted only for its exact original prefix slot and payload.
-    static func legacyEventRecords(_ connection: EluSQLiteConnection) throws -> [Int64: EluQueuedRecord] {
-        guard EluSQLiteRuntimeSchema.hasLegacyEvents(try connection.integerPragma("user_version")) else { return [:] }
-        let manifest = try connection.withStatement("SELECT singleton,body,body_sha256 FROM legacy_events_import") { statement in
-            try connection.step(statement, expecting: SQLITE_ROW)
-            guard try connection.requiredInteger(statement, column: 0) == 1 else { throw EluRuntimeQueueError.corruptStorage }
-            let bytes = try connection.requiredData(statement, column: 1, maximumBytes: EluLegacyEventsImport.maximumEncodedBytes)
-            guard try connection.requiredString(statement, column: 2) == EluV1StrictCanonicalJSON.hash(bytes),
-                  sqlite3_step(statement) == SQLITE_DONE else { throw EluRuntimeQueueError.corruptStorage }
-            return try EluLegacyEventsImport.decode(bytes)
-        }
-        let state = try loadState(connection, validateQueue: false)
-        let records = try manifest.records()
-        guard manifest.state.streamMetadata.streamId == state.streamId,
-              manifest.state.identity.migration == state.identity.migration,
-              state.nextSequence >= Int64(records.count) else { throw EluRuntimeQueueError.corruptStorage }
-        return Dictionary(uniqueKeysWithValues: records.map { ($0.sequence, $0) })
     }
 
     static func insertInitialState(
@@ -2352,7 +2251,6 @@ private enum EluRuntimeDatabase {
         maximumCount: Int,
         streamId: String
     ) throws -> [EluStoredQueueRecord] {
-        let legacyRecords = try legacyEventRecords(connection)
         return try connection.withStatement(
             """
             SELECT sequence, kind, record_id, occurred_at, payload,
@@ -2375,8 +2273,7 @@ private enum EluRuntimeDatabase {
                     try decodeQueueRow(
                         connection,
                         statement: statement,
-                        streamId: streamId,
-                        legacyRecords: legacyRecords
+                        streamId: streamId
                     )
                 )
             }
@@ -2544,7 +2441,6 @@ private enum EluRuntimeDatabase {
         _ connection: EluSQLiteConnection,
         state: EluStoredRuntimeState
     ) throws {
-        let legacyRecords = try legacyEventRecords(connection)
         try connection.withStatement(
             """
             SELECT sequence, kind, record_id, occurred_at, payload,
@@ -2567,8 +2463,7 @@ private enum EluRuntimeDatabase {
                 let storedRecord = try decodeQueueRow(
                     connection,
                     statement: statement,
-                    streamId: state.streamId,
-                    legacyRecords: legacyRecords
+                    streamId: state.streamId
                 )
                 guard storedRecord.record.sequence == sequence else {
                     throw EluRuntimeQueueError.corruptStorage
@@ -2592,8 +2487,7 @@ private enum EluRuntimeDatabase {
     private static func decodeQueueRow(
         _ connection: EluSQLiteConnection,
         statement: OpaquePointer,
-        streamId: String,
-        legacyRecords: [Int64: EluQueuedRecord]
+        streamId: String
     ) throws -> EluStoredQueueRecord {
         let sequence = try connection.requiredInteger(statement, column: 0)
         let kindValue = try connection.requiredString(statement, column: 1)
@@ -2629,12 +2523,7 @@ private enum EluRuntimeDatabase {
         } catch {
             throw EluRuntimeQueueError.corruptStorage
         }
-        let idIsValid: Bool
-        if let original = legacyRecords[sequence] {
-            idIsValid = original == record
-        } else {
-            idIsValid = recordId == EluRuntimeIdentifier.recordId(kind: kind, streamId: streamId, sequence: sequence)
-        }
+        let idIsValid = recordId == EluRuntimeIdentifier.recordId(kind: kind, streamId: streamId, sequence: sequence)
         guard record.sequence == sequence,
               record.recordId == recordId, idIsValid,
               EluRFC3339.string(from: record.occurredAt) == occurredAt,
@@ -3355,8 +3244,7 @@ actor EluSQLiteRuntimeQueue {
             "flag_store_\(EluRuntimeIdentifier.compactUUID())"
         },
         configurationGate: EluV2ConfigAuthorityGate? = nil,
-        faultInjector: (any EluRuntimeQueueFaultInjecting)? = nil,
-        legacyStartupSource: EluLegacyStartupSource? = nil
+        faultInjector: (any EluRuntimeQueueFaultInjecting)? = nil
     ) async throws -> EluSQLiteRuntimeQueue {
         guard configurationGate.map({ $0.siteKey == exactConstructorSiteKey }) ?? true else {
             throw EluRuntimeQueueError.invalidState
@@ -3374,9 +3262,7 @@ actor EluSQLiteRuntimeQueue {
                 clock: clock,
                 anonymousIdGenerator: anonymousIdGenerator,
                 streamIdGenerator: streamIdGenerator,
-                faultInjector: faultInjector,
-                legacyStartupSource: legacyStartupSource,
-                importLimits: limits
+                faultInjector: faultInjector
             )
         }.value
         if EluSQLiteRuntimeSchema.hasNativeReplayAuthority(opened.databaseSchemaVersion) {
@@ -3425,8 +3311,7 @@ actor EluSQLiteRuntimeQueue {
             "flag_store_\(EluRuntimeIdentifier.compactUUID())"
         },
         configurationGate: EluV2ConfigAuthorityGate? = nil,
-        faultInjector: (any EluRuntimeQueueFaultInjecting)? = nil,
-        legacyStartupSource: EluLegacyStartupSource? = nil
+        faultInjector: (any EluRuntimeQueueFaultInjecting)? = nil
     ) async throws -> EluSQLiteRuntimeQueue {
         try await openCaptureRuntime(
             rootDirectoryURL: rootDirectoryURL,
@@ -3441,8 +3326,7 @@ actor EluSQLiteRuntimeQueue {
             sessionIdGenerator: sessionIdGenerator,
             flagStoreEpochGenerator: flagStoreEpochGenerator,
             configurationGate: configurationGate,
-            faultInjector: faultInjector,
-            legacyStartupSource: legacyStartupSource
+            faultInjector: faultInjector
         )
     }
 
@@ -3575,7 +3459,7 @@ actor EluSQLiteRuntimeQueue {
         guard base == 1 || base == 3 || base == 5 || base == 7 else {
             throw EluRuntimeQueueError.unsupportedSchemaVersion(databaseSchemaVersion)
         }
-        let target = EluSQLiteRuntimeSchema.preservingLegacyEvents(base + 1, from: databaseSchemaVersion)
+        let target = base + 1
         try replayStorageTransaction { connection, _ in
             guard try connection.integerPragma("user_version") == databaseSchemaVersion else { throw EluRuntimeQueueError.corruptStorage }
             try EluRuntimeDatabase.verifySchema(connection, databaseVersion: databaseSchemaVersion)
@@ -3597,7 +3481,7 @@ actor EluSQLiteRuntimeQueue {
         }
         let base = EluSQLiteRuntimeSchema.baseVersion(databaseSchemaVersion)
         guard base == 1 || base == 2 else { throw EluRuntimeQueueError.unsupportedSchemaVersion(databaseSchemaVersion) }
-        let target = EluSQLiteRuntimeSchema.preservingLegacyEvents(base == 2 ? 4 : 3, from: databaseSchemaVersion)
+        let target: Int64 = base == 2 ? 4 : 3
         try replayStorageTransaction { connection, _ in
             guard try connection.integerPragma("user_version") == databaseSchemaVersion else { throw EluRuntimeQueueError.corruptStorage }
             try EluRuntimeDatabase.verifySchema(connection, databaseVersion: databaseSchemaVersion)
@@ -3616,8 +3500,7 @@ actor EluSQLiteRuntimeQueue {
             try EluRuntimeDatabase.verifySchema(try requireResources().connection, databaseVersion: databaseSchemaVersion)
             return
         }
-        let target = EluSQLiteRuntimeSchema.preservingLegacyEvents(
-            EluSQLiteRuntimeSchema.baseVersion(databaseSchemaVersion) == 4 ? 6 : 5, from: databaseSchemaVersion)
+        let target = EluSQLiteRuntimeSchema.baseVersion(databaseSchemaVersion) == 4 ? Int64(6) : 5
         try replayStorageTransaction { connection, _ in
             try EluRuntimeDatabase.verifySchema(connection, databaseVersion: databaseSchemaVersion)
             try connection.execute(EluSQLiteRuntimeSchema.createReplayDelivery)
@@ -3636,8 +3519,7 @@ actor EluSQLiteRuntimeQueue {
         guard let namespace = ownerNamespaceHash,
               EluSQLiteRuntimeSchema.hasReplayDelivery(databaseSchemaVersion) else { throw EluRuntimeQueueError.invalidState }
         if !EluSQLiteRuntimeSchema.hasNativeReplayAuthority(databaseSchemaVersion) {
-            let target = EluSQLiteRuntimeSchema.preservingLegacyEvents(
-                EluSQLiteRuntimeSchema.baseVersion(databaseSchemaVersion) == 6 ? 8 : 7, from: databaseSchemaVersion)
+            let target = EluSQLiteRuntimeSchema.baseVersion(databaseSchemaVersion) == 6 ? Int64(8) : 7
             try replayStorageTransaction { connection, disk in
                 try EluRuntimeDatabase.verifySchema(connection, databaseVersion: databaseSchemaVersion)
                 try connection.execute(EluSQLiteRuntimeSchema.createNativeReplayAuthority)
@@ -7657,9 +7539,7 @@ actor EluSQLiteRuntimeQueue {
         if references.isEmpty {
             return try snapshot()
         }
-        if !EluSQLiteRuntimeSchema.hasLegacyEvents(databaseSchemaVersion) {
-            try validateAcknowledgementReferences(references, streamId: state.streamId, legacyRecords: [:])
-        }
+        try validateAcknowledgementReferences(references, streamId: state.streamId)
         let resources = try requireResources()
         let connection = resources.connection
         var commitAttempted = false
@@ -7675,10 +7555,6 @@ actor EluSQLiteRuntimeQueue {
             }
             try faultInjector?.hit(.afterStateRead)
 
-            if EluSQLiteRuntimeSchema.hasLegacyEvents(databaseSchemaVersion) {
-                try validateAcknowledgementReferences(references, streamId: diskState.streamId,
-                    legacyRecords: EluRuntimeDatabase.legacyEventRecords(connection))
-            }
             if try acknowledgementIsIdempotent(references, state: diskState) {
                 try connection.execute("COMMIT")
                 return state.snapshot
@@ -8586,18 +8462,12 @@ actor EluSQLiteRuntimeQueue {
 
     private func validateAcknowledgementReferences(
         _ references: [EluQueueAcknowledgementReference],
-        streamId: String,
-        legacyRecords: [Int64: EluQueuedRecord]
+        streamId: String
     ) throws {
         var previous: Int64?
         for reference in references {
-            let idIsValid: Bool
-            if let original = legacyRecords[reference.sequence] {
-                idIsValid = reference.kind == original.kind && reference.recordId == original.recordId
-            } else {
-                idIsValid = reference.recordId == EluRuntimeIdentifier.recordId(
-                    kind: reference.kind, streamId: streamId, sequence: reference.sequence)
-            }
+            let idIsValid = reference.recordId == EluRuntimeIdentifier.recordId(
+                kind: reference.kind, streamId: streamId, sequence: reference.sequence)
             guard reference.sequence >= 0,
                   reference.streamId == streamId, idIsValid
             else {

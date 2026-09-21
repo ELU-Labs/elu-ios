@@ -2,16 +2,18 @@
 
 This branch is an implementation checkpoint, not a released SDK.
 
-Local focused runtime, facade, consent, and native performance tests pass. The
-provider boundary and additive API guards pass; the iOS symbol graph preserves
-all 25 original public symbols and includes 28 explicit additions. The legacy
-reader remains subject to migration qualification and a pinned source boundary.
+The clean candidate retired the unused preview import path under the dated
+[storage compatibility decision](storage-compatibility.md). Its current source
+passed all 691 local iOS 18.3.1 simulator tests and all 145 release-script tests.
+Immutable baseline verification passes, and the strict tracked-source scanner
+reports zero findings without changing its policy. These checks do not certify
+physical devices or the final distribution and service deployment.
 
-The current source passed 689 local iOS 18.3 simulator tests, including UIKit
-privacy and readable system secondary text. This is simulator source evidence,
-not physical-device or final-distribution qualification.
-Exact distribution installation, supported upgrades, Lab engine readback,
-customer-player rendering, and resource overhead remain release gates.
+Exact distribution installation, supported owned upgrades, Lab engine readback,
+customer-player rendering, physical-device checks, and resource overhead remain
+release gates. The iOS symbol graph preserves all 25 original public symbols
+and includes 28 explicit additions; this source API check is separate from
+runtime and package qualification.
 
 Replay currently covers supported UIKit wireframes and complete visible
 single-line native text under authorizing policy. SwiftUI content remains

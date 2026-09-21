@@ -13,7 +13,7 @@ python3 scripts/verify-symbol-graph.py /path/to/ios-symbol-graphs
 
 This is a source API check, not proof of binary compatibility, supported
 upgrades, package qualification, or customer readiness. The release checks and
-Lab migration/adoption tests remain required.
+Lab clean-install and supported owned-store upgrade tests remain required.
 
 `package-metadata.json` records the current owned package's exact manifest
 digest, product, targets, linker settings, and empty dependency set for strict
@@ -22,7 +22,8 @@ provider-backed wrapper and remains unchanged for baseline checks. Both modes
 reject manifest tampering; the current package does not reuse a historical
 manifest digest or dependency claim.
 
-The provider boundary retains the existing compatibility reader and permits
-only its exact upstream provenance comment. Provider imports and live provider
-types remain prohibited, including in that reader. Its source is hash-pinned;
-changes require review without removing the upgrade qualification gates.
+The boundary check forbids the retired preview startup/import surfaces and
+requires the exact owned bootstrap factory. The strict source and artifact
+scanner remains unchanged and permits identifiers only in approved legal
+notices. Historical manifests, source archives, and original public API
+baselines remain immutable; they do not promise persisted-data import support.

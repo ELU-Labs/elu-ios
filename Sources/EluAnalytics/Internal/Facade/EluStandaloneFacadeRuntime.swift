@@ -134,7 +134,6 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, @unchecked Sendable {
     static func make(context: EluRuntimeBackendContext) -> EluStandaloneFacadeRuntime? {
         guard let rootDirectoryURL = runtimeDirectoryURL() else { return nil }
         let siteKey = context.siteKey
-        guard let legacyStartupSource = try? EluLegacyStartupSource.live(siteKey: siteKey) else { return nil }
         return EluStandaloneFacadeRuntime(
             context: context,
             openStack: {
@@ -142,8 +141,7 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, @unchecked Sendable {
                     rootDirectoryURL: rootDirectoryURL,
                     siteKey: siteKey,
                     configHost: context.configHost,
-                    performance: context.performance,
-                    legacyStartupSource: legacyStartupSource
+                    performance: context.performance
                 )
             },
             guardedFlagsDidLoad: context.guardedFlagsDidLoad

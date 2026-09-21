@@ -242,7 +242,6 @@ actor EluStandaloneRuntime {
         sessionIdGenerator: @escaping @Sendable () -> String = {
             "session_\(EluStandaloneRuntime.compactUUID())"
         },
-        legacyStartupSource: EluLegacyStartupSource? = nil,
         performance: EluPerformanceOptions = .init()
     ) async throws -> EluStandaloneRuntime {
         guard isHeaderSafeSiteKey(siteKey) else {
@@ -276,8 +275,7 @@ actor EluStandaloneRuntime {
             anonymousIdGenerator: anonymousIdGenerator,
             streamIdGenerator: streamIdGenerator,
             sessionIdGenerator: sessionIdGenerator,
-            configurationGate: configurationGate,
-            legacyStartupSource: legacyStartupSource
+            configurationGate: configurationGate
         )
         let initialSnapshot: EluRuntimeQueueSnapshot
         do {

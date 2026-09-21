@@ -8,8 +8,7 @@ public struct EluSetupOptions {
     public var performance = EluPerformanceOptions()
 
     /// Internal construction marker for the owned runtime. Customer code
-    /// cannot select or construct another backend. Legacy identity import
-    /// remains a separate, explicitly validated compatibility operation.
+    /// cannot select or construct another backend.
     var runtimeSelection: EluRuntimeSelection = .standalone
 
     public init(configHost: URL = URL(string: "https://elu.dev")!) {

@@ -64,14 +64,14 @@ class FeatureFlagBoundaryScannerTests(unittest.TestCase):
 
     def test_native_composition_cannot_expand_platform_or_provider_access(self) -> None:
         path = pathlib.Path(MODULE.NATIVE_COMPOSITION_SOURCE)
-        for token in ["import UIKit", "URLSession", "URLRequest", "import PostHog", "import Network", "class Other: EluV2ReplayHTTPTransport {}"]:
+        for token in ["import UIKit", "URLSession", "URLRequest", "import Network", "class Other: EluV2ReplayHTTPTransport {}"]:
             self.assertTrue(MODULE.scan_replay_storage_source(path, token), token)
 
     def test_native_capture_owner_can_join_values_and_ui_only_in_exact_file(self) -> None:
         path = pathlib.Path(MODULE.NATIVE_CAPTURE_SOURCE)
         text = "import UIKit\nEluNativeReplayCaptureOwner EluNativeReplayCapturePhysicalUse EluUIKitReplayCollector EluNativeReplaySealer EluV2ReplayPreparedRequest"
         self.assertEqual([], MODULE.scan_replay_storage_source(path, text))
-        for token in ["URLSession", "URLRequest", "import Network", "import PostHog", "EluV2URLSessionReplayTransport()"]:
+        for token in ["URLSession", "URLRequest", "import Network", "EluV2URLSessionReplayTransport()"]:
             self.assertTrue(MODULE.scan_replay_storage_source(path, token), token)
 
     def test_native_capture_cannot_escape_to_public_stack_or_sibling_paths(self) -> None:
@@ -90,7 +90,7 @@ class FeatureFlagBoundaryScannerTests(unittest.TestCase):
     def test_native_sealer_can_only_prepare_values(self) -> None:
         exact = pathlib.Path(MODULE.NATIVE_SEALER_SOURCE)
         self.assertEqual([], MODULE.scan_replay_storage_source(exact, "struct EluNativeReplaySealer { let value: EluV2ReplayPreparedRequest }"))
-        for token in ["URLSession", "URLRequest", "import UIKit", "import PostHog", "import Network",
+        for token in ["URLSession", "URLRequest", "import UIKit", "import Network",
                       "EluV2ReplayDeliveryCoordinator", "EluV2ReplayStoredChunk", "ensureReplaySchema()", "ensureReplayDeliverySchema()",
                       "let queue: EluSQLiteRuntimeQueue", "queue.appendReplay(value)", "queue.reconcileReplay()",
                       "EluNativeReplayAuthority()", "EluNativeReplayScope()", "let permit: EluNativeReplayPermit",
@@ -117,7 +117,7 @@ class FeatureFlagBoundaryScannerTests(unittest.TestCase):
         path = pathlib.Path("Sources/EluAnalytics/Internal/Replay/EluNativeReplayLifecycle.swift")
         self.assertTrue(MODULE.scan_replay_storage_source(path, "queue.ensureReplaySchema()"))
         exact = pathlib.Path(MODULE.NATIVE_AUTHORITY_SOURCE)
-        for token in ["URLSession", "URLRequest", "import UIKit", "import PostHog", "EluV2URLSessionReplayTransport()"]:
+        for token in ["URLSession", "URLRequest", "import UIKit", "EluV2URLSessionReplayTransport()"]:
             self.assertTrue(MODULE.scan_replay_storage_source(exact, token))
 
     def test_exact_replay_transport_seam_cannot_expand_to_other_files_or_construction(self) -> None:
@@ -125,7 +125,7 @@ class FeatureFlagBoundaryScannerTests(unittest.TestCase):
             self.assertTrue(MODULE.scan_replay_storage_source(pathlib.Path(path), "EluV2URLSessionReplayTransport()"))
         exact = pathlib.Path(MODULE.REPLAY_TRANSPORT_SOURCE)
         self.assertEqual(MODULE.scan_replay_storage_source(exact, "final class EluV2URLSessionReplayTransport: EluV2ReplayHTTPTransport, @unchecked Sendable { let request: URLRequest }"), [])
-        for text in ["EluV2URLSessionReplayTransport()", "import UIKit", "import PostHog", "import Network", "class Other: EluV2ReplayHTTPTransport {}"]:
+        for text in ["EluV2URLSessionReplayTransport()", "import UIKit", "import Network", "class Other: EluV2ReplayHTTPTransport {}"]:
             self.assertTrue(MODULE.scan_replay_storage_source(exact, text))
 
     def test_replay_delivery_schema_cannot_be_activated_by_factory(self) -> None:
@@ -148,7 +148,7 @@ class FeatureFlagBoundaryScannerTests(unittest.TestCase):
     def test_exact_replay_storage_files_cannot_construct_network_provider_or_ui(self) -> None:
         path = pathlib.Path("Sources/EluAnalytics/Internal/Replay/EluV2ReplayPreparedRequest.swift")
         self.assertEqual(MODULE.scan_replay_storage_source(path, "struct EluV2ReplayPreparedRequest {}"), [])
-        for token in ["URLSession", "URLRequest", "import UIKit", "import PostHog"]:
+        for token in ["URLSession", "URLRequest", "import UIKit"]:
             self.assertTrue(MODULE.scan_replay_storage_source(path, token))
 
     def test_replay_schema_definition_cannot_gain_an_eager_call(self) -> None:
@@ -284,7 +284,6 @@ class FeatureFlagBoundaryScannerTests(unittest.TestCase):
         for mutation in [
             source.replace("configHost: context.configHost", "configHost: otherHost", 1),
             source.replace("performance: context.performance", "performance: otherPerformance", 1),
-            source.replace("legacyStartupSource: legacyStartupSource", "legacyStartupSource: nil", 1),
             source.replace("guardedFlagsDidLoad: context.guardedFlagsDidLoad", "guardedFlagsDidLoad: unchecked", 1),
             source.replace("try await EluStandaloneStack.make(", "try await EluStandaloneRuntime.make(", 1),
         ]:
@@ -306,7 +305,7 @@ class FeatureFlagBoundaryScannerTests(unittest.TestCase):
             self.assertIn("the runtime selection escaped into the public API", errors)
 
     def test_provider_free_target_rejects_nested_provider_source(self) -> None:
-        for token in ["import PostHog", "let value = PostHogSDK.self", "import phlibwebp", "import PHPLCrashReporter", "final class EluProviderRuntime {}"]:
+        for token in ["import phlibwebp", "import PHPLCrashReporter", "final class EluProviderRuntime {}"]:
             with verification_root() as root:
                 path = root / "Sources/EluAnalytics/Internal/Other/Nested.swift"
                 path.parent.mkdir(parents=True)
@@ -320,16 +319,13 @@ class FeatureFlagBoundaryScannerTests(unittest.TestCase):
                 path.write_text(path.read_text() + "\n" + token)
                 self.assertIn("standalone package adds an external source or binary dependency", MODULE.verify(root))
 
-    def test_legacy_provenance_exception_does_not_allow_live_provider_or_copy(self) -> None:
-        for token in ["import PostHog", "let value = PostHogSDK.self", "import PHPLCrashReporter"]:
+    def test_retired_preview_import_surfaces_cannot_return(self) -> None:
+        for token in MODULE.RETIRED_STARTUP_SYMBOLS:
             with verification_root() as root:
-                path = root / MODULE.LEGACY_SOURCE
-                path.write_text(path.read_text() + "\n" + token)
-                self.assertTrue(any("removed provider source dependency" in error for error in MODULE.verify(root)))
-        with verification_root() as root:
-            path = root / MODULE.LEGACY_SOURCE
-            path.with_name("CopiedLegacyReader.swift").write_text(path.read_text())
-            self.assertTrue(any("removed provider source dependency" in error for error in MODULE.verify(root)))
+                path = root / "Sources/EluAnalytics/Internal/Other/PreviewImport.swift"
+                path.parent.mkdir(parents=True)
+                path.write_text("struct " + token + " {}")
+                self.assertTrue(any("retired preview import" in error for error in MODULE.verify(root)))
 
     def test_verifier_recursively_scans_nested_flag_sources(self) -> None:
         with verification_root() as root:

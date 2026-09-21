@@ -78,8 +78,7 @@ def prepare_fresh_root(parent: pathlib.Path, mode: str = "strict") -> tuple[path
     shutil.copy2(SNAPSHOT, root / "Baselines" / "package-validation" / SNAPSHOT.name)
     shutil.copy2(CURRENT_SNAPSHOT, root / "API" / CURRENT_SNAPSHOT.name)
     shutil.copy2(DEPENDENCIES, root / "legal" / DEPENDENCIES.name)
-    source = PACKAGE_MANIFEST if mode == "strict" else ROOT / "scripts/tests/fixtures/legacy-package.swift"
-    shutil.copy2(source, root / PACKAGE_MANIFEST.name)
+    shutil.copy2(PACKAGE_MANIFEST, root / PACKAGE_MANIFEST.name)
     dump = root / "package-dump.json"
     dump.write_text(json.dumps(package_dump(mode)), encoding="utf-8")
     return root, dump
@@ -136,12 +135,6 @@ class VerifyPackageSurfaceTests(unittest.TestCase):
         self.assertEqual(commit_count.stdout.strip(), "1")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("verified strict Package.swift metadata", result.stdout)
-
-    def test_legacy_baseline_still_verifies_its_exact_manifest(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root, dump = prepare_fresh_root(pathlib.Path(directory), "baseline")
-            result = run_verifier(root, dump, mode="baseline")
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_strict_surface_rejects_dependency_or_unreviewed_target(self) -> None:
         for change in ("dependencies", "targets"):

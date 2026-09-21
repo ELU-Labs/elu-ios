@@ -91,9 +91,12 @@ Do not identify with emails or other PII as the id; use your stable internal
 user id. Before `identify`, activity is tracked anonymously and linked on the
 first identify.
 
-The owned runtime uses separate storage. Installing it alone does not import
-the previous runtime's identity. Identity continuity is part of the migration
-qualification required before a standalone rollout.
+The owned runtime uses separate storage. The unused 0.1.0 release is not a
+supported persisted-data import source: this candidate starts a fresh owned
+installation and leaves its old files untouched. Unpublished preview databases
+with import receipts are refused without deleting their database, WAL, or SHM
+files. Existing supported owned-store schemas retain identity, consent, queued
+records, and their ordinary schema upgrades. See [storage compatibility](docs/storage-compatibility.md).
 
 ## Screen tracking and SwiftUI
 
