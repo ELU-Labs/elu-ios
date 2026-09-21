@@ -312,18 +312,18 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, @unchecked Sendable {
                 owner.record(await runtime.captureException(properties: exception))
             }
 
-        case let .identify(distinctId, userProperties):
+        case let .identify(distinctId, userProperties, userPropertiesOnce):
             guard let userId = EluFacadeJSON.identifier(distinctId, maximumLength: 512) else {
                 count(.invalidInput)
                 return
             }
-            let projected = project(userProperties)
+            let projected = project(userProperties), projectedOnce = project(userPropertiesOnce)
             // The synchronous getter follows call order: the new id is
             // reported from the moment `identify` is accepted, and the
             // projection is withdrawn once the call settles.
             projectIdentity { $0.projectedDistinctId = userId }
             enqueue(settlesProjection: true, affectsFlags: true) { runtime, owner in
-                owner.apply(await runtime.identify(userId, properties: projected))
+                owner.apply(await runtime.identify(userId, properties: projected, propertiesOnce: projectedOnce))
                 owner.scheduleFlagReload()
             }
 
@@ -384,11 +384,11 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, @unchecked Sendable {
                 owner.scheduleFlagReload()
             }
 
-        case let .setPersonProperties(properties):
-            let projected = project(properties)
-            guard !projected.isEmpty else { return }
+        case let .setPersonProperties(properties, propertiesOnce):
+            let projected = project(properties), projectedOnce = project(propertiesOnce)
+            guard !projected.isEmpty || !projectedOnce.isEmpty else { return }
             enqueue(affectsFlags: true) { runtime, owner in
-                owner.apply(await runtime.setPersonProperties(projected))
+                owner.apply(await runtime.setPersonProperties(projected, propertiesOnce: projectedOnce))
                 owner.scheduleFlagReload()
             }
 
@@ -427,6 +427,19 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, @unchecked Sendable {
                 }
             }
 
+        case .resetGroups:
+            enqueue(affectsFlags: true) { runtime, owner in
+                owner.apply(await runtime.updateFlagContext(.resetGroups)); owner.scheduleFlagReload()
+            }
+        case .resetPersonPropertiesForFlags:
+            enqueue(affectsFlags: true) { runtime, owner in
+                owner.apply(await runtime.updateFlagContext(.resetPerson)); owner.scheduleFlagReload()
+            }
+        case let .resetGroupPropertiesForFlags(type):
+            if let type, EluFacadeJSON.identifier(type, maximumLength: 256) == nil { count(.invalidInput); return }
+            enqueue(affectsFlags: true) { runtime, owner in
+                owner.apply(await runtime.updateFlagContext(.resetGroup(type))); owner.scheduleFlagReload()
+            }
         case .reset:
             // The loaded flags belong to the identity that is ending, so a
             // read before the queued call runs must not report them or
@@ -499,6 +512,14 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, @unchecked Sendable {
         if let projectedDistinctId { return projectedDistinctId }
         guard let identity else { return nil }
         return identity.userId ?? identity.anonymousId
+    }
+
+    func groups() -> [String: String] {
+        withLock {
+            guard !isShutDown, pendingFlagIntents.isEmpty, pendingIdentityOperations == 0,
+                  !(consentProjection?.optedOut ?? identity?.optedOut ?? false) else { return [:] }
+            return identity?.groups ?? [:]
+        }
     }
 
     var flagsAreLoaded: Bool {

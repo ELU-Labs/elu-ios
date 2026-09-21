@@ -671,9 +671,10 @@ actor EluStandaloneRuntime {
     @discardableResult
     func identify(
         _ userId: String,
-        properties: [String: EluJSONValue] = [:]
+        properties: [String: EluJSONValue] = [:],
+        propertiesOnce: [String: EluJSONValue] = [:]
     ) async -> EluRuntimeQueueSnapshot? {
-        await mutate(.identify(userId: userId, set: properties, setOnce: [:]))
+        await mutate(.identify(userId: userId, set: properties, setOnce: propertiesOnce))
     }
 
     /// Links a second id to the identified one. The queue rejects an alias
@@ -685,10 +686,11 @@ actor EluStandaloneRuntime {
 
     @discardableResult
     func setPersonProperties(
-        _ properties: [String: EluJSONValue]
+        _ properties: [String: EluJSONValue],
+        propertiesOnce: [String: EluJSONValue] = [:]
     ) async -> EluRuntimeQueueSnapshot? {
-        guard !properties.isEmpty else { return nil }
-        return await mutate(.setPersonProperties(set: properties, setOnce: [:], unset: []))
+        guard !properties.isEmpty || !propertiesOnce.isEmpty else { return nil }
+        return await mutate(.setPersonProperties(set: properties, setOnce: propertiesOnce, unset: []))
     }
 
     /// Associates a group, and describes it in the same transition when
@@ -730,35 +732,20 @@ actor EluStandaloneRuntime {
     }
 
     @discardableResult
-    func setFlagPersonProperties(
-        _ properties: [String: EluJSONValue]
-    ) async -> EluRuntimeQueueSnapshot? {
-        guard phase != .closed, !properties.isEmpty else { return nil }
-        return await mutate(.setPersonProperties(set: properties, setOnce: [:], unset: []))
+    func setFlagPersonProperties(_ properties: [String: EluJSONValue]) async -> EluRuntimeQueueSnapshot? {
+        await updateFlagContext(.person(properties))
     }
 
-    /// Group properties describe the group this device is currently
-    /// associated with, so a type with no association has nothing to describe.
     @discardableResult
-    func setFlagGroupProperties(
-        type: String,
-        properties: [String: EluJSONValue]
-    ) async -> EluRuntimeQueueSnapshot? {
-        guard phase != .closed, !properties.isEmpty else { return nil }
-        guard let snapshot = try? await queue.snapshot(),
-              let key = snapshot.identity.groups[type]
-        else {
-            return nil
-        }
-        return await mutate(
-            .setGroupProperties(
-                groupType: type,
-                groupKey: key,
-                set: properties,
-                setOnce: [:],
-                unset: []
-            )
-        )
+    func setFlagGroupProperties(type: String, properties: [String: EluJSONValue]) async -> EluRuntimeQueueSnapshot? {
+        await updateFlagContext(.group(type: type, properties: properties))
+    }
+
+    @discardableResult
+    func updateFlagContext(_ change: EluStandaloneFlagContextChange) async -> EluRuntimeQueueSnapshot? {
+        performanceMonitor.invalidate()
+        guard phase != .closed, let snapshot = try? await queue.updateStandaloneFlagContext(change) else { return nil }
+        return await commit(snapshot)
     }
 
     /// Ends the current identity: a fresh anonymous id is minted and groups,

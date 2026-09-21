@@ -177,6 +177,10 @@ final class EluCore {
         }
     }
 
+    func getGroups() -> [String: String] {
+        queue.sync { state == .running ? (backend?.groups() ?? [:]) : [:] }
+    }
+
     func getFeatureFlag(_ key: String) -> Any? {
         queue.sync {
             guard state == .running else { return nil }

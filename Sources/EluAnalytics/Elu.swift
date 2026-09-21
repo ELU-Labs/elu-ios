@@ -51,6 +51,10 @@ public enum Elu {
         EluCore.shared.dispatch(.identify(distinctId: distinctId, userProperties: userProperties))
     }
 
+    public static func identify(_ distinctId: String, userProperties: [String: Any]?, userPropertiesOnce: [String: Any]) {
+        EluCore.shared.dispatch(.identify(distinctId: distinctId, userProperties: userProperties, userPropertiesOnce: userPropertiesOnce))
+    }
+
     /// Clear identity and stored ids (call on logout).
     public static func reset() {
         EluCore.shared.reset()
@@ -67,6 +71,17 @@ public enum Elu {
 
     public static func setPersonProperties(_ properties: [String: Any]) {
         EluCore.shared.dispatch(.setPersonProperties(properties))
+    }
+
+    public static func setPersonProperties(_ properties: [String: Any], propertiesOnce: [String: Any]) {
+        EluCore.shared.dispatch(.setPersonProperties(properties, propertiesOnce: propertiesOnce))
+    }
+
+    public static func getGroups() -> [String: String] { EluCore.shared.getGroups() }
+    public static func resetGroups() { EluCore.shared.dispatch(.resetGroups) }
+    public static func resetPersonPropertiesForFlags() { EluCore.shared.dispatch(.resetPersonPropertiesForFlags) }
+    public static func resetGroupPropertiesForFlags(_ type: String? = nil) {
+        EluCore.shared.dispatch(.resetGroupPropertiesForFlags(type))
     }
 
     // MARK: - Events

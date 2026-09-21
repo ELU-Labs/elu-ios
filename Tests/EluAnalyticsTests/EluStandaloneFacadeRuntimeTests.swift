@@ -106,6 +106,61 @@ final class EluStandaloneFacadeRuntimeTests: XCTestCase {
         }
     }
 
+    func testSetOnceOverloadsGroupsAndLocalFlagContextResetsPersist() async throws {
+        try await withTemporaryDirectory { root in
+            let harness = try await makeHarness(root: root)
+            harness.backend.execute(.identify(distinctId: "member", userProperties: ["plan": "pro"], userPropertiesOnce: ["joined": "first"]))
+            harness.backend.execute(.setPersonProperties([:], propertiesOnce: ["joined": "second", "source": "native"]))
+            harness.backend.execute(.group(type: "company", key: "acme", properties: nil))
+            await harness.backend.settled()
+            XCTAssertEqual(harness.backend.groups(), ["company": "acme"])
+            let before = try await harness.runtime.queueSnapshot()
+            XCTAssertEqual(before.flagContext.personProperties["joined"], .string("first"))
+            XCTAssertEqual(before.flagContext.personProperties["source"], .string("native"))
+            harness.backend.execute(.setPersonPropertiesForFlags(["beta": true]))
+            harness.backend.execute(.setGroupPropertiesForFlags(type: "company", properties: ["tier": "test"]))
+            harness.backend.execute(.setGroupPropertiesForFlags(type: "project", properties: ["tier": "preview"]))
+            harness.backend.execute(.resetPersonPropertiesForFlags)
+            harness.backend.execute(.resetGroupPropertiesForFlags("company"))
+            await harness.backend.settled()
+            let reset = try await harness.runtime.queueSnapshot()
+            XCTAssertTrue(reset.flagContext.personProperties.isEmpty)
+            XCTAssertNil(reset.flagContext.groupProperties["company"])
+            XCTAssertEqual(reset.flagContext.groupProperties["project"], ["tier": .string("preview")])
+            XCTAssertEqual(reset.queuedCount, before.queuedCount, "flag context changes must remain local")
+            harness.backend.execute(.resetGroupPropertiesForFlags(nil))
+            await harness.backend.settled()
+            let allGroupsReset = try await harness.runtime.queueSnapshot()
+            XCTAssertTrue(allGroupsReset.flagContext.groupProperties.isEmpty)
+            XCTAssertEqual(allGroupsReset.identity.groups, ["company": "acme"])
+            XCTAssertEqual(allGroupsReset.queuedCount, before.queuedCount)
+            harness.backend.execute(.resetGroups)
+            await harness.backend.settled()
+            XCTAssertTrue(harness.backend.groups().isEmpty)
+            await harness.close()
+            let reopened = try await makeHarness(root: root)
+            let restored = try await reopened.runtime.queueSnapshot()
+            XCTAssertTrue(restored.identity.groups.isEmpty)
+            XCTAssertTrue(restored.flagContext.personProperties.isEmpty)
+            XCTAssertTrue(restored.flagContext.groupProperties.isEmpty)
+            await reopened.close()
+        }
+    }
+
+    func testRegisterOnceDefaultsUseScalarNumericEqualityWithoutDeepObjectComparison() async throws {
+        try await withTemporaryDirectory { root in
+            let harness = try await makeHarness(root: root)
+            harness.backend.execute(.register(["numeric": 1, "object": ["a": 1]]))
+            harness.backend.execute(.registerOnce(["numeric": 2], defaultValue: 1.0))
+            harness.backend.execute(.registerOnce(["object": "wrong"], defaultValue: ["a": 1]))
+            await harness.backend.settled()
+            let snapshot = try await harness.runtime.queueSnapshot()
+            XCTAssertEqual(snapshot.identity.superProperties["numeric"], .integer(2))
+            XCTAssertEqual(snapshot.identity.superProperties["object"], .object(["a": .integer(1)]))
+            await harness.close()
+        }
+    }
+
     func testEveryFacadeMethodRecordsThroughTheOwnedRuntimeInCallOrder() async throws {
         try await withTemporaryDirectory { root in
             let harness = try await makeHarness(root: root)
@@ -157,8 +212,6 @@ final class EluStandaloneFacadeRuntimeTests: XCTestCase {
                     "associateGroup",
                     "setGroupProperties",
                     "setPersonProperties",
-                    "setPersonProperties",
-                    "setGroupProperties",
                 ]
             )
             await harness.close()

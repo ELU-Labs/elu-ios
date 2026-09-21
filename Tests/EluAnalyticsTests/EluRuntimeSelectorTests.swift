@@ -468,7 +468,7 @@ final class SelectorBackend: EluRuntimeBackend, @unchecked Sendable {
         case let .capture(event, _): record("capture(\(event))")
         case let .screen(name, _): record("screen(\(name))")
         case .captureException: record("captureException")
-        case let .identify(distinctId, _): record("identify(\(distinctId))")
+        case let .identify(distinctId, _, _): record("identify(\(distinctId))")
         case let .alias(alias): record("alias(\(alias))")
         case .register: record("register")
         case .registerOnce: record("registerOnce")
@@ -480,6 +480,9 @@ final class SelectorBackend: EluRuntimeBackend, @unchecked Sendable {
         case let .setGroupPropertiesForFlags(type, _):
             record("setGroupPropertiesForFlags(\(type))")
         case .reset: record("reset")
+        case .resetGroups: record("resetGroups")
+        case .resetPersonPropertiesForFlags: record("resetPersonPropertiesForFlags")
+        case .resetGroupPropertiesForFlags: record("resetGroupPropertiesForFlags")
         }
     }
 

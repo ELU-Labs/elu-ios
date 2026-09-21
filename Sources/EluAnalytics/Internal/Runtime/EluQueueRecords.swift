@@ -871,3 +871,12 @@ private enum EluQueueRecordCoding {
         }
     }
 }
+
+/// Local-only flag evaluation state, separate from customer person/group mutations.
+enum EluStandaloneFlagContextChange: Sendable {
+    case person([String: EluJSONValue])
+    case group(type: String, properties: [String: EluJSONValue])
+    case resetPerson
+    case resetGroup(String?)
+    case resetGroups
+}

@@ -129,12 +129,23 @@ Elu.getFeatureFlag(_:)                   Elu.isFeatureEnabled(_:)
 Elu.getFeatureFlagPayload(_:)            Elu.reloadFeatureFlags(_:)
 Elu.onFeatureFlagsLoaded(_:)             Elu.setPersonPropertiesForFlags(_:)
 Elu.setGroupPropertiesForFlags(_:properties:)
+Elu.getGroups() / Elu.resetGroups()
+Elu.resetPersonPropertiesForFlags()      Elu.resetGroupPropertiesForFlags(_:)
 ```
 
 `registerOnce` preserves existing properties unless they equal the supplied
 default (the default sentinel is `"None"`). `getFeatureFlagResult` returns one
 current snapshot with `key`, `enabled`, `variant`, and JSON-compatible `payload`;
 nil means the flag is missing or unavailable.
+
+The `identify(_:userProperties:userPropertiesOnce:)` and
+`setPersonProperties(_:propertiesOnce:)` overloads can set first-write person
+properties. The `ForFlags` setters and resets change only this device's flag
+evaluation context; they do not send person or group property updates. Pass a
+group type to reset that group's flag context, or omit it to reset all group
+flag context. `resetGroups()` clears group associations and their flag context.
+`getGroups()` returns the settled associations, or an empty dictionary while a
+context change is pending or collection is opted out.
 
 Call `Elu.optOut()` to persist consent withdrawal. Reset/logout preserves that
 choice. Call `Elu.optIn()` to restore collection subject to current remote

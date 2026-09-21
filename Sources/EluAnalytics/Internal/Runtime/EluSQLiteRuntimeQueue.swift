@@ -6950,6 +6950,19 @@ actor EluSQLiteRuntimeQueue {
         return .rejected(.storageProvenNotCommitted, snapshot: state.snapshot)
     }
 
+    private static func matchesRegisterOnceDefault(_ value: EluJSONValue?, _ fallback: EluJSONValue?) -> Bool {
+        switch (value, fallback) {
+        case (.null?, .null?): return true
+        case let (.bool(a)?, .bool(b)?): return a == b
+        case let (.string(a)?, .string(b)?): return a.utf8.elementsEqual(b.utf8)
+        case let (.integer(a)?, .integer(b)?): return a == b
+        case let (.number(a)?, .number(b)?): return a == b
+        case let (.integer(a)?, .number(b)?): return Double(a) == b
+        case let (.number(a)?, .integer(b)?): return a == Double(b)
+        default: return false // Browser object/array defaults compare by identity, not structure.
+        }
+    }
+
     @discardableResult
     func registerStandaloneSuperProperties(
         _ properties: [String: EluJSONValue],
@@ -6968,7 +6981,7 @@ actor EluSQLiteRuntimeQueue {
         var identity = state.identity
         for (key, value) in properties {
             let existing = identity.superProperties[key]
-            if !onlyIfAbsent || existing == nil || (defaultValue != nil && existing == defaultValue) {
+            if !onlyIfAbsent || existing == nil || Self.matchesRegisterOnceDefault(existing, defaultValue) {
                 identity.superProperties[key] = value
             }
         }
@@ -7171,6 +7184,29 @@ actor EluSQLiteRuntimeQueue {
             return try commitPrepared(expectedGeneration: expectedGeneration,
                 identity: prepared.identity, flagContext: prepared.flagContext, drafts: []).snapshot
         }
+    }
+
+    /// Local overrides and membership resets never produce person/group wire mutations.
+    func updateStandaloneFlagContext(_ change: EluStandaloneFlagContextChange) throws -> EluRuntimeQueueSnapshot {
+        var identity = state.identity, context = state.flagContext
+        switch change {
+        case let .person(properties):
+            context.personProperties.merge(properties) { _, new in new }
+        case let .group(type, properties):
+            guard EluIdentityState.valid(type, maximumLength: 256) else { throw EluRuntimeQueueError.invalidRecord }
+            context.groupProperties[type, default: [:]].merge(properties) { _, new in new }
+        case .resetPerson: context.personProperties = [:]
+        case let .resetGroup(type):
+            if let type { context.groupProperties.removeValue(forKey: type) } else { context.groupProperties = [:] }
+        case .resetGroups: identity.groups = [:]; context.groupProperties = [:]
+        }
+        try context.validate()
+        guard context != state.flagContext || identity.groups != state.identity.groups else { return state.snapshot }
+        guard identity.contextRevision < Int64.max, let now = canonicalDate(clock()), now >= identity.updatedAt else {
+            throw EluRuntimeQueueError.invalidState
+        }
+        identity.contextRevision += 1; identity.updatedAt = now
+        return try commitPrepared(expectedGeneration: state.generation, identity: identity, flagContext: context, drafts: []).snapshot
     }
 
     /// Applies flag evaluation context through the owner runtime so the
