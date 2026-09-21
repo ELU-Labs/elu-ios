@@ -58,8 +58,11 @@ def main() -> int:
         fail("public-api.txt does not match the immutable tag")
 
     current_source = (ROOT / "Sources" / "EluAnalytics" / "Elu.swift").read_text(encoding="utf-8")
-    if public_declarations(current_source) != expected_api:
-        fail("current facade differs from the frozen 0.1.0 public API")
+    current_api = public_declarations(current_source)
+    if any(declaration not in current_api for declaration in expected_api):
+        fail("current facade removed or changed a frozen 0.1.0 public declaration")
+    # Additions are checked against the separate exact symbol ledger after the
+    # iOS build. The immutable baseline is never rewritten to accept new APIs.
 
     metadata = json.loads((BASELINE / "package-metadata.json").read_text(encoding="utf-8"))
     if metadata["source"]["commit"] != COMMIT:

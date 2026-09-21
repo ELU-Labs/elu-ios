@@ -15,6 +15,13 @@ This is a source API check, not proof of binary compatibility, supported
 upgrades, package qualification, or customer readiness. The release checks and
 Lab migration/adoption tests remain required.
 
+`package-metadata.json` records the current owned package's exact manifest
+digest, product, targets, linker settings, and empty dependency set for strict
+release checks. The historical package-validation ledger describes the prior
+provider-backed wrapper and remains unchanged for baseline checks. Both modes
+reject manifest tampering; the current package does not reuse a historical
+manifest digest or dependency claim.
+
 The provider boundary retains the existing compatibility reader and permits
 only its exact upstream provenance comment. Provider imports and live provider
 types remain prohibited, including in that reader. Its source is hash-pinned;
