@@ -31,7 +31,11 @@ final class EluStandaloneRuntimeTests: XCTestCase {
             runtime.performanceLifecycleIntent(foreground: true)
             await runtime.markForegrounded()
             _ = await runtime.flush()
+            let sessionBeforeSample = try await runtime.queueSnapshot().identity.session
+            clock.advance(seconds: 1)
             try await awaitCondition(timeoutSeconds: 7) { try await runtime.queueSnapshot().queuedCount >= 1 }
+            let sessionAfterSample = try await runtime.queueSnapshot().identity.session
+            XCTAssertEqual(sessionAfterSample, sessionBeforeSample, "passive sampling cannot extend idle time")
             runtime.performanceLifecycleIntent(foreground: false)
             _ = await runtime.flush()
             let requests = await transport.recordedRequests()

@@ -6,6 +6,45 @@ import XCTest
 final class EluV1CaptureRuntimeTests: XCTestCase {
     private let baseDate = Date(timeIntervalSince1970: 1_785_801_660)
 
+    func testPassivePerformancePreservesIdleBoundaryAcrossRestartAndNeverCreatesSession() async throws {
+        try await withTemporaryDirectory { root in
+            let clock = TestCaptureClock(wall: baseDate, continuous: 1_000_000_000)
+            let configData = try config { object in
+                var session = try XCTUnwrap(object["session"] as? [String: Any])
+                session["idleTimeoutSeconds"] = 60
+                object["session"] = session
+            }
+            let queue = try await makeCaptureQueue(root: root, clock: clock)
+            _ = await queue.submitCaptureAuthority(configData: configData, effectivePrivacyStateData: try privacy(contextRevision: 0, allowed: true))
+            let initialSample = await queue.capturePerformanceSample(command(kind: .capture, name: "$performance_sample", occurredAt: clock.wall()), admissionGuard: { true })
+            guard case .rejected(.invalidEvent, _) = initialSample else { return XCTFail("A sample cannot create a session") }
+            guard case let .accepted(_, first) = await queue.capture(command(kind: .capture, name: "user_action", occurredAt: clock.wall())) else {
+                return XCTFail("Expected initial user activity")
+            }
+            clock.advance(seconds: 59)
+            guard case let .accepted(_, sampled) = await queue.capturePerformanceSample(command(kind: .capture, name: "$performance_sample", occurredAt: clock.wall()), admissionGuard: { true }) else {
+                return XCTFail("Expected a sample in the existing live session")
+            }
+            XCTAssertEqual(sampled.identity.session, first.identity.session)
+            XCTAssertEqual(sampled.identity.updatedAt, first.identity.updatedAt)
+            await queue.close()
+
+            let reopened = try await makeCaptureQueue(root: root, clock: clock)
+            let restored = try await reopened.snapshot()
+            XCTAssertEqual(restored.identity.session, first.identity.session)
+            _ = await reopened.submitCaptureAuthority(configData: configData, effectivePrivacyStateData: try privacy(contextRevision: 0, allowed: true))
+            clock.advance(seconds: 1)
+            guard case .rejected(.invalidEvent, _) = await reopened.capturePerformanceSample(command(kind: .capture, name: "$performance_sample", occurredAt: clock.wall()), admissionGuard: { true }) else {
+                return XCTFail("A sample at the idle deadline cannot resume the session")
+            }
+            guard case let .accepted(_, next) = await reopened.capture(command(kind: .capture, name: "next_user_action", occurredAt: clock.wall())) else {
+                return XCTFail("Expected a fresh session")
+            }
+            XCTAssertNotEqual(next.identity.session?.id, first.identity.session?.id)
+            await reopened.close()
+        }
+    }
+
     func testCaptureAuthorityOwnsSessionPropertiesConsentAndGeneration() async throws {
         try await withTemporaryDirectory { root in
             let clock = TestCaptureClock(wall: baseDate, continuous: 1_000_000_000)

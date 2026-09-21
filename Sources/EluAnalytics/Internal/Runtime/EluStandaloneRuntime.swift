@@ -865,7 +865,8 @@ actor EluStandaloneRuntime {
               lastSnapshot.identity.revision == identityRevision,
               lastSnapshot.identity.contextRevision == contextRevision,
               lastSnapshot.identity.session?.id == sessionID, isCurrent() else { return }
-        _ = await capture("$performance_sample", properties: fields, admissionGuard: isCurrent)
+        let command = EluV1CaptureCommand(kind: .capture, name: "$performance_sample", occurredAt: clock(), properties: fields, versions: versions)
+        _ = await record(command, performanceSample: true, admissionGuard: isCurrent)
     }
 
     /// Triggers delivery now; without an activated authority nothing is sent.
@@ -925,12 +926,15 @@ actor EluStandaloneRuntime {
         return result
     }
 
-    private func record(_ command: EluV1CaptureCommand, admissionGuard: (@Sendable () -> Bool)? = nil) async -> EluV1CaptureResult {
+    private func record(_ command: EluV1CaptureCommand, performanceSample: Bool = false, admissionGuard: (@Sendable () -> Bool)? = nil) async -> EluV1CaptureResult {
         let fence = deliveryFence
         let decision = fence.token()
-        let result = await queue.capture(command, admissionGuard: {
+        let current: @Sendable () -> Bool = {
             fence.isCurrent(decision) && (admissionGuard?() ?? true)
-        })
+        }
+        let result = performanceSample
+            ? await queue.capturePerformanceSample(command, admissionGuard: current)
+            : await queue.capture(command, admissionGuard: current)
         switch result {
         case let .accepted(_, snapshot):
             lastSnapshot = snapshot

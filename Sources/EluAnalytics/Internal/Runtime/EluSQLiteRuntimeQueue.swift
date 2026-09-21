@@ -2704,6 +2704,7 @@ private enum EluRuntimeDatabase {
 
 private enum EluPreparedRecordDraft: Sendable {
     case event(EluEventDraft)
+    case performanceSample(EluEventDraft)
     case mutation(
         change: EluMutationChange,
         identity: EluIdentityState,
@@ -6817,6 +6818,19 @@ actor EluSQLiteRuntimeQueue {
     /// Creates and consumes admission entirely inside this actor operation.
     /// No authority token or detached resolution is returned to the caller.
     func capture(_ command: EluV1CaptureCommand, admissionGuard: (@Sendable () -> Bool)? = nil) -> EluV1CaptureResult {
+        capture(command, performanceSample: false, admissionGuard: admissionGuard)
+    }
+
+    /// A passive sample requires an existing live foreground session. It may
+    /// neither start/resume a session nor extend its user-activity timeout.
+    func capturePerformanceSample(_ command: EluV1CaptureCommand, admissionGuard: @escaping @Sendable () -> Bool) -> EluV1CaptureResult {
+        guard command.kind == .capture, command.name == "$performance_sample" else {
+            return .rejected(.invalidEvent, snapshot: state.snapshot)
+        }
+        return capture(command, performanceSample: true, admissionGuard: admissionGuard)
+    }
+
+    private func capture(_ command: EluV1CaptureCommand, performanceSample: Bool, admissionGuard: (@Sendable () -> Bool)?) -> EluV1CaptureResult {
         let before = state.snapshot
         let sourceWitness = captureSourceWitness
         guard sourceIsCurrent(sourceWitness), admissionGuard?() ?? true else { return .rejected(.authorityAbsent, snapshot: before) }
@@ -6857,7 +6871,8 @@ actor EluSQLiteRuntimeQueue {
             prepared = try prepareCapture(
                 command: command,
                 occurredAt: occurredAt,
-                authority: authority
+                authority: authority,
+                performanceSample: performanceSample
             )
         } catch {
             return .rejected(.invalidEvent, snapshot: before)
@@ -6869,7 +6884,7 @@ actor EluSQLiteRuntimeQueue {
                     expectedGeneration: state.generation,
                     identity: prepared.identity,
                     flagContext: state.flagContext,
-                    drafts: [.event(prepared.draft)],
+                    drafts: [performanceSample ? .performanceSample(prepared.draft) : .event(prepared.draft)],
                     surfaceProvenNotCommitted: true,
                     prewriteValidation: { diskState in
                         guard self.sourceIsCurrent(sourceWitness), admissionGuard?() ?? true else { throw EluRuntimeQueueError.sourceAuthorityUnavailable }
@@ -7949,7 +7964,8 @@ actor EluSQLiteRuntimeQueue {
     private func prepareCapture(
         command: EluV1CaptureCommand,
         occurredAt: Date,
-        authority: EluV1CaptureAuthoritySnapshot
+        authority: EluV1CaptureAuthoritySnapshot,
+        performanceSample: Bool
     ) throws -> (identity: EluIdentityState, draft: EluEventDraft) {
         var properties = state.identity.superProperties
         for (key, value) in command.properties { properties[key] = value }
@@ -7962,7 +7978,15 @@ actor EluSQLiteRuntimeQueue {
 
         let previous = state.identity.session
         let session: EluSessionState
-        if let previous {
+        if performanceSample {
+            guard let previous, previous.lifecycle == .active, previous.backgroundedAt == nil,
+                  occurredAt >= previous.lastActivityAt,
+                  occurredAt.timeIntervalSince(previous.lastActivityAt) < Double(min(previous.timeoutSeconds, authority.idleTimeoutSeconds)),
+                  occurredAt.timeIntervalSince(previous.startedAt) < Double(authority.maximumDurationSeconds)
+            else { throw EluRuntimeQueueError.invalidState }
+            try validateStoredSession(previous, identityUpdatedAt: state.identity.updatedAt)
+            session = previous
+        } else if let previous {
             try validateStoredSession(previous, identityUpdatedAt: state.identity.updatedAt)
             guard occurredAt >= previous.lastActivityAt,
                   occurredAt >= previous.startedAt
@@ -8008,7 +8032,7 @@ actor EluSQLiteRuntimeQueue {
 
         var identity = state.identity
         identity.session = session
-        identity.updatedAt = occurredAt
+        if !performanceSample { identity.updatedAt = occurredAt }
         let draft = EluEventDraft(
             kind: command.kind,
             name: command.name,
@@ -8459,13 +8483,19 @@ actor EluSQLiteRuntimeQueue {
             let sequence = firstSequence + Int64(index)
             let rawRecord: EluQueuedRecord
             switch draft {
-            case let .event(eventDraft):
+            case let .event(eventDraft), let .performanceSample(eventDraft):
+                let isPassive: Bool
+                if case .performanceSample = draft { isPassive = true } else { isPassive = false }
                 guard let session = identity.session,
                       session.lifecycle == .active,
                       session.backgroundedAt == nil,
                       eventDraft.expectedSessionId == session.id,
                       eventDraft.occurredAt >= session.startedAt,
-                      eventDraft.occurredAt <= session.lastActivityAt
+                      (isPassive
+                        ? eventDraft.kind == .capture && eventDraft.name == "$performance_sample"
+                            && eventDraft.occurredAt >= session.lastActivityAt
+                            && eventDraft.occurredAt.timeIntervalSince(session.lastActivityAt) < Double(session.timeoutSeconds)
+                        : eventDraft.occurredAt <= session.lastActivityAt)
                 else {
                     throw EluRuntimeQueueError.invalidRecord
                 }
