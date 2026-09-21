@@ -249,3 +249,17 @@ launch time or automatically report fatal crashes.
 ## SDK development
 
 [SDK development status](docs/sdk-development-status.md) tracks validation gaps and related work.
+
+## App privacy manifest
+
+The package includes `PrivacyInfo.xcprivacy`. It declares the SDK's linked
+analytics, manual exception, native performance/diagnostic data, and ordinary
+replay text, with tracking disabled. Performance remains disabled by default;
+replay still requires eligible privacy authority, and masked inputs and blocked
+content are excluded. Elapsed-time clocks are used for in-app timers and duration
+measurements; raw system boot time is not sent. Review your app's complete data
+practices when preparing its App Store privacy disclosures.
+
+The categories and elapsed-time reason follow Apple's
+[data-type definitions](https://developer.apple.com/documentation/bundleresources/app-privacy-configuration/nsprivacycollecteddatatypes/nsprivacycollecteddatatype)
+and [required API reasons](https://developer.apple.com/documentation/bundleresources/app-privacy-configuration/nsprivacyaccessedapitypes/nsprivacyaccessedapitypereasons).
