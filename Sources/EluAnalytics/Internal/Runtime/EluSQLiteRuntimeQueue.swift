@@ -32,6 +32,7 @@ enum EluRuntimeQueueFaultPoint: Equatable, Sendable {
     case open
     case beforeInitialInstall
     case afterInitialInstall
+    case afterInspectionCopy
     case beforeBegin
     case beforeNativeDenialRead
     case afterBegin
@@ -698,6 +699,11 @@ private enum EluRuntimeQueueBootstrap {
             }
             _ = Darwin.fchmod(lockDescriptor, mode_t(0o600))
 
+            // Scratch belongs to this exact store lease. Reuse one reserved
+            // directory so abrupt process death cannot accumulate UUID copies.
+            let scratchURL = try prepareScratchDirectory(in: canonicalURL)
+            defer { try? removeScratchDirectory(scratchURL) }
+
             let databaseURL = canonicalURL.appendingPathComponent(
                 EluSQLiteRuntimeSchema.databaseFilename,
                 isDirectory: false
@@ -714,12 +720,14 @@ private enum EluRuntimeQueueBootstrap {
                 )
                 try installFreshDatabase(
                     at: databaseURL,
+                    scratchDirectory: scratchURL,
                     state: importedState,
                     faultInjector: faultInjector
                 )
             }
 
-            let inspected = try inspectExisting(databaseURL: databaseURL)
+            let inspected = try inspectExisting(databaseURL: databaseURL,
+                scratchDirectory: scratchURL, faultInjector: faultInjector)
             let openedConnection = try EluSQLiteConnection(path: databaseURL.path, create: false)
             connection = openedConnection
             let liveInspection = try inspectExisting(connection: openedConnection)
@@ -763,22 +771,13 @@ private enum EluRuntimeQueueBootstrap {
     }
 
     private static func inspectExisting(
-        databaseURL: URL
+        databaseURL: URL,
+        scratchDirectory: URL,
+        faultInjector: (any EluRuntimeQueueFaultInjecting)?
     ) throws -> EluRuntimeInspection {
         let fileManager = FileManager.default
-        let inspectionDirectory = fileManager.temporaryDirectory.appendingPathComponent(
-            "elu-runtime-inspection-\(UUID().uuidString)",
-            isDirectory: true
-        )
-        try fileManager.createDirectory(
-            at: inspectionDirectory,
-            withIntermediateDirectories: false,
-            attributes: [.posixPermissions: 0o700]
-        )
-        defer { try? fileManager.removeItem(at: inspectionDirectory) }
-
-        let inspectionDatabase = inspectionDirectory.appendingPathComponent(
-            EluSQLiteRuntimeSchema.databaseFilename,
+        let inspectionDatabase = scratchDirectory.appendingPathComponent(
+            "inspection.sqlite3",
             isDirectory: false
         )
         try fileManager.copyItem(at: databaseURL, to: inspectionDatabase)
@@ -788,6 +787,7 @@ private enum EluRuntimeQueueBootstrap {
             let destination = URL(fileURLWithPath: inspectionDatabase.path + suffix)
             try fileManager.copyItem(at: source, to: destination)
         }
+        try faultInjector?.hit(.afterInspectionCopy)
 
         let connection = try EluSQLiteConnection(path: inspectionDatabase.path, create: false)
         defer { connection.close() }
@@ -816,6 +816,7 @@ private enum EluRuntimeQueueBootstrap {
 
     private static func installFreshDatabase(
         at databaseURL: URL,
+        scratchDirectory: URL,
         state: EluStoredRuntimeState,
         faultInjector: (any EluRuntimeQueueFaultInjecting)?
     ) throws {
@@ -823,16 +824,10 @@ private enum EluRuntimeQueueBootstrap {
         guard !fileManager.fileExists(atPath: databaseURL.path) else {
             throw EluRuntimeQueueError.ownershipConflict
         }
-        let stagedURL = databaseURL.deletingLastPathComponent().appendingPathComponent(
-            ".\(databaseURL.lastPathComponent).\(UUID().uuidString).staged",
+        let stagedURL = scratchDirectory.appendingPathComponent(
+            "install.sqlite3",
             isDirectory: false
         )
-        var installed = false
-        defer {
-            if !installed {
-                removeDatabaseFamily(at: stagedURL)
-            }
-        }
 
         let connection = try EluSQLiteConnection(path: stagedURL.path, create: true)
         do {
@@ -861,7 +856,6 @@ private enum EluRuntimeQueueBootstrap {
         try synchronizeFile(stagedURL)
         try faultInjector?.hit(.beforeInitialInstall)
         try fileManager.moveItem(at: stagedURL, to: databaseURL)
-        installed = true
         try EluDarwinDirectorySynchronizer().synchronize(
             directoryURL: databaseURL.deletingLastPathComponent()
         )
@@ -879,10 +873,53 @@ private enum EluRuntimeQueueBootstrap {
         }
     }
 
-    private static func removeDatabaseFamily(at databaseURL: URL) {
-        let fileManager = FileManager.default
-        for suffix in ["", "-wal", "-shm"] {
-            try? fileManager.removeItem(at: URL(fileURLWithPath: databaseURL.path + suffix))
+    private static func prepareScratchDirectory(in directory: URL) throws -> URL {
+        let scratch = directory.appendingPathComponent(".runtime-state-v1.scratch", isDirectory: true)
+        var metadata = stat()
+        if scratch.path.withCString({ lstat($0, &metadata) }) == 0 {
+            try removeScratchDirectory(scratch)
+        } else if errno != ENOENT {
+            throw EluRuntimeQueueError.invalidDirectory
+        }
+        guard scratch.path.withCString({ Darwin.mkdir($0, mode_t(0o700)) }) == 0 else {
+            throw EluRuntimeQueueError.invalidDirectory
+        }
+        return scratch
+    }
+
+    /// Called only while the original store's exclusive lock is held. Never
+    /// scan global temporary storage, recurse, or follow scratch symlinks.
+    private static func removeScratchDirectory(_ directory: URL) throws {
+        let descriptor = directory.path.withCString { Darwin.open($0, O_RDONLY | O_DIRECTORY | O_NOFOLLOW) }
+        guard descriptor >= 0 else { throw EluRuntimeQueueError.invalidDirectory }
+        defer { _ = Darwin.close(descriptor) }
+        var metadata = stat()
+        guard fstat(descriptor, &metadata) == 0,
+              metadata.st_mode & S_IFMT == S_IFDIR, metadata.st_uid == geteuid() else {
+            throw EluRuntimeQueueError.invalidDirectory
+        }
+        let names = try FileManager.default.contentsOfDirectory(atPath: directory.path)
+        let allowed = Set(["inspection.sqlite3", "install.sqlite3"].flatMap { name in
+            ["", "-wal", "-shm", "-journal"].map { name + $0 }
+        })
+        // Validate every entry before removing any bytes. An unfamiliar file,
+        // directory, hard link or symbolic link must leave the family intact.
+        for name in names {
+            var entry = stat()
+            guard allowed.contains(name), name.withCString({ fstatat(descriptor, $0, &entry, AT_SYMLINK_NOFOLLOW) }) == 0,
+                  entry.st_mode & S_IFMT == S_IFREG, entry.st_nlink == 1,
+                  entry.st_uid == geteuid() else { throw EluRuntimeQueueError.invalidDirectory }
+        }
+        for name in names {
+            guard name.withCString({ unlinkat(descriptor, $0, 0) }) == 0 else {
+                throw EluRuntimeQueueError.databaseUnavailable
+            }
+        }
+        var current = stat()
+        guard directory.path.withCString({ lstat($0, &current) }) == 0,
+              current.st_dev == metadata.st_dev, current.st_ino == metadata.st_ino,
+              directory.path.withCString({ Darwin.rmdir($0) }) == 0 else {
+            throw EluRuntimeQueueError.databaseUnavailable
         }
     }
 
