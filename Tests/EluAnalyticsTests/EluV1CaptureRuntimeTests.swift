@@ -6,6 +6,170 @@ import XCTest
 final class EluV1CaptureRuntimeTests: XCTestCase {
     private let baseDate = Date(timeIntervalSince1970: 1_785_801_660)
 
+    func testRemoteQueueQuotaAppliesBeforeReplayStorageOrAnyNativeRootExists() async throws {
+        for schemaVersion in [1, 2] {
+            try await withTemporaryDirectory { root in
+                let clock = TestCaptureClock(wall: baseDate, continuous: 1_000_000_000)
+                let queue = try await makeCaptureQueue(root: root, clock: clock)
+                let data = try quotaConfig(bytes: 1_024, schemaVersion: schemaVersion)
+                guard case .activated = await queue.submitCaptureAuthority(configData: data,
+                    effectivePrivacyStateData: try privacy(contextRevision: 0, allowed: true)) else {
+                    return XCTFail("Expected validated config")
+                }
+                let before = try await queue.snapshot()
+                let result = await queue.capture(command(kind: .capture, name: "headless_oversize", occurredAt: clock.wall(),
+                    properties: ["value": .string(String(repeating: "x", count: 2_048))]))
+                guard case let .rejected(.queueLimit, after) = result else {
+                    await queue.close()
+                    return XCTFail("Remote quota must bind event admission without replay schema or a UIKit root")
+                }
+                XCTAssertEqual(after, before, "Quota rejection must not create a session or advance sequence")
+                let records = try await queue.peek(maximumCount: 10, maximumBytes: 1_000_000)
+                XCTAssertTrue(records.isEmpty)
+                await queue.close()
+            }
+        }
+    }
+
+    func testRemoteQueueQuotaReappliesOnRestartBeforeNewCapture() async throws {
+        try await withTemporaryDirectory { root in
+            let clock = TestCaptureClock(wall: baseDate, continuous: 1_000_000_000)
+            let data = try quotaConfig(bytes: 4_096)
+            let queue = try await makeCaptureQueue(root: root, clock: clock)
+            _ = await queue.submitCaptureAuthority(configData: data,
+                effectivePrivacyStateData: try privacy(contextRevision: 0, allowed: true))
+            guard case .accepted = await queue.capture(command(kind: .capture, name: "before_restart", occurredAt: clock.wall())) else {
+                return XCTFail("Expected an event below the current quota")
+            }
+            let expected = try await queue.snapshot()
+            await queue.close()
+            let reopened = try await makeCaptureQueue(root: root, clock: clock)
+            guard case .rejected(.authorityAbsent, _) = await reopened.capture(command(kind: .capture, name: "no_authority", occurredAt: clock.wall())) else {
+                return XCTFail("Stored queue state cannot authorize fresh capture")
+            }
+            guard case .activated = await reopened.submitCaptureAuthority(configData: data,
+                effectivePrivacyStateData: try privacy(contextRevision: 0, allowed: true)) else {
+                return XCTFail("Expected the same still-valid config to be revalidated")
+            }
+            let result = await reopened.capture(command(kind: .capture, name: "after_restart", occurredAt: clock.wall(),
+                properties: ["value": .string(String(repeating: "x", count: 4_096))]))
+            guard case let .rejected(.queueLimit, actual) = result else {
+                await reopened.close()
+                return XCTFail("Revalidated remote quota must apply after restart")
+            }
+            XCTAssertEqual(actual, expected)
+            await reopened.close()
+        }
+    }
+
+    func testRemoteQueueQuotaLoweringPreservesBacklogAndRaisingReplacesOldReplayLimit() async throws {
+        try await withTemporaryDirectory { root in
+            let clock = TestCaptureClock(wall: baseDate, continuous: 1_000_000_000)
+            let queue = try await makeCaptureQueue(root: root, clock: clock)
+            let large = command(kind: .capture, name: "existing", occurredAt: clock.wall(),
+                properties: ["value": .string(String(repeating: "x", count: 4_096))])
+            _ = await queue.submitCaptureAuthority(configData: try quotaConfig(bytes: 32_768),
+                effectivePrivacyStateData: try privacy(contextRevision: 0, allowed: true))
+            guard case .accepted = await queue.capture(large) else { return XCTFail("Expected initial event") }
+            let before = try await queue.snapshot()
+            let records = try await queue.peek(maximumCount: 10, maximumBytes: 1_000_000)
+            let lower = try quotaConfig(bytes: 1_024, issuedSecond: 10)
+            guard case .activated = await queue.submitCaptureAuthority(configData: lower,
+                effectivePrivacyStateData: try privacy(contextRevision: 0, allowed: true)) else {
+                return XCTFail("Expected lower quota to activate")
+            }
+            let result = await queue.capture(command(kind: .capture, name: "blocked_by_backlog", occurredAt: clock.wall()))
+            guard case let .rejected(.queueLimit, unchanged) = result else {
+                await queue.close()
+                return XCTFail("Existing backlog exceeding a lower quota must prevent new admission")
+            }
+            XCTAssertEqual(unchanged, before)
+            let retained = try await queue.peek(maximumCount: 10, maximumBytes: 1_000_000)
+            XCTAssertEqual(retained, records, "A new quota must not delete already accepted records")
+
+            // Install the old limit in replay storage, then replace only the
+            // event authority. Fresh event quota cannot depend on a replay pass.
+            try await queue.ensureReplaySchema()
+            let manager = EluV1ConfigManager()
+            _ = try manager.update(configData: lower, now: clock.wall())
+            let identity = try XCTUnwrap(manager.validatedCandidateIdentity())
+            _ = try await queue.reconcileReplayConfiguration(configData: lower,
+                expectedConfigWitness: EluV2ReplayConfigWitness(issuedAt: identity.issuedAt, semanticHash: identity.semanticHash),
+                supportedProtocolGeneration: nil, mayRetainProfile: { _ in false })
+            guard case .activated = await queue.submitCaptureAuthority(configData: try quotaConfig(bytes: 65_536, issuedSecond: 20),
+                effectivePrivacyStateData: try privacy(contextRevision: 0, allowed: true)) else {
+                return XCTFail("Expected increased quota to activate")
+            }
+            guard case .accepted = await queue.capture(large) else {
+                await queue.close()
+                return XCTFail("A stale replay ledger must not permanently pin the old event quota")
+            }
+            await queue.close()
+        }
+    }
+
+    func testRemoteQueueQuotaFromSupersededSourceCannotReplaceCurrentLimit() async throws {
+        try await withTemporaryDirectory { root in
+            let clock = TestCaptureClock(wall: baseDate, continuous: 1_000_000_000)
+            let gate = sourceGate(clock)
+            let lower = try quotaConfig(bytes: 1_024)
+            let oldSource = try publishSource(gate, data: lower, clock: clock)
+            let queue = try await makeCaptureQueue(root: root, clock: clock, configurationGate: gate)
+            _ = await queue.submitCaptureAuthority(configData: lower,
+                effectivePrivacyStateData: try privacy(contextRevision: 0, allowed: true), sourceWitness: oldSource)
+            let higher = try quotaConfig(bytes: 32_768, issuedSecond: 10)
+            let current = try publishSource(gate, data: higher, clock: clock)
+            guard case .activated = await queue.submitCaptureAuthority(configData: higher,
+                effectivePrivacyStateData: try privacy(contextRevision: 0, allowed: true), sourceWitness: current) else {
+                return XCTFail("Expected current source to activate")
+            }
+            guard case .terminated = await queue.submitCaptureAuthority(configData: lower,
+                effectivePrivacyStateData: try privacy(contextRevision: 0, allowed: true), sourceWitness: oldSource) else {
+                return XCTFail("Superseded source must be rejected")
+            }
+            guard case .accepted = await queue.capture(command(kind: .capture, name: "current_quota", occurredAt: clock.wall(),
+                properties: ["value": .string(String(repeating: "x", count: 2_048))])) else {
+                return XCTFail("The current larger quota must survive rejected stale input")
+            }
+            await queue.close()
+        }
+    }
+
+    func testRemoteQueueQuotaAlsoBoundsOwnedWireMutationsAtomically() async throws {
+        try await withTemporaryDirectory { root in
+            let clock = TestCaptureClock(wall: baseDate, continuous: 1_000_000_000)
+            let queue = try await makeCaptureQueue(root: root, clock: clock)
+            _ = await queue.submitCaptureAuthority(configData: try quotaConfig(bytes: 1_024),
+                effectivePrivacyStateData: try privacy(contextRevision: 0, allowed: true))
+            let before = try await queue.snapshot()
+            do {
+                _ = try await queue.applyOwnedMutation(.setPersonProperties(
+                    set: ["value": .string(String(repeating: "x", count: 2_048))], setOnce: [:], unset: []),
+                    versions: command(kind: .capture, name: "unused", occurredAt: clock.wall()).versions,
+                    expectedGeneration: before.generation)
+                XCTFail("Wire mutations share the current server queue quota")
+            } catch { XCTAssertEqual(error as? EluRuntimeQueueError, .queueByteLimitExceeded) }
+            let after = try await queue.snapshot()
+            XCTAssertEqual(after, before)
+            await queue.close()
+        }
+    }
+
+    private func quotaConfig(bytes: Int, issuedSecond: Int = 0, schemaVersion: Int = 2) throws -> Data {
+        try config { object in
+            var limits = try XCTUnwrap(object["limits"] as? [String: Any])
+            limits["queueBytes"] = bytes; object["limits"] = limits
+            object["revision"] = "queue-quota-\(issuedSecond)"
+            object["issuedAt"] = String(format: "2026-08-04T00:00:%02d.000Z", issuedSecond)
+            if schemaVersion == 2 {
+                let fixture = fixtureURL("config-enabled.json").deletingLastPathComponent().deletingLastPathComponent()
+                    .deletingLastPathComponent().appendingPathComponent("V2/fixtures/config-enabled.json")
+                let v2 = try jsonObject(Data(contentsOf: fixture))
+                object["schemaVersion"] = 2; object["capabilities"] = v2["capabilities"]; object["endpoints"] = v2["endpoints"]
+            }
+        }
+    }
+
     func testPassivePerformancePreservesIdleBoundaryAcrossRestartAndNeverCreatesSession() async throws {
         try await withTemporaryDirectory { root in
             let clock = TestCaptureClock(wall: baseDate, continuous: 1_000_000_000)

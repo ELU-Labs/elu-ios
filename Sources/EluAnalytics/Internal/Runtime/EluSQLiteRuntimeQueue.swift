@@ -6709,7 +6709,8 @@ actor EluSQLiteRuntimeQueue {
             monotonicStartedAt: monotonicOrigin,
             monotonicBudget: monotonicBudget,
             idleTimeoutSeconds: resolution.sessionIdleTimeoutSeconds,
-            maximumDurationSeconds: resolution.sessionMaximumDurationSeconds
+            maximumDurationSeconds: resolution.sessionMaximumDurationSeconds,
+            maximumQueueBytes: resolution.limits.queueBytes
         )
         guard consumeSource(sourceWitness, data: configData, apply: {
             captureSourceWitness = sourceWitness
@@ -6804,6 +6805,7 @@ actor EluSQLiteRuntimeQueue {
                     identity: prepared.identity,
                     flagContext: state.flagContext,
                     drafts: [performanceSample ? .performanceSample(prepared.draft) : .event(prepared.draft)],
+                    maximumQueueBytes: authority.maximumQueueBytes,
                     surfaceProvenNotCommitted: true,
                     prewriteValidation: { diskState in
                         guard self.sourceIsCurrent(sourceWitness), admissionGuard?() ?? true else { throw EluRuntimeQueueError.sourceAuthorityUnavailable }
@@ -7093,12 +7095,16 @@ actor EluSQLiteRuntimeQueue {
         }
         let witness = captureSourceWitness
         let admitsWire = allowWire && wireGuard() && (configurationGate == nil || freshMutationSourceIsCurrent(witness, diskState: state))
+        let maximumQueueBytes: Int?
+        if case let .authorized(authority) = captureAuthority { maximumQueueBytes = authority.maximumQueueBytes }
+        else { maximumQueueBytes = nil }
         do {
             return try commitPrepared(
                 expectedGeneration: expectedGeneration,
                 identity: prepared.identity,
                 flagContext: prepared.flagContext,
                 drafts: admitsWire ? prepared.drafts : [],
+                maximumQueueBytes: maximumQueueBytes,
                 prewriteValidation: { diskState in
                     if admitsWire && !prepared.drafts.isEmpty &&
                         (!wireGuard() || (self.configurationGate != nil &&
@@ -7305,6 +7311,7 @@ actor EluSQLiteRuntimeQueue {
         identity: EluIdentityState,
         flagContext: EluPersistedFlagContext,
         drafts: [EluPreparedRecordDraft],
+        maximumQueueBytes: Int? = nil,
         surfaceProvenNotCommitted: Bool = false,
         prewriteValidation: ((EluStoredRuntimeState) throws -> Void)? = nil,
         precommitValidation: (() throws -> Void)? = nil
@@ -7390,10 +7397,17 @@ actor EluSQLiteRuntimeQueue {
                 throw EluRuntimeQueueError.counterExhausted
             }
             let nextBytes = diskState.liveBytes + addedBytes
-            let replayQueueLimit = EluSQLiteRuntimeSchema.hasReplay(databaseSchemaVersion)
-                ? try EluRuntimeDatabase.readReplayState(connection).maximumQueueBytes : Int64(limits.maximumBytes)
+            // Current capture authority carries the validated remote quota even
+            // before optional replay storage exists. A previous replay policy
+            // cannot pin an obsolete lower limit after the config is replaced.
+            let configuredQueueLimit: Int64
+            if let maximumQueueBytes { configuredQueueLimit = Int64(maximumQueueBytes) }
+            else {
+                configuredQueueLimit = EluSQLiteRuntimeSchema.hasReplay(databaseSchemaVersion)
+                    ? try EluRuntimeDatabase.readReplayState(connection).maximumQueueBytes : Int64(limits.maximumBytes)
+            }
             if !storedRecords.isEmpty,
-               nextBytes + replayTotals.bytes > min(Int64(limits.maximumBytes), replayQueueLimit)
+               nextBytes + replayTotals.bytes > min(Int64(limits.maximumBytes), configuredQueueLimit)
             {
                 throw EluRuntimeQueueError.queueByteLimitExceeded
             }
