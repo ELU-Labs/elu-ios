@@ -1,167 +1,132 @@
-# ELU Mobile SDK — behavioral contract
+# EluAnalytics for iOS — runtime contract
 
-The ELU mobile SDKs (iOS and Android) are driven entirely by ELU remote
-configuration. The design rules:
+This describes the ELU-owned iOS runtime and public `Elu.*` API. See the
+[README](README.md) for installation and code examples. Customer support applies
+to the exact artifacts in a reviewed release after its required checks pass;
+source implementation alone does not establish package or service qualification.
 
-1. The SDK is initialized with ONLY a site key — `Elu.setup` is the mobile
-   analog of ELU's one-line web script tag.
-2. It fetches per-site-key remote config from
-   `GET https://elu.dev/v1/<siteKey>/config` and caches it on disk.
-3. It ships **fail-closed compiled defaults** (EU-block ON, masking ON,
-   replay off-until-config) until the first usable config arrives. That
-   initial config may loosen the defaults. Once the runtime is running, fresh
-   config tightens immediately while loosening waits for the next launch;
-   captured frames cannot be retroactively re-masked.
-4. Customer code only ever touches the `Elu.*` facade — never the underlying
-   provider SDK.
+## Setup and configuration
 
-## 1. Config endpoint
+Call `Elu.setup(siteKey:)` once at application launch. A second setup call is
+ignored. The package supports iOS 13+ and has no external Swift package
+dependencies. Optional setup parameters include native performance settings and
+an approved development config host; production uses the default `https://elu.dev`.
 
-`GET /v1/<siteKey>/config` — unauthenticated, CDN-cached (~5-minute
-propagation). Always HTTP 200 with JSON.
+The runtime obtains configuration from `GET /sdk/v2/<siteKey>/config`. An HTTP
+success alone does not authorize analytics: the document must pass validation
+and its current authority must permit the operation. Configuration has a bounded
+validity window checked against wall and continuous clocks. Expiry, withdrawal,
+or a failed refresh removes authority; there is no indefinitely valid cached
+configuration or legacy runtime fallback. Accepted configuration changes apply
+through the current authority gates, without a blanket next-launch delay.
 
-Disabled (unknown / revoked / paused keys — not distinguished):
+Remote policy, local consent, region restrictions, identity, and lifecycle gates
+all apply. The EU restriction uses the documented timezone heuristic and fails
+closed. Config requests may continue while analytics is blocked so the site can
+recover. Blocking collection does not mean no SDK state is stored locally.
 
-```json
-{ "v": 1, "enabled": false }
-```
+Calls while setup or configuration is pending may enter a bounded in-memory
+buffer; these calls are not yet durable records. Disabled or denied collection
+does not authorize sending that buffer.
 
-Enabled:
+## Identity, properties, flags, and screens
 
-```json
-{
-  "v": 1,
-  "enabled": true,
-  "publicToken": "example-token",
-  "host": "<analytics-host-from-elu-config>",
-  "privacy": {
-    "blockEu": true,
-    "maskTextInputs": true,
-    "maskAllText": false,
-    "maskImages": false,
-    "replayNewUsersOnly": false,
-    "replayMaxMinutes": 0
-  }
-}
-```
+Call `Elu.identify` after login or session restoration using the app's stable
+internal user ID, and `Elu.reset()` on logout. The SDK does not infer identity.
+Reset creates a new anonymous identity, clears group associations and super
+properties, and preserves the consent choice. Already admitted records retain
+their original identity; they are not relabeled as the next user.
 
-The host is supplied by ELU remote configuration; this example does not
-prescribe a production hostname.
+The facade exposes events, aliases, groups, person and super properties,
+first-write properties, and feature flags. `registerOnce` preserves existing
+values unless they equal its supplied default sentinel. Flag results are bound
+to the current evaluation context; unavailable flags do not imply a successful
+evaluation. `ForFlags` setters and resets change evaluation context only, without
+sending person or group property updates. The README lists the public methods.
 
-Defaults when a privacy field is missing or unparseable: `blockEu` and
-`maskTextInputs` true, everything else off, `replayMaxMinutes` 0 = unlimited
-(valid range 1–60; out-of-range means unlimited). Unknown fields are ignored.
-A malformed response body is a FETCH FAILURE (keep cached config / stay
-pending) — never `enabled:false`.
+Application lifecycle events are automatic when collection is eligible.
+Logical screens require explicit `Elu.screen(...)` calls in both UIKit and
+SwiftUI. Element-interaction autocapture, surveys, and push auto-capture are not
+provided.
 
-Fetch policy: on every `setup()` (cold start), re-fetch on app-foreground if
-the last success is older than 15 minutes, 10s timeout, in-process backoff,
-cached config valid indefinitely.
+## Consent and durable delivery
 
-## 2. Lifecycle state machine
+`Elu.optOut()` persists withdrawal and stops collection and delivery. Reset,
+relaunch, or a remote re-enable does not clear that choice. `Elu.optIn()` restores
+collection only when current policy also permits it. Its default `$opt_in` event
+is one ordinary capture attempt, not an event backfilled after configuration
+becomes eligible; pass `captureEventName: nil` to suppress it.
 
-States: `idle` → `pending` (setup called, no usable config yet) → `running`
-(runtime initialized) / `disabled` (config said `enabled:false`, or
-EU-blocked).
+The latest valid consent choice made before setup is retained in memory and
+saved before configuration or lifecycle work can authorize collection. It is
+durable only once the runtime opens; ending the process before setup cannot
+persist it. Event, screen, and exception calls made during denial are discarded
+even if consent is later granted. Opt-out removes queued replay; previously
+admitted analytics events remain paused subject to later eligible delivery.
 
-- `setup(siteKey)` is idempotent (second call warns and no-ops). It records
-  the first-launch marker (the `replayNewUsersOnly` probe), runs the EU
-  guard, then: cached-enabled config → initialize immediately; cached
-  disabled → `disabled` (keeps fetching so re-activation recovers); no cache
-  (first launch ever) → `pending`, facade calls buffer in memory (FIFO,
-  cap 100, drop-oldest, never persisted, never sent).
-- Device-in-EU AND `blockEu` (from cached config, or the compiled default
-  TRUE when no config exists yet) ⇒ blocked. Buffered ops held while the
-  decision is pending flush if the fetched config says `blockEu:false` and
-  are dropped if it says `blockEu:true`. Until the decision is made, the
-  analytics runtime stays uninitialized and emits no events or replay; the
-  ELU config request itself still occurs.
-- Facade methods are safe in EVERY state: `pending` buffers event-class
-  calls (getters return defaults), `disabled` no-ops, `running` delegates.
-  Never throws, never blocks the caller.
+Admitted records use a site-scoped owned SQLite store and survive ordinary
+process termination. Event and replay admission share record and logical-byte
+limits; current remote `queueBytes` also limits admission without requiring
+replay initialization. A lower limit preserves existing backlog but rejects
+new records that exceed it. Logical queue limits are not a physical SQLite,
+WAL, or filesystem disk ceiling. Privacy changes can remove replay that no
+longer meets policy.
 
-Mid-session rules for a FRESH config while `running` — tightening applies
-immediately, loosening waits for the next launch:
+`Elu.flush()` requests a delivery attempt. It does not await acknowledgment or
+guarantee delivery before termination. Unacknowledged durable events may retry
+on a later eligible launch; lost acknowledgments do not justify treating a
+request as delivered. Offline storage does not bypass current configuration,
+consent, or privacy authority.
 
-| Change | Action now |
-|---|---|
-| `enabled` true→false | opt out + stop replay; state → `disabled` |
-| `enabled` false→true (runtime never initialized) | initialize now |
-| `blockEu` false→true and device is EU | opt out + stop replay; `disabled` |
-| any masking tightened | stop replay for the rest of the run |
-| `replayNewUsersOnly` turned on, device is returning | stop replay |
-| `replayMaxMinutes` reduced | recompute budget; stop replay if exceeded |
-| anything loosened | applies at next launch |
+## Replay and privacy
 
-## 3. Privacy semantics
+Replay uses bounded UIKit wireframes, not screenshots. The binary supports
+`elu-native-wireframe-v1` with gzip and `protocol-generation-v1`; current server
+qualification and configuration must authorize that exact support. Sampling,
+session budgets, lifecycle, identity, consent, and local privacy still apply.
 
-All capture controls act CLIENT-SIDE — masked or blocked analytics content
-never leaves the device. ELU config requests still occur while capture is
-blocked so a re-enabled site can recover.
+The blanket profile masks text. When current policy authorizes ordinary text,
+supported fully visible, single-line `UILabel` and `UIButton` text can remain
+readable if it fits without wrapping or truncation. Unsupported attributed
+content, attachments, links, transparent text, and custom subclasses remain
+masked or opaque. All input values, including `UITextField` and `UITextView`,
+stay hidden. Images, web views, custom drawing, and SwiftUI content use
+content-free placeholders. SwiftUI replay is not supported.
 
-- **`blockEu`** (compiled default ON, fail-closed): IANA-timezone heuristic —
-  blocked when the zone is empty/unreadable, starts with `Europe/`, or is one
-  of: `Asia/Nicosia, Asia/Famagusta, Atlantic/Canary, Atlantic/Madeira,
-  Atlantic/Azores, Atlantic/Reykjavik, Atlantic/Faroe, Africa/Ceuta,
-  America/Cayenne, America/Guadeloupe, America/Martinique, Indian/Reunion,
-  Indian/Mayotte`. Blocked = the analytics runtime never initializes: no
-  runtime identity storage, analytics events, or replay. ELU config fetches
-  continue so re-activation can recover.
-- **`maskTextInputs`** (default ON): mask typed input in replay. Platform
-  note: the underlying mobile SDKs have a single text-masking knob that
-  masks ALL rendered text (labels included), not just inputs — tighter than
-  the web posture, accepted as the fail-closed direction.
-- **`maskAllText`** (opt-in): strongest text masking the platform offers;
-  also disables log capture into replay where the platform supports it
-  (log lines routinely echo the same user text).
-- **`maskImages`** (opt-in): mask all images in replay.
-- **`replayNewUsersOnly`** (opt-in): replay only for devices whose
-  first-launch marker was created by this install's first `setup()` call.
-  Returning device ⇒ replay disabled at init; events unaffected.
-- **`replayMaxMinutes`** (opt-in, 1–60, 0 = unlimited): per-session
-  visual-replay budget, resumed across relaunches within the same session,
-  enforced by a short poll (±5s granularity). Events keep flowing.
-- Passwords are always masked by the underlying SDK regardless of settings.
+Apply `Elu.maskView` or `Elu.blockView` on the main thread before presenting
+private UIKit content. Masking hides subtree text; blocking excludes content
+and descendants, allowing only a content-free bounds placeholder. These
+restrictions last for the view's lifetime and cannot weaken remote policy.
+Unresolved native blocking rules disable replay. Ordinary analytics properties
+and manually reported errors are not automatically redacted by replay masking;
+applications must choose appropriate values to send.
 
-## 4. Compiled defaults
+## Exceptions and native performance
 
-The SDK owns its runtime configuration: token + host come from ELU config
-only; screen tracking and application
-lifecycle events ON; session replay ON in screenshot mode; element-
-interaction autocapture, surveys, and optional extras OFF.
-Replay on/off, sampling, and minimum duration remain governed server-side by
-the ELU-managed project. The SDK never calls opt-in/opt-out except on
-the ELU kill-switch path (and clears a persisted opt-out at init so a
-re-enabled workspace recovers).
+`Elu.captureException` records errors explicitly supplied by the app, including
+bounded cause chains. Automatic fatal-crash reporting is not provided.
 
-## 5. Super properties
+Native performance sampling is disabled by default. Enable it through
+`EluPerformanceOptions` at setup; server policy must also permit the selected
+measurements. Foreground samples report process physical memory footprint and
+completed main-thread response stalls above the configured threshold. Missing
+memory readings are omitted. Consent, identity, configuration, and lifecycle
+changes discard pending samples. See the README for option ranges and examples.
+These measurements do not supply browser DOM metrics, Web Vitals, JavaScript
+heap size, browser long tasks, or full application launch time.
 
-Registered at init AND re-registered after every `reset()` (the underlying
-`reset()` clears super properties along with identity):
+## Storage upgrades and release evidence
 
-```
-elu_sdk: "ios" | "android"
-elu_sdk_version: "<sdk semver>"
-elu_facade_version: 1
-```
+Supported owned-store schemas preserve identity, consent, queued records, and
+ordinary schema upgrades. Version 0.2.0 does not import persisted data from the
+unused 0.1.0 runtime and leaves its files untouched. Unsupported transition or
+unknown schemas fail closed without destructive recovery. Reset does not grant
+permission to erase an unsupported store. Exact supported schema and owned-file
+import boundaries are documented in [storage compatibility](docs/storage-compatibility.md).
 
-## 6. Facade surface
-
-`setup`, `capture`, `identify`, `reset`, `alias`, `distinctId`, `screen`,
-`captureException`, `register`, `unregister`, `group`,
-`setPersonProperties`, `setPersonPropertiesForFlags`,
-`setGroupPropertiesForFlags`, `getFeatureFlag`, `getFeatureFlagPayload`,
-`isFeatureEnabled`, `reloadFeatureFlags`, `onFeatureFlagsLoaded`, `flush`.
-
-Identity is customer-supplied ONLY (`identify` from your auth flow, `reset`
-on logout) — the SDK never auto-identifies. The facade deliberately omits
-runtime configuration access, session-recording start/stop, surveys, and
-opt-in/out: exposing those would couple the public ELU API to implementation
-details.
-
-Buffered-op ordering: the pre-config buffer replays strictly FIFO once
-running — including `reset`, so a pre-config logout delivers pre-reset
-events under the pre-reset identity. `capture` events buffered on Android
-carry their call-time timestamps; other buffered ops (and all buffered iOS
-ops) are stamped at drain time, up to ~10s late on the first-ever launch
-only.
+The bundled privacy manifest describes the SDK's data categories and API use;
+review the complete app's disclosures as explained in the README. Release
+qualification separately requires exact distribution checks, supported upgrades,
+device testing, Lab engine readback and customer-player rendering, privacy and
+resource measurements. Compilation or stored replay bytes alone are not those
+checks.
