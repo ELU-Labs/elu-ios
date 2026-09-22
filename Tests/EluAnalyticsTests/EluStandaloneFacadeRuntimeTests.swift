@@ -13,6 +13,176 @@ final class EluStandaloneFacadeRuntimeTests: XCTestCase {
         var errorDescription: String? { "checkout failed" }
     }
 
+    func testRegisterOncePreservesValuesAndUsesExplicitDefaultAtomically() async throws {
+        try await withTemporaryDirectory { root in
+            let harness = try await makeHarness(root: root)
+            harness.backend.execute(.register(["tier": "gold", "empty": NSNull(), "sentinel": "None"]))
+            harness.backend.execute(.registerOnce(["tier": "silver", "empty": "changed", "new": 42,
+                                                  "sentinel": "filled"], defaultValue: "None"))
+            await harness.backend.settled()
+            var snapshot = try await harness.runtime.queueSnapshot()
+            XCTAssertEqual(snapshot.identity.superProperties["tier"], .string("gold"))
+            XCTAssertEqual(snapshot.identity.superProperties["empty"], .null)
+            XCTAssertEqual(snapshot.identity.superProperties["sentinel"], .string("filled"))
+            XCTAssertEqual(snapshot.identity.superProperties["new"], .integer(42))
+            harness.backend.execute(.registerOnce(["empty": "present"], defaultValue: NSNull()))
+            await harness.backend.settled()
+            snapshot = try await harness.runtime.queueSnapshot()
+            XCTAssertEqual(snapshot.identity.superProperties["empty"], .string("present"))
+            await harness.close()
+            let reopened = try await makeHarness(root: root)
+            let restored = try await reopened.runtime.queueSnapshot()
+            XCTAssertEqual(restored.identity.superProperties, snapshot.identity.superProperties)
+            await reopened.close()
+        }
+    }
+
+    func testFlagResultUsesOneCurrentSnapshotAndClearsOnIdentityIntent() async throws {
+        try await withTemporaryDirectory { root in
+            let harness = try await makeHarness(root: root, flagTransport: FacadeFlagTransport())
+            XCTAssertNil(harness.backend.featureFlagResult("variant"))
+            harness.backend.activate()
+            await harness.backend.settled()
+            let result = try XCTUnwrap(harness.backend.featureFlagResult("variant"))
+            XCTAssertEqual(result.key, "variant")
+            XCTAssertTrue(result.enabled)
+            XCTAssertEqual(result.variant, "variant-a")
+            XCTAssertEqual((result.payload as? [String: Any])?["color"] as? String, "violet")
+            XCTAssertFalse(try XCTUnwrap(harness.backend.featureFlagResult("enabled")).enabled)
+            XCTAssertNil(harness.backend.featureFlagResult("absent"))
+            let finish = harness.backend.beginPendingOperation(.reset)
+            XCTAssertNil(harness.backend.featureFlagResult("variant"))
+            finish?()
+            await harness.close()
+        }
+    }
+
+    func testConsentPersistsAcrossResetAndRestartAndRestoresCaptureExplicitly() async throws {
+        try await withTemporaryDirectory { root in
+            let harness = try await makeHarness(root: root)
+            harness.backend.execute(.consent(EluConsentOperation(optedOut: true)))
+            XCTAssertTrue(harness.backend.isOptedOut())
+            harness.backend.execute(.capture(event: "private", properties: nil))
+            harness.backend.execute(.reset)
+            await harness.backend.settled()
+            let beforeRestart = try await harness.runtime.queueSnapshot()
+            XCTAssertTrue(beforeRestart.identity.optedOut)
+            XCTAssertNil(beforeRestart.identity.session)
+            XCTAssertEqual(beforeRestart.queuedCount, 0)
+            await harness.close()
+            let reopened = try await makeHarness(root: root)
+            XCTAssertTrue(reopened.backend.isOptedOut())
+            reopened.backend.execute(.consent(EluConsentOperation(optedOut: false, event: "$opt_in")))
+            reopened.backend.execute(.capture(event: "allowed", properties: nil))
+            await reopened.backend.settled()
+            XCTAssertFalse(reopened.backend.isOptedOut())
+            _ = await reopened.runtime.flush()
+            let events = try await reopened.transport.recordedEvents()
+            XCTAssertEqual(events.compactMap { $0["name"] as? String }, ["$opt_in", "allowed"])
+            await reopened.close()
+        }
+    }
+
+    func testInitialConsentPrecedesInjectedConfigurationAndPreservesSavedChoiceWhenAbsent() async throws {
+        try await withTemporaryDirectory { root in
+            let denied = try await makeHarness(root: root, initialConsent: EluConsentOperation(optedOut: true))
+            denied.backend.execute(.capture(event: "private", properties: nil))
+            await denied.backend.settled()
+            let saved = try await denied.runtime.queueSnapshot()
+            XCTAssertTrue(saved.identity.optedOut)
+            XCTAssertEqual(saved.queuedCount, 0)
+            await denied.close()
+            let reopened = try await makeHarness(root: root)
+            XCTAssertTrue(reopened.backend.isOptedOut(), "No pre-setup choice must preserve durable denial")
+            await reopened.close()
+            let granted = try await makeHarness(root: root, initialConsent: EluConsentOperation(optedOut: false))
+            granted.backend.execute(.capture(event: "allowed", properties: nil))
+            await granted.backend.settled()
+            let allowed = try await granted.runtime.queueSnapshot()
+            XCTAssertFalse(allowed.identity.optedOut)
+            XCTAssertEqual(allowed.queuedCount, 1)
+            await granted.close()
+        }
+    }
+
+    func testNewOptOutIntentCannotBeReopenedByAnOlderOptInOrConfigRefresh() async throws {
+        try await withTemporaryDirectory { root in
+            let harness = try await makeHarness(root: root)
+            let oldOptIn = UUID(), newOptOut = UUID()
+            harness.runtime.acceptConsentIntent(oldOptIn, optedOut: false)
+            harness.runtime.acceptConsentIntent(newOptOut, optedOut: true)
+            _ = await harness.runtime.setOptedOut(true, intent: newOptOut)
+            // Simulate a grant accepted before denial but dispatched after it.
+            let stale = await harness.runtime.setOptedOut(false, intent: oldOptIn)
+            XCTAssertNil(stale)
+            let result = await harness.runtime.capture("must-not-capture")
+            guard case .rejected = result else { return XCTFail("newer opt-out must fence admission") }
+            guard case .unavailable = await harness.runtime.flush() else { return XCTFail("newer opt-out must fence delivery") }
+            let snapshot = try await harness.runtime.queueSnapshot()
+            XCTAssertTrue(snapshot.identity.optedOut)
+            XCTAssertEqual(snapshot.queuedCount, 0)
+            await harness.close()
+            let reopened = try await makeHarness(root: root)
+            XCTAssertTrue(reopened.backend.isOptedOut(), "latest denial must survive process restart")
+            await reopened.close()
+        }
+    }
+
+    func testSetOnceOverloadsGroupsAndLocalFlagContextResetsPersist() async throws {
+        try await withTemporaryDirectory { root in
+            let harness = try await makeHarness(root: root)
+            harness.backend.execute(.identify(distinctId: "member", userProperties: ["plan": "pro"], userPropertiesOnce: ["joined": "first"]))
+            harness.backend.execute(.setPersonProperties([:], propertiesOnce: ["joined": "second", "source": "native"]))
+            harness.backend.execute(.group(type: "company", key: "acme", properties: nil))
+            await harness.backend.settled()
+            XCTAssertEqual(harness.backend.groups(), ["company": "acme"])
+            let before = try await harness.runtime.queueSnapshot()
+            XCTAssertEqual(before.flagContext.personProperties["joined"], .string("first"))
+            XCTAssertEqual(before.flagContext.personProperties["source"], .string("native"))
+            harness.backend.execute(.setPersonPropertiesForFlags(["beta": true]))
+            harness.backend.execute(.setGroupPropertiesForFlags(type: "company", properties: ["tier": "test"]))
+            harness.backend.execute(.setGroupPropertiesForFlags(type: "project", properties: ["tier": "preview"]))
+            harness.backend.execute(.resetPersonPropertiesForFlags)
+            harness.backend.execute(.resetGroupPropertiesForFlags("company"))
+            await harness.backend.settled()
+            let reset = try await harness.runtime.queueSnapshot()
+            XCTAssertTrue(reset.flagContext.personProperties.isEmpty)
+            XCTAssertNil(reset.flagContext.groupProperties["company"])
+            XCTAssertEqual(reset.flagContext.groupProperties["project"], ["tier": .string("preview")])
+            XCTAssertEqual(reset.queuedCount, before.queuedCount, "flag context changes must remain local")
+            harness.backend.execute(.resetGroupPropertiesForFlags(nil))
+            await harness.backend.settled()
+            let allGroupsReset = try await harness.runtime.queueSnapshot()
+            XCTAssertTrue(allGroupsReset.flagContext.groupProperties.isEmpty)
+            XCTAssertEqual(allGroupsReset.identity.groups, ["company": "acme"])
+            XCTAssertEqual(allGroupsReset.queuedCount, before.queuedCount)
+            harness.backend.execute(.resetGroups)
+            await harness.backend.settled()
+            XCTAssertTrue(harness.backend.groups().isEmpty)
+            await harness.close()
+            let reopened = try await makeHarness(root: root)
+            let restored = try await reopened.runtime.queueSnapshot()
+            XCTAssertTrue(restored.identity.groups.isEmpty)
+            XCTAssertTrue(restored.flagContext.personProperties.isEmpty)
+            XCTAssertTrue(restored.flagContext.groupProperties.isEmpty)
+            await reopened.close()
+        }
+    }
+
+    func testRegisterOnceDefaultsUseScalarNumericEqualityWithoutDeepObjectComparison() async throws {
+        try await withTemporaryDirectory { root in
+            let harness = try await makeHarness(root: root)
+            harness.backend.execute(.register(["numeric": 1, "object": ["a": 1]]))
+            harness.backend.execute(.registerOnce(["numeric": 2], defaultValue: 1.0))
+            harness.backend.execute(.registerOnce(["object": "wrong"], defaultValue: ["a": 1]))
+            await harness.backend.settled()
+            let snapshot = try await harness.runtime.queueSnapshot()
+            XCTAssertEqual(snapshot.identity.superProperties["numeric"], .integer(2))
+            XCTAssertEqual(snapshot.identity.superProperties["object"], .object(["a": .integer(1)]))
+            await harness.close()
+        }
+    }
+
     func testEveryFacadeMethodRecordsThroughTheOwnedRuntimeInCallOrder() async throws {
         try await withTemporaryDirectory { root in
             let harness = try await makeHarness(root: root)
@@ -64,8 +234,6 @@ final class EluStandaloneFacadeRuntimeTests: XCTestCase {
                     "associateGroup",
                     "setGroupProperties",
                     "setPersonProperties",
-                    "setPersonProperties",
-                    "setGroupProperties",
                 ]
             )
             await harness.close()
@@ -248,7 +416,8 @@ final class EluStandaloneFacadeRuntimeTests: XCTestCase {
 
             let snapshot = try await harness.runtime.queueSnapshot()
             XCTAssertEqual(snapshot.queuedCount, 0)
-            XCTAssertNil(snapshot.identity.userId)
+            // Local identity survives without capture authority; no mutation is backfilled.
+            XCTAssertEqual(snapshot.identity.userId, "user-1")
             let flushed = await harness.runtime.flush()
             XCTAssertEqual(flushed, .unavailable)
             let records = try await harness.transport.recordedRecords()
@@ -307,7 +476,8 @@ final class EluStandaloneFacadeRuntimeTests: XCTestCase {
 
             let snapshot = try await harness.runtime.queueSnapshot()
             XCTAssertEqual(snapshot.queuedCount, 0)
-            XCTAssertNil(snapshot.identity.userId)
+            // Local identity survives without capture authority; no mutation is backfilled.
+            XCTAssertEqual(snapshot.identity.userId, "user-1")
             let records = try await harness.transport.recordedRecords()
             XCTAssertTrue(records.isEmpty)
             await harness.close()
@@ -376,7 +546,8 @@ final class EluStandaloneFacadeRuntimeTests: XCTestCase {
     private func makeHarness(
         root: URL,
         document: Data? = nil,
-        flagTransport: (any EluV1FlagTransport)? = nil
+        flagTransport: (any EluV1FlagTransport)? = nil,
+        initialConsent: EluConsentOperation? = nil
     ) async throws -> Harness {
         let transport = FacadeBatchTransport()
         let clock = FacadeClock(wall: baseDate)
@@ -409,7 +580,8 @@ final class EluStandaloneFacadeRuntimeTests: XCTestCase {
             config: try TestConfigFactory.make(),
             configDocument: document ?? fixture("config-enabled.json"),
             isNewUser: true,
-            flagsDidLoad: { _ = announcements.next() }
+            flagsDidLoad: { _ = announcements.next() },
+            initialConsent: initialConsent
         )
         let backend = EluStandaloneFacadeRuntime(
             context: context,

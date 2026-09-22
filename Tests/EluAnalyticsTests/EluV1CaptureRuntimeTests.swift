@@ -6,6 +6,209 @@ import XCTest
 final class EluV1CaptureRuntimeTests: XCTestCase {
     private let baseDate = Date(timeIntervalSince1970: 1_785_801_660)
 
+    func testRemoteQueueQuotaAppliesBeforeReplayStorageOrAnyNativeRootExists() async throws {
+        for schemaVersion in [1, 2] {
+            try await withTemporaryDirectory { root in
+                let clock = TestCaptureClock(wall: baseDate, continuous: 1_000_000_000)
+                let queue = try await makeCaptureQueue(root: root, clock: clock)
+                let data = try quotaConfig(bytes: 1_024, schemaVersion: schemaVersion)
+                guard case .activated = await queue.submitCaptureAuthority(configData: data,
+                    effectivePrivacyStateData: try privacy(contextRevision: 0, allowed: true)) else {
+                    return XCTFail("Expected validated config")
+                }
+                let before = try await queue.snapshot()
+                let result = await queue.capture(command(kind: .capture, name: "headless_oversize", occurredAt: clock.wall(),
+                    properties: ["value": .string(String(repeating: "x", count: 2_048))]))
+                guard case let .rejected(.queueLimit, after) = result else {
+                    await queue.close()
+                    return XCTFail("Remote quota must bind event admission without replay schema or a UIKit root")
+                }
+                XCTAssertEqual(after, before, "Quota rejection must not create a session or advance sequence")
+                let records = try await queue.peek(maximumCount: 10, maximumBytes: 1_000_000)
+                XCTAssertTrue(records.isEmpty)
+                await queue.close()
+            }
+        }
+    }
+
+    func testRemoteQueueQuotaReappliesOnRestartBeforeNewCapture() async throws {
+        try await withTemporaryDirectory { root in
+            let clock = TestCaptureClock(wall: baseDate, continuous: 1_000_000_000)
+            let data = try quotaConfig(bytes: 4_096)
+            let queue = try await makeCaptureQueue(root: root, clock: clock)
+            _ = await queue.submitCaptureAuthority(configData: data,
+                effectivePrivacyStateData: try privacy(contextRevision: 0, allowed: true))
+            guard case .accepted = await queue.capture(command(kind: .capture, name: "before_restart", occurredAt: clock.wall())) else {
+                return XCTFail("Expected an event below the current quota")
+            }
+            let expected = try await queue.snapshot()
+            await queue.close()
+            let reopened = try await makeCaptureQueue(root: root, clock: clock)
+            guard case .rejected(.authorityAbsent, _) = await reopened.capture(command(kind: .capture, name: "no_authority", occurredAt: clock.wall())) else {
+                return XCTFail("Stored queue state cannot authorize fresh capture")
+            }
+            guard case .activated = await reopened.submitCaptureAuthority(configData: data,
+                effectivePrivacyStateData: try privacy(contextRevision: 0, allowed: true)) else {
+                return XCTFail("Expected the same still-valid config to be revalidated")
+            }
+            let result = await reopened.capture(command(kind: .capture, name: "after_restart", occurredAt: clock.wall(),
+                properties: ["value": .string(String(repeating: "x", count: 4_096))]))
+            guard case let .rejected(.queueLimit, actual) = result else {
+                await reopened.close()
+                return XCTFail("Revalidated remote quota must apply after restart")
+            }
+            XCTAssertEqual(actual, expected)
+            await reopened.close()
+        }
+    }
+
+    func testRemoteQueueQuotaLoweringPreservesBacklogAndRaisingReplacesOldReplayLimit() async throws {
+        try await withTemporaryDirectory { root in
+            let clock = TestCaptureClock(wall: baseDate, continuous: 1_000_000_000)
+            let queue = try await makeCaptureQueue(root: root, clock: clock)
+            let large = command(kind: .capture, name: "existing", occurredAt: clock.wall(),
+                properties: ["value": .string(String(repeating: "x", count: 4_096))])
+            _ = await queue.submitCaptureAuthority(configData: try quotaConfig(bytes: 32_768),
+                effectivePrivacyStateData: try privacy(contextRevision: 0, allowed: true))
+            guard case .accepted = await queue.capture(large) else { return XCTFail("Expected initial event") }
+            let before = try await queue.snapshot()
+            let records = try await queue.peek(maximumCount: 10, maximumBytes: 1_000_000)
+            let lower = try quotaConfig(bytes: 1_024, issuedSecond: 10)
+            guard case .activated = await queue.submitCaptureAuthority(configData: lower,
+                effectivePrivacyStateData: try privacy(contextRevision: 0, allowed: true)) else {
+                return XCTFail("Expected lower quota to activate")
+            }
+            let result = await queue.capture(command(kind: .capture, name: "blocked_by_backlog", occurredAt: clock.wall()))
+            guard case let .rejected(.queueLimit, unchanged) = result else {
+                await queue.close()
+                return XCTFail("Existing backlog exceeding a lower quota must prevent new admission")
+            }
+            XCTAssertEqual(unchanged, before)
+            let retained = try await queue.peek(maximumCount: 10, maximumBytes: 1_000_000)
+            XCTAssertEqual(retained, records, "A new quota must not delete already accepted records")
+
+            // Install the old limit in replay storage, then replace only the
+            // event authority. Fresh event quota cannot depend on a replay pass.
+            try await queue.ensureReplaySchema()
+            let manager = EluV1ConfigManager()
+            _ = try manager.update(configData: lower, now: clock.wall())
+            let identity = try XCTUnwrap(manager.validatedCandidateIdentity())
+            _ = try await queue.reconcileReplayConfiguration(configData: lower,
+                expectedConfigWitness: EluV2ReplayConfigWitness(issuedAt: identity.issuedAt, semanticHash: identity.semanticHash),
+                supportedProtocolGeneration: nil, mayRetainProfile: { _ in false })
+            guard case .activated = await queue.submitCaptureAuthority(configData: try quotaConfig(bytes: 65_536, issuedSecond: 20),
+                effectivePrivacyStateData: try privacy(contextRevision: 0, allowed: true)) else {
+                return XCTFail("Expected increased quota to activate")
+            }
+            guard case .accepted = await queue.capture(large) else {
+                await queue.close()
+                return XCTFail("A stale replay ledger must not permanently pin the old event quota")
+            }
+            await queue.close()
+        }
+    }
+
+    func testRemoteQueueQuotaFromSupersededSourceCannotReplaceCurrentLimit() async throws {
+        try await withTemporaryDirectory { root in
+            let clock = TestCaptureClock(wall: baseDate, continuous: 1_000_000_000)
+            let gate = sourceGate(clock)
+            let lower = try quotaConfig(bytes: 1_024)
+            let oldSource = try publishSource(gate, data: lower, clock: clock)
+            let queue = try await makeCaptureQueue(root: root, clock: clock, configurationGate: gate)
+            _ = await queue.submitCaptureAuthority(configData: lower,
+                effectivePrivacyStateData: try privacy(contextRevision: 0, allowed: true), sourceWitness: oldSource)
+            let higher = try quotaConfig(bytes: 32_768, issuedSecond: 10)
+            let current = try publishSource(gate, data: higher, clock: clock)
+            guard case .activated = await queue.submitCaptureAuthority(configData: higher,
+                effectivePrivacyStateData: try privacy(contextRevision: 0, allowed: true), sourceWitness: current) else {
+                return XCTFail("Expected current source to activate")
+            }
+            guard case .terminated = await queue.submitCaptureAuthority(configData: lower,
+                effectivePrivacyStateData: try privacy(contextRevision: 0, allowed: true), sourceWitness: oldSource) else {
+                return XCTFail("Superseded source must be rejected")
+            }
+            guard case .accepted = await queue.capture(command(kind: .capture, name: "current_quota", occurredAt: clock.wall(),
+                properties: ["value": .string(String(repeating: "x", count: 2_048))])) else {
+                return XCTFail("The current larger quota must survive rejected stale input")
+            }
+            await queue.close()
+        }
+    }
+
+    func testRemoteQueueQuotaAlsoBoundsOwnedWireMutationsAtomically() async throws {
+        try await withTemporaryDirectory { root in
+            let clock = TestCaptureClock(wall: baseDate, continuous: 1_000_000_000)
+            let queue = try await makeCaptureQueue(root: root, clock: clock)
+            _ = await queue.submitCaptureAuthority(configData: try quotaConfig(bytes: 1_024),
+                effectivePrivacyStateData: try privacy(contextRevision: 0, allowed: true))
+            let before = try await queue.snapshot()
+            do {
+                _ = try await queue.applyOwnedMutation(.setPersonProperties(
+                    set: ["value": .string(String(repeating: "x", count: 2_048))], setOnce: [:], unset: []),
+                    versions: command(kind: .capture, name: "unused", occurredAt: clock.wall()).versions,
+                    expectedGeneration: before.generation)
+                XCTFail("Wire mutations share the current server queue quota")
+            } catch { XCTAssertEqual(error as? EluRuntimeQueueError, .queueByteLimitExceeded) }
+            let after = try await queue.snapshot()
+            XCTAssertEqual(after, before)
+            await queue.close()
+        }
+    }
+
+    private func quotaConfig(bytes: Int, issuedSecond: Int = 0, schemaVersion: Int = 2) throws -> Data {
+        try config { object in
+            var limits = try XCTUnwrap(object["limits"] as? [String: Any])
+            limits["queueBytes"] = bytes; object["limits"] = limits
+            object["revision"] = "queue-quota-\(issuedSecond)"
+            object["issuedAt"] = String(format: "2026-08-04T00:00:%02d.000Z", issuedSecond)
+            if schemaVersion == 2 {
+                let fixture = fixtureURL("config-enabled.json").deletingLastPathComponent().deletingLastPathComponent()
+                    .deletingLastPathComponent().appendingPathComponent("V2/fixtures/config-enabled.json")
+                let v2 = try jsonObject(Data(contentsOf: fixture))
+                object["schemaVersion"] = 2; object["capabilities"] = v2["capabilities"]; object["endpoints"] = v2["endpoints"]
+            }
+        }
+    }
+
+    func testPassivePerformancePreservesIdleBoundaryAcrossRestartAndNeverCreatesSession() async throws {
+        try await withTemporaryDirectory { root in
+            let clock = TestCaptureClock(wall: baseDate, continuous: 1_000_000_000)
+            let configData = try config { object in
+                var session = try XCTUnwrap(object["session"] as? [String: Any])
+                session["idleTimeoutSeconds"] = 60
+                object["session"] = session
+            }
+            let queue = try await makeCaptureQueue(root: root, clock: clock)
+            _ = await queue.submitCaptureAuthority(configData: configData, effectivePrivacyStateData: try privacy(contextRevision: 0, allowed: true))
+            let initialSample = await queue.capturePerformanceSample(command(kind: .capture, name: "$performance_sample", occurredAt: clock.wall()), admissionGuard: { true })
+            guard case .rejected(.invalidEvent, _) = initialSample else { return XCTFail("A sample cannot create a session") }
+            guard case let .accepted(_, first) = await queue.capture(command(kind: .capture, name: "user_action", occurredAt: clock.wall())) else {
+                return XCTFail("Expected initial user activity")
+            }
+            clock.advance(seconds: 59)
+            guard case let .accepted(_, sampled) = await queue.capturePerformanceSample(command(kind: .capture, name: "$performance_sample", occurredAt: clock.wall()), admissionGuard: { true }) else {
+                return XCTFail("Expected a sample in the existing live session")
+            }
+            XCTAssertEqual(sampled.identity.session, first.identity.session)
+            XCTAssertEqual(sampled.identity.updatedAt, first.identity.updatedAt)
+            await queue.close()
+
+            let reopened = try await makeCaptureQueue(root: root, clock: clock)
+            let restored = try await reopened.snapshot()
+            XCTAssertEqual(restored.identity.session, first.identity.session)
+            _ = await reopened.submitCaptureAuthority(configData: configData, effectivePrivacyStateData: try privacy(contextRevision: 0, allowed: true))
+            clock.advance(seconds: 1)
+            guard case .rejected(.invalidEvent, _) = await reopened.capturePerformanceSample(command(kind: .capture, name: "$performance_sample", occurredAt: clock.wall()), admissionGuard: { true }) else {
+                return XCTFail("A sample at the idle deadline cannot resume the session")
+            }
+            guard case let .accepted(_, next) = await reopened.capture(command(kind: .capture, name: "next_user_action", occurredAt: clock.wall())) else {
+                return XCTFail("Expected a fresh session")
+            }
+            XCTAssertNotEqual(next.identity.session?.id, first.identity.session?.id)
+            await reopened.close()
+        }
+    }
+
     func testCaptureAuthorityOwnsSessionPropertiesConsentAndGeneration() async throws {
         try await withTemporaryDirectory { root in
             let clock = TestCaptureClock(wall: baseDate, continuous: 1_000_000_000)
@@ -816,23 +1019,406 @@ final class EluV1CaptureRuntimeTests: XCTestCase {
         }
     }
 
+    func testSourceWitnessWithdrawalIsNonterminalAndSameDocumentCanRecover() async throws {
+        try await withTemporaryDirectory { root in
+            let clock = TestCaptureClock(wall: baseDate, continuous: 1)
+            let gate = sourceGate(clock)
+            let data = fixture("config-enabled.json")
+            let original = try publishSource(gate, data: data, clock: clock)
+            let queue = try await makeCaptureQueue(root: root, clock: clock, configurationGate: gate)
+            guard case .terminated = await queue.submitCaptureAuthority(configData: data,
+                effectivePrivacyStateData: try privacy(contextRevision: 0, allowed: true)) else {
+                return XCTFail("Bound owner must require the source witness")
+            }
+            guard case .activated = await queue.submitCaptureAuthority(configData: data,
+                effectivePrivacyStateData: try privacy(contextRevision: 0, allowed: true), sourceWitness: original) else {
+                return XCTFail("Live source should activate")
+            }
+            gate.publish(token: EluV2ConfigLifecycleToken(), lease: nil)
+            guard case .rejected(.authorityAbsent, _) = await queue.capture(command(kind: .capture, name: "withdrawn", occurredAt: clock.wall())) else {
+                return XCTFail("Source withdrawal must stop fresh capture")
+            }
+            let recovered = try publishSource(gate, data: data, clock: clock)
+            guard case .activated = await queue.submitCaptureAuthority(configData: data,
+                effectivePrivacyStateData: try privacy(contextRevision: 0, allowed: true), sourceWitness: recovered) else {
+                return XCTFail("Withdrawal must not poison same-document recovery")
+            }
+            guard case .terminated = await queue.submitCaptureAuthority(configData: data,
+                effectivePrivacyStateData: try privacy(contextRevision: 0, allowed: true), sourceWitness: original) else {
+                return XCTFail("Queued old token must stay rejected")
+            }
+            guard case .accepted = await queue.capture(command(kind: .capture, name: "recovered", occurredAt: clock.wall())) else {
+                return XCTFail("Stale submission must not replace current authority")
+            }
+            await queue.close()
+        }
+    }
+
+    func testSourceExpiryBeforeWriteOrCommitRollsBackFreshCapture() async throws {
+        for point in [EluRuntimeQueueFaultPoint.afterStateRead, .beforeCommit] {
+            try await withTemporaryDirectory { root in
+                let clock = TestCaptureClock(wall: baseDate, continuous: 1)
+                let gate = sourceGate(clock)
+                let data = fixture("config-enabled.json")
+                let witness = try publishSource(gate, data: data, clock: clock)
+                let fault = CaptureRuntimeFaultInjector { candidate in
+                    if candidate == point { clock.advance(seconds: 10) }
+                }
+                let queue = try await makeCaptureQueue(root: root, clock: clock, faultInjector: fault, configurationGate: gate)
+                _ = await queue.submitCaptureAuthority(configData: data,
+                    effectivePrivacyStateData: try privacy(contextRevision: 0, allowed: true), sourceWitness: witness)
+                guard case .rejected(.authorityAbsent, _) = await queue.capture(command(kind: .capture, name: "racing", occurredAt: clock.wall())) else {
+                    return XCTFail("Source expired while SQLite owned the operation")
+                }
+                let snapshot = try await queue.snapshot()
+                XCTAssertEqual(snapshot.queuedCount, 0)
+                XCTAssertEqual(snapshot.nextSequence, 0)
+                await queue.close()
+            }
+        }
+    }
+
+    func testFinalCaptureAndFlagPublicationConsumesOriginalSourceLease() async throws {
+        for flags in [false, true] {
+            try await withTemporaryDirectory { root in
+                let clock = TestCaptureClock(wall: baseDate, continuous: 1)
+                let probe = SourceGateReadProbe(clock: clock)
+                let gate = EluV2ConfigAuthorityGate(siteKey: "elu_pk_test_capture", clock: probe.source)
+                let data = fixture("config-enabled.json")
+                let witness = try publishSource(gate, data: data, clock: clock)
+                let queue = try await makeCaptureQueue(root: root, clock: clock, configurationGate: gate)
+                if flags { try await queue.ensureFlagSchema() }
+                probe.expireOnSecondCheck()
+                if flags {
+                    let result = await queue.submitFlagConfig(data, sourceWitness: witness)
+                    XCTAssertEqual(result, .restricted(.missing))
+                } else {
+                    guard case .terminated = await queue.submitCaptureAuthority(configData: data,
+                        effectivePrivacyStateData: try privacy(contextRevision: 0, allowed: true), sourceWitness: witness) else {
+                        return XCTFail("Final publication must consume the original lease")
+                    }
+                    let authority = await queue.captureAuthorityForTesting()
+                    XCTAssertEqual(authority, .absent)
+                }
+                await queue.close()
+            }
+        }
+    }
+
+    func testSourceWithdrawalFencesFlagsWithoutDestroyingDurableAuthority() async throws {
+        try await withTemporaryDirectory { root in
+            let clock = TestCaptureClock(wall: baseDate, continuous: 1)
+            let gate = sourceGate(clock)
+            let data = fixture("config-enabled.json")
+            let witness = try publishSource(gate, data: data, clock: clock)
+            let queue = try await makeCaptureQueue(root: root, clock: clock, configurationGate: gate)
+            try await queue.ensureFlagSchema()
+            guard case .allowed = await queue.submitFlagConfig(data, sourceWitness: witness) else { return XCTFail("Expected flags authority") }
+            let versions = command(kind: .capture, name: "unused", occurredAt: clock.wall()).versions
+            guard case let .begun(request) = await queue.beginFlagReload(requestId: "flags_source_1", versions: versions) else { return XCTFail("Expected begun request") }
+            let response = try sourceFlagResponse(request)
+            let committed = await queue.commitFlagReload(token: request.token, response: response)
+            XCTAssertEqual(committed, .updated)
+            guard case .hit = await queue.readFlagCache(versions: versions) else { return XCTFail("Expected live source cache") }
+            guard case let .begun(pending) = await queue.beginFlagReload(requestId: "flags_source_pending", versions: versions) else { return XCTFail("Expected pending request") }
+            let pendingResponse = try sourceFlagResponse(pending)
+            gate.publish(token: EluV2ConfigLifecycleToken(), lease: nil)
+            let send = await queue.authorizeFlagSend(token: pending.token)
+            XCTAssertEqual(send, .stale)
+            let cache = await queue.readFlagCache(versions: versions)
+            XCTAssertEqual(cache, .restricted(.missing))
+            let recovered = try publishSource(gate, data: data, clock: clock)
+            guard case .allowed = await queue.submitFlagConfig(data, sourceWitness: recovered) else { return XCTFail("Same-document recovery must stay possible") }
+            let recoveredSend = await queue.authorizeFlagSend(token: pending.token)
+            XCTAssertEqual(recoveredSend, .stale, "An older physical request cannot borrow a recovered source token")
+            let recoveredCommit = await queue.commitFlagReload(token: pending.token, response: pendingResponse)
+            XCTAssertEqual(recoveredCommit, .stale)
+            let recoveredCache = await queue.readFlagCache(versions: versions)
+            XCTAssertEqual(recoveredCache, .restricted(.missing), "A cached result retains its original source token")
+            guard case let .begun(fresh) = await queue.beginFlagReload(requestId: "flags_source_2", versions: versions) else { return XCTFail("Expected new request after recovery") }
+            let freshSend = await queue.authorizeFlagSend(token: fresh.token)
+            XCTAssertEqual(freshSend, .allowed)
+            await queue.close()
+        }
+    }
+
+    func testUnavailableSourcePreservesLocalMutationResetAndConsentWithoutWireDrafts() async throws {
+        try await withTemporaryDirectory { root in
+            let clock = TestCaptureClock(wall: baseDate, continuous: 1)
+            let gate = sourceGate(clock)
+            let queue = try await makeCaptureQueue(root: root, clock: clock, configurationGate: gate, anonymousIdGenerator: { "anon_\(UUID().uuidString)" })
+            let versions = command(kind: .capture, name: "unused", occurredAt: clock.wall()).versions
+            let initial = try await queue.snapshot()
+            let identified = try await queue.applyOwnedMutation(.identify(userId: "local-person", set: ["plan": .string("pro")], setOnce: [:]), versions: versions, expectedGeneration: initial.generation)
+            XCTAssertEqual(identified.identity.userId, "local-person")
+            XCTAssertEqual(identified.queuedCount, 0)
+            let grouped = try await queue.applyOwnedMutation(.associateGroup(groupType: "company", groupKey: "local-company"), versions: versions, expectedGeneration: identified.generation)
+            XCTAssertEqual(grouped.identity.groups["company"], "local-company")
+            XCTAssertEqual(grouped.queuedCount, 0)
+            let optedOut = try await queue.setOptedOut(true, expectedGeneration: grouped.generation)
+            XCTAssertTrue(optedOut.identity.optedOut)
+            let reset = try await queue.reset(expectedGeneration: optedOut.generation)
+            XCTAssertNil(reset.identity.userId)
+            XCTAssertEqual(reset.queuedCount, 0)
+            await queue.close()
+        }
+    }
+
+    func testSourceWithdrawalDuringMutationPreservesLocalStateWithoutStaleWire() async throws {
+        try await withTemporaryDirectory { root in
+            let clock = TestCaptureClock(wall: baseDate, continuous: 1)
+            let gate = sourceGate(clock)
+            let data = fixture("config-enabled.json")
+            let witness = try publishSource(gate, data: data, clock: clock)
+            let fault = CaptureRuntimeFaultInjector { point in
+                if point == .beforeCommit { gate.publish(token: EluV2ConfigLifecycleToken(), lease: nil) }
+            }
+            let queue = try await makeCaptureQueue(root: root, clock: clock, faultInjector: fault, configurationGate: gate)
+            _ = await queue.submitCaptureAuthority(configData: data,
+                effectivePrivacyStateData: try privacy(contextRevision: 0, allowed: true), sourceWitness: witness)
+            let initial = try await queue.snapshot()
+            let local = try await queue.applyOwnedMutation(.identify(userId: "racing-person", set: [:], setOnce: [:]),
+                versions: command(kind: .capture, name: "unused", occurredAt: clock.wall()).versions, expectedGeneration: initial.generation)
+            XCTAssertEqual(local.identity.userId, "racing-person")
+            XCTAssertEqual(local.queuedCount, 0)
+            XCTAssertEqual(local.nextSequence, 0)
+            await queue.close()
+        }
+    }
+
+    func testLawfulQueuedEventsRemainReadableAndAcknowledgableAfterSourceWithdrawal() async throws {
+        try await withTemporaryDirectory { root in
+            let clock = TestCaptureClock(wall: baseDate, continuous: 1)
+            let gate = sourceGate(clock)
+            let data = fixture("config-enabled.json")
+            let witness = try publishSource(gate, data: data, clock: clock)
+            let queue = try await makeCaptureQueue(root: root, clock: clock, configurationGate: gate)
+            _ = await queue.submitCaptureAuthority(configData: data,
+                effectivePrivacyStateData: try privacy(contextRevision: 0, allowed: true), sourceWitness: witness)
+            guard case let .accepted(record, snapshot) = await queue.capture(command(kind: .capture, name: "lawful", occurredAt: clock.wall())) else { return XCTFail("Expected captured row") }
+            gate.publish(token: EluV2ConfigLifecycleToken(), lease: nil)
+            let rows = try await queue.peek(maximumCount: 10, maximumBytes: 1_048_576)
+            XCTAssertEqual(rows.count, 1)
+            _ = try await queue.acknowledge([EluQueueAcknowledgementReference(streamId: snapshot.streamId,
+                sequence: record.sequence, kind: record.kind, recordId: record.recordId)])
+            let drained = try await queue.snapshot()
+            XCTAssertEqual(drained.queuedCount, 0)
+            await queue.close()
+        }
+    }
+
+    func testPortableFlagProjectionRetainsOriginalCacheDeadlineAcrossReads() async throws {
+        try await withTemporaryDirectory { root in
+            let clock = TestCaptureClock(wall: baseDate, continuous: 1)
+            let h = try await projectionFixture(root: root, clock: clock)
+            XCTAssertTrue(h.projection.authority.isCurrent())
+            clock.set(wall: baseDate, continuous: 100_000_000_001)
+            let reread = await h.queue.readFlagProjection(versions: h.versions)
+            XCTAssertNotNil(reread)
+            clock.set(wall: baseDate, continuous: 179_000_000_001)
+            XCTAssertFalse(h.projection.authority.isCurrent())
+            XCTAssertFalse(reread?.authority.isCurrent() ?? true)
+            XCTAssertEqual(h.projection.lookup("enabled"), .missing)
+            await h.queue.close()
+        }
+    }
+
+    func testFlagRequestGuardRotatesAtBeginWhileCacheSurvivesAndContextInvalidatesBoth() async throws {
+        try await withTemporaryDirectory { root in
+            let clock = TestCaptureClock(wall: baseDate, continuous: 1)
+            let h = try await projectionFixture(root: root, clock: clock)
+            // No capture authority has been installed; flags are independently live.
+            let capture = await h.queue.captureAuthorityForTesting()
+            XCTAssertEqual(capture, .absent)
+            guard case let .begun(first) = await h.queue.beginFlagReload(requestId: "guard_first", versions: h.versions) else { return XCTFail("Expected flag begin") }
+            let firstGuard = await h.queue.flagSendGuard(token: first.token)
+            XCTAssertTrue(firstGuard?.isCurrent() ?? false)
+            guard case let .begun(second) = await h.queue.beginFlagReload(requestId: "guard_second", versions: h.versions) else { return XCTFail("Expected second begin") }
+            let secondGuard = await h.queue.flagSendGuard(token: second.token)
+            XCTAssertFalse(firstGuard?.isCurrent() ?? true)
+            XCTAssertTrue(secondGuard?.isCurrent() ?? false)
+            XCTAssertTrue(h.projection.authority.isCurrent(), "Reload must retain the lawful prior cache")
+            let state = try await h.queue.snapshot()
+            _ = try await h.queue.setFlagPersonProperties(["plan": .string("updated")], versions: h.versions, expectedGeneration: state.generation)
+            XCTAssertFalse(h.projection.authority.isCurrent())
+            XCTAssertFalse(secondGuard?.isCurrent() ?? true)
+            await h.queue.close()
+        }
+    }
+
+    func testPortableFlagProjectionFailsOnWithdrawalQueuedMutationCloseAndClockRollback() async throws {
+        for operation in 0 ..< 4 {
+            try await withTemporaryDirectory { root in
+                let clock = TestCaptureClock(wall: baseDate, continuous: 1)
+                let h = try await projectionFixture(root: root, clock: clock)
+                switch operation {
+                case 0: h.gate.publish(token: EluV2ConfigLifecycleToken(), lease: nil)
+                case 1: h.queue.invalidateFlagProjection()
+                case 2: await h.queue.close()
+                default:
+                    clock.set(wall: baseDate, continuous: 100_000_000_001)
+                    XCTAssertTrue(h.projection.authority.isCurrent())
+                    clock.set(wall: baseDate, continuous: 50_000_000_001)
+                }
+                XCTAssertFalse(h.projection.authority.isCurrent())
+                if operation == 3 {
+                    clock.set(wall: baseDate, continuous: 101_000_000_001)
+                    let reread = await h.queue.readFlagProjection(versions: h.versions)
+                    XCTAssertNil(reread, "Observed clock rollback must not rearm a new guard")
+                }
+                await h.queue.close()
+            }
+        }
+    }
+
+    func testCacheReplacementAndConfigApplicationInvalidateRetainedProjection() async throws {
+        try await withTemporaryDirectory { root in
+            let clock = TestCaptureClock(wall: baseDate, continuous: 1)
+            let h = try await projectionFixture(root: root, clock: clock)
+            guard case let .begun(next) = await h.queue.beginFlagReload(requestId: "projection_replacement", versions: h.versions) else { return XCTFail("Expected begin") }
+            let committed = await h.queue.commitFlagReload(token: next.token, response: try sourceFlagResponse(next))
+            XCTAssertEqual(committed, .updated)
+            XCTAssertFalse(h.projection.authority.isCurrent())
+            let fresh = await h.queue.readFlagProjection(versions: h.versions)
+            XCTAssertTrue(fresh?.authority.isCurrent() ?? false)
+            _ = await h.queue.submitFlagConfig(h.data, sourceWitness: h.source)
+            XCTAssertFalse(fresh?.authority.isCurrent() ?? true)
+            await h.queue.close()
+        }
+    }
+
+    func testPendingProjectionIntentRejectsOldAndNewGuardsUntilEveryIntentSettles() async throws {
+        try await withTemporaryDirectory { root in
+            let clock = TestCaptureClock(wall: baseDate, continuous: 1)
+            let h = try await projectionFixture(root: root, clock: clock)
+            let first = h.queue.beginFlagProjectionIntent()
+            let second = h.queue.beginFlagProjectionIntent()
+            XCTAssertFalse(h.projection.authority.isCurrent())
+            let pending = await h.queue.readFlagProjection(versions: h.versions)
+            XCTAssertNil(pending, "A reread before the queued mutation must not mint old-state authority")
+            h.queue.finishFlagProjectionIntent(first)
+            let stillPending = await h.queue.readFlagProjection(versions: h.versions)
+            XCTAssertNil(stillPending)
+            h.queue.finishFlagProjectionIntent(second)
+            let settled = await h.queue.readFlagProjection(versions: h.versions)
+            XCTAssertNotNil(settled)
+            XCTAssertFalse(h.projection.authority.isCurrent(), "Settling cannot revive a prior projection")
+            await h.queue.close()
+        }
+    }
+
+    func testConcurrentProjectionChecksSerializeClockSamplingWithRollbackFloor() async throws {
+        try await withTemporaryDirectory { root in
+            let clock = TestCaptureClock(wall: baseDate, continuous: 1)
+            let probe = ProjectionClockProbe(clock: clock)
+            let h = try await projectionFixture(root: root, clock: clock, clockOverride: { probe.wall() })
+            probe.arm()
+            let completed = expectation(description: "concurrent checks")
+            completed.expectedFulfillmentCount = 2
+            let values = ProjectionCheckValues()
+            DispatchQueue.global().async { values.add(h.projection.authority.isCurrent()); completed.fulfill() }
+            XCTAssertEqual(probe.first.wait(timeout: .now() + 2), .success)
+            DispatchQueue.global().async { values.add(h.projection.authority.isCurrent()); completed.fulfill() }
+            XCTAssertEqual(probe.second.wait(timeout: .now() + 0.05), .timedOut,
+                "The second check cannot sample time before the first releases the ordering lock")
+            probe.release.signal()
+            await fulfillment(of: [completed], timeout: 2)
+            XCTAssertEqual(values.read(), [true, true])
+            await h.queue.close()
+        }
+    }
+
+    func testBoundFlagClientUsesOriginalRequestGuardAndRemainsIndependentOfCapture() async throws {
+        for change in 0 ..< 3 {
+            try await withTemporaryDirectory { root in
+                let clock = TestCaptureClock(wall: baseDate, continuous: 1)
+                let h = try await projectionFixture(root: root, clock: clock)
+                let transport = ProjectionBoundFlagTransport(beforeStart: {
+                    if change == 1 {
+                        let state = try? await h.queue.snapshot()
+                        if let state { _ = try? await h.queue.setFlagPersonProperties(["plan": .string("changed")], versions: h.versions, expectedGeneration: state.generation) }
+                    } else if change == 2 {
+                        h.gate.publish(token: EluV2ConfigLifecycleToken(), lease: nil)
+                    }
+                })
+                let client = try await EluV1FlagClient.make(runtime: h.queue, transport: transport, versions: h.versions)
+                let projection = await client.reloadProjection()
+                if change == 0 {
+                    XCTAssertNotNil(projection)
+                    XCTAssertEqual(projection?.lookup("enabled"), .found(value: .bool(false), payload: nil))
+                } else { XCTAssertNil(projection) }
+                let calls = await transport.calls
+                XCTAssertEqual(calls, 1)
+                await client.close()
+                XCTAssertFalse(projection?.authority.isCurrent() ?? false)
+                await h.queue.close()
+            }
+        }
+    }
+
+    private func projectionFixture(root: URL, clock: TestCaptureClock, clockOverride: (@Sendable () -> Date)? = nil) async throws -> (
+        queue: EluSQLiteRuntimeQueue, gate: EluV2ConfigAuthorityGate, data: Data,
+        source: EluV2ConfigAuthorityWitness, versions: EluVersionContext, projection: EluV1FlagCacheProjection
+    ) {
+        let gate = sourceGate(clock)
+        let data = fixture("config-enabled.json")
+        let source = try publishSource(gate, data: data, clock: clock, leaseSeconds: 1000)
+        let queue = try await makeCaptureQueue(root: root, clock: clock, configurationGate: gate, clockOverride: clockOverride)
+        try await queue.ensureFlagSchema()
+        let versions = command(kind: .capture, name: "unused", occurredAt: clock.wall()).versions
+        guard case .allowed = await queue.submitFlagConfig(data, sourceWitness: source),
+              case let .begun(request) = await queue.beginFlagReload(requestId: "projection_initial", versions: versions) else { throw EluRuntimeQueueError.invalidState }
+        let committed = await queue.commitFlagReload(token: request.token, response: try sourceFlagResponse(request))
+        XCTAssertEqual(committed, .updated)
+        let value = await queue.readFlagProjection(versions: versions)
+        let projection = try XCTUnwrap(value)
+        return (queue, gate, data, source, versions, projection)
+    }
+
+    private func sourceFlagResponse(_ begun: EluV1FlagBegunRequest) throws -> EluV1FlagResponse {
+        let body = try JSONSerialization.data(withJSONObject: [
+            "schemaVersion": 1, "requestId": begun.token.requestId,
+            "contextRevision": begun.token.witness.contextRevision,
+            "identityRevision": begun.token.witness.identityRevision,
+            "flagsRevision": "flags-source-1", "evaluatedAt": "2026-08-04T00:01:01.000Z",
+            "expiresAt": "2026-08-04T00:04:00.000Z", "flags": ["enabled": true], "payloads": [:],
+        ] as [String: Any], options: [.sortedKeys])
+        return try EluV1FlagCodec.decodeResponse(body, for: begun.request)
+    }
+
+    private func sourceGate(_ clock: TestCaptureClock) -> EluV2ConfigAuthorityGate {
+        EluV2ConfigAuthorityGate(siteKey: "elu_pk_test_capture", clock: EluV2ConfigClock(
+            wallNow: { clock.wall() }, continuousNow: { clock.continuous() }, floorTicks: { $0 }, floorNanoseconds: { $0 }))
+    }
+
+    private func publishSource(_ gate: EluV2ConfigAuthorityGate, data: Data, clock: TestCaptureClock, leaseSeconds: UInt64 = 10) throws -> EluV2ConfigAuthorityWitness {
+        let token = EluV2ConfigLifecycleToken()
+        gate.publish(token: token, lease: EluV2ConfigLease(data: data,
+            expiresAt: try EluV1Timestamp("2026-08-04T00:05:00.000Z"), continuousDeadline: clock.continuous() + leaseSeconds * 1_000_000_000))
+        return try XCTUnwrap(gate.witness(for: token))
+    }
+
     private func makeCaptureQueue(
         root: URL,
         clock: TestCaptureClock,
         limits: EluRuntimeQueueLimits? = nil,
-        faultInjector: (any EluRuntimeQueueFaultInjecting)? = nil
+        faultInjector: (any EluRuntimeQueueFaultInjecting)? = nil,
+        configurationGate: EluV2ConfigAuthorityGate? = nil,
+        anonymousIdGenerator: @escaping @Sendable () -> String = { "anon_capture_vector" },
+        clockOverride: (@Sendable () -> Date)? = nil
     ) async throws -> EluSQLiteRuntimeQueue {
         let resolvedLimits = try limits ?? EluRuntimeQueueLimits()
         return try await EluSQLiteRuntimeQueue.openCaptureRuntime(
             rootDirectoryURL: root,
             exactConstructorSiteKey: "elu_pk_test_capture",
             limits: resolvedLimits,
-            clock: { clock.wall() },
+            clock: clockOverride ?? { clock.wall() },
             continuousClock: { clock.continuous() },
             continuousBudgetConverter: { $0 },
-            anonymousIdGenerator: { "anon_capture_vector" },
+            anonymousIdGenerator: anonymousIdGenerator,
             streamIdGenerator: { "stream_capture_vector" },
             sessionIdGenerator: { "session_\(UUID().uuidString.lowercased())" },
+            configurationGate: configurationGate,
             faultInjector: faultInjector
         )
     }
@@ -1050,5 +1636,76 @@ private final class CaptureRuntimeFaultInjector: EluRuntimeQueueFaultInjecting, 
         lock.lock()
         defer { lock.unlock() }
         return counts[String(describing: point), default: 0]
+    }
+}
+
+private final class SourceGateReadProbe: @unchecked Sendable {
+    private let clock: TestCaptureClock
+    private let lock = NSLock()
+    private var remaining: Int?
+    init(clock: TestCaptureClock) { self.clock = clock }
+    func expireOnSecondCheck() { lock.lock(); remaining = 2; lock.unlock() }
+    var source: EluV2ConfigClock {
+        EluV2ConfigClock(wallNow: {
+            self.lock.lock()
+            if let remaining = self.remaining { self.remaining = remaining - 1 }
+            let expires = self.remaining == 0
+            if expires { self.remaining = nil }
+            self.lock.unlock()
+            if expires { self.clock.advance(seconds: 10) }
+            return self.clock.wall()
+        }, continuousNow: { self.clock.continuous() }, floorTicks: { $0 }, floorNanoseconds: { $0 })
+    }
+}
+
+private final class ProjectionClockProbe: @unchecked Sendable {
+    let first = DispatchSemaphore(value: 0)
+    let second = DispatchSemaphore(value: 0)
+    let release = DispatchSemaphore(value: 0)
+    private let lock = NSLock()
+    private let clock: TestCaptureClock
+    private var count: Int?
+    init(clock: TestCaptureClock) { self.clock = clock }
+    func arm() { lock.lock(); count = 0; lock.unlock() }
+    func wall() -> Date {
+        lock.lock()
+        if let value = count { count = value + 1 }
+        let sample = count
+        lock.unlock()
+        let captured = clock.wall().addingTimeInterval(Double(sample ?? 0) / 1000)
+        if sample == 1 { first.signal(); _ = release.wait(timeout: .now() + 3) }
+        if sample == 2 { second.signal() }
+        return captured
+    }
+}
+
+private final class ProjectionCheckValues: @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [Bool] = []
+    func add(_ value: Bool) { lock.lock(); values.append(value); lock.unlock() }
+    func read() -> [Bool] { lock.lock(); defer { lock.unlock() }; return values }
+}
+
+private actor ProjectionBoundFlagTransport: EluV1AuthorizedFlagTransport {
+    private let beforeStart: @Sendable () async -> Void
+    private(set) var calls = 0
+    init(beforeStart: @escaping @Sendable () async -> Void) { self.beforeStart = beforeStart }
+    func send(endpoint: URL, requestBody: Data) async throws -> Data {
+        XCTFail("Bound client used the unguarded transport method")
+        throw EluV1BoundTransportError.staleAuthority
+    }
+    func send(endpoint: URL, requestBody: Data, authority: EluV1TransportAuthority) async throws -> Data {
+        calls += 1
+        guard await authority.revalidate() else { throw EluV1BoundTransportError.staleAuthority }
+        await beforeStart()
+        guard authority.isCurrent() else { throw EluV1BoundTransportError.staleAuthority }
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: requestBody) as? [String: Any])
+        let identity = try XCTUnwrap(object["identity"] as? [String: Any])
+        return try JSONSerialization.data(withJSONObject: [
+            "schemaVersion": 1, "requestId": object["requestId"]!, "contextRevision": object["contextRevision"]!,
+            "identityRevision": identity["revision"]!, "flagsRevision": "bound-flags",
+            "evaluatedAt": "2026-08-04T00:01:01.000Z", "expiresAt": "2026-08-04T00:04:00.000Z",
+            "flags": ["enabled": false], "payloads": [:],
+        ] as [String: Any], options: [.sortedKeys])
     }
 }

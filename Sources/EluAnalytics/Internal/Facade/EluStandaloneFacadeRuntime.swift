@@ -28,22 +28,31 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, @unchecked Sendable {
     }
 
     let selection: EluRuntimeSelection = .standalone
-    /// This runtime records no replay frames, so it offers no replay control
-    /// and the facade's replay budget never applies to it.
+    /// Public replay controls remain disabled. Internal composition starts
+    /// capture only with separately qualified local proof and durable policy.
     let replayControl: (any EluReplayControl)? = nil
 
     private let flagsDidLoad: () -> Void
+    private var guardedFlagsDidLoad: (@Sendable (@escaping @Sendable () -> Bool) -> Void)?
+    private var stack: EluStandaloneStack?
+    private let nativeLifecycle = EluNativeReplayLifecycle()
+    private var foregroundIntent = false
+    private var foregroundGeneration = UUID()
+    private var flagGeneration = UUID()
+    private var pendingFlagIntents: [UUID: EluStandaloneFacadePendingIntent] = [:]
     private let flagTransport: (any EluV1FlagTransport)?
     private let lock = NSLock()
 
     private var tail: Task<Void, Never>?
+    private var tailVersion = UUID()
     private var started: Started?
 
     private var identity: EluIdentityState?
     private var projectedDistinctId: String?
     private var pendingIdentityOperations = 0
+    private var consentProjection: (id: UUID, optedOut: Bool)?
 
-    private var flagCache: EluV1FlagCacheSnapshot?
+    private var flagCache: EluV1FlagCacheProjection?
     private var flagsLoadedState = false
     private var flagLoadDeferred = true
     private var flagReloadScheduled = false
@@ -61,14 +70,65 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, @unchecked Sendable {
     init(
         context: EluRuntimeBackendContext,
         open: @escaping @Sendable () async throws -> EluStandaloneRuntime,
-        flagTransport: (any EluV1FlagTransport)? = nil
+        flagTransport: (any EluV1FlagTransport)? = nil,
+        observeApplicationLifecycle: Bool = false
     ) {
         flagsDidLoad = context.flagsDidLoad
         self.flagTransport = flagTransport
+        if let initialConsent = context.initialConsent { acceptConsent(initialConsent) }
         let document = context.configDocument
         tail = Task { [weak self] in
-            await self?.start(open: open, configDocument: document)
+            await self?.start(open: open, configDocument: document, observeApplicationLifecycle: observeApplicationLifecycle)
         }
+    }
+
+    /// Injected internal stack path. The later public bootstrap supplies a
+    /// dispatcher that checks the supplied predicate on its final callback queue.
+    init(
+        context: EluRuntimeBackendContext,
+        openStack: @escaping @Sendable () async throws -> EluStandaloneStack,
+        guardedFlagsDidLoad: @escaping @Sendable (@escaping @Sendable () -> Bool) -> Void
+    ) {
+        flagsDidLoad = context.flagsDidLoad
+        flagTransport = nil
+        self.guardedFlagsDidLoad = guardedFlagsDidLoad
+        if let initialConsent = context.initialConsent { acceptConsent(initialConsent) }
+        tail = Task { [weak self] in
+            guard let self, let stack = try? await openStack() else { return }
+            let accepted = self.withLock { () -> Bool in
+                guard !self.isShutDown else { return false }
+                self.stack = stack
+                self.started = Started(runtime: stack.runtime, flags: stack.flags)
+                self.bindPendingIntents(to: stack.runtime)
+                return true
+            }
+            guard accepted, await self.persistStartupConsent(to: stack.runtime) else { stack.close(); return }
+            stack.observe(onIntent: { [weak self] in self?.configurationIntent() },
+                onSettled: { [weak self] in self?.scheduleFlagReload() },
+                onReady: context.initialConfigurationReady)
+            await stack.runtime.installNativeReplayComposition(lifecycle: self.nativeLifecycle, capabilities: EluStandaloneRuntime.readbackProvenReplayCapabilities, deferredUntilActivation: true)
+            self.syncIdentity(await stack.runtime.currentSnapshot.identity)
+            stack.start()
+            self.applyForegroundIntent()
+        }
+        attachOwnedLifecycle()
+    }
+
+    func setForeground(_ foreground: Bool) {
+        withLock {
+            guard !isShutDown else { return }
+            foregroundIntent = foreground
+            started?.runtime.performanceLifecycleIntent(foreground: foreground)
+            foregroundGeneration = UUID()
+        }
+        applyForegroundIntent()
+    }
+
+    private func applyForegroundIntent() {
+        let (current, foreground, generation) = withLock { (stack, foregroundIntent, foregroundGeneration) }
+        current?.setForeground(foreground, ifCurrent: { [weak self] in
+            self?.withLock { self?.isShutDown == false && self?.foregroundGeneration == generation } ?? false
+        })
     }
 
     /// Opens the site-scoped runtime under the ELU support directory with the
@@ -78,12 +138,15 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, @unchecked Sendable {
         let siteKey = context.siteKey
         return EluStandaloneFacadeRuntime(
             context: context,
-            open: {
-                try await EluStandaloneRuntime.make(
+            openStack: {
+                try await EluStandaloneStack.make(
                     rootDirectoryURL: rootDirectoryURL,
-                    siteKey: siteKey
+                    siteKey: siteKey,
+                    configHost: context.configHost,
+                    performance: context.performance
                 )
-            }
+            },
+            guardedFlagsDidLoad: context.guardedFlagsDidLoad
         )
     }
 
@@ -108,23 +171,47 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, @unchecked Sendable {
 
     private func start(
         open: @escaping @Sendable () async throws -> EluStandaloneRuntime,
-        configDocument: Data?
+        configDocument: Data?,
+        observeApplicationLifecycle: Bool
     ) async {
         guard let runtime = try? await open() else { return }
-        if let configDocument {
-            _ = await runtime.applyConfiguration(configDocument)
-        }
         var client: EluV1FlagClient?
         if let flagTransport {
             client = try? await runtime.flagClient(transport: flagTransport)
-            if let client, let configDocument {
-                _ = await client.applyConfig(configDocument)
-            }
+        }
+        let accepted = withLock { () -> Bool in
+            guard !isShutDown else { return false }
+            started = Started(runtime: runtime, flags: client)
+            bindPendingIntents(to: runtime)
+            return true
+        }
+        guard accepted, await persistStartupConsent(to: runtime) else { await client?.close(); await runtime.close(); return }
+        if let configDocument {
+            _ = await runtime.applyConfiguration(configDocument)
+            _ = await client?.applyConfig(configDocument)
         }
         let snapshot = await runtime.currentSnapshot
-        withLock { started = Started(runtime: runtime, flags: client) }
+        await runtime.installNativeReplayComposition(lifecycle: nativeLifecycle, capabilities: EluStandaloneRuntime.readbackProvenReplayCapabilities, deferredUntilActivation: true)
         syncIdentity(snapshot.identity)
-        attachLifecycle(to: runtime)
+        if observeApplicationLifecycle { attachLifecycle(to: runtime) }
+    }
+
+    /// The in-memory fence protects concurrent withdrawal, but it is not a
+    /// substitute for saving the choice before startup. A superseding intent
+    /// is retried; a storage failure closes startup instead of granting it.
+    private func persistStartupConsent(to runtime: EluStandaloneRuntime) async -> Bool {
+        while true {
+            let (stopped, choice) = withLock { (isShutDown, consentProjection) }
+            guard !stopped else { return false }
+            guard let choice else { return true }
+            let snapshot = await runtime.setOptedOut(choice.optedOut, intent: choice.id)
+            let current = withLock { !isShutDown && consentProjection?.id == choice.id }
+            if current {
+                guard let snapshot, snapshot.identity.optedOut == choice.optedOut else { return false }
+                syncIdentity(snapshot.identity)
+                return true
+            }
+        }
     }
 
     private func attachLifecycle(to runtime: EluStandaloneRuntime) {
@@ -134,7 +221,7 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, @unchecked Sendable {
             // controller interception, so SwiftUI and UIKit screens are
             // reported through `Elu.screen`.
             let emitter = EluApplicationLifecycleEmitter(
-                tracker: EluApplicationLifecycleTracker(sink: runtime.lifecycleSink())
+                tracker: EluApplicationLifecycleTracker(sink: runtime.lifecycleSink()), nativeLifecycle: nativeLifecycle
             )
             lock.lock()
             let shuttingDown = isShutDown
@@ -143,6 +230,68 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, @unchecked Sendable {
             guard !shuttingDown else { return }
             emitter.attach()
         #endif
+    }
+
+    private func attachOwnedLifecycle() {
+        #if canImport(UIKit)
+            let emitter = EluApplicationLifecycleEmitter(
+                tracker: EluApplicationLifecycleTracker(sink: EluStandaloneFacadeLifecycleSink(owner: self)), nativeLifecycle: nativeLifecycle)
+            withLock { lifecycleEmitter = emitter }
+            emitter.attach()
+        #endif
+    }
+
+    fileprivate func applicationForegrounded(at occurredAt: Date, fromBackground: Bool) {
+        setForeground(true)
+        enqueue { runtime, _ in
+            _ = await runtime.capture(EluStandaloneRuntime.applicationOpenedEvent,
+                properties: [EluStandaloneRuntime.fromBackgroundProperty: .bool(fromBackground)],
+                occurredAt: occurredAt)
+            await runtime.markForegrounded()
+        }
+    }
+
+    fileprivate func applicationBackgrounded(at occurredAt: Date) {
+        setForeground(false)
+        enqueue { runtime, _ in
+            _ = await runtime.capture(EluStandaloneRuntime.applicationBackgroundedEvent, occurredAt: occurredAt)
+            _ = await runtime.markBackgrounded(at: occurredAt)
+        }
+    }
+
+    fileprivate func lifecycleScreen(_ name: String, at occurredAt: Date) {
+        enqueue { runtime, _ in _ = await runtime.screen(name, occurredAt: occurredAt) }
+    }
+
+    func beginPendingOperation(_ op: EluBufferedOp) -> (() -> Void)? {
+        if case let .consent(operation) = op { acceptConsent(operation) }
+        guard op.changesFlagContext else { return nil }
+        let pending = withLock { () -> EluStandaloneFacadePendingIntent? in
+            guard !isShutDown else { return nil }
+            flagGeneration = UUID()
+            clearFlagsLocked()
+            let pending = EluStandaloneFacadePendingIntent()
+            if let runtime = started?.runtime { pending.bind(runtime) }
+            pendingFlagIntents[pending.id] = pending
+            return pending
+        }
+        guard let pending else { return nil }
+        return { [weak self] in self?.finishPendingIntent(pending) }
+    }
+
+    func flagNotificationPredicate() -> (@Sendable () -> Bool)? {
+        withLock {
+            guard !isShutDown, pendingFlagIntents.isEmpty, flagsLoadedState else { return nil }
+            let generation = flagGeneration
+            let projection = flagCache
+            return { [weak self] in
+                self?.withLock {
+                    guard let self, !self.isShutDown, self.pendingFlagIntents.isEmpty,
+                          self.flagGeneration == generation, self.flagsLoadedState else { return false }
+                    return projection?.authority.isCurrent() ?? true
+                } ?? false
+            }
+        }
     }
 
     // MARK: - Facade operations
@@ -179,18 +328,18 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, @unchecked Sendable {
                 owner.record(await runtime.captureException(properties: exception))
             }
 
-        case let .identify(distinctId, userProperties):
+        case let .identify(distinctId, userProperties, userPropertiesOnce):
             guard let userId = EluFacadeJSON.identifier(distinctId, maximumLength: 512) else {
                 count(.invalidInput)
                 return
             }
-            let projected = project(userProperties)
+            let projected = project(userProperties), projectedOnce = project(userPropertiesOnce)
             // The synchronous getter follows call order: the new id is
             // reported from the moment `identify` is accepted, and the
             // projection is withdrawn once the call settles.
             projectIdentity { $0.projectedDistinctId = userId }
-            enqueue(settlesProjection: true) { runtime, owner in
-                owner.apply(await runtime.identify(userId, properties: projected))
+            enqueue(settlesProjection: true, affectsFlags: true) { runtime, owner in
+                owner.apply(await runtime.identify(userId, properties: projected, propertiesOnce: projectedOnce))
                 owner.scheduleFlagReload()
             }
 
@@ -199,15 +348,28 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, @unchecked Sendable {
                 count(.invalidInput)
                 return
             }
-            enqueue { runtime, owner in
+            enqueue(affectsFlags: true) { runtime, owner in
                 owner.apply(await runtime.alias(aliasId))
             }
 
         case let .register(properties):
             let projected = project(properties)
             guard !projected.isEmpty else { return }
-            enqueue { runtime, owner in
+            enqueue(affectsFlags: true) { runtime, owner in
                 owner.apply(await runtime.registerSuperProperties(projected))
+            }
+
+        case let .registerOnce(properties, defaultValue):
+            let projected = project(properties)
+            guard !projected.isEmpty else { return }
+            let projectedDefault = defaultValue.flatMap { EluFacadeJSON.value($0) }
+            guard defaultValue == nil || projectedDefault != nil else {
+                count(.invalidInput)
+                return
+            }
+            enqueue(affectsFlags: true) { runtime, owner in
+                owner.apply(await runtime.registerSuperProperties(projected,
+                    onlyIfAbsent: true, defaultValue: projectedDefault))
             }
 
         case let .unregister(key):
@@ -216,7 +378,7 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, @unchecked Sendable {
                 return
             }
             guard !EluFacadeJSON.isReservedKey(key) else { return }
-            enqueue { runtime, owner in
+            enqueue(affectsFlags: true) { runtime, owner in
                 owner.apply(await runtime.unregisterSuperProperty(key))
             }
 
@@ -228,7 +390,7 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, @unchecked Sendable {
                 return
             }
             let projected = project(properties)
-            enqueue { runtime, owner in
+            enqueue(affectsFlags: true) { runtime, owner in
                 owner.apply(
                     await runtime.group(type: groupType, key: groupKey, properties: projected)
                 )
@@ -238,18 +400,18 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, @unchecked Sendable {
                 owner.scheduleFlagReload()
             }
 
-        case let .setPersonProperties(properties):
-            let projected = project(properties)
-            guard !projected.isEmpty else { return }
-            enqueue { runtime, owner in
-                owner.apply(await runtime.setPersonProperties(projected))
+        case let .setPersonProperties(properties, propertiesOnce):
+            let projected = project(properties), projectedOnce = project(propertiesOnce)
+            guard !projected.isEmpty || !projectedOnce.isEmpty else { return }
+            enqueue(affectsFlags: true) { runtime, owner in
+                owner.apply(await runtime.setPersonProperties(projected, propertiesOnce: projectedOnce))
                 owner.scheduleFlagReload()
             }
 
         case let .setPersonPropertiesForFlags(properties):
             let projected = project(properties)
             guard !projected.isEmpty else { return }
-            enqueue { runtime, owner in
+            enqueue(affectsFlags: true) { runtime, owner in
                 owner.apply(await runtime.setFlagPersonProperties(projected))
                 owner.scheduleFlagReload()
             }
@@ -261,19 +423,45 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, @unchecked Sendable {
             }
             let projected = project(properties)
             guard !projected.isEmpty else { return }
-            enqueue { runtime, owner in
+            enqueue(affectsFlags: true) { runtime, owner in
                 owner.apply(
                     await runtime.setFlagGroupProperties(type: groupType, properties: projected)
                 )
                 owner.scheduleFlagReload()
             }
 
+        case let .consent(operation):
+            acceptConsent(operation)
+            let properties = project(operation.properties)
+            enqueue(affectsFlags: true) { runtime, owner in
+                let snapshot = await runtime.setOptedOut(operation.optedOut, intent: operation.id)
+                owner.apply(snapshot)
+                guard snapshot != nil, !operation.optedOut else { return }
+                owner.scheduleFlagReload()
+                if let event = operation.event {
+                    owner.record(await runtime.capture(event, properties: properties))
+                }
+            }
+
+        case .resetGroups:
+            enqueue(affectsFlags: true) { runtime, owner in
+                owner.apply(await runtime.updateFlagContext(.resetGroups)); owner.scheduleFlagReload()
+            }
+        case .resetPersonPropertiesForFlags:
+            enqueue(affectsFlags: true) { runtime, owner in
+                owner.apply(await runtime.updateFlagContext(.resetPerson)); owner.scheduleFlagReload()
+            }
+        case let .resetGroupPropertiesForFlags(type):
+            if let type, EluFacadeJSON.identifier(type, maximumLength: 256) == nil { count(.invalidInput); return }
+            enqueue(affectsFlags: true) { runtime, owner in
+                owner.apply(await runtime.updateFlagContext(.resetGroup(type))); owner.scheduleFlagReload()
+            }
         case .reset:
             // The loaded flags belong to the identity that is ending, so a
             // read before the queued call runs must not report them or
             // attribute an exposure to the identity replacing it.
             projectIdentity { $0.clearFlagsLocked() }
-            enqueue(settlesProjection: true) { runtime, owner in
+            enqueue(settlesProjection: true, affectsFlags: true) { runtime, owner in
                 owner.apply(await runtime.resetIdentity())
                 owner.clearFlags()
                 owner.scheduleFlagReload()
@@ -288,6 +476,7 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, @unchecked Sendable {
         lock.unlock()
         guard !alreadyActive else { return }
         enqueue { runtime, owner in
+            await runtime.activateNativeReplayComposition()
             await owner.loadFlags(runtime)
         }
     }
@@ -301,11 +490,16 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, @unchecked Sendable {
     func shutDown() {
         lock.lock()
         isShutDown = true
+        flagGeneration = UUID()
+        clearFlagsLocked()
+        let currentStack = stack
+        started?.runtime.invalidateAuthority()
         #if canImport(UIKit)
             let emitter = lifecycleEmitter
             lifecycleEmitter = nil
         #endif
         lock.unlock()
+        currentStack?.close()
         #if canImport(UIKit)
             emitter?.detach()
         #endif
@@ -316,6 +510,18 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, @unchecked Sendable {
 
     // MARK: - Getters
 
+    private func acceptConsent(_ operation: EluConsentOperation) {
+        withLock {
+            guard operation.acceptOnce() else { return }
+            consentProjection = (operation.id, operation.optedOut)
+            started?.runtime.acceptConsentIntent(operation.id, optedOut: operation.optedOut)
+        }
+    }
+
+    func isOptedOut() -> Bool {
+        withLock { consentProjection?.optedOut ?? identity?.optedOut ?? false }
+    }
+
     func distinctId() -> String? {
         lock.lock()
         defer { lock.unlock() }
@@ -324,10 +530,19 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, @unchecked Sendable {
         return identity.userId ?? identity.anonymousId
     }
 
+    func groups() -> [String: String] {
+        withLock {
+            guard !isShutDown, pendingFlagIntents.isEmpty, pendingIdentityOperations == 0,
+                  !(consentProjection?.optedOut ?? identity?.optedOut ?? false) else { return [:] }
+            return identity?.groups ?? [:]
+        }
+    }
+
     var flagsAreLoaded: Bool {
         lock.lock()
         defer { lock.unlock() }
-        return flagsLoadedState
+        return !isShutDown && pendingFlagIntents.isEmpty && flagsLoadedState &&
+            (flagCache?.authority.isCurrent() ?? true)
     }
 
     func featureFlag(_ key: String) -> Any? {
@@ -344,6 +559,13 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, @unchecked Sendable {
             return nil
         }
         return EluFacadeJSON.payload(payload)
+    }
+
+    func featureFlagResult(_ key: String) -> EluFeatureFlagResult? {
+        guard let read = readFlag(key, reportsExposure: true) else { return nil }
+        return EluFeatureFlagResult(key: key, enabled: EluFacadeJSON.flagIsEnabled(read.value),
+            variant: EluFacadeJSON.flagValue(read.value) as? String,
+            payload: read.payload.map(EluFacadeJSON.payload))
     }
 
     func isFeatureEnabled(_ key: String) -> Bool {
@@ -373,19 +595,21 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, @unchecked Sendable {
     ) -> (value: EluV1FlagValue, payload: EluV1FlagJSONValue?)? {
         guard !key.isEmpty else { return nil }
         lock.lock()
-        guard !isShutDown, flagsLoadedState, let flagCache else {
+        guard !isShutDown, pendingFlagIntents.isEmpty, flagsLoadedState,
+              let flagCache, flagCache.authority.isCurrent() else {
             lock.unlock()
             return nil
         }
         let lookup = flagCache.lookup(key)
+        let generation = flagGeneration
         lock.unlock()
 
         switch lookup {
         case .missing:
-            if reportsExposure { reportExposure(key, value: nil, payload: nil) }
+            if reportsExposure { reportExposure(key, value: nil, payload: nil, projection: flagCache, generation: generation) }
             return nil
         case let .found(value, payload):
-            if reportsExposure { reportExposure(key, value: value, payload: payload) }
+            if reportsExposure { reportExposure(key, value: value, payload: payload, projection: flagCache, generation: generation) }
             return (value, payload)
         }
     }
@@ -397,11 +621,13 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, @unchecked Sendable {
     private func reportExposure(
         _ key: String,
         value: EluV1FlagValue?,
-        payload: EluV1FlagJSONValue?
+        payload: EluV1FlagJSONValue?,
+        projection: EluV1FlagCacheProjection,
+        generation: UUID
     ) {
         let ledgerKey = EluFacadeJSON.exposureKey(key, value: value)
         lock.lock()
-        guard !exposures.contains(ledgerKey) else {
+        guard projectionIsCurrentLocked(projection, generation: generation), !exposures.contains(ledgerKey) else {
             lock.unlock()
             return
         }
@@ -419,7 +645,8 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, @unchecked Sendable {
         let properties = reported
 
         enqueue { runtime, owner in
-            let result = await runtime.capture("$feature_flag_called", properties: properties)
+            let result = await runtime.capture("$feature_flag_called", properties: properties,
+                admissionGuard: { owner.withLock { owner.projectionIsCurrentLocked(projection, generation: generation) } })
             owner.record(result)
             if case .rejected = result {
                 owner.withdrawExposure(ledgerKey, recordedAt: revision)
@@ -442,9 +669,7 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, @unchecked Sendable {
             publishFlagsLoaded()
             return
         }
-        if case let .hit(snapshot) = await client.readAll() {
-            publish(snapshot)
-        }
+        if let projection = await client.readProjection() { publish(projection) }
         await reloadFlags(runtime)
     }
 
@@ -455,19 +680,13 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, @unchecked Sendable {
         }
         for _ in 0 ..< Self.flagReloadAttempts {
             guard !isStopped else { return }
-            switch await client.reload() {
-            case let .updated(snapshot), let .cached(snapshot):
-                publish(snapshot)
-                return
-            case .stale:
-                // Superseded by an identity or configuration change; the next
-                // attempt evaluates the current witness.
-                continue
-            case .restricted, .terminal:
-                publishFlagsLoaded()
+            if let projection = await client.reloadProjection() {
+                publish(projection)
                 return
             }
+            guard !isStopped else { return }
         }
+        publishFlagsLoaded()
     }
 
     private func scheduleFlagReload() {
@@ -483,22 +702,41 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, @unchecked Sendable {
         }
     }
 
-    private func publish(_ snapshot: EluV1FlagCacheSnapshot) {
+    private func publish(_ projection: EluV1FlagCacheProjection) {
         lock.lock()
-        flagCache = snapshot
+        guard !isShutDown, pendingFlagIntents.isEmpty, projection.authority.isCurrent() else { lock.unlock(); return }
+        flagCache = projection
         flagsLoadedState = true
+        let generation = flagGeneration
         lock.unlock()
-        flagsDidLoad()
+        notifyFlags { [weak self] in
+            self?.withLock { self?.projectionIsCurrentLocked(projection, generation: generation) ?? false } ?? false
+        }
     }
 
-    /// Flags finished loading without a snapshot to publish. Registered
-    /// callbacks still run: the contract is that they fire every time flags
-    /// finish loading, not only when the values changed.
     private func publishFlagsLoaded() {
         lock.lock()
+        guard !isShutDown, pendingFlagIntents.isEmpty else { lock.unlock(); return }
+        clearFlagsLocked()
         flagsLoadedState = true
+        let generation = flagGeneration
         lock.unlock()
-        flagsDidLoad()
+        notifyFlags { [weak self] in
+            self?.withLock { self?.flagGeneration == generation && self?.isShutDown == false && self?.pendingFlagIntents.isEmpty == true } ?? false
+        }
+    }
+
+    private func notifyFlags(_ isCurrent: @escaping @Sendable () -> Bool) {
+        if let guardedFlagsDidLoad { guardedFlagsDidLoad(isCurrent) }
+        else if isCurrent() { flagsDidLoad() }
+    }
+
+    private func projectionIsCurrentLocked(_ projection: EluV1FlagCacheProjection, generation: UUID) -> Bool {
+        !isShutDown && pendingFlagIntents.isEmpty && flagGeneration == generation && projection.authority.isCurrent()
+    }
+
+    private func configurationIntent() {
+        withLock { flagGeneration = UUID(); clearFlagsLocked() }
     }
 
     private func clearFlags() {
@@ -583,13 +821,24 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, @unchecked Sendable {
     /// another facade call against the same runtime.
     private func enqueue(
         settlesProjection: Bool = false,
+        affectsFlags: Bool = false,
         whileShutDown: Bool = false,
         always: (@Sendable () -> Void)? = nil,
         _ operation: @escaping @Sendable (EluStandaloneRuntime, EluStandaloneFacadeRuntime)
             async -> Void
     ) {
         lock.lock()
+        let pending: EluStandaloneFacadePendingIntent?
+        if affectsFlags {
+            flagGeneration = UUID()
+            clearFlagsLocked()
+            let value = EluStandaloneFacadePendingIntent()
+            if let runtime = started?.runtime { value.bind(runtime) }
+            pendingFlagIntents[value.id] = value
+            pending = value
+        } else { pending = nil }
         let previous = tail
+        tailVersion = UUID()
         tail = Task { [weak self] in
             await previous?.value
             guard let self else {
@@ -598,6 +847,7 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, @unchecked Sendable {
             }
             defer {
                 if settlesProjection { self.settleIdentityProjection() }
+                if let pending { self.finishPendingIntent(pending) }
                 always?()
             }
             guard whileShutDown || !self.isStopped else {
@@ -609,8 +859,25 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, @unchecked Sendable {
                 return
             }
             await operation(runtime, self)
+            runtime.reevaluateNativeReplay()
         }
         lock.unlock()
+    }
+
+    /// Called only while the facade lock is held; no database work occurs.
+    private func bindPendingIntents(to runtime: EluStandaloneRuntime) {
+        runtime.performanceLifecycleIntent(foreground: foregroundIntent)
+        runtime.bindNativeLifecycle(nativeLifecycle)
+        for intent in pendingFlagIntents.values { intent.bind(runtime) }
+        if let consentProjection { runtime.acceptConsentIntent(consentProjection.id, optedOut: consentProjection.optedOut) }
+    }
+
+    private func finishPendingIntent(_ intent: EluStandaloneFacadePendingIntent) {
+        withLock {
+            guard pendingFlagIntents.removeValue(forKey: intent.id) != nil else { return }
+            intent.finish()
+            flagGeneration = UUID()
+        }
     }
 
     private func currentRuntime() -> EluStandaloneRuntime? {
@@ -642,7 +909,11 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, @unchecked Sendable {
 
     /// Resolves once every call handed over so far has reached the runtime.
     func settled() async {
-        await withLock { tail }?.value
+        while true {
+            let (current, version) = withLock { (tail, tailVersion) }
+            await current?.value
+            if withLock({ tailVersion == version }) { return }
+        }
     }
 
     private func withLock<Value>(_ body: () -> Value) -> Value {
@@ -692,4 +963,36 @@ private final class EluFacadeCallback: @unchecked Sendable {
         let body = self.body
         DispatchQueue.main.async(execute: body)
     }
+}
+
+private final class EluStandaloneFacadePendingIntent: @unchecked Sendable {
+    let id = UUID()
+    private var runtime: EluStandaloneRuntime?
+    private var token: EluStandaloneFlagProjectionIntent?
+    private var nativeToken: EluNativeReplayIntent?
+    func bind(_ owner: EluStandaloneRuntime) {
+        guard runtime == nil else { return }
+        runtime = owner
+        token = owner.beginFlagProjectionIntent()
+        nativeToken = owner.beginNativeProjectionIntent()
+    }
+    func finish() {
+        if let runtime, let token { runtime.finishFlagProjectionIntent(token) }
+        if let runtime, let nativeToken { runtime.finishNativeProjectionIntent(nativeToken) }
+        runtime = nil
+        token = nil
+        nativeToken = nil
+    }
+}
+
+/// One lifecycle source drives source availability and ordered local runtime
+/// facts. It owns no transport, provider, or authority of its own.
+private final class EluStandaloneFacadeLifecycleSink: EluRuntimeLifecycleSink, @unchecked Sendable {
+    private weak var owner: EluStandaloneFacadeRuntime?
+    init(owner: EluStandaloneFacadeRuntime) { self.owner = owner }
+    func applicationForegrounded(at occurredAt: Date, fromBackground: Bool) {
+        owner?.applicationForegrounded(at: occurredAt, fromBackground: fromBackground)
+    }
+    func applicationBackgrounded(at occurredAt: Date) { owner?.applicationBackgrounded(at: occurredAt) }
+    func screenViewed(_ name: String, at occurredAt: Date) { owner?.lifecycleScreen(name, at: occurredAt) }
 }

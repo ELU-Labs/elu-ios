@@ -19,6 +19,7 @@ fi
 network_trace="$(cd "$(dirname "$network_trace")" && pwd)/$(basename "$network_trace")"
 
 python3 scripts/verify-release-tag.py "$release_tag"
+python3 scripts/validate-runtime-network-evidence.py "$network_trace"
 if ! command -v xcodebuild >/dev/null 2>&1; then
   echo "release preflight requires full Xcode" >&2
   exit 1
@@ -44,6 +45,7 @@ python3 Conformance/validate-baselines.py
 python3 Conformance/validate-v1-config.py
 python3 Conformance/validate-v1-queue.py
 python3 Conformance/validate-v1-flags.py
+python3 Conformance/validate-v2-replay.py
 run_logged resolve swift package resolve
 swift package dump-package > "$output/package-metadata.json" 2> "$logs/dump-package.log"
 python3 scripts/verify-package-surface.py --mode strict "$output/package-metadata.json"
@@ -80,11 +82,9 @@ run_logged archive xcodebuild archive \
     CODE_SIGNING_ALLOWED=NO
 )
 
-run_logged source-archive git archive \
-  --format=zip \
-  --prefix="elu-ios-$release_tag/" \
-  --output="$source_archive" \
-  "$release_tag"
+run_logged source-archive python3 scripts/create-source-archive.py \
+  --ref "$release_tag" \
+  --output "$source_archive"
 python3 scripts/verify-symbol-graph.py "$symbols"
 python3 scripts/generate-release-evidence.py \
   --output "$output/evidence" \

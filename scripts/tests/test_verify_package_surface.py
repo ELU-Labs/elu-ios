@@ -14,13 +14,14 @@ import unittest
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 VERIFIER = ROOT / "scripts" / "verify-package-surface.py"
 SNAPSHOT = ROOT / "Baselines" / "package-validation" / "package-metadata.json"
+CURRENT_SNAPSHOT = ROOT / "API" / "package-metadata.json"
 DEPENDENCIES = ROOT / "legal" / "THIRD_PARTY_NOTICES.dependencies.json"
 PACKAGE_MANIFEST = ROOT / "Package.swift"
 
 
-def package_dump() -> dict[str, object]:
+def package_dump(mode: str = "strict") -> dict[str, object]:
     dependency = json.loads(DEPENDENCIES.read_text(encoding="utf-8"))["packages"][0]
-    return {
+    result = {
         "name": "EluAnalytics",
         "toolsVersion": {"_version": "5.9.0"},
         "platforms": [{"platformName": "ios", "version": "13.0"}],
@@ -62,24 +63,29 @@ def package_dump() -> dict[str, object]:
             }
         ],
     }
+    if mode == "strict":
+        result["dependencies"] = []
+    return result
 
 
-def prepare_fresh_root(parent: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path]:
+def prepare_fresh_root(parent: pathlib.Path, mode: str = "strict") -> tuple[pathlib.Path, pathlib.Path]:
     root = parent / "fresh-root"
     (root / "scripts").mkdir(parents=True)
     (root / "Baselines" / "package-validation").mkdir(parents=True)
     (root / "legal").mkdir(parents=True)
+    (root / "API").mkdir()
     shutil.copy2(VERIFIER, root / "scripts" / VERIFIER.name)
     shutil.copy2(SNAPSHOT, root / "Baselines" / "package-validation" / SNAPSHOT.name)
+    shutil.copy2(CURRENT_SNAPSHOT, root / "API" / CURRENT_SNAPSHOT.name)
     shutil.copy2(DEPENDENCIES, root / "legal" / DEPENDENCIES.name)
     shutil.copy2(PACKAGE_MANIFEST, root / PACKAGE_MANIFEST.name)
     dump = root / "package-dump.json"
-    dump.write_text(json.dumps(package_dump()), encoding="utf-8")
+    dump.write_text(json.dumps(package_dump(mode)), encoding="utf-8")
     return root, dump
 
 
 def run_verifier(
-    root: pathlib.Path, dump: pathlib.Path, *, mode: str = "baseline"
+    root: pathlib.Path, dump: pathlib.Path, *, mode: str = "strict"
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [
@@ -128,7 +134,18 @@ class VerifyPackageSurfaceTests(unittest.TestCase):
 
         self.assertEqual(commit_count.stdout.strip(), "1")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("verified Package.swift metadata", result.stdout)
+        self.assertIn("verified strict Package.swift metadata", result.stdout)
+
+    def test_strict_surface_rejects_dependency_or_unreviewed_target(self) -> None:
+        for change in ("dependencies", "targets"):
+            with tempfile.TemporaryDirectory() as directory:
+                root, dump = prepare_fresh_root(pathlib.Path(directory))
+                value = json.loads(dump.read_text())
+                if change == "dependencies": value[change] = package_dump("baseline")[change]
+                else: value[change].append({"name": "Unreviewed", "type": "regular"})
+                dump.write_text(json.dumps(value))
+                result = run_verifier(root, dump)
+                self.assertNotEqual(result.returncode, 0)
 
     def test_manifest_tampering_is_rejected_by_recorded_digest(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

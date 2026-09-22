@@ -13,6 +13,51 @@ final class EluStandaloneRuntimeTests: XCTestCase {
         var errorDescription: String? { "checkout failed" }
     }
 
+    func testOptInNativePerformanceUsesOwnedEventSerializationAndStopsOnConsent() async throws {
+        try await withTemporaryDirectory { root in
+            let transport = RecordingBatchTransport()
+            let clock = TestRuntimeClock(wall: Date(timeIntervalSince1970: 1_785_888_090))
+            let runtime = try await makeRuntime(root: root, transport: transport, clock: clock,
+                performance: .init(enabled: true, sampleIntervalMilliseconds: 5_000))
+            let fixtureURL = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+                .deletingLastPathComponent().deletingLastPathComponent()
+                .appendingPathComponent("Conformance/V2/fixtures/config-enabled.json")
+            var config = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: fixtureURL)) as? [String: Any])
+            config["capturePerformance"] = ["memory": true, "long_tasks": true, "sample_interval_ms": 5_000]
+            guard case .capturing = await runtime.applyConfiguration(try JSONSerialization.data(withJSONObject: config)) else {
+                await runtime.close(); return XCTFail("expected active performance policy")
+            }
+            _ = await runtime.capture("session-start")
+            runtime.performanceLifecycleIntent(foreground: true)
+            await runtime.markForegrounded()
+            _ = await runtime.flush()
+            let sessionBeforeSample = try await runtime.queueSnapshot().identity.session
+            clock.advance(seconds: 1)
+            try await awaitCondition(timeoutSeconds: 7) { try await runtime.queueSnapshot().queuedCount >= 1 }
+            let sessionAfterSample = try await runtime.queueSnapshot().identity.session
+            XCTAssertEqual(sessionAfterSample, sessionBeforeSample, "passive sampling cannot extend idle time")
+            runtime.performanceLifecycleIntent(foreground: false)
+            _ = await runtime.flush()
+            let requests = await transport.recordedRequests()
+            let events = try requests.flatMap { try batchEvents($0) }
+            let sample = try XCTUnwrap(events.first { $0["name"] as? String == "$performance_sample" })
+            let properties = try XCTUnwrap(sample["properties"] as? [String: Any])
+            XCTAssertEqual(properties["$performance_platform"] as? String, "ios")
+            XCTAssertEqual(properties["$performance_sample_interval_ms"] as? Int, 5_000)
+            XCTAssertEqual(properties["$app_foreground"] as? Bool, true)
+            XCTAssertGreaterThan(try XCTUnwrap(properties["$memory_process_footprint_bytes"] as? Int), 0)
+            XCTAssertNotNil(properties["$main_thread_stall_count"])
+            XCTAssertNil(properties["$memory_used_js_heap_bytes"])
+            XCTAssertNil(properties["$long_task_count"])
+            let intent = UUID(); runtime.acceptConsentIntent(intent, optedOut: true)
+            _ = await runtime.setOptedOut(true, intent: intent)
+            let snapshot = try await runtime.queueSnapshot()
+            XCTAssertTrue(snapshot.identity.optedOut)
+            XCTAssertEqual(snapshot.queuedCount, 0)
+            await runtime.close()
+        }
+    }
+
     func testEnabledConfigActivatesCaptureAndFlushDrainsOneAuthorizedBatch() async throws {
         try await withTemporaryDirectory { root in
             let transport = RecordingBatchTransport()
@@ -318,8 +363,9 @@ final class EluStandaloneRuntimeTests: XCTestCase {
             guard case .capturing = await second.applyConfiguration(fixture("config-enabled.json")) else {
                 return XCTFail("Expected capture authority after restart")
             }
-            let secondFlush = await second.flush()
-            XCTAssertEqual(secondFlush, .triggered(.resolved(delivered: 1, terminallyDiscarded: 0)))
+            // Installing source authority resumes the retained batch without
+            // another caller-triggered flush. Inspect only after its ACK commits.
+            try await awaitCondition { try await second.queueSnapshot().queuedCount == 0 }
 
             let failingRequests = await failing.recordedRequests()
             let acceptingRequests = await accepting.recordedRequests()
@@ -486,7 +532,8 @@ final class EluStandaloneRuntimeTests: XCTestCase {
         clock: TestRuntimeClock,
         timeZoneIdentifier: String? = "America/New_York",
         backgroundHandoff: EluStandaloneBackgroundHandoff? = nil,
-        flushDelayNanoseconds: UInt64 = EluStandaloneRuntime.defaultFlushDelayNanoseconds
+        flushDelayNanoseconds: UInt64 = EluStandaloneRuntime.defaultFlushDelayNanoseconds,
+        performance: EluPerformanceOptions = .init()
     ) async throws -> EluStandaloneRuntime {
         try await EluStandaloneRuntime.make(
             rootDirectoryURL: root,
@@ -503,7 +550,8 @@ final class EluStandaloneRuntimeTests: XCTestCase {
             flushDelayNanoseconds: flushDelayNanoseconds,
             anonymousIdGenerator: { "anon_runtime" },
             streamIdGenerator: { "stream_runtime" },
-            sessionIdGenerator: { "session_\(UUID().uuidString.lowercased())" }
+            sessionIdGenerator: { "session_\(UUID().uuidString.lowercased())" },
+            performance: performance
         )
     }
 

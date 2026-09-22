@@ -40,6 +40,7 @@ struct EluV1CaptureAuthoritySnapshot: Equatable, Sendable {
     let monotonicBudget: UInt64
     let idleTimeoutSeconds: Int
     let maximumDurationSeconds: Int
+    let maximumQueueBytes: Int
 }
 
 struct EluV1CaptureAuthorityTerminal: Equatable, Sendable {

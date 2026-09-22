@@ -12,6 +12,7 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 SNAPSHOT = ROOT / "Baselines" / "package-validation" / "package-metadata.json"
+CURRENT_SNAPSHOT = ROOT / "API" / "package-metadata.json"
 DEPENDENCIES = ROOT / "legal" / "THIRD_PARTY_NOTICES.dependencies.json"
 PACKAGE_MANIFEST = ROOT / "Package.swift"
 SNAPSHOT_VERSION = 3
@@ -58,7 +59,8 @@ def verify_manifest_provenance(expected: dict[str, object]) -> None:
 def main() -> int:
     args = parse_args()
     actual = json.loads(args.dump.read_text(encoding="utf-8"))
-    expected = json.loads(SNAPSHOT.read_text(encoding="utf-8"))
+    snapshot = CURRENT_SNAPSHOT if args.mode == "strict" else SNAPSHOT
+    expected = json.loads(snapshot.read_text(encoding="utf-8"))
     verify_manifest_provenance(expected)
     dependency = json.loads(DEPENDENCIES.read_text(encoding="utf-8"))["packages"][0]
     package = expected["package"]
@@ -86,13 +88,8 @@ def main() -> int:
     actual_targets = [
         {"name": item["name"], "type": item["type"]} for item in actual.get("targets", [])
     ]
-    if args.mode == "baseline" and actual_targets != package["targets"]:
+    if actual_targets != package["targets"]:
         fail(f"targets changed: {actual_targets!r}")
-    if args.mode == "strict":
-        actual_target_names = {item["name"] for item in actual_targets}
-        required_target_names = {item["name"] for item in package["targets"]}
-        if not required_target_names.issubset(actual_target_names):
-            fail("strict package removed a frozen facade or test target")
 
     actual_target_settings: dict[str, list[dict[str, str]]] = {}
     for target in actual.get("targets", []):
@@ -114,6 +111,8 @@ def main() -> int:
 
     dependencies = actual.get("dependencies", [])
     if args.mode == "strict":
+        if expected.get("dependencies") != [] or dependencies != []:
+            fail("strict package must retain the reviewed zero-dependency surface")
         print("verified strict Package.swift metadata and public product surface")
         return 0
     if len(dependencies) != 1:

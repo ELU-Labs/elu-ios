@@ -1110,10 +1110,55 @@ final class EluSQLiteRuntimeQueueTests: XCTestCase {
                 _ = try await makeQueue(directory: directory)
                 XCTFail("Expected future schema rejection")
             } catch let error as EluRuntimeQueueError {
-                XCTAssertEqual(error, .unsupportedSchemaVersion(3))
+                XCTAssertEqual(error, .unsupportedSchemaVersion(9))
             }
             let after = try [database, wal, shm].map { try Data(contentsOf: $0) }
             XCTAssertEqual(after, before)
+        }
+    }
+
+    func testRetiredImportSchemaVersionsPreserveDatabaseWalAndShmBytes() async throws {
+        for version in 17...24 {
+            try await withTemporaryDirectory { directory in
+                let queue = try await makeQueue(directory: directory)
+                await queue.close()
+                let database = databaseURL(directory)
+                let external = try openWALDatabase(database,
+                    mutationSQL: "CREATE TABLE preview_import_receipt (body BLOB); INSERT INTO preview_import_receipt VALUES (X'010203'); PRAGMA user_version=\(version)")
+                defer { _ = sqlite3_close_v2(external) }
+                let files = [database, URL(fileURLWithPath: database.path + "-wal"),
+                    URL(fileURLWithPath: database.path + "-shm")]
+                let before = try files.map { try Data(contentsOf: $0) }
+                do {
+                    _ = try await makeQueue(directory: directory)
+                    XCTFail("Retired preview schema must fail closed")
+                } catch let error as EluRuntimeQueueError {
+                    XCTAssertEqual(error, .unsupportedSchemaVersion(Int64(version)))
+                }
+                XCTAssertEqual(try files.map { try Data(contentsOf: $0) }, before)
+            }
+        }
+    }
+
+    func testCleanSetupAndReopenLeaveUnrelatedApplicationDataUntouched() async throws {
+        try await withTemporaryDirectory { directory in
+            let unrelated = directory.appendingPathComponent("unrelated-application-data")
+            let original = Data("Preserve old application bytes".utf8)
+            try original.write(to: unrelated)
+            let queue = try await EluSQLiteRuntimeQueue.openCaptureRuntime(
+                rootDirectoryURL: directory, exactConstructorSiteKey: "elu_pk_clean_setup",
+                limits: EluRuntimeQueueLimits())
+            let first = try await queue.snapshot()
+            XCTAssertNil(first.identity.userId)
+            XCTAssertEqual(first.nextSequence, 0)
+            await queue.close()
+            let reopened = try await EluSQLiteRuntimeQueue.openCaptureRuntime(
+                rootDirectoryURL: directory, exactConstructorSiteKey: "elu_pk_clean_setup",
+                limits: EluRuntimeQueueLimits())
+            let restored = try await reopened.snapshot()
+            XCTAssertEqual(restored, first)
+            await reopened.close()
+            XCTAssertEqual(try Data(contentsOf: unrelated), original)
         }
     }
 
@@ -1418,7 +1463,7 @@ final class EluSQLiteRuntimeQueueTests: XCTestCase {
     }
 
     private func openFutureWALDatabase(_ url: URL) throws -> OpaquePointer {
-        try openWALDatabase(url, mutationSQL: "PRAGMA user_version=3")
+        try openWALDatabase(url, mutationSQL: "PRAGMA user_version=9")
     }
 
     private func openWALDatabase(

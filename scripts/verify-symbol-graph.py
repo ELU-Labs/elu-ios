@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare a built EluAnalytics symbol graph with the frozen public snapshot."""
+"""Preserve the frozen API and permit only separately reviewed additions."""
 
 from __future__ import annotations
 
@@ -11,6 +11,19 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 SNAPSHOT = ROOT / "Baselines" / "0.1.0" / "public-symbols.json"
+ADDITIONS = ROOT / "API" / "public-symbol-additions.json"
+
+
+def expected_symbols(snapshot: pathlib.Path = SNAPSHOT, additions: pathlib.Path = ADDITIONS) -> tuple[str, set[str]]:
+    baseline = json.loads(snapshot.read_text(encoding="utf-8"))
+    added = json.loads(additions.read_text(encoding="utf-8"))
+    if added.get("module") != baseline["module"] or added.get("baseline") != "Baselines/0.1.0/public-symbols.json":
+        raise ValueError("additive API ledger does not match the frozen baseline")
+    original_names = [entry["name"] for entry in baseline["symbols"]]
+    added_names = [entry["name"] for entry in added["symbols"]]
+    if len(set(added_names)) != len(added_names) or set(original_names) & set(added_names):
+        raise ValueError("additive API ledger contains duplicate or baseline symbols")
+    return baseline["module"], set(original_names) | set(added_names)
 
 
 def parse_args() -> argparse.Namespace:
@@ -27,8 +40,11 @@ def candidates(path: pathlib.Path) -> list[pathlib.Path]:
 
 def main() -> int:
     args = parse_args()
-    expected_data = json.loads(SNAPSHOT.read_text(encoding="utf-8"))
-    expected = {symbol["name"] for symbol in expected_data["symbols"]}
+    try:
+        module, expected = expected_symbols()
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        print(f"invalid API ledger: {error}", file=sys.stderr)
+        return 1
     actual: set[str] = set()
     matched_files: list[pathlib.Path] = []
     for path in candidates(args.path):
@@ -36,7 +52,7 @@ def main() -> int:
             graph = json.loads(path.read_text(encoding="utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
             continue
-        if graph.get("module", {}).get("name") != expected_data["module"]:
+        if graph.get("module", {}).get("name") != module:
             continue
         matched_files.append(path)
         for symbol in graph.get("symbols", []):

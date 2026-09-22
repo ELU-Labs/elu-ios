@@ -785,32 +785,57 @@ def verify_public_contract_clean() -> None:
             fail(f"public repository file contains planning leakage: {relative}")
 
 
-def verify_unwired() -> None:
-    # The internal config module may decode the frozen v2 document; it stays
-    # dark. Every other production source, including the public facade, must
-    # not know the v2 replay role or protocol generation until the facade
-    # cutover is reviewed.
-    forbidden = ("replayProtocolGeneration", "/v2/replay")
-    sources = ROOT / "Sources" / "EluAnalytics"
-    config_module = sources / "Internal" / "Config"
+V2_GENERATION_SOURCES = frozenset({
+    "Sources/EluAnalytics/Internal/Config/EluV1ConfigContract.swift",
+    "Sources/EluAnalytics/Internal/Config/EluV1ConfigManager.swift",
+    "Sources/EluAnalytics/Internal/Replay/EluNativeReplayAuthority.swift",
+    "Sources/EluAnalytics/Internal/Replay/EluNativeReplaySealer.swift",
+    "Sources/EluAnalytics/Internal/Runtime/EluSQLiteRuntimeQueue.swift",
+})
+V2_ENDPOINT_SOURCES = frozenset({
+    "Sources/EluAnalytics/Internal/Config/EluV1ConfigContract.swift",
+    "Sources/EluAnalytics/Internal/Config/EluV1ConfigManager.swift",
+    "Sources/EluAnalytics/Internal/Replay/EluV2URLSessionReplayTransport.swift",
+})
+PUBLIC_FACADE_SOURCES = frozenset(
+    f"Sources/EluAnalytics/{name}" for name in
+    ("Elu.swift", "EluState.swift", "EluConfigClient.swift", "EluRemoteConfig.swift")
+)
+
+
+def scan_v2_runtime_source(relative: str, source: str) -> list[str]:
+    errors: list[str] = []
+    if "elu-http-v2" in source:
+        errors.append(f"production source activates unsupported transport token elu-http-v2: {relative}")
+    for token, allowed in (("replayProtocolGeneration", V2_GENERATION_SOURCES),
+                           ("/v2/replay", V2_ENDPOINT_SOURCES)):
+        if token in source and relative not in allowed:
+            errors.append(f"production source exposes v2 token {token} outside its owned boundary: {relative}")
+    if relative in PUBLIC_FACADE_SOURCES and (
+        "EluV1ConfigManager" in source or "EluV1ConfigDocument" in source
+    ):
+        errors.append(f"public facade references the internal config manager: {relative}")
+    return errors
+
+
+def verify_runtime_boundary() -> None:
+    # Frozen bytes below remain unchanged. Current source is wired through exact
+    # owned boundaries; local codec selection does not certify engine readback.
+    # The shared verifier also requires current authority guards, deferred facade
+    # activation, and the exact binary-supported native capability selection.
+    boundary = runpy.run_path(str(ROOT / "scripts/verify-feature-flag-boundary.py"))
+    errors = boundary["verify"](ROOT)
     projection_found = False
-    for path in sources.rglob("*.swift"):
+    for path in (ROOT / "Sources/EluAnalytics").rglob("*.swift"):
         source = path.read_text(encoding="utf-8")
-        if "elu-http-v2" in source:
-            fail(f"production source activates v2 transport token elu-http-v2: {path.relative_to(ROOT)}")
-        if config_module in path.parents:
-            if "/v2/replay" in source:
-                projection_found = True
-            continue
-        for token in forbidden:
-            if token in source:
-                fail(f"production source activates v2 transport token {token}: {path.relative_to(ROOT)}")
+        relative = path.relative_to(ROOT).as_posix()
+        errors.extend(scan_v2_runtime_source(relative, source))
+        if relative == "Sources/EluAnalytics/Internal/Config/EluV1ConfigManager.swift":
+            projection_found = '"/v2/replay"' in source
     if not projection_found:
-        fail("the internal config module must project the frozen v2 replay role")
-    for facade in ("Elu.swift", "EluState.swift", "EluConfigClient.swift", "EluRemoteConfig.swift"):
-        source = (sources / facade).read_text(encoding="utf-8")
-        if "EluV1ConfigManager" in source or "EluV1ConfigDocument" in source:
-            fail(f"public facade references the internal config manager: Sources/EluAnalytics/{facade}")
+        errors.append("the config manager must project the exact v2 replay role")
+    if errors:
+        fail("; ".join(errors))
 
 
 def main() -> int:
@@ -1337,7 +1362,7 @@ def main() -> int:
         fail("external readback privacy evidence drifted")
 
     verify_public_contract_clean()
-    verify_unwired()
+    verify_runtime_boundary()
     executable_vectors = (
         len(activity["negativeRequests"])
         + len(activity["rawStrictJson"]["duplicateKeyCases"])

@@ -1,0 +1,120 @@
+{
+  "snapshotVersion": 1,
+  "module": "EluAnalytics",
+  "baseline": "Baselines/0.1.0/public-symbols.json",
+  "description": "Additive source API for the native runtime candidate; this ledger is not release or migration qualification.",
+  "symbols": [
+    {
+      "kind": "swift.type.method",
+      "name": "Elu.blockView(_:)"
+    },
+    {
+      "kind": "swift.type.method",
+      "name": "Elu.getFeatureFlagResult(_:)"
+    },
+    {
+      "kind": "swift.type.method",
+      "name": "Elu.getGroups()"
+    },
+    {
+      "kind": "swift.type.method",
+      "name": "Elu.identify(_:userProperties:userPropertiesOnce:)"
+    },
+    {
+      "kind": "swift.type.method",
+      "name": "Elu.isOptedOut()"
+    },
+    {
+      "kind": "swift.type.method",
+      "name": "Elu.maskView(_:)"
+    },
+    {
+      "kind": "swift.type.method",
+      "name": "Elu.optIn(captureEventName:properties:)"
+    },
+    {
+      "kind": "swift.type.method",
+      "name": "Elu.optOut()"
+    },
+    {
+      "kind": "swift.type.method",
+      "name": "Elu.registerOnce(_:defaultValue:)"
+    },
+    {
+      "kind": "swift.type.method",
+      "name": "Elu.resetGroupPropertiesForFlags(_:)"
+    },
+    {
+      "kind": "swift.type.method",
+      "name": "Elu.resetGroups()"
+    },
+    {
+      "kind": "swift.type.method",
+      "name": "Elu.resetPersonPropertiesForFlags()"
+    },
+    {
+      "kind": "swift.type.method",
+      "name": "Elu.setPersonProperties(_:propertiesOnce:)"
+    },
+    {
+      "kind": "swift.struct",
+      "name": "EluFeatureFlagResult"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluFeatureFlagResult.enabled"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluFeatureFlagResult.key"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluFeatureFlagResult.payload"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluFeatureFlagResult.variant"
+    },
+    {
+      "kind": "swift.struct",
+      "name": "EluPerformanceOptions"
+    },
+    {
+      "kind": "swift.func.op",
+      "name": "EluPerformanceOptions.!=(_:_:)"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluPerformanceOptions.enabled"
+    },
+    {
+      "kind": "swift.init",
+      "name": "EluPerformanceOptions.init(enabled:memory:mainThreadStalls:sampleIntervalMilliseconds:mainThreadStallThresholdMilliseconds:)"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluPerformanceOptions.mainThreadStallThresholdMilliseconds"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluPerformanceOptions.mainThreadStalls"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluPerformanceOptions.memory"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluPerformanceOptions.sampleIntervalMilliseconds"
+    },
+    {
+      "kind": "swift.init",
+      "name": "EluSetupOptions.init(configHost:performance:)"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluSetupOptions.performance"
+    }
+  ]
+}

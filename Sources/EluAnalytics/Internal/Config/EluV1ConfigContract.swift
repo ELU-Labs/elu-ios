@@ -61,6 +61,7 @@ struct EluV1ConfigDocument: Decodable, Sendable {
     let session: EluV1SessionPolicy?
     let limits: EluV1Limits?
     let reason: String?
+    let capturePerformance: EluCapturePerformancePolicy?
 
     private enum CodingKeys: String, CodingKey, CaseIterable {
         case schemaVersion
@@ -76,6 +77,7 @@ struct EluV1ConfigDocument: Decodable, Sendable {
         case session
         case limits
         case reason
+        case capturePerformance
     }
 
     init(from decoder: Decoder) throws {
@@ -114,6 +116,10 @@ struct EluV1ConfigDocument: Decodable, Sendable {
         session = try container.eluDecodeIfPresent(EluV1SessionPolicy.self, forKey: .session)
         limits = try container.eluDecodeIfPresent(EluV1Limits.self, forKey: .limits)
         reason = try container.eluDecodeIfPresent(String.self, forKey: .reason)
+        capturePerformance = try container.eluDecodeIfPresent(EluCapturePerformancePolicy.self, forKey: .capturePerformance)
+        guard capturePerformance == nil || (schemaVersion == Self.v2SchemaVersion && status == .enabled) else {
+            throw EluV1ConfigResolutionError.malformedConfig
+        }
         if let reason, !EluV1Validation.validString(reason, minimum: 0, maximum: 256) {
             throw EluV1ConfigResolutionError.malformedConfig
         }
@@ -1393,5 +1399,28 @@ enum EluV1Validation {
 
     private static func integer(_ bytes: [UInt8], _ range: Range<Int>) -> Int {
         range.reduce(0) { $0 * 10 + Int(bytes[$1] - 48) }
+    }
+}
+
+/// Optional current control-plane sampling policy. Native metrics use their own
+/// names; the browser long-task switch enables native responsiveness sampling.
+struct EluCapturePerformancePolicy: Decodable, Equatable, Sendable {
+    let memory: Bool
+    let mainThreadStalls: Bool
+    let sampleIntervalMilliseconds: Int
+    private enum CodingKeys: String, CodingKey, CaseIterable {
+        case memory
+        case mainThreadStalls = "long_tasks"
+        case sampleIntervalMilliseconds = "sample_interval_ms"
+    }
+    init(from decoder: Decoder) throws {
+        try EluClosedRecord.requireOnly(CodingKeys.self, from: decoder)
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        memory = try container.decode(Bool.self, forKey: .memory)
+        mainThreadStalls = try container.decode(Bool.self, forKey: .mainThreadStalls)
+        sampleIntervalMilliseconds = try container.decode(Int.self, forKey: .sampleIntervalMilliseconds)
+        guard (5_000 ... 2_147_483_647).contains(sampleIntervalMilliseconds) else {
+            throw EluV1ConfigResolutionError.malformedConfig
+        }
     }
 }

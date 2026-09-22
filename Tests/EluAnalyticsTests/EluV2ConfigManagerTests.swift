@@ -6,6 +6,26 @@ final class EluV2ConfigManagerTests: XCTestCase {
     private let v1Now = Date(timeIntervalSince1970: 1_785_801_660) // 2026-08-04T00:01:00Z
     private let v2Now = Date(timeIntervalSince1970: 1_785_888_090) // 2026-08-05T00:01:30Z
 
+    func testOptionalCurrentPerformancePolicyIsStrictAndBackwardCompatible() throws {
+        let bytes = try v2Config { $0["capturePerformance"] = ["memory": true, "long_tasks": false, "sample_interval_ms": 5_000] }
+        let document = try JSONDecoder().decode(EluV1ConfigDocument.self, from: bytes)
+        XCTAssertTrue(try XCTUnwrap(document.capturePerformance).memory)
+        XCTAssertFalse(try XCTUnwrap(document.capturePerformance).mainThreadStalls)
+        XCTAssertEqual(document.capturePerformance?.sampleIntervalMilliseconds, 5_000)
+        XCTAssertNil(try JSONDecoder().decode(EluV1ConfigDocument.self, from: v2Fixture("config-enabled.json")).capturePerformance)
+        for malformed: [String: Any] in [
+            ["memory": true, "long_tasks": false, "sample_interval_ms": 4_999],
+            ["memory": true, "long_tasks": false, "sample_interval_ms": 2_147_483_648],
+            ["memory": true, "long_tasks": false, "sample_interval_ms": 5_000, "extra": true],
+            ["memory": true, "sample_interval_ms": 5_000],
+        ] {
+            let data = try v2Config { $0["capturePerformance"] = malformed }
+            XCTAssertThrowsError(try JSONDecoder().decode(EluV1ConfigDocument.self, from: data))
+        }
+        let legacy = try v1Config { $0["capturePerformance"] = ["memory": true, "long_tasks": false, "sample_interval_ms": 5_000] }
+        XCTAssertThrowsError(try JSONDecoder().decode(EluV1ConfigDocument.self, from: legacy))
+    }
+
     func testFrozenV2DocumentInstallsWithV2ReplayRoleExactPairsAndProtocolGeneration() throws {
         let manager = self.manager(readbackProven: [browserPair])
         XCTAssertEqual(

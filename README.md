@@ -4,16 +4,17 @@ ELU product intelligence for native iOS apps. One site key, no other
 configuration — behavior (privacy controls, kill switches, session replay)
 is managed from your ELU dashboard and delivered as remote config.
 
-ELU Analytics 0.1.0 exposes an ELU-owned API and currently uses PostHog's
-native runtime for managed capture and ingest. You do not need a PostHog
-account or key; application code should call only `Elu.*`.
-This provider-backed disclosure and dependency are temporary; both must be
-absent from a standalone ELU runtime release.
+This package uses the ELU-owned analytics runtime and has no external Swift
+package dependencies. Customer installation and support apply to the exact
+version and artifacts listed in a reviewed [GitHub release](https://github.com/ELU-Labs/elu-ios/releases)
+after its required release checks have passed. A source checkout alone does not
+establish release qualification. Application code uses `Elu.*` with an ELU site key.
 
 - Swift Package, iOS 13+
-- Session replay, screen tracking, lifecycle events out of the box
-- All privacy controls act on-device at capture time: masked or blocked
-  content never leaves the phone
+- Events, identity, feature flags, screen tracking, and lifecycle events
+- Remote configuration controls whether analytics may run
+- Bounded UIKit replay, gated by current server qualification, configuration,
+  and on-device privacy, with package and service qualification required for release
 
 ## Install (Swift Package Manager)
 
@@ -22,11 +23,13 @@ add to your `Package.swift`:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/ELU-Labs/elu-ios.git", exact: "0.1.0"),
+    .package(url: "https://github.com/ELU-Labs/elu-ios.git", exact: "0.2.0"),
 ]
 ```
 
-Then add `EluAnalytics` to your target's dependencies.
+Then add `EluAnalytics` to your target's dependencies. Install version 0.2.0 only
+when its reviewed release and matching tag are available at the link above.
+Use unpublished source as a local Swift package for development.
 
 ## Setup
 
@@ -61,13 +64,13 @@ struct MyApp: App {
 }
 ```
 
-That's it. Events are captured with `Elu.capture(...)`; everything else
-(replay, screen views, lifecycle events) is automatic per your dashboard
-settings.
+Use `Elu.capture(...)` for custom events. Screen and lifecycle tracking follow
+the behavior below.
 
-On the very first launch of a fresh install the SDK fetches its config
-before initializing — calls made in that window are buffered in memory and
-sent once config arrives (session replay starts from the next launch).
+The SDK fetches an eligible configuration before sending analytics. Calls made
+while setup or configuration is pending are subject to the SDK's bounded
+buffering and privacy rules. A missing, disabled, expired, or ineligible
+configuration does not grant permission to send.
 
 ## Identity: you own it
 
@@ -86,11 +89,18 @@ Do not identify with emails or other PII as the id; use your stable internal
 user id. Before `identify`, activity is tracked anonymously and linked on the
 first identify.
 
+The owned runtime uses separate storage. The unused 0.1.0 release is not a
+supported persisted-data import source: version 0.2.0 starts a fresh owned
+installation and leaves its old files untouched. Unpublished preview databases
+with import receipts are refused without deleting their database, WAL, or SHM
+files. Existing supported owned-store schemas retain identity, consent, queued
+records, and their ordinary schema upgrades. See [storage compatibility](docs/storage-compatibility.md).
+
 ## Screen tracking and SwiftUI
 
-UIKit view controllers are tracked automatically (`$screen` on
-`viewDidAppear`). **SwiftUI navigation does not go through view controllers**,
-so call `Elu.screen(...)` manually when a logical screen appears:
+The owned runtime records application lifecycle events automatically. Call
+`Elu.screen(...)` when a logical screen appears in both UIKit and SwiftUI;
+the SDK does not intercept view controller methods. For SwiftUI:
 
 ```swift
 struct CheckoutView: View {
@@ -111,6 +121,8 @@ Elu.setup(siteKey:)                      Elu.capture(_:properties:)
 Elu.identify(_:userProperties:)          Elu.screen(_:properties:)
 Elu.reset()                              Elu.captureException(_:properties:)
 Elu.alias(_:)                            Elu.register(_:) / Elu.unregister(_:)
+Elu.registerOnce(_:defaultValue:)        Elu.getFeatureFlagResult(_:)
+Elu.optOut() / Elu.optIn()               Elu.isOptedOut()
 Elu.distinctId()                         Elu.group(_:key:properties:)
 Elu.setPersonProperties(_:)              Elu.flush()
 
@@ -118,10 +130,40 @@ Elu.getFeatureFlag(_:)                   Elu.isFeatureEnabled(_:)
 Elu.getFeatureFlagPayload(_:)            Elu.reloadFeatureFlags(_:)
 Elu.onFeatureFlagsLoaded(_:)             Elu.setPersonPropertiesForFlags(_:)
 Elu.setGroupPropertiesForFlags(_:properties:)
+Elu.getGroups() / Elu.resetGroups()
+Elu.resetPersonPropertiesForFlags()      Elu.resetGroupPropertiesForFlags(_:)
 ```
 
-Every method is safe to call at any time — before setup, while config is
-loading, or when analytics is disabled — it never throws and never blocks.
+`registerOnce` preserves existing properties unless they equal the supplied
+default (the default sentinel is `"None"`). `getFeatureFlagResult` returns one
+current snapshot with `key`, `enabled`, `variant`, and JSON-compatible `payload`;
+nil means the flag is missing or unavailable.
+
+The `identify(_:userProperties:userPropertiesOnce:)` and
+`setPersonProperties(_:propertiesOnce:)` overloads can set first-write person
+properties. The `ForFlags` setters and resets change only this device's flag
+evaluation context; they do not send person or group property updates. Pass a
+group type to reset that group's flag context, or omit it to reset all group
+flag context. `resetGroups()` clears group associations and their flag context.
+`getGroups()` returns the settled associations, or an empty dictionary while a
+context change is pending or collection is opted out.
+
+Call `Elu.optOut()` to persist consent withdrawal. Reset/logout preserves that
+choice. Call `Elu.optIn()` to restore collection subject to current remote
+policy; `Elu.optIn(captureEventName: nil)` suppresses the default `$opt_in` event.
+The latest valid choice made before setup is retained in memory, then saved
+before configuration or lifecycle work can authorize collection. It becomes
+durable when the runtime opens; a process ending before setup cannot persist it.
+The opt-in event is one normal capture attempt and is discarded if configuration
+is not eligible then; it is not backfilled later. Event calls made while opted
+out are discarded, and queued replay is removed.
+
+`flush()` requests a delivery attempt; it does not wait for acknowledgment or
+guarantee a send before termination. Unacknowledged durable events remain for a
+later eligible launch.
+
+The facade accepts calls before setup, while config is loading, and when
+analytics is disabled without throwing errors into application code.
 When analytics is disabled or a device is EU-blocked, `Elu.*` event calls are
 no-ops and no analytics events or replay leave the device. ELU config checks
 continue so a re-enabled site can recover.
@@ -129,27 +171,28 @@ continue so a re-enabled site can recover.
 ## Remote-controlled vs baked-in
 
 Controlled from the ELU dashboard without an app update. Changes apply after
-the next successful eligible config refresh; a fetch failure keeps the last
-known safe config until the device can refresh again:
+the SDK accepts the refreshed configuration. A previously accepted
+configuration can authorize work only within its validity window:
 
 - Analytics on/off (kill switch)
 - EU visitor blocking (`blockEu` — on by default, timezone heuristic,
   fail-closed: blocked devices send no analytics events or replay)
-- Replay text/input masking, image masking
-- Replay for new users only; per-session replay minute budget
-- Replay sampling and minimum duration (project settings)
+- Feature flag evaluation
+
+Replay privacy, sampling, and per-session limits are implemented in the owned
+runtime. The binary supports `elu-native-wireframe-v1` with gzip and
+`protocol-generation-v1`; current server qualification must advertise that exact
+support before configuration can authorize capture. Local consent, region,
+identity, lifecycle, masking, and budget gates also apply. Source support does
+not establish package, engine readback, or customer-player qualification.
 
 Baked into the binary (changes require an SDK update):
 
-- Screen tracking and application lifecycle events: on
-- Session replay screenshot mode: on (required by ELU's analysis pipeline)
+- Application lifecycle events: on; screen names: explicit `Elu.screen` calls
+- Native replay formats and the supported UIKit view coverage described below
 - Element-interaction autocapture, surveys, push auto-capture: off
 - The facade surface itself (`elu_facade_version` super property tells ELU
   what each installed binary can do)
-
-Tightening a privacy setting takes effect immediately for live sessions
-(replay stops rather than continue with looser masking); loosening applies
-from the next app launch.
 
 ## Dev/staging
 
@@ -159,3 +202,69 @@ Elu.setup(siteKey: "YOUR_SITE_KEY",
 ```
 
 Production apps should always use the default host.
+
+## UIKit replay coverage
+
+The SDK supports bounded UIKit wireframes. When policy allows
+ordinary text, supported fully visible, single-line `UILabel` and `UIButton`
+text remains readable when it fits without wrapping or truncation. Transparent text, attachments, links, unsupported attributed content,
+and custom subclasses remain masked or opaque. All input values, including `UITextField` and `UITextView`, remain hidden. Images, web
+views, custom drawing, and SwiftUI content are represented by content-free
+placeholders. SwiftUI replay is not supported.
+
+Apply additional restrictions on the main thread before content is presented:
+
+```swift
+Elu.maskView(profileContainer) // Masks text throughout the subtree.
+Elu.blockView(paymentContainer) // Excludes content and descendants.
+```
+
+Restrictions last for the view's lifetime and cannot weaken remote policy.
+Unknown native blocking rules disable replay. Replay remains subject to engine,
+player, privacy, and device qualification before release.
+
+`captureException` records errors explicitly supplied by your app, including
+bounded cause chains. Automatic fatal-crash capture is not currently supplied.
+Browser DOM, Web Vitals, and browser long-task APIs do not apply to native apps.
+
+## Native performance
+
+Native performance sampling is disabled by default. To opt in:
+
+```swift
+let performance = EluPerformanceOptions(enabled: true,
+    sampleIntervalMilliseconds: 30_000,
+    mainThreadStallThresholdMilliseconds: 250)
+Elu.setup(siteKey: "YOUR_SITE_KEY", options: EluSetupOptions(performance: performance))
+```
+
+Server policy must also enable these measurements. While the app is foregrounded,
+`$performance_sample` contains process physical memory footprint and completed
+main-thread response stalls above the configured threshold. These are native
+measurements, not JavaScript heap size or browser long tasks. A stall is counted
+after the main thread recovers; no stack traces, messages, URLs, or view content
+are collected. Unavailable memory readings are omitted.
+
+Consent, identity, configuration, and lifecycle changes discard pending samples.
+Intervals must be 5,000–2,147,483,647 milliseconds; the effective interval is the
+slower of local and server settings. Stall thresholds must be 100–60,000
+milliseconds. Invalid options disable sampling. This does not measure full app
+launch time or automatically report fatal crashes.
+
+## SDK development
+
+[SDK development status](docs/sdk-development-status.md) tracks validation gaps and related work.
+
+## App privacy manifest
+
+The package includes `PrivacyInfo.xcprivacy`. It declares the SDK's linked
+analytics, manual exception, native performance/diagnostic data, and ordinary
+replay text, with tracking disabled. Performance remains disabled by default;
+replay still requires eligible privacy authority, and masked inputs and blocked
+content are excluded. Elapsed-time clocks are used for in-app timers and duration
+measurements; raw system boot time is not sent. Review your app's complete data
+practices when preparing its App Store privacy disclosures.
+
+The categories and elapsed-time reason follow Apple's
+[data-type definitions](https://developer.apple.com/documentation/bundleresources/app-privacy-configuration/nsprivacycollecteddatatypes/nsprivacycollecteddatatype)
+and [required API reasons](https://developer.apple.com/documentation/bundleresources/app-privacy-configuration/nsprivacyaccessedapitypes/nsprivacyaccessedapitypereasons).

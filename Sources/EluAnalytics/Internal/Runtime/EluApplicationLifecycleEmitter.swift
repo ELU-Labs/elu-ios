@@ -122,22 +122,30 @@ final class EluApplicationLifecycleTracker: @unchecked Sendable {
 /// `EluApplicationLifecycleTracker`. A scene-based app posts both families for
 /// the same boundary, so the tracker decides which one counts. The screen name
 /// is the view controller's class name, which needs no lookup and is stable
-/// across launches. Nothing registers this emitter yet.
+/// across launches. The owned facade attaches exactly one emitter per run.
 final class EluApplicationLifecycleEmitter: @unchecked Sendable {
     private let tracker: EluApplicationLifecycleTracker
+    private let nativeLifecycle: EluNativeReplayLifecycle?
     private let notificationCenter: NotificationCenter
+    private let seedCurrentState: Bool
     private let lock = NSLock()
     private var observers: [NSObjectProtocol] = []
+    private var attachment: UUID?
 
     init(
         tracker: EluApplicationLifecycleTracker,
-        notificationCenter: NotificationCenter = .default
+        nativeLifecycle: EluNativeReplayLifecycle? = nil,
+        notificationCenter: NotificationCenter = .default,
+        seedCurrentState: Bool = true
     ) {
         self.tracker = tracker
+        self.nativeLifecycle = nativeLifecycle
         self.notificationCenter = notificationCenter
+        self.seedCurrentState = seedCurrentState
     }
 
     deinit {
+        if let attachment { nativeLifecycle?.detached(attachment) }
         for observer in observers {
             notificationCenter.removeObserver(observer)
         }
@@ -145,32 +153,82 @@ final class EluApplicationLifecycleEmitter: @unchecked Sendable {
 
     func attach() {
         lock.lock()
-        defer { lock.unlock() }
-        guard observers.isEmpty else { return }
+        guard attachment == nil else { lock.unlock(); return }
+        let token = UUID()
+        attachment = token
+        lock.unlock()
+        nativeLifecycle?.attached(token)
+        // UIKit state is sampled only on main, after subscribing. Signals
+        // received while the asynchronous stack opens are retained by its sink.
+        if Thread.isMainThread { install(token) }
+        else { DispatchQueue.main.async { [weak self] in self?.install(token) } }
+    }
+
+    private func install(_ token: UUID) {
+        lock.lock()
+        guard attachment == token else { lock.unlock(); return }
         let tracker = self.tracker
+        let native = nativeLifecycle
         observers = [
-            observe(UIApplication.didBecomeActiveNotification) { _ in
+            observe(UIApplication.didBecomeActiveNotification, token: token) { _ in
+                native?.receive(.didActivate, attachment: token)
                 tracker.applicationActivated()
             },
-            observe(UIApplication.didEnterBackgroundNotification) { _ in
+            observe(UIApplication.didEnterBackgroundNotification, token: token) { _ in
                 tracker.applicationBackgrounded()
             },
-            observe(UIScene.didActivateNotification) { identity in
+            observe(UIScene.didActivateNotification, token: token) { identity in
+                native?.receive(.didActivate, attachment: token)
                 tracker.sceneActivated(identity)
             },
-            observe(UIScene.didEnterBackgroundNotification) { identity in
+            observe(UIScene.didEnterBackgroundNotification, token: token) { identity in
                 tracker.sceneBackgrounded(identity)
+                native?.receive(.sceneDidBackground, attachment: token)
             },
         ]
+        if let native {
+            observers += [
+                observe(UIWindow.didBecomeKeyNotification, token: token) { _ in
+                    native.receive(.rootChanged, attachment: token)
+                },
+                observe(UIWindow.didResignKeyNotification, token: token) { _ in
+                    native.receive(.rootChanged, attachment: token)
+                },
+                observe(NSNotification.Name.NSSystemTimeZoneDidChange, token: token) { _ in
+                    native.receive(.timeZoneChanged, attachment: token)
+                },
+                observe(UIApplication.willResignActiveNotification, token: token) { _ in
+                    native.receive(.applicationWillResign, attachment: token)
+                },
+                observe(UIScene.willDeactivateNotification, token: token) { identity in
+                    native.receive(.sceneWillDeactivate(identity), attachment: token)
+                },
+            ]
+        }
+        lock.unlock()
+        guard seedCurrentState, isAttached(token) else { return }
+        let activeScenes = UIApplication.shared.connectedScenes.filter { $0.activationState == .foregroundActive }
+        if !activeScenes.isEmpty {
+            for scene in activeScenes where isAttached(token) { tracker.sceneActivated(EluSceneIdentity(scene)) }
+        } else if UIApplication.shared.applicationState == .active, isAttached(token) {
+            tracker.applicationActivated()
+        }
     }
 
     func detach() {
         lock.lock()
-        defer { lock.unlock() }
-        for observer in observers {
-            notificationCenter.removeObserver(observer)
-        }
+        let original = attachment
+        attachment = nil
+        let current = observers
         observers = []
+        lock.unlock()
+        if let original { nativeLifecycle?.detached(original) }
+        for observer in current { notificationCenter.removeObserver(observer) }
+    }
+
+    private func isAttached(_ token: UUID) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return attachment == token
     }
 
     func viewControllerAppeared(_ viewController: UIViewController) {
@@ -187,9 +245,11 @@ final class EluApplicationLifecycleEmitter: @unchecked Sendable {
     /// second scene becoming active; application notifications carry no scene.
     private func observe(
         _ name: Notification.Name,
+        token: UUID,
         _ handler: @escaping @Sendable (EluSceneIdentity) -> Void
     ) -> NSObjectProtocol {
-        notificationCenter.addObserver(forName: name, object: nil, queue: nil) { notification in
+        notificationCenter.addObserver(forName: name, object: nil, queue: nil) { [weak self] notification in
+            guard self?.isAttached(token) == true else { return }
             handler(EluSceneIdentity(notification.object as? UIScene))
         }
     }

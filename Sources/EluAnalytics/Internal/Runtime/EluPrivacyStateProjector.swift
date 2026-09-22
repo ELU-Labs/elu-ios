@@ -101,6 +101,33 @@ struct EluProjectedPrivacyState: Equatable, Sendable {
     let replayBudgetRemainingSeconds: Int
 }
 
+/// Current local policy facts for sealed bytes, not a wire privacy state or fresh
+/// capture projection. Its original configuration witness prevents cross-document use.
+struct EluProjectedSealedReplayPolicy: Sendable {
+    let configWitness: EluV1ConfigManager.ValidatedCandidateIdentity
+    let policyRevision: String
+    let contextRevision: Int64
+    let identityOptedOut: Bool
+    let timeZoneIdentifier: String?
+    let onDeviceDecision: EluProjectedOnDeviceDecision
+    let profile: EluNativeMaskingProfile
+    let profileCompatibility: EluNativeMaskingCompatibility
+
+    fileprivate init(context: EluV1PrivacyProjectionContext,
+        configWitness: EluV1ConfigManager.ValidatedCandidateIdentity,
+        identity: EluIdentitySnapshot, timeZoneIdentifier: String?) {
+        self.configWitness = configWitness
+        policyRevision = context.policy.revision
+        contextRevision = identity.identity.contextRevision
+        identityOptedOut = identity.identity.optedOut
+        self.timeZoneIdentifier = timeZoneIdentifier
+        onDeviceDecision = EluPrivacyStateProjector.onDeviceDecision(regionPolicy: context.policy.regionPolicy,
+            timeZoneIdentifier: timeZoneIdentifier, identityOptedOut: identity.identity.optedOut)
+        profile = .blanketMask()
+        profileCompatibility = profile.compatibility(with: context.policy.masking, platform: .ios)
+    }
+}
+
 enum EluPrivacyStateProjectionError: Error, Equatable, Sendable {
     case invalidClock
     case invalidContextRevision
@@ -112,12 +139,54 @@ enum EluPrivacyStateProjectionError: Error, Equatable, Sendable {
 /// the only input the capture authority accepts for privacy, so every claim
 /// here is derived the same way the config manager re-derives it.
 enum EluPrivacyStateProjector {
+    /// The fixed profile describes the retained bytes, not a currently running
+    /// collector. No draw, session, clock budget or fresh authorization is produced.
+    static func projectSealedPolicy(context: EluV1PrivacyProjectionContext,
+        configWitness: EluV1ConfigManager.ValidatedCandidateIdentity,
+        identity: EluIdentitySnapshot, timeZoneIdentifier: String?
+    ) throws -> EluProjectedSealedReplayPolicy {
+        guard identity.identity.contextRevision >= 0 else { throw EluPrivacyStateProjectionError.invalidContextRevision }
+        return EluProjectedSealedReplayPolicy(context: context, configWitness: configWitness,
+            identity: identity, timeZoneIdentifier: timeZoneIdentifier)
+    }
+
     static let regionalPolicyReason = "regional-policy"
     static let identityOptedOutReason = "identity-opted-out"
 
     static func project(
         context: EluV1PrivacyProjectionContext,
         input: EluPrivacyProjectionInput
+    ) throws -> EluProjectedPrivacyState {
+        try project(context: context, input: input, originalNativeSample: nil)
+    }
+
+    /// Native facts come from the original SQLite observation. Profile metadata
+    /// and remote advertisement alone cannot produce a locally proven pair.
+    static func projectNative(
+        observation: EluNativeReplayProjectionInput,
+        profile: EluNativeMaskingProfile,
+        capabilities: EluNativeReplayCapabilities,
+        evaluatedAt: Date,
+        timeZoneIdentifier: String?
+    ) throws -> EluProjectedPrivacyState {
+        guard observation.isCurrent(), let originalDraw = observation.originalSampleDraw else { throw EluNativeReplayAuthorityError.stale }
+        guard profile.compatibility(with: observation.context.policy.masking, platform: .ios) == .compatible
+        else { throw EluNativeReplayAuthorityError.incompatibleProfile }
+        let sampled = observation.accounting.selected(currentRate: observation.context.policy.replay.sampleRate)
+        let result = try project(context: observation.context,
+            input: EluPrivacyProjectionInput(contextRevision: observation.identity.identity.contextRevision,
+                identityOptedOut: observation.identity.identity.optedOut, timeZoneIdentifier: timeZoneIdentifier,
+                evaluatedAt: evaluatedAt, appliedMasking: .init(text: profile.textMasking, inputs: .all, images: .block),
+                replaySampleDraw: originalDraw, replaySessionEligible: observation.sessionEligible,
+                replayBudgetRemainingSeconds: observation.accounting.remainingWholeSeconds,
+                localReplayTransports: capabilities.pairs), originalNativeSample: sampled)
+        guard observation.isCurrent() else { throw EluNativeReplayAuthorityError.stale }
+        return result
+    }
+
+    private static func project(
+        context: EluV1PrivacyProjectionContext, input: EluPrivacyProjectionInput,
+        originalNativeSample: Bool?
     ) throws -> EluProjectedPrivacyState {
         guard input.evaluatedAt.timeIntervalSinceReferenceDate.isFinite else {
             throw EluPrivacyStateProjectionError.invalidClock
@@ -145,7 +214,7 @@ enum EluPrivacyStateProjector {
         }
         let platformFallbackApplied = !allIOSRulesRecognized
 
-        let replaySampled = try isSampled(
+        let replaySampled = try originalNativeSample ?? isSampled(
             draw: input.replaySampleDraw,
             sampleRate: policy.replay.sampleRate
         )

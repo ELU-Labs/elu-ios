@@ -28,11 +28,11 @@ jobs:
           python3 Conformance/validate-v1-queue.py
           python3 Conformance/validate-v1-flags.py
           python3 Conformance/validate-v2-replay.py
-      - name: Validate upgrade evidence definitions
+      - name: Validate immutable historical evidence definitions
         run: python3 scripts/validate-upgrade-evidence.py
-      - name: Enforce source scan baseline
+      - name: Enforce strict source scan
         run: |
-          python3 scripts/zero-brand-scan.py --mode baseline
+          python3 scripts/zero-brand-scan.py --mode strict
           python3 scripts/verify-feature-flag-boundary.py
       - name: Test strict scanners, evidence, and release trust
         run: python3 -m unittest discover -s scripts/tests -p 'test_*.py' -v
@@ -47,12 +47,12 @@ jobs:
           fetch-depth: 0
       - name: Toolchain
         run: xcodebuild -version
-      - name: Resolve and verify exact dependency
+      - name: Verify owned dependency-free package
         run: |
           swift package resolve
           swift package dump-package > "$PWD/.build/package-metadata.json"
-          python3 scripts/verify-package-surface.py "$PWD/.build/package-metadata.json"
-          python3 scripts/verify-dependencies.py --mode baseline
+          python3 scripts/verify-package-surface.py --mode strict "$PWD/.build/package-metadata.json"
+          python3 scripts/verify-dependencies.py --mode strict
       - name: Prepare iOS simulator
         run: |
           simulator_udid="$(xcrun simctl create 'ELU SDK Tests' 'iPhone 16 Pro')"
@@ -95,19 +95,17 @@ jobs:
       - name: Generate source archive and release evidence
         run: |
           mkdir -p "$PWD/.build/artifacts"
-          git archive \
-            --format=zip \
-            --prefix=elu-ios-source/ \
-            --output="$PWD/.build/artifacts/elu-ios-source.zip" \
-            HEAD
+          python3 scripts/create-source-archive.py \
+            --ref HEAD \
+            --output "$PWD/.build/artifacts/elu-ios-source.zip"
           python3 scripts/generate-release-evidence.py \
             --output "$PWD/.build/release-evidence" \
             --artifact "$PWD/.build/artifacts/elu-ios-source.zip" \
             --artifact "$PWD/.build/interface-derived-data/Build/Products"
           (cd "$PWD/.build/release-evidence" && shasum -a 256 -c SHA256SUMS)
-      - name: Report artifact scan findings
+      - name: Enforce strict artifact scan
         run: |
-          python3 scripts/zero-brand-scan.py --mode report \
+          python3 scripts/zero-brand-scan.py --mode strict \
             --input "$PWD/.build/artifacts/elu-ios-source.zip" \
             --input "$PWD/.build/interface-derived-data/Build/Products" \
             --input "$PWD/.build/symbol-graphs" \
@@ -117,34 +115,30 @@ jobs:
         run: xcrun simctl delete "$ELU_SIMULATOR_UDID"
 
   upgrade-evidence:
-    name: 0.1.0 simulator upgrade evidence
+    name: Clean install and owned-store upgrades
     needs: validation
     runs-on: macos-15
-    timeout-minutes: 60
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - name: Validate checked evidence definitions
-        run: python3 scripts/validate-upgrade-evidence.py
-      - name: Run same-container simulator upgrade
-        continue-on-error: true
+      - name: Prepare iOS simulator
         run: |
-          python3 scripts/run-upgrade-evidence.py \
-            --output "$RUNNER_TEMP/elu-ios-upgrade-evidence" \
-            --custody runner-transient
-      - name: Validate generated evidence shape
-        if: always()
+          simulator_udid="$(xcrun simctl create 'ELU Storage Compatibility' 'iPhone 16 Pro')"
+          xcrun simctl boot "$simulator_udid"
+          xcrun simctl bootstatus "$simulator_udid" -b
+          echo "ELU_SIMULATOR_UDID=$simulator_udid" >> "$GITHUB_ENV"
+      - name: Verify owned persistence and unsupported-store refusal
         run: |
-          python3 scripts/validate-upgrade-evidence.py \
-            --manifest "$RUNNER_TEMP/elu-ios-upgrade-evidence/manifest.json"
-      - name: Require verified upgrade evidence
-        if: always()
-        run: |
-          python3 scripts/validate-upgrade-evidence.py \
-            --manifest "$RUNNER_TEMP/elu-ios-upgrade-evidence/manifest.json" \
-            --raw-archive "$RUNNER_TEMP/elu-ios-upgrade-evidence/raw-evidence.tar.gz" \
-            --require-verified
-      - name: Discard raw simulator capture
-        if: always()
-        run: rm -f "$RUNNER_TEMP/elu-ios-upgrade-evidence/raw-evidence.tar.gz"
+          xcodebuild test \
+            -scheme EluAnalytics \
+            -destination "id=$ELU_SIMULATOR_UDID" \
+            -derivedDataPath "$RUNNER_TEMP/elu-storage-derived-data" \
+            -resultBundlePath "$RUNNER_TEMP/elu-storage.xcresult" \
+            -parallel-testing-enabled NO \
+            -only-testing:EluAnalyticsTests/EluSQLiteRuntimeQueueTests \
+            -only-testing:EluAnalyticsTests/EluV1CaptureRuntimeTests \
+            -only-testing:EluAnalyticsTests/EluV2ReplayStorageTests \
+            CODE_SIGNING_ALLOWED=NO
+      - name: Delete iOS simulator
+        if: always() && env.ELU_SIMULATOR_UDID != ''
+        run: xcrun simctl delete "$ELU_SIMULATOR_UDID"
