@@ -18,6 +18,17 @@ final class EluNativePerformanceTests: XCTestCase {
         XCTAssertEqual(selected.intervalMilliseconds, 60_000)
         XCTAssertNil(EluNativePerformanceSettings.resolve(.init(enabled: true, memory: false), remote: policy))
     }
+    func testFrameCadenceIsExplicitAndRequiresRemoteResponsivenessGrant() throws {
+        var local = EluPerformanceOptions(enabled: true, memory: false, mainThreadStalls: false)
+        XCTAssertFalse(local.frameCadence)
+        XCTAssertNil(EluNativePerformanceSettings.resolve(local, remote: try remote()))
+        local.frameCadence = true
+        let settings = try XCTUnwrap(EluNativePerformanceSettings.resolve(local, remote: remote()))
+        XCTAssertTrue(settings.frameCadence); XCTAssertFalse(settings.memory); XCTAssertFalse(settings.mainThreadStalls)
+        XCTAssertNil(EluNativePerformanceSettings.resolve(local, remote: try remote(stalls: false)))
+        local.enabled = false
+        XCTAssertNil(EluNativePerformanceSettings.resolve(local, remote: try remote()))
+    }
     func testOneOutstandingProbeCompletedThresholdAndWindowReset() throws {
         let settings = try XCTUnwrap(EluNativePerformanceSettings.resolve(
             .init(enabled: true, sampleIntervalMilliseconds: 5_000), remote: remote()))
@@ -101,6 +112,33 @@ final class EluNativePerformanceTests: XCTestCase {
         try await Task.sleep(nanoseconds: 150_000_000)
         XCTAssertTrue(received.values().isEmpty)
     }
+    #if !canImport(UIKit)
+    func testUnavailableDisplayLinkDoesNotInventZeroOrSuppressValidMemory() async throws {
+        let clock = PerformanceTestClock(), received = PerformanceTestSamples()
+        let monitor = EluNativePerformanceMonitor(now: { clock.read() }, footprint: { 123 })
+        defer { monitor.invalidate() }
+        monitor.setForeground(true)
+        var local = EluPerformanceOptions(enabled: true, memory: false, mainThreadStalls: false, sampleIntervalMilliseconds: 5_000)
+        local.frameCadence = true
+        var settings = try XCTUnwrap(EluNativePerformanceSettings.resolve(local, remote: remote()))
+        monitor.start(settings: settings, authority: { true }) { received.append($0, $1) }
+        clock.advance(5_000_000_000)
+        try await Task.sleep(nanoseconds: 150_000_000)
+        XCTAssertTrue(received.values().isEmpty)
+        local.memory = true
+        settings = try XCTUnwrap(EluNativePerformanceSettings.resolve(local, remote: remote()))
+        monitor.start(settings: settings, authority: { true }) { received.append($0, $1) }
+        clock.advance(5_000_000_000)
+        for _ in 0 ..< 20 {
+            if !received.values().isEmpty { break }
+            try await Task.sleep(nanoseconds: 25_000_000)
+        }
+        let sample = try XCTUnwrap(received.values().first?.1)
+        XCTAssertEqual(sample["$memory_process_footprint_bytes"], .integer(123))
+        XCTAssertNil(sample["$display_link_callback_count"])
+        XCTAssertNil(sample["$display_link_interval_mean_ms"])
+    }
+    #endif
 }
 
 private final class PerformanceTestClock: @unchecked Sendable {

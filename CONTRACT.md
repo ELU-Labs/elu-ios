@@ -139,6 +139,10 @@ measurements. Foreground samples report process physical memory footprint and
 completed main-thread response stalls above the configured threshold. Missing
 memory readings are omitted. Consent, identity, configuration, and lifecycle
 changes discard pending samples. See the README for option ranges and examples.
+The separately enabled `frameCadence` option observes public display-link
+callbacks under the same responsiveness grant. It reports bounded callback
+interval summaries, without inspecting rendered content or changing the app's
+frame rate. It does not claim rendered or dropped frame counts.
 These measurements do not supply browser DOM metrics, Web Vitals, JavaScript
 heap size, browser long tasks, or full application launch time.
 

@@ -6,6 +6,9 @@ public struct EluPerformanceOptions: Sendable, Equatable {
     public var enabled: Bool
     public var memory: Bool
     public var mainThreadStalls: Bool
+    /// Display-link callback cadence, not rendered or dropped frame counts.
+    /// Disabled by default; current server policy must also permit collection.
+    public var frameCadence = false
     public var sampleIntervalMilliseconds: Int
     public var mainThreadStallThresholdMilliseconds: Int
 

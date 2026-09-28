@@ -89,6 +89,10 @@
       "name": "EluPerformanceOptions.enabled"
     },
     {
+      "kind": "swift.property",
+      "name": "EluPerformanceOptions.frameCadence"
+    },
+    {
       "kind": "swift.init",
       "name": "EluPerformanceOptions.init(enabled:memory:mainThreadStalls:sampleIntervalMilliseconds:mainThreadStallThresholdMilliseconds:)"
     },

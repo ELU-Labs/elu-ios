@@ -4,6 +4,7 @@ import Darwin
 struct EluNativePerformanceSettings: Equatable, Sendable {
     let memory: Bool
     let mainThreadStalls: Bool
+    let frameCadence: Bool
     let intervalMilliseconds: Int
     let thresholdMilliseconds: Int
 
@@ -13,8 +14,9 @@ struct EluNativePerformanceSettings: Equatable, Sendable {
               (100 ... 60_000).contains(local.mainThreadStallThresholdMilliseconds) else { return nil }
         let memory = local.memory && remote.memory
         let stalls = local.mainThreadStalls && remote.mainThreadStalls
-        guard memory || stalls else { return nil }
-        return Self(memory: memory, mainThreadStalls: stalls,
+        let frames = local.frameCadence && remote.mainThreadStalls
+        guard memory || stalls || frames else { return nil }
+        return Self(memory: memory, mainThreadStalls: stalls, frameCadence: frames,
             intervalMilliseconds: max(local.sampleIntervalMilliseconds, remote.sampleIntervalMilliseconds),
             thresholdMilliseconds: local.mainThreadStallThresholdMilliseconds)
     }
@@ -80,6 +82,7 @@ final class EluNativePerformanceMonitor: @unchecked Sendable {
     private var pendingMainProbe = false
     private var mutations: Set<UUID> = []
     private var foreground = false
+    private let frameCadence = EluNativeFrameCadenceMonitor()
     private let now: @Sendable () -> UInt64
     private let footprint: @Sendable () -> UInt64?
     init(now: @escaping @Sendable () -> UInt64 = { DispatchTime.now().uptimeNanoseconds },
@@ -88,8 +91,9 @@ final class EluNativePerformanceMonitor: @unchecked Sendable {
     }
     deinit { invalidate() }
     func invalidate() {
-        lock.lock(); run = nil; let old = timer; timer = nil; lock.unlock()
+        lock.lock(); let oldID = run?.id; run = nil; let old = timer; timer = nil; lock.unlock()
         old?.cancel()
+        if let oldID { frameCadence.stop(id: oldID) }
     }
     func setForeground(_ value: Bool) {
         lock.lock(); foreground = value; lock.unlock()
@@ -97,7 +101,8 @@ final class EluNativePerformanceMonitor: @unchecked Sendable {
     }
     func beginMutation() -> UUID {
         lock.lock(); let id = UUID(); mutations.insert(id)
-        run = nil; let old = timer; timer = nil; lock.unlock(); old?.cancel()
+        let oldID = run?.id; run = nil; let old = timer; timer = nil; lock.unlock(); old?.cancel()
+        if let oldID { frameCadence.stop(id: oldID) }
         return id
     }
     func finishMutation(_ id: UUID) {
@@ -120,6 +125,9 @@ final class EluNativePerformanceMonitor: @unchecked Sendable {
         timer = source
         lock.unlock()
         source.resume()
+        if settings.frameCadence {
+            frameCadence.start(id: id, current: { [weak self] in self?.isCurrent(id) == true })
+        }
     }
     private func tick(_ id: UUID) {
         guard isCurrent(id) else { invalidateIfCurrent(id); return }
@@ -142,7 +150,11 @@ final class EluNativePerformanceMonitor: @unchecked Sendable {
         if value.window.settings.memory, let bytes = footprint(), bytes <= UInt64(Int64.max) {
             fields["$memory_process_footprint_bytes"] = .integer(Int64(bytes))
         }
-        guard value.window.settings.mainThreadStalls || fields["$memory_process_footprint_bytes"] != nil else { return }
+        if value.window.settings.frameCadence, let cadence = frameCadence.take(id: id) {
+            fields.merge(cadence, uniquingKeysWith: { _, new in new })
+        }
+        guard value.window.settings.mainThreadStalls || fields["$memory_process_footprint_bytes"] != nil
+            || fields["$display_link_interval_count"] != nil else { return }
         fields["$performance_platform"] = .string("ios")
         fields["$app_foreground"] = .bool(true)
         fields["$performance_sample_interval_ms"] = .integer(Int64(value.window.settings.intervalMilliseconds))
@@ -161,6 +173,7 @@ final class EluNativePerformanceMonitor: @unchecked Sendable {
         lock.lock()
         guard run?.id == id else { lock.unlock(); return }
         run = nil; let old = timer; timer = nil; lock.unlock(); old?.cancel()
+        frameCadence.stop(id: id)
     }
     static func processFootprint() -> UInt64? {
         var information = task_vm_info_data_t()

@@ -273,9 +273,10 @@ setting does not grant this separate, explicitly installed analytics collector.
 Native performance sampling is disabled by default. To opt in:
 
 ```swift
-let performance = EluPerformanceOptions(enabled: true,
+var performance = EluPerformanceOptions(enabled: true,
     sampleIntervalMilliseconds: 30_000,
     mainThreadStallThresholdMilliseconds: 250)
+performance.frameCadence = true // Optional display-link callback intervals.
 Elu.setup(siteKey: "YOUR_SITE_KEY", options: EluSetupOptions(performance: performance))
 ```
 
@@ -285,6 +286,13 @@ main-thread response stalls above the configured threshold. These are native
 measurements, not JavaScript heap size or browser long tasks. A stall is counted
 after the main thread recovers; no stack traces, messages, URLs, or view content
 are collected. Unavailable memory readings are omitted.
+
+With `frameCadence` enabled and server responsiveness policy permitting it,
+foreground samples also include display-link callback count, interval count,
+mean and maximum interval, and the count of intervals of at least 50 milliseconds.
+These `$display_link_*` fields measure callback cadence; they are not rendered
+frame counts, dropped frames, or Web Vitals. The observer does not change the
+app's preferred frame rate. Missing, invalid or oversized windows are omitted.
 
 Consent, identity, configuration, and lifecycle changes discard pending samples.
 Intervals must be 5,000–2,147,483,647 milliseconds; the effective interval is the
