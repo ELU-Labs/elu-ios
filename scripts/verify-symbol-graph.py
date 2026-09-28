@@ -42,6 +42,9 @@ def main() -> int:
     args = parse_args()
     try:
         module, expected = expected_symbols()
+        main_snapshot = json.loads((ROOT / "Baselines/current/public-symbols.json").read_text(encoding="utf-8"))
+        if main_snapshot["module"] != module or not {entry["name"] for entry in main_snapshot["symbols"]} <= expected:
+            raise ValueError("additive API ledger drops reviewed main symbols")
     except (OSError, ValueError, KeyError, TypeError) as error:
         print(f"invalid API ledger: {error}", file=sys.stderr)
         return 1

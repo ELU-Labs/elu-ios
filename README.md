@@ -207,7 +207,19 @@ Elu.setup(siteKey: "YOUR_SITE_KEY",
           options: EluSetupOptions(configHost: URL(string: "https://staging.elu.dev")!))
 ```
 
-Production apps should always use the default host.
+ELU Cloud apps use the default host. For a declared self-hosted config origin:
+
+```swift
+let instance = URL(string: "https://analytics.example.com")!
+Elu.setup(siteKey: "YOUR_SITE_KEY",
+          options: EluSetupOptions(configHost: instance, apiHost: instance))
+```
+
+Both origins must match exactly and use HTTPS without an explicit port,
+credentials, path beyond `/`, query, fragment or trailing-dot hostname.
+The instance must serve the owned `/sdk/v2/<siteKey>/config` contract. Declaring
+an origin does not bypass configuration or delivery authorization. The owned
+self-hosted delivery path still requires separate release qualification.
 
 ## UIKit replay coverage
 

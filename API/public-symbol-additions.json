@@ -113,6 +113,14 @@
       "name": "EluPerformanceOptions.sampleIntervalMilliseconds"
     },
     {
+      "kind": "swift.property",
+      "name": "EluSetupOptions.apiHost"
+    },
+    {
+      "kind": "swift.init",
+      "name": "EluSetupOptions.init(configHost:apiHost:)"
+    },
+    {
       "kind": "swift.init",
       "name": "EluSetupOptions.init(configHost:performance:)"
     },

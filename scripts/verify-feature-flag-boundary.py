@@ -12,8 +12,8 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 PINNED = {
-    "Sources/EluAnalytics/Elu.swift": "f7bda90f1e46157d409f64f68d402043a2e72ae843442347f421518616b1510a",
-    "Sources/EluAnalytics/EluState.swift": "b8f249fd99beded52286c36d007cc4eb1b66cadbbead43989d4f5f61536fdf7b",
+    "Sources/EluAnalytics/Elu.swift": "7ca1e2d87fe849f4d263a32b0e14a61d3d9b5ec4b69f9c5c5d3275c7f5353ec7",
+    "Sources/EluAnalytics/EluState.swift": "fb6f2afdcb3d6a47eb25418cc438af158ab91b2c9899d8e4bdd48e90b42dc00e",
     "Sources/EluAnalytics/EluConfigClient.swift": "152abfb01a6d0aa81e470d3185ecd4db3aeeef26d8626e67bab8f0a41e20d43d",
     "Sources/EluAnalytics/Internal/Facade/EluRuntimeBackend.swift": "f0452fa8d53a90e3c1daa46830d37495a5f42f19c326376a34da761f3ce5d98c",
     "Package.swift": "86701aa42833ddfff4b928e8ed59608cfe46f54e2765656f8166a75633219398",

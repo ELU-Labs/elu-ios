@@ -61,6 +61,11 @@ def main() -> int:
     current_api = public_declarations(current_source)
     if any(declaration not in current_api for declaration in expected_api):
         fail("current facade removed or changed a frozen 0.1.0 public declaration")
+    # Main's reviewed self-hosting additions also remain a required subset.
+    # The owned candidate's complete surface uses the additive symbol ledger.
+    main_api = (ROOT / "Baselines" / "current" / "public-api.txt").read_text(encoding="utf-8").splitlines()
+    if any(declaration not in current_api for declaration in main_api):
+        fail("current facade removed a reviewed main public declaration")
     # Additions are checked against the separate exact symbol ledger after the
     # iOS build. The immutable baseline is never rewritten to accept new APIs.
 
