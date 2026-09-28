@@ -92,8 +92,11 @@ without complete history fail closed for this replay restriction only.
 Absent this field, all devices remain eligible subject to the ordinary gates.
 
 The blanket profile masks text. When current policy authorizes ordinary text,
-supported fully visible, single-line `UILabel` and `UIButton` text can remain
-readable if it fits without wrapping or truncation. Unsupported attributed
+supported fully visible `UILabel` and `UIButton` text can remain
+readable when its full layout fits, including multiline and wrapped text.
+Standard table and collection views expose only visible standard cells through
+their public content views, with all actual ancestor restrictions retained.
+Truncated text, unsupported attributed
 content, attachments, links, transparent text, and custom subclasses remain
 masked or opaque. All input values, including `UITextField` and `UITextView`,
 stay hidden. Images, web views, custom drawing, and SwiftUI content use

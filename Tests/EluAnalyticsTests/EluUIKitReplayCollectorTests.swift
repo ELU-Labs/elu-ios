@@ -40,6 +40,31 @@ private final class WeakViewBox {
 }
 
 @MainActor
+private final class ReplayTableDataSource: NSObject, UITableViewDataSource {
+    func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int { 30 }
+    func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
+        let cell = UITableViewCell(style: .default, reuseIdentifier: nil)
+        let label = UILabel(frame: CGRect(x: 10, y: 5, width: 200, height: 30))
+        label.text = "Visible table row \(indexPath.row)"; label.textColor = .black
+        cell.contentView.addSubview(label)
+        return cell
+    }
+}
+
+@MainActor
+private final class ReplayCollectionDataSource: NSObject, UICollectionViewDataSource {
+    func collectionView(_ collectionView: UICollectionView, numberOfItemsInSection section: Int) -> Int { 30 }
+    func collectionView(_ collectionView: UICollectionView, cellForItemAt indexPath: IndexPath) -> UICollectionViewCell {
+        let cell = collectionView.dequeueReusableCell(withReuseIdentifier: "ordinary", for: indexPath)
+        cell.contentView.subviews.forEach { $0.removeFromSuperview() }
+        let label = UILabel(frame: CGRect(x: 5, y: 5, width: 240, height: 30))
+        label.text = "Visible collection item \(indexPath.item)"; label.textColor = .black
+        cell.contentView.addSubview(label)
+        return cell
+    }
+}
+
+@MainActor
 final class EluUIKitReplayCollectorTests: XCTestCase {
     private var window: UIWindow!
     private var root: UIView!
@@ -124,6 +149,123 @@ final class EluUIKitReplayCollectorTests: XCTestCase {
         let snapshot = try EluUIKitReplayCollector().collect(root: root, ordinal: 0, timestamp: 100,
             hasUnresolvedConfiguredBlockRules: false, profile: .sensitiveMask(), isCurrent: { true })
         XCTAssertTrue(snapshot.nodes.contains { $0.kind == .ordinaryText("Ordinary native text") })
+    }
+
+    private func sensitiveSnapshot() throws -> EluNativeMaskedSnapshot {
+        try EluUIKitReplayCollector().collect(root: root, ordinal: 0, timestamp: 100,
+            hasUnresolvedConfiguredBlockRules: false, profile: .sensitiveMask(), isCurrent: { true })
+    }
+
+    func testCompleteMultilineAndWrappedLabelsRemainReadable() throws {
+        let values = ["Order completed\nThank you", "A visible sentence wraps onto another line"]
+        for (index, value) in values.enumerated() {
+            let label = UILabel(frame: CGRect(x: 0, y: index * 110, width: 220, height: 100))
+            label.text = value; label.textColor = .black; label.numberOfLines = 0
+            label.lineBreakMode = .byWordWrapping; root.addSubview(label)
+        }
+        settle()
+        let snapshot = try sensitiveSnapshot()
+        for value in values { XCTAssertTrue(snapshot.nodes.contains { $0.kind == .ordinaryText(value) }, value) }
+    }
+
+    func testCompleteDynamicTypeMultilineTextRemainsReadable() throws {
+        let parent = try XCTUnwrap(window.rootViewController)
+        let controller = UIViewController()
+        parent.addChild(controller)
+        parent.setOverrideTraitCollection(UITraitCollection(preferredContentSizeCategory: .accessibilityLarge), forChild: controller)
+        controller.view.frame = root.bounds; root.addSubview(controller.view)
+        controller.didMove(toParent: parent)
+        defer { controller.willMove(toParent: nil); controller.view.removeFromSuperview(); controller.removeFromParent() }
+        let label = UILabel(frame: CGRect(x: 0, y: 0, width: 280, height: 260))
+        label.font = UIFont.preferredFont(forTextStyle: .body,
+            compatibleWith: controller.traitCollection)
+        label.adjustsFontForContentSizeCategory = true
+        label.numberOfLines = 0; label.lineBreakMode = .byWordWrapping
+        label.textColor = .black; label.text = "Large\nType"; controller.view.addSubview(label); settle()
+        XCTAssertEqual(label.traitCollection.preferredContentSizeCategory, .accessibilityLarge)
+        XCTAssertGreaterThan(label.font.pointSize, UIFont.preferredFont(forTextStyle: .body).pointSize)
+        XCTAssertTrue(try sensitiveSnapshot().nodes.contains { $0.kind == .ordinaryText("Large\nType") })
+    }
+
+    func testMultilineLimitsAndPartialLastLineNeverExposeUnderlyingSuffix() throws {
+        for (index, lines) in [1, 2, 0].enumerated() {
+            let label = UILabel(frame: CGRect(x: 0, y: index * 80, width: 250, height: lines == 0 ? 25 : 75))
+            label.font = .systemFont(ofSize: 20); label.numberOfLines = lines
+            label.lineBreakMode = .byTruncatingTail
+            label.text = "Visible\nSecond\nPRIVATE_HIDDEN_\(index)"; root.addSubview(label)
+        }
+        settle()
+        XCTAssertFalse(try sensitiveSnapshot().nodes.contains { if case .ordinaryText = $0.kind { return true }; return false })
+    }
+
+    func testTitleLabelAnnotationIsRespectedBeforeTextRead() throws {
+        let masked = UIButton(frame: CGRect(x: 0, y: 0, width: 250, height: 40))
+        let blocked = UIButton(frame: CGRect(x: 0, y: 50, width: 250, height: 40))
+        masked.setTitle("PRIVATE_MASKED_TITLE", for: .normal)
+        blocked.setTitle("PRIVATE_BLOCKED_TITLE", for: .normal)
+        root.addSubview(masked); root.addSubview(blocked); settle()
+        Elu.maskView(try XCTUnwrap(masked.titleLabel)); Elu.blockView(try XCTUnwrap(blocked.titleLabel))
+        XCTAssertFalse(try sensitiveSnapshot().nodes.contains { if case .ordinaryText = $0.kind { return true }; return false })
+    }
+
+    func testStandardTableUsesOnlyVisibleCellContentAndInheritedRestrictions() throws {
+        let data = ReplayTableDataSource()
+        let table = UITableView(frame: CGRect(x: 0, y: 0, width: 280, height: 150), style: .plain)
+        table.rowHeight = 44; table.dataSource = data; root.addSubview(table)
+        table.reloadData(); settle()
+        XCTAssertFalse(table.visibleCells.isEmpty)
+        let readable = try sensitiveSnapshot()
+        XCTAssertTrue(readable.nodes.contains { $0.kind == .ordinaryText("Visible table row 0") })
+        XCTAssertFalse(readable.nodes.contains { $0.kind == .ordinaryText("Visible table row 29") })
+        let first = try XCTUnwrap(table.visibleCells.first)
+        Elu.maskView(first.contentView)
+        XCTAssertFalse(try sensitiveSnapshot().nodes.contains { $0.kind == .ordinaryText("Visible table row 0") })
+        // UIKit may insert implementation wrappers. An annotation on any actual
+        // ancestor must still stop the public visibleCells projection.
+        Elu.blockView(try XCTUnwrap(first.superview))
+        XCTAssertFalse(try sensitiveSnapshot().nodes.contains { if case .ordinaryText = $0.kind { return true }; return false })
+    }
+
+    func testStandardCollectionUsesOnlyVisibleCellContentAndBlockExcludesDescendants() throws {
+        let layout = UICollectionViewFlowLayout(); layout.itemSize = CGSize(width: 270, height: 44)
+        let collection = UICollectionView(frame: CGRect(x: 0, y: 0, width: 280, height: 150), collectionViewLayout: layout)
+        collection.register(UICollectionViewCell.self, forCellWithReuseIdentifier: "ordinary")
+        let data = ReplayCollectionDataSource(); collection.dataSource = data; root.addSubview(collection)
+        collection.reloadData(); settle()
+        XCTAssertFalse(collection.visibleCells.isEmpty)
+        let readable = try sensitiveSnapshot()
+        XCTAssertTrue(readable.nodes.contains { $0.kind == .ordinaryText("Visible collection item 0") })
+        XCTAssertFalse(readable.nodes.contains { $0.kind == .ordinaryText("Visible collection item 29") })
+        Elu.blockView(collection)
+        let blocked = try sensitiveSnapshot()
+        XCTAssertEqual(blocked.nodes.map(\.kind), [.rectangle, .placeholder])
+    }
+
+    func testVisibleTableCellCannotProjectThroughCustomDrawingWrapper() throws {
+        let data = ReplayTableDataSource()
+        let table = UITableView(frame: CGRect(x: 0, y: 0, width: 280, height: 150), style: .plain)
+        table.rowHeight = 44; table.dataSource = data; root.addSubview(table)
+        table.reloadData(); settle()
+        let first = try XCTUnwrap(table.visibleCells.first)
+        let parent = try XCTUnwrap(first.superview)
+        let wrapper = OpaqueView(frame: parent.bounds)
+        parent.addSubview(wrapper); wrapper.addSubview(first)
+        XCTAssertTrue(table.visibleCells.contains { $0 === first }, "Fixture must retain the projected cell")
+        wrapper.reads = 0
+        XCTAssertFalse(try sensitiveSnapshot().nodes.contains { $0.kind == .ordinaryText("Visible table row 0") })
+        XCTAssertEqual(wrapper.reads, 0)
+    }
+
+    func testCustomContainerAndMaskedMultilineSubtreeRemainClosed() throws {
+        let opaque = OpaqueView(frame: CGRect(x: 0, y: 0, width: 280, height: 90))
+        let label = UILabel(frame: opaque.bounds); label.numberOfLines = 0
+        label.text = "PRIVATE_CUSTOM\nDRAWING"; opaque.addSubview(label); root.addSubview(opaque)
+        let container = UIView(frame: CGRect(x: 0, y: 100, width: 280, height: 90))
+        let masked = UILabel(frame: container.bounds); masked.numberOfLines = 0
+        masked.text = "PRIVATE_MASKED\nMULTILINE"; container.addSubview(masked); root.addSubview(container)
+        Elu.maskView(container); settle(); opaque.reads = 0
+        XCTAssertFalse(try sensitiveSnapshot().nodes.contains { if case .ordinaryText = $0.kind { return true }; return false })
+        XCTAssertEqual(opaque.reads, 0)
     }
 
     func testSensitiveProfileReadsSystemSecondaryTextButMasksFaintGlyphColors() throws {

@@ -212,8 +212,11 @@ Production apps should always use the default host.
 ## UIKit replay coverage
 
 The SDK supports bounded UIKit wireframes. When policy allows
-ordinary text, supported fully visible, single-line `UILabel` and `UIButton`
-text remains readable when it fits without wrapping or truncation. Transparent text, attachments, links, unsupported attributed content,
+ordinary text, supported fully visible `UILabel` and `UIButton` text remains
+readable when its complete layout fits, including multiline and wrapped labels.
+Standard `UITableView` and `UICollectionView` instances project visible standard
+cells through their public `contentView`; offscreen cells are excluded and actual
+ancestor mask, block, visibility and clipping restrictions still apply. Transparent or truncated text, attachments, links, unsupported attributed content,
 and custom subclasses remain masked or opaque. All input values, including `UITextField` and `UITextView`, remain hidden. Images, web
 views, custom drawing, and SwiftUI content are represented by content-free
 placeholders. SwiftUI replay is not supported.

@@ -47,6 +47,8 @@ final class EluUIKitReplayCollector {
         let inheritedClip: CGRect
         let masked: Bool
         let blocked: Bool
+        var projectedParent: UIView? = nil
+        var systemCellContent = false
     }
     private nonisolated let fence = EluUIKitCollectionFence()
     private let identity: () -> UUID
@@ -112,6 +114,38 @@ final class EluUIKitReplayCollector {
             visited += 1
             guard visited <= maximumViews, visit.depth <= maximumDepth else { throw EluUIKitReplayCollectionError.treeLimit }
             let view = visit.view
+            var inheritedClip = visit.inheritedClip
+            var blocked = visit.blocked
+            var masked = visit.masked
+            // visibleCells is a public projection through UIKit's implementation
+            // wrappers. Every actual skipped ancestor still strengthens privacy.
+            var skipped = view.superview, skippedCount = 0, skippedHidden = false
+            if let projectedParent = visit.projectedParent {
+                while let current = skipped, current !== projectedParent {
+                    try check(); skippedCount += 1
+                    guard skippedCount + visit.depth <= maximumDepth else { throw EluUIKitReplayCollectionError.treeLimit }
+                    guard current.window === window else { throw EluUIKitReplayCollectionError.invalidRoot }
+                    if current.isHidden || current.alpha == 0 { skippedHidden = true; break }
+                    // A cell reparented under app/custom drawing must not gain
+                    // access through visibleCells. UIKit's own implementation
+                    // ancestry is recognized by its public owning bundle, never
+                    // by private class names or selectors.
+                    guard canProjectThroughListAncestor(current) else { skippedHidden = true; break }
+                    try validateGeometry(current)
+                    blocked = blocked || current.alpha != 1 || current.eluReplayRestriction == .block
+                        || restrictions.contains { $0.view === current && $0.action == .block }
+                    masked = masked || current.eluReplayRestriction == .mask
+                        || restrictions.contains { $0.view === current && $0.action == .mask }
+                    if current.clipsToBounds || current.layer.masksToBounds || current is UIScrollView {
+                        let clip = current.convert(current.bounds, to: root).offsetBy(dx: -rootBounds.minX, dy: -rootBounds.minY)
+                        _ = try rect(clip)
+                        inheritedClip = intersection(clip, inheritedClip, viewport: viewportRect)
+                    }
+                    skipped = current.superview
+                }
+                if skippedHidden { continue }
+                guard skipped === projectedParent else { throw EluUIKitReplayCollectionError.invalidRoot }
+            }
             if view.isHidden || view.alpha == 0 { continue }
             guard view.window === root.window, view.alpha.isFinite else { throw EluUIKitReplayCollectionError.invalidRoot }
             let layer = view.layer
@@ -119,14 +153,16 @@ final class EluUIKitReplayCollector {
             let converted = view.convert(view.bounds, to: root)
                 .offsetBy(dx: -rootBounds.minX, dy: -rootBounds.minY)
             let bounds = try rect(converted)
-            let visible = intersection(converted, visit.inheritedClip, viewport: viewportRect)
-            var blocked = visit.blocked || view.eluReplayRestriction == .block
-            var masked = visit.masked || view.eluReplayRestriction == .mask
+            let visible = intersection(converted, inheritedClip, viewport: viewportRect)
+            blocked = blocked || view.eluReplayRestriction == .block
+            masked = masked || view.eluReplayRestriction == .mask
             for restriction in restrictions where restriction.view === view {
                 switch restriction.action { case .block: blocked = true; case .mask: masked = true }
             }
             let kind: EluNativeMaskedKind
             let traversable: Bool
+            var projectedChildren: [UIView]? = nil
+            var childrenAreCellContent = false
             if blocked || view.alpha != 1 {
                 kind = .placeholder; traversable = false
             } else if view is UIImageView || view is WKWebView {
@@ -148,11 +184,25 @@ final class EluUIKitReplayCollector {
                 // plain title overridden by an attributed/configured title.
                 let titleLabel = button.titleLabel
                 kind = !masked && visible == converted
-                    && titleLabel.map({ !$0.isHidden && hasVisiblePlainText($0) }) == true
+                    && titleLabel.map({ label in
+                        label.eluReplayRestriction == nil
+                            && !restrictions.contains { $0.view === label }
+                            && button.bounds.contains(label.convert(label.bounds, to: button))
+                            && hasVisiblePlainText(label)
+                    }) == true
                     ? ordinaryText(titleLabel?.text ?? "") : .text
                 traversable = false
+            } else if let table = view as? UITableView, type(of: table) == UITableView.self {
+                kind = .rectangle; traversable = true; projectedChildren = table.visibleCells
+            } else if let collection = view as? UICollectionView, type(of: collection) == UICollectionView.self {
+                kind = .rectangle; traversable = true; projectedChildren = collection.visibleCells
+            } else if let cell = view as? UITableViewCell, type(of: cell) == UITableViewCell.self {
+                kind = .rectangle; traversable = true; projectedChildren = [cell.contentView]; childrenAreCellContent = true
+            } else if let cell = view as? UICollectionViewCell, type(of: cell) == UICollectionViewCell.self {
+                kind = .rectangle; traversable = true; projectedChildren = [cell.contentView]; childrenAreCellContent = true
             } else if type(of: view) == UIView.self || type(of: view) == UIWindow.self
-                        || type(of: view) == UIStackView.self || type(of: view) == UIScrollView.self {
+                        || type(of: view) == UIStackView.self || type(of: view) == UIScrollView.self
+                        || visit.systemCellContent {
                 kind = .rectangle; traversable = true
             } else {
                 // Unknown/custom-drawn/SwiftUI/video/map controls are opaque.
@@ -173,13 +223,16 @@ final class EluUIKitReplayCollector {
             let style = try EluNativeStyle(color: kind == .placeholder ? .init(red: 255, green: 255, blue: 255) : nil)
             nodes.append(.init(identity: projection.identity, kind: kind, bounds: bounds, clip: try rect(visible), style: style))
             if traversable {
-                var clip = visit.inheritedClip
+                var clip = inheritedClip
                 if view.clipsToBounds || layer.masksToBounds || view is UIScrollView {
                     clip = intersection(converted, clip, viewport: viewportRect)
                 }
-                let children = view.subviews
+                let children = projectedChildren ?? view.subviews
                 guard children.count <= maximumViews - visited - stack.count else { throw EluUIKitReplayCollectionError.treeLimit }
-                for child in children.reversed() { stack.append(Visit(view: child, depth: visit.depth + 1, inheritedClip: clip, masked: masked, blocked: false)) }
+                for child in children.reversed() {
+                    stack.append(Visit(view: child, depth: visit.depth + skippedCount + 1, inheritedClip: clip,
+                        masked: masked, blocked: false, projectedParent: view, systemCellContent: childrenAreCellContent))
+                }
             }
         }
         try check()
@@ -202,14 +255,6 @@ final class EluUIKitReplayCollector {
         // custom attributes and transparent runs stay masked as one unit.
         guard let attributed = label.attributedText else { return label.text?.isEmpty ?? true }
         guard attributed.length <= 4_096 else { return false }
-        // A fully visible view can still truncate its underlying string. Keep
-        // the first text profile conservative: only complete single-line text
-        // that fits without wrapping or ellipsis may be serialized.
-        guard attributed.string.rangeOfCharacter(from: .newlines) == nil else { return false }
-        let fullSize = attributed.size()
-        guard fullSize.width.isFinite, fullSize.height.isFinite,
-              fullSize.width <= label.bounds.width,
-              fullSize.height <= label.bounds.height else { return false }
         let allowed: Set<NSAttributedString.Key> = [.font, .foregroundColor, .paragraphStyle, .shadow]
         var visible = true
         attributed.enumerateAttributes(in: NSRange(location: 0, length: attributed.length)) { attributes, _, stop in
@@ -231,12 +276,58 @@ final class EluUIKitReplayCollector {
             }
             if !visible { stop.pointee = true }
         }
-        return visible
+        return visible && allTextFits(attributed, in: label)
+    }
+
+    /// UILabel may truncate inside a fully visible view. A bounded public
+    /// TextKit layout must account for every character and glyph without a
+    /// clipped or truncated line before the original string can leave UIKit.
+    private func allTextFits(_ attributed: NSAttributedString, in label: UILabel) -> Bool {
+        guard !label.adjustsFontSizeToFitWidth, !label.allowsDefaultTighteningForTruncation,
+              label.bounds.width > 0, label.bounds.height > 0, let font = label.font else { return false }
+        if attributed.length == 0 { return true }
+        let storage = NSTextStorage(attributedString: attributed)
+        let range = NSRange(location: 0, length: storage.length)
+        attributed.enumerateAttributes(in: range) { attributes, run, _ in
+            if attributes[.font] == nil { storage.addAttribute(.font, value: font, range: run) }
+            if attributes[.paragraphStyle] == nil {
+                let paragraph = NSMutableParagraphStyle()
+                paragraph.alignment = label.textAlignment; paragraph.lineBreakMode = label.lineBreakMode
+                storage.addAttribute(.paragraphStyle, value: paragraph, range: run)
+            }
+        }
+        let manager = NSLayoutManager()
+        let container = NSTextContainer(size: label.bounds.size)
+        container.lineFragmentPadding = 0
+        container.maximumNumberOfLines = label.numberOfLines
+        container.lineBreakMode = label.lineBreakMode
+        manager.addTextContainer(container); storage.addLayoutManager(manager)
+        manager.ensureLayout(for: container)
+        let glyphs = manager.glyphRange(for: container)
+        guard glyphs.location == 0, glyphs.length == manager.numberOfGlyphs,
+              manager.characterRange(forGlyphRange: glyphs, actualGlyphRange: nil) == range else { return false }
+        let available = CGRect(origin: .zero, size: label.bounds.size)
+        var complete = true
+        manager.enumerateLineFragments(forGlyphRange: glyphs) { _, used, _, line, stop in
+            if !available.contains(used) || manager.truncatedGlyphRange(inLineFragmentForGlyphAt: line.location).location != NSNotFound {
+                complete = false; stop.pointee = true
+            }
+        }
+        let bounds = manager.boundingRect(forGlyphRange: glyphs, in: container)
+        return complete && available.contains(bounds)
     }
 
     private func ordinaryText(_ text: String) -> EluNativeMaskedKind {
         // Refuse oversized content as one unit rather than retaining a prefix.
         text.utf8.count <= 4_096 ? .ordinaryText(text) : .placeholder
+    }
+
+    private func canProjectThroughListAncestor(_ view: UIView) -> Bool {
+        if type(of: view) == UIView.self || type(of: view) == UIStackView.self
+            || type(of: view) == UIScrollView.self { return true }
+        if view is UIControl || view is UILabel || view is UITextView || view is UIImageView
+            || view is WKWebView || view is UIVisualEffectView { return false }
+        return Bundle(for: type(of: view)).bundleURL == Bundle(for: UIView.self).bundleURL
     }
 
     private func validateGeometry(_ view: UIView) throws {
