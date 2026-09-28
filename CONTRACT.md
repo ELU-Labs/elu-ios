@@ -84,6 +84,12 @@ Replay uses bounded UIKit wireframes, not screenshots. The binary supports
 `elu-native-wireframe-v1` with gzip and `protocol-generation-v1`; current server
 qualification and configuration must authorize that exact support. Sampling,
 session budgets, lifecycle, identity, consent, and local privacy still apply.
+When optional configuration-v2 `replayAudience` is `"new-devices"`, replay is
+limited to the installation's first successfully committed capture session.
+The history is durable even when no replay started, survives identity and
+consent changes, and cannot advance on a rolled-back capture. Older stores
+without complete history fail closed for this replay restriction only.
+Absent this field, all devices remain eligible subject to the ordinary gates.
 
 The blanket profile masks text. When current policy authorizes ordinary text,
 supported fully visible, single-line `UILabel` and `UIButton` text can remain

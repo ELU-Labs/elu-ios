@@ -33,6 +33,7 @@ enum EluRuntimeQueueFaultPoint: Equatable, Sendable {
     case beforeInitialInstall
     case afterInitialInstall
     case afterInspectionCopy
+    case beforeCaptureHistoryMigrationCommit
     case beforeBegin
     case beforeNativeDenialRead
     case afterBegin
@@ -83,6 +84,7 @@ struct EluRuntimeQueueSnapshot: Equatable, Sendable {
 }
 
 private struct EluStoredRuntimeState: Equatable, Sendable {
+    var captureSessionHistory: EluCaptureSessionHistory = .unknown
     var generation: Int64
     var identity: EluIdentityState
     var flagContext: EluPersistedFlagContext
@@ -133,14 +135,26 @@ private enum EluSQLiteRuntimeSchema {
     static let flagDatabaseVersion: Int64 = 2
     static let replayDatabaseVersion: Int64 = 3
     static let flagReplayDatabaseVersion: Int64 = 4
-    // Only owned schemas 1...8 are supported. Unpublished import-ledger
-    // schemas 17...24 remain unsupported; opening never rewrites them.
-    static func baseVersion(_ version: Int64) -> Int64 { version }
-    static func supports(_ version: Int64) -> Bool { (1...8).contains(version) }
-    static func hasFlags(_ version: Int64) -> Bool { [2, 4, 6, 8].contains(version) }
-    static func hasReplay(_ version: Int64) -> Bool { (3...8).contains(version) }
-    static func hasReplayDelivery(_ version: Int64) -> Bool { (5...8).contains(version) }
-    static func hasNativeReplayAuthority(_ version: Int64) -> Bool { [7, 8].contains(version) }
+    // Schemas 9...16 add installation capture history to owned schemas 1...8.
+    // Unpublished import-ledger schemas 17...24 remain unsupported.
+    static func baseVersion(_ version: Int64) -> Int64 { version > 8 ? version - 8 : version }
+    static func supports(_ version: Int64) -> Bool { (1...16).contains(version) }
+    static func hasCaptureHistory(_ version: Int64) -> Bool { (9...16).contains(version) }
+    static func preservingCaptureHistory(_ base: Int64, from version: Int64) -> Int64 {
+        base + (hasCaptureHistory(version) ? 8 : 0)
+    }
+    static func hasFlags(_ version: Int64) -> Bool { [2, 4, 6, 8].contains(baseVersion(version)) }
+    static func hasReplay(_ version: Int64) -> Bool { (3...8).contains(baseVersion(version)) }
+    static func hasReplayDelivery(_ version: Int64) -> Bool { (5...8).contains(baseVersion(version)) }
+    static func hasNativeReplayAuthority(_ version: Int64) -> Bool { [7, 8].contains(baseVersion(version)) }
+    static let createCaptureSessionHistory = """
+    CREATE TABLE capture_session_history (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        stream_id TEXT NOT NULL,
+        metadata BLOB NOT NULL CHECK (length(metadata) > 0 AND length(metadata) <= 2048)
+    )
+    """
+    static let captureSessionHistoryColumns = ["singleton": "INTEGER", "stream_id": "TEXT", "metadata": "BLOB"]
     static let createNativeReplayAuthority = """
     CREATE TABLE native_replay_authority (
         singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -738,6 +752,8 @@ private enum EluRuntimeQueueBootstrap {
                 throw EluRuntimeQueueError.corruptStorage
             }
             try configureDurability(openedConnection, initializing: false)
+            let databaseSchemaVersion = try migrateCaptureHistory(connection: openedConnection,
+                version: liveInspection.databaseSchemaVersion, state: state, faultInjector: faultInjector)
             state = try normalizeLegacyOptedOutSession(
                 connection: openedConnection,
                 state: state
@@ -757,7 +773,7 @@ private enum EluRuntimeQueueBootstrap {
             return EluRuntimeBootstrapResult(
                 resources: resources,
                 state: state,
-                databaseSchemaVersion: liveInspection.databaseSchemaVersion
+                databaseSchemaVersion: databaseSchemaVersion
             )
         } catch {
             connection?.close()
@@ -767,6 +783,30 @@ private enum EluRuntimeQueueBootstrap {
             }
             EluRuntimeOwnershipRegistry.shared.release(canonicalDirectory)
             throw mapOpenError(error)
+        }
+    }
+
+    private static func migrateCaptureHistory(connection: EluSQLiteConnection, version: Int64,
+                                              state: EluStoredRuntimeState,
+                                              faultInjector: (any EluRuntimeQueueFaultInjecting)?) throws -> Int64 {
+        guard !EluSQLiteRuntimeSchema.hasCaptureHistory(version) else { return version }
+        let target = version + 8
+        try connection.execute("BEGIN IMMEDIATE")
+        do {
+            try EluRuntimeDatabase.verifySchema(connection, databaseVersion: version)
+            // An old store has no complete history. Preserve its data, and deny
+            // only the restricted replay audience instead of guessing a first visit.
+            try connection.execute(EluSQLiteRuntimeSchema.createCaptureSessionHistory)
+            try EluRuntimeDatabase.writeCaptureSessionHistory(connection, stream: state.streamId,
+                history: .unknown, inserting: true)
+            try connection.execute("PRAGMA user_version = \(target)")
+            try EluRuntimeDatabase.verifySchema(connection, databaseVersion: target)
+            try faultInjector?.hit(.beforeCaptureHistoryMigrationCommit)
+            try connection.execute("COMMIT")
+            return target
+        } catch {
+            try? connection.execute("ROLLBACK")
+            throw error
         }
     }
 
@@ -835,8 +875,11 @@ private enum EluRuntimeQueueBootstrap {
             try connection.execute("BEGIN IMMEDIATE")
             try connection.execute(EluSQLiteRuntimeSchema.createRuntimeState)
             try connection.execute(EluSQLiteRuntimeSchema.createQueueRecords)
+            try connection.execute(EluSQLiteRuntimeSchema.createCaptureSessionHistory)
             try EluRuntimeDatabase.insertInitialState(connection, state: state)
-            try connection.execute("PRAGMA user_version = 1")
+            try EluRuntimeDatabase.writeCaptureSessionHistory(connection, stream: state.streamId,
+                history: state.captureSessionHistory, inserting: true)
+            try connection.execute("PRAGMA user_version = 9")
             try connection.execute("COMMIT")
             try connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             try connection.withStatement("PRAGMA journal_mode=DELETE") { statement in
@@ -1033,6 +1076,7 @@ private enum EluRuntimeQueueBootstrap {
             var identity = diskState.identity
             identity.session = nil
             let normalized = EluStoredRuntimeState(
+                captureSessionHistory: diskState.captureSessionHistory,
                 generation: diskState.generation + 1,
                 identity: identity,
                 flagContext: diskState.flagContext,
@@ -1061,7 +1105,7 @@ private enum EluRuntimeQueueBootstrap {
         streamId: String,
         forceOptOut: Bool
     ) throws -> EluStoredRuntimeState {
-        try storedState(
+        var state = try storedState(
             from: EluPersistedState(
                 identity: freshIdentity(
                     now: now,
@@ -1072,6 +1116,8 @@ private enum EluRuntimeQueueBootstrap {
                 flagContext: EluPersistedFlagContext()
             )
         )
+        state.captureSessionHistory = .unseen
+        return state
     }
 
     private static func freshIdentity(
@@ -2127,6 +2173,12 @@ private enum EluRuntimeDatabase {
         if EluSQLiteRuntimeSchema.hasFlags(databaseVersion) {
             expectedObjects["flag_cache_records"] = "table"
         }
+        if EluSQLiteRuntimeSchema.hasCaptureHistory(databaseVersion) {
+            expectedObjects["capture_session_history"] = "table"
+            try verifyColumns(connection, table: "capture_session_history", expected: EluSQLiteRuntimeSchema.captureSessionHistoryColumns)
+            try verifyCreateSQL(connection, table: "capture_session_history", expected: EluSQLiteRuntimeSchema.createCaptureSessionHistory)
+            _ = try loadState(connection, validateQueue: false)
+        }
         if EluSQLiteRuntimeSchema.hasReplay(databaseVersion) {
             expectedObjects["replay_state"] = "table"
             expectedObjects["replay_chunks"] = "table"
@@ -2261,7 +2313,10 @@ private enum EluRuntimeDatabase {
                 EluPersistedFlagContext.self,
                 data: flagContextData
             )
+            let history = EluSQLiteRuntimeSchema.hasCaptureHistory(try connection.integerPragma("user_version"))
+                ? try readCaptureSessionHistory(connection, stream: streamId) : .unknown
             let state = EluStoredRuntimeState(
+                captureSessionHistory: history,
                 generation: generation,
                 identity: identity,
                 flagContext: flagContext,
@@ -2344,6 +2399,30 @@ private enum EluRuntimeDatabase {
         }
     }
 
+    static func readCaptureSessionHistory(_ connection: EluSQLiteConnection, stream: String) throws -> EluCaptureSessionHistory {
+        try connection.withStatement("SELECT singleton,stream_id,metadata FROM capture_session_history") { statement in
+            try connection.step(statement, expecting: SQLITE_ROW)
+            guard try connection.requiredInteger(statement, column: 0) == 1,
+                  try connection.requiredString(statement, column: 1).utf8.elementsEqual(stream.utf8)
+            else { throw EluRuntimeQueueError.corruptStorage }
+            let data = try connection.requiredData(statement, column: 2, maximumBytes: EluCaptureSessionHistory.maximumBytes)
+            guard sqlite3_step(statement) == SQLITE_DONE else { throw EluRuntimeQueueError.corruptStorage }
+            return try EluCaptureSessionHistory.decode(data)
+        }
+    }
+
+    static func writeCaptureSessionHistory(_ connection: EluSQLiteConnection, stream: String,
+                                          history: EluCaptureSessionHistory, inserting: Bool = false) throws {
+        let sql = inserting ? "INSERT INTO capture_session_history(singleton,stream_id,metadata) VALUES(1,?,?)"
+            : "UPDATE capture_session_history SET stream_id=?,metadata=? WHERE singleton=1"
+        try connection.withStatement(sql) { statement in
+            try connection.bind(stream, at: 1, to: statement)
+            try connection.bind(history.encoded(), at: 2, to: statement)
+            try connection.step(statement)
+        }
+        guard try connection.changes() == 1 else { throw EluRuntimeQueueError.corruptStorage }
+    }
+
     static func updateState(
         _ connection: EluSQLiteConnection,
         from expectedGeneration: Int64,
@@ -2377,6 +2456,9 @@ private enum EluRuntimeDatabase {
         }
         guard try connection.changes() == 1 else {
             throw EluRuntimeQueueError.generationMismatch
+        }
+        if EluSQLiteRuntimeSchema.hasCaptureHistory(try connection.integerPragma("user_version")) {
+            try writeCaptureSessionHistory(connection, stream: state.streamId, history: state.captureSessionHistory)
         }
     }
 
@@ -3496,7 +3578,7 @@ actor EluSQLiteRuntimeQueue {
         guard base == 1 || base == 3 || base == 5 || base == 7 else {
             throw EluRuntimeQueueError.unsupportedSchemaVersion(databaseSchemaVersion)
         }
-        let target = base + 1
+        let target = EluSQLiteRuntimeSchema.preservingCaptureHistory(base + 1, from: databaseSchemaVersion)
         try replayStorageTransaction { connection, _ in
             guard try connection.integerPragma("user_version") == databaseSchemaVersion else { throw EluRuntimeQueueError.corruptStorage }
             try EluRuntimeDatabase.verifySchema(connection, databaseVersion: databaseSchemaVersion)
@@ -3518,7 +3600,7 @@ actor EluSQLiteRuntimeQueue {
         }
         let base = EluSQLiteRuntimeSchema.baseVersion(databaseSchemaVersion)
         guard base == 1 || base == 2 else { throw EluRuntimeQueueError.unsupportedSchemaVersion(databaseSchemaVersion) }
-        let target: Int64 = base == 2 ? 4 : 3
+        let target = EluSQLiteRuntimeSchema.preservingCaptureHistory(base == 2 ? 4 : 3, from: databaseSchemaVersion)
         try replayStorageTransaction { connection, _ in
             guard try connection.integerPragma("user_version") == databaseSchemaVersion else { throw EluRuntimeQueueError.corruptStorage }
             try EluRuntimeDatabase.verifySchema(connection, databaseVersion: databaseSchemaVersion)
@@ -3537,7 +3619,8 @@ actor EluSQLiteRuntimeQueue {
             try EluRuntimeDatabase.verifySchema(try requireResources().connection, databaseVersion: databaseSchemaVersion)
             return
         }
-        let target = EluSQLiteRuntimeSchema.baseVersion(databaseSchemaVersion) == 4 ? Int64(6) : 5
+        let target = EluSQLiteRuntimeSchema.preservingCaptureHistory(
+            EluSQLiteRuntimeSchema.baseVersion(databaseSchemaVersion) == 4 ? 6 : 5, from: databaseSchemaVersion)
         try replayStorageTransaction { connection, _ in
             try EluRuntimeDatabase.verifySchema(connection, databaseVersion: databaseSchemaVersion)
             try connection.execute(EluSQLiteRuntimeSchema.createReplayDelivery)
@@ -3556,7 +3639,8 @@ actor EluSQLiteRuntimeQueue {
         guard let namespace = ownerNamespaceHash,
               EluSQLiteRuntimeSchema.hasReplayDelivery(databaseSchemaVersion) else { throw EluRuntimeQueueError.invalidState }
         if !EluSQLiteRuntimeSchema.hasNativeReplayAuthority(databaseSchemaVersion) {
-            let target = EluSQLiteRuntimeSchema.baseVersion(databaseSchemaVersion) == 6 ? Int64(8) : 7
+            let target = EluSQLiteRuntimeSchema.preservingCaptureHistory(
+                EluSQLiteRuntimeSchema.baseVersion(databaseSchemaVersion) == 6 ? 8 : 7, from: databaseSchemaVersion)
             try replayStorageTransaction { connection, disk in
                 try EluRuntimeDatabase.verifySchema(connection, databaseVersion: databaseSchemaVersion)
                 try connection.execute(EluSQLiteRuntimeSchema.createNativeReplayAuthority)
@@ -3613,6 +3697,7 @@ actor EluSQLiteRuntimeQueue {
         let now = clock()
         guard document.schemaVersion == 2, document.status == .enabled,
               document.features?.replay == true, let replay = document.privacy?.replay, replay.enabled,
+              document.replayAudience != "new-devices" || disk.captureSessionHistory.permits(session),
               document.issuedAt == capture.configBoundary.issuedAt,
               EluV1StrictCanonicalJSON.hash(raw.canonicalData) == capture.configBoundary.semanticHash,
               EluV2ReplayText.equal(document.site?.id, capture.configSiteId),
@@ -7424,7 +7509,13 @@ actor EluSQLiteRuntimeQueue {
                 try faultInjector?.hit(.afterRecordInsert(index))
             }
 
+            var history = diskState.captureSessionHistory
+            if drafts.contains(where: { if case .event = $0 { return true }; return false }),
+               let session = canonicalIdentity.session {
+                history = history.observing(session)
+            }
             let nextState = EluStoredRuntimeState(
+                captureSessionHistory: history,
                 generation: diskState.generation + 1,
                 identity: canonicalIdentity,
                 flagContext: canonicalFlagContext,
@@ -7663,6 +7754,7 @@ actor EluSQLiteRuntimeQueue {
                 nextHead = lastSequence + 1
             }
             let nextState = EluStoredRuntimeState(
+                captureSessionHistory: diskState.captureSessionHistory,
                 generation: diskState.generation + 1,
                 identity: diskState.identity,
                 flagContext: diskState.flagContext,

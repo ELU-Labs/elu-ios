@@ -62,6 +62,8 @@ struct EluV1ConfigDocument: Decodable, Sendable {
     let limits: EluV1Limits?
     let reason: String?
     let capturePerformance: EluCapturePerformancePolicy?
+    /// Absent means all devices. This restricts replay only, never events.
+    let replayAudience: String?
 
     private enum CodingKeys: String, CodingKey, CaseIterable {
         case schemaVersion
@@ -78,6 +80,7 @@ struct EluV1ConfigDocument: Decodable, Sendable {
         case limits
         case reason
         case capturePerformance
+        case replayAudience
     }
 
     init(from decoder: Decoder) throws {
@@ -117,6 +120,11 @@ struct EluV1ConfigDocument: Decodable, Sendable {
         limits = try container.eluDecodeIfPresent(EluV1Limits.self, forKey: .limits)
         reason = try container.eluDecodeIfPresent(String.self, forKey: .reason)
         capturePerformance = try container.eluDecodeIfPresent(EluCapturePerformancePolicy.self, forKey: .capturePerformance)
+        replayAudience = try container.eluDecodeIfPresent(String.self, forKey: .replayAudience)
+        guard replayAudience == nil || (replayAudience == "new-devices"
+            && schemaVersion == Self.v2SchemaVersion && status == .enabled) else {
+            throw EluV1ConfigResolutionError.malformedConfig
+        }
         guard capturePerformance == nil || (schemaVersion == Self.v2SchemaVersion && status == .enabled) else {
             throw EluV1ConfigResolutionError.malformedConfig
         }

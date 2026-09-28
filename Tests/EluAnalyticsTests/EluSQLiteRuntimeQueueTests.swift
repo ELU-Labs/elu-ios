@@ -1110,7 +1110,7 @@ final class EluSQLiteRuntimeQueueTests: XCTestCase {
                 _ = try await makeQueue(directory: directory)
                 XCTFail("Expected future schema rejection")
             } catch let error as EluRuntimeQueueError {
-                XCTAssertEqual(error, .unsupportedSchemaVersion(9))
+                XCTAssertEqual(error, .unsupportedSchemaVersion(99))
             }
             let after = try [database, wal, shm].map { try Data(contentsOf: $0) }
             XCTAssertEqual(after, before)
@@ -1463,7 +1463,7 @@ final class EluSQLiteRuntimeQueueTests: XCTestCase {
     }
 
     private func openFutureWALDatabase(_ url: URL) throws -> OpaquePointer {
-        try openWALDatabase(url, mutationSQL: "PRAGMA user_version=9")
+        try openWALDatabase(url, mutationSQL: "PRAGMA user_version=99")
     }
 
     private func openWALDatabase(

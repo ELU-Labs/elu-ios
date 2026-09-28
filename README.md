@@ -183,7 +183,13 @@ Replay privacy, sampling, and per-session limits are implemented in the owned
 runtime. The binary supports `elu-native-wireframe-v1` with gzip and
 `protocol-generation-v1`; current server qualification must advertise that exact
 support before configuration can authorize capture. Local consent, region,
-identity, lifecycle, masking, and budget gates also apply. Source support does
+identity, lifecycle, masking, and budget gates also apply. Optional
+`replayAudience: "new-devices"` restricts replay to this installation's first
+successfully captured session, even if that session was not recorded. Restart,
+identify, reset, or consent changes do not make a later session eligible.
+Ordinary events remain available under their own consent and config rules.
+Existing stores with unknown capture history do not qualify for this restricted
+audience; see [storage compatibility](docs/storage-compatibility.md). Source support does
 not establish package, engine readback, or customer-player qualification.
 
 Baked into the binary (changes require an SDK update):

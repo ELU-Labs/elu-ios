@@ -10,9 +10,14 @@ previous 0.1.0 runtime, and it does not open, rewrite, or delete that runtime's
 files. Applications should call `Elu.identify` after restoring their own login
 state and apply their current consent choice through the public consent APIs.
 
-Supported owned SQLite schemas 1 through 8 retain their existing reopen,
-transaction recovery, identity, consent, offline queue, flag, and replay schema
-upgrade behavior. The existing owned JSON state importer remains supported
+Supported owned SQLite schemas 1 through 8 upgrade to schemas 9 through 16,
+which add installation capture-session history. Reopen, transaction recovery,
+identity, consent, offline queue, flags, and replay records remain preserved.
+Old SQLite and imported owned JSON stores cannot prove complete first-session
+history. They remain eligible for ordinary analytics and all-device replay,
+but do not qualify when remote policy restricts replay to new devices. New
+installations record their first successfully committed capture session even
+when replay is disabled; identify, reset, and consent changes never clear it. The existing owned JSON state importer remains supported
 within that same site-scoped storage namespace; its source is read-only.
 
 Unpublished transition SQLite schemas 17 through 24, which carried preview
