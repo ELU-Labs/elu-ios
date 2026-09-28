@@ -13,6 +13,56 @@ final class EluStandaloneRuntimeTests: XCTestCase {
         var errorDescription: String? { "checkout failed" }
     }
 
+    func testNetworkObservationUsesOwnedWireAndDropsAcrossAuthorityChanges() async throws {
+        try await withTemporaryDirectory { root in
+            let transport = RecordingBatchTransport(), clock = TestRuntimeClock(wall: baseDate)
+            let runtime = try await makeRuntime(root: root, transport: transport, clock: clock)
+            let request = URLRequest(url: URL(string: "https://customer.example/private?token=secret")!)
+            XCTAssertNil(runtime.beginNetworkObservation(request))
+            runtime.performanceLifecycleIntent(foreground: true)
+            await runtime.markForegrounded()
+            _ = await runtime.applyConfiguration(fixture("config-enabled.json"))
+            let first = try XCTUnwrap(runtime.beginNetworkObservation(request)); first.start(); first.finish(response: nil, failed: true)
+            try await awaitCondition { try await runtime.queueSnapshot().queuedCount == 1 }
+            _ = await runtime.flush()
+            let requests = await transport.recordedRequests()
+            let event = try XCTUnwrap(batchEvents(XCTUnwrap(requests.first)).first)
+            XCTAssertEqual(event["name"] as? String, "$network_request")
+            let properties = try XCTUnwrap(event["properties"] as? [String: Any])
+            XCTAssertEqual(properties["$network_failed"] as? Bool, true)
+            XCTAssertNil(properties["$network_url"]); XCTAssertNil(properties["$pathname"])
+
+            let pendingMutation = try XCTUnwrap(runtime.beginNetworkObservation(request)); pendingMutation.start()
+            let intent = runtime.beginFlagProjectionIntent()
+            XCTAssertNil(runtime.beginNetworkObservation(request))
+            runtime.finishFlagProjectionIntent(intent)
+            pendingMutation.finish(response: nil, failed: false)
+            _ = await runtime.applyConfiguration(fixture("config-enabled.json"))
+            let oldConfiguration = try XCTUnwrap(runtime.beginNetworkObservation(request)); oldConfiguration.start()
+            _ = await runtime.applyConfiguration(fixture("config-enabled.json"))
+            oldConfiguration.finish(response: nil, failed: false)
+            let oldIdentity = try XCTUnwrap(runtime.beginNetworkObservation(request)); oldIdentity.start()
+            _ = await runtime.identify("user-b")
+            oldIdentity.finish(response: nil, failed: false)
+            let oldForeground = try XCTUnwrap(runtime.beginNetworkObservation(request)); oldForeground.start()
+            runtime.performanceLifecycleIntent(foreground: false)
+            _ = await runtime.applyConfiguration(fixture("config-enabled.json"))
+            XCTAssertNil(runtime.beginNetworkObservation(request), "Actor refresh cannot override synchronous background denial")
+            oldForeground.finish(response: nil, failed: false)
+            runtime.performanceLifecycleIntent(foreground: true)
+            await runtime.markForegrounded()
+            let oldConsent = try XCTUnwrap(runtime.beginNetworkObservation(request)); oldConsent.start()
+            let denial = UUID(); runtime.acceptConsentIntent(denial, optedOut: true)
+            XCTAssertNil(runtime.beginNetworkObservation(request))
+            oldConsent.finish(response: nil, failed: false)
+            _ = await runtime.setOptedOut(true, intent: denial)
+            let remaining = try await runtime.queueSnapshot()
+            // identify may emit its own mutation, but no stale network event.
+            XCTAssertLessThanOrEqual(remaining.queuedCount, 1)
+            await runtime.close(); XCTAssertNil(runtime.beginNetworkObservation(request))
+        }
+    }
+
     func testOptInNativePerformanceUsesOwnedEventSerializationAndStopsOnConsent() async throws {
         try await withTemporaryDirectory { root in
             let transport = RecordingBatchTransport()

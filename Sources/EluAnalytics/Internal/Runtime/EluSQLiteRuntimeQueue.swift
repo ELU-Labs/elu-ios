@@ -2713,6 +2713,7 @@ private enum EluRuntimeDatabase {
 private enum EluPreparedRecordDraft: Sendable {
     case event(EluEventDraft)
     case performanceSample(EluEventDraft)
+    case networkObservation(EluEventDraft)
     case mutation(
         change: EluMutationChange,
         identity: EluIdentityState,
@@ -6835,7 +6836,23 @@ actor EluSQLiteRuntimeQueue {
         return capture(command, performanceSample: true, admissionGuard: admissionGuard)
     }
 
-    private func capture(_ command: EluV1CaptureCommand, performanceSample: Bool, admissionGuard: (@Sendable () -> Bool)?) -> EluV1CaptureResult {
+    /// Completion retains its request-start ownership. It never extends an
+    /// existing session, but can atomically create the first actual session.
+    func captureNetworkObservation(_ command: EluV1CaptureCommand, context: EluNetworkObservationContext,
+                                   admissionGuard: @escaping @Sendable () -> Bool) -> EluV1CaptureResult {
+        guard command.kind == .capture, command.name == "$network_request" else {
+            return .rejected(.invalidEvent, snapshot: state.snapshot)
+        }
+        guard state.identity.revision == context.identityRevision,
+              state.identity.contextRevision == context.contextRevision,
+              state.identity.session?.id == context.sessionID,
+              state.identity.session?.startedAt == context.sessionStartedAt else {
+            return .rejected(.authorityWitnessChanged, snapshot: state.snapshot)
+        }
+        return capture(command, performanceSample: false, networkObservation: true, admissionGuard: admissionGuard)
+    }
+
+    private func capture(_ command: EluV1CaptureCommand, performanceSample: Bool, networkObservation: Bool = false, admissionGuard: (@Sendable () -> Bool)?) -> EluV1CaptureResult {
         let before = state.snapshot
         let sourceWitness = captureSourceWitness
         guard sourceIsCurrent(sourceWitness), admissionGuard?() ?? true else { return .rejected(.authorityAbsent, snapshot: before) }
@@ -6877,7 +6894,7 @@ actor EluSQLiteRuntimeQueue {
                 command: command,
                 occurredAt: occurredAt,
                 authority: authority,
-                performanceSample: performanceSample
+                performanceSample: performanceSample || (networkObservation && state.identity.session != nil)
             )
         } catch {
             return .rejected(.invalidEvent, snapshot: before)
@@ -6889,7 +6906,8 @@ actor EluSQLiteRuntimeQueue {
                     expectedGeneration: state.generation,
                     identity: prepared.identity,
                     flagContext: state.flagContext,
-                    drafts: [performanceSample ? .performanceSample(prepared.draft) : .event(prepared.draft)],
+                    drafts: [performanceSample ? .performanceSample(prepared.draft)
+                        : networkObservation ? .networkObservation(prepared.draft) : .event(prepared.draft)],
                     maximumQueueBytes: authority.maximumQueueBytes,
                     surfaceProvenNotCommitted: true,
                     prewriteValidation: { diskState in
@@ -7510,7 +7528,9 @@ actor EluSQLiteRuntimeQueue {
             }
 
             var history = diskState.captureSessionHistory
-            if drafts.contains(where: { if case .event = $0 { return true }; return false }),
+            if drafts.contains(where: {
+                switch $0 { case .event, .networkObservation: return true; default: return false }
+            }),
                let session = canonicalIdentity.session {
                 history = history.observing(session)
             }
@@ -8502,16 +8522,21 @@ actor EluSQLiteRuntimeQueue {
             let sequence = firstSequence + Int64(index)
             let rawRecord: EluQueuedRecord
             switch draft {
-            case let .event(eventDraft), let .performanceSample(eventDraft):
+            case let .event(eventDraft), let .performanceSample(eventDraft), let .networkObservation(eventDraft):
                 let isPassive: Bool
-                if case .performanceSample = draft { isPassive = true } else { isPassive = false }
+                let passiveName: String?
+                switch draft {
+                case .performanceSample: isPassive = true; passiveName = "$performance_sample"
+                case .networkObservation: isPassive = true; passiveName = "$network_request"
+                default: isPassive = false; passiveName = nil
+                }
                 guard let session = identity.session,
                       session.lifecycle == .active,
                       session.backgroundedAt == nil,
                       eventDraft.expectedSessionId == session.id,
                       eventDraft.occurredAt >= session.startedAt,
                       (isPassive
-                        ? eventDraft.kind == .capture && eventDraft.name == "$performance_sample"
+                        ? eventDraft.kind == .capture && eventDraft.name == passiveName
                             && eventDraft.occurredAt >= session.lastActivityAt
                             && eventDraft.occurredAt.timeIntervalSince(session.lastActivityAt) < Double(session.timeoutSeconds)
                         : eventDraft.occurredAt <= session.lastActivityAt)

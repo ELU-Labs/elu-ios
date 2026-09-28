@@ -115,6 +115,22 @@
     {
       "kind": "swift.property",
       "name": "EluSetupOptions.performance"
+    },
+    {
+      "kind": "swift.class",
+      "name": "EluURLSession"
+    },
+    {
+      "kind": "swift.method",
+      "name": "EluURLSession.data(for:delegate:)"
+    },
+    {
+      "kind": "swift.init",
+      "name": "EluURLSession.init(session:)"
+    },
+    {
+      "kind": "swift.method",
+      "name": "EluURLSession.perform(_:completionHandler:)"
     }
   ]
 }

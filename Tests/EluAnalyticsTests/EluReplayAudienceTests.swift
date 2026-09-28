@@ -2,7 +2,68 @@ import Foundation
 import XCTest
 @testable import EluAnalytics
 
+private final class NetworkAudiencePermission: @unchecked Sendable {
+    private let lock = NSLock(); private var allowed = true
+    var current: Bool { lock.lock(); defer { lock.unlock() }; return allowed }
+    func withdraw() { lock.lock(); allowed = false; lock.unlock() }
+}
+
 final class EluReplayAudienceTests: XCTestCase {
+    func testNetworkFinalAdmissionWithdrawalRollsBackEventSessionAndHistory() async throws {
+        let fault = DeliveryFault(); let h = try await make(fault: fault); defer { h.base.remove() }
+        let before = try await h.queue.snapshot(), permission = NetworkAudiencePermission()
+        let versions = try EluVersionContext(runtime: EluVersionComponent(name: "elu-ios", version: "0.2.0"),
+            facade: EluVersionComponent(name: "elu-ios", version: "0.2.0"))
+        let command = EluV1CaptureCommand(kind: .capture, name: "$network_request", occurredAt: h.base.now, properties: [:], versions: versions)
+        let context = EluNetworkObservationContext(identityRevision: before.identity.revision,
+            contextRevision: before.identity.contextRevision, sessionID: nil)
+        fault.action = { if $0 == .beforeCommit { permission.withdraw() } }
+        guard case .rejected(.authorityAbsent, _) = await h.queue.captureNetworkObservation(command, context: context, admissionGuard: { permission.current }) else {
+            return XCTFail("Withdrawn completion passed final commit")
+        }
+        fault.action = nil
+        XCTAssertEqual(try history(h), .unseen)
+        let after = try await h.queue.snapshot(); XCTAssertEqual(before, after)
+        await h.queue.close(); try await h.reopen(); XCTAssertEqual(try history(h), .unseen)
+        await h.queue.close()
+    }
+    func testNetworkTransactionRollbackDoesNotConsumeCaptureHistory() async throws {
+        let fault = DeliveryFault(); let h = try await make(fault: fault); defer { h.base.remove() }
+        let before = try await h.queue.snapshot()
+        let versions = try EluVersionContext(runtime: EluVersionComponent(name: "elu-ios", version: "0.2.0"),
+            facade: EluVersionComponent(name: "elu-ios", version: "0.2.0"))
+        let command = EluV1CaptureCommand(kind: .capture, name: "$network_request", occurredAt: h.base.now, properties: [:], versions: versions)
+        let context = EluNetworkObservationContext(identityRevision: before.identity.revision,
+            contextRevision: before.identity.contextRevision, sessionID: nil)
+        fault.action = { if $0 == .beforeCommit { throw EluRuntimeQueueError.faultInjected($0) } }
+        guard case .rejected(.storageProvenNotCommitted, _) = await h.queue.captureNetworkObservation(command, context: context, admissionGuard: { true }) else {
+            return XCTFail("Expected transactional failure")
+        }
+        fault.action = nil
+        XCTAssertEqual(try history(h), .unseen)
+        let after = try await h.queue.snapshot(); XCTAssertEqual(before, after)
+        await h.queue.close(); try await h.reopen(); XCTAssertEqual(try history(h), .unseen)
+        await h.queue.close()
+    }
+    func testFirstNetworkObservationClaimsTheSameAtomicCaptureHistory() async throws {
+        let h = try await make(); defer { h.base.remove() }
+        let before = try await h.queue.snapshot()
+        let versions = try EluVersionContext(runtime: EluVersionComponent(name: "elu-ios", version: "0.2.0"),
+            facade: EluVersionComponent(name: "elu-ios", version: "0.2.0"))
+        let command = EluV1CaptureCommand(kind: .capture, name: "$network_request", occurredAt: h.base.now, properties: [:], versions: versions)
+        let context = EluNetworkObservationContext(identityRevision: before.identity.revision,
+            contextRevision: before.identity.contextRevision, sessionID: nil)
+        guard case .rejected = await h.queue.captureNetworkObservation(command, context: context, admissionGuard: { false }) else {
+            return XCTFail("Denied completion admitted")
+        }
+        XCTAssertEqual(try history(h), .unseen)
+        guard case let .accepted(_, snapshot) = await h.queue.captureNetworkObservation(command, context: context, admissionGuard: { true }) else {
+            return XCTFail("Expected first network event")
+        }
+        XCTAssertTrue(try history(h).permits(XCTUnwrap(snapshot.identity.session)))
+        try await enableReplay(h); _ = try await h.observe()
+        await h.queue.close()
+    }
     func testReplayCannotClaimHistoryBeforeAnAcceptedCapture() async throws {
         let h = try await make(); defer { h.base.remove() }
         try await enableReplay(h)

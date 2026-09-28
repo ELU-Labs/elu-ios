@@ -110,6 +110,24 @@ Unresolved native blocking rules disable replay. Ordinary analytics properties
 and manually reported errors are not automatically redacted by replay masking;
 applications must choose appropriate values to send.
 
+## Instrumented customer networking
+
+`EluURLSession` explicitly wraps a customer-supplied Foundation session. It never
+replaces delegates, swizzles other clients, or changes customer request behavior
+when telemetry is denied. The completion API supports iOS 13; Foundation async
+requests support iOS 15 and later. It reports only method, status, data-request
+completion duration, native initiator and transport-failure Boolean. URLs,
+headers, bodies and error text are excluded; SDK origins are excluded.
+
+At most 200 eligible observation attempts are admitted per process across all
+wrappers. The app must remain foregrounded. The original identity, context,
+session, consent and config authority
+must still match at durable enqueue. Existing session activity is preserved;
+when no session exists, the first accepted completion can atomically start one
+and claim the same first-capture history used by replay audience selection.
+Instrumentation requires current general capture permission, independently of
+the replay request-detail setting. The README documents installation and limits.
+
 ## Exceptions and native performance
 
 `Elu.captureException` records errors explicitly supplied by the app, including

@@ -236,6 +236,38 @@ player, privacy, and device qualification before release.
 bounded cause chains. Automatic fatal-crash capture is not currently supplied.
 Browser DOM, Web Vitals, and browser long-task APIs do not apply to native apps.
 
+## Customer networking
+
+Instrument requests explicitly with the session your app already owns:
+
+```swift
+let instrumented = EluURLSession(session: customerSession)
+// iOS 13+: starts immediately; the returned Foundation task can be cancelled.
+let task = instrumented.perform(request) { data, response, error in
+    // Handle the original Foundation result on its normal completion queue.
+}
+// iOS 15+: preserves Foundation async cancellation and task-delegate behavior.
+let (data, response) = try await instrumented.data(for: request)
+```
+
+The wrapper preserves the supplied session, delegates, request and response. It
+does not intercept other clients or initialize ELU. Requests still run when
+analytics is unavailable or consent is denied. Only eligible instrumented
+foreground requests produce `$network_request`, with `$network_method`,
+`$network_status_code`, `$network_response_time_ms`, `$network_initiator`
+(`urlsession`), and `$network_failed`. HTTP error status alone is not a transport
+failure. Elapsed time ends when Foundation completes the data request, including
+body receipt; it is not a server-only timing measurement.
+
+No URL, path, query, fragment, headers, bodies, response content, or error text is
+recorded. Custom HTTP methods become `UNKNOWN`; SDK origins and successful
+redirects to them are excluded. There are at most 200 eligible observation
+attempts per process across all wrappers, including observations later discarded.
+Consent, identity, context, session, foreground or configuration changes discard in-flight
+telemetry. A completion does not prolong an existing session's idle timeout.
+Current general analytics permission is required; the replay `captureNetwork`
+setting does not grant this separate, explicitly installed analytics collector.
+
 ## Native performance
 
 Native performance sampling is disabled by default. To opt in:

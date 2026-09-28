@@ -33,6 +33,7 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, @unchecked Sendable {
     let replayControl: (any EluReplayControl)? = nil
 
     private let flagsDidLoad: () -> Void
+    private let networkConfigHost: String?
     private var guardedFlagsDidLoad: (@Sendable (@escaping @Sendable () -> Bool) -> Void)?
     private var stack: EluStandaloneStack?
     private let nativeLifecycle = EluNativeReplayLifecycle()
@@ -74,6 +75,7 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, @unchecked Sendable {
         observeApplicationLifecycle: Bool = false
     ) {
         flagsDidLoad = context.flagsDidLoad
+        networkConfigHost = context.configHost.host?.lowercased()
         self.flagTransport = flagTransport
         if let initialConsent = context.initialConsent { acceptConsent(initialConsent) }
         let document = context.configDocument
@@ -90,6 +92,7 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, @unchecked Sendable {
         guardedFlagsDidLoad: @escaping @Sendable (@escaping @Sendable () -> Bool) -> Void
     ) {
         flagsDidLoad = context.flagsDidLoad
+        networkConfigHost = context.configHost.host?.lowercased()
         flagTransport = nil
         self.guardedFlagsDidLoad = guardedFlagsDidLoad
         if let initialConsent = context.initialConsent { acceptConsent(initialConsent) }
@@ -122,6 +125,14 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, @unchecked Sendable {
             foregroundGeneration = UUID()
         }
         applyForegroundIntent()
+    }
+
+    func beginNetworkObservation(_ request: URLRequest) -> EluNetworkObservation? {
+        withLock {
+            guard !isShutDown, pendingIdentityOperations == 0,
+                  consentProjection?.optedOut != true else { return nil }
+            return started?.runtime.beginNetworkObservation(request, excludedHost: networkConfigHost)
+        }
     }
 
     private func applyForegroundIntent() {

@@ -47,6 +47,7 @@ protocol EluRuntimeBackend: AnyObject {
     /// Synchronous intent before the core queue hop. Completion transfers
     /// protection to execute's own ordered work, or releases a discarded call.
     func beginPendingOperation(_ op: EluBufferedOp) -> (() -> Void)?
+    func beginNetworkObservation(_ request: URLRequest) -> EluNetworkObservation?
 
     /// Performs one facade operation. Operations reach the runtime in the
     /// order they are handed over, including operations replayed from the
@@ -133,6 +134,7 @@ extension EluRuntimeBackend {
         return { [weak self] in self?.flagsAreLoaded == true }
     }
     func beginPendingOperation(_ op: EluBufferedOp) -> (() -> Void)? { nil }
+    func beginNetworkObservation(_ request: URLRequest) -> EluNetworkObservation? { nil }
 }
 
 extension EluBufferedOp {

@@ -186,6 +186,12 @@ final class EluCore {
         dispatch(.reset)
     }
 
+    func beginNetworkObservation(_ request: URLRequest) -> EluNetworkObservation? {
+        backendIntentLock.lock(); defer { backendIntentLock.unlock() }
+        guard acceptedConsent?.optedOut != true else { return nil }
+        return intentBackend?.beginNetworkObservation(request)
+    }
+
     func flush() {
         queue.async { [self] in
             if state == .running { backend?.flush() }

@@ -209,6 +209,50 @@ final class EluV1CaptureRuntimeTests: XCTestCase {
         }
     }
 
+    func testNetworkCompletionCreatesFirstSessionButCannotExtendIdleOrCrossOwnership() async throws {
+        try await withTemporaryDirectory { root in
+            let clock = TestCaptureClock(wall: baseDate, continuous: 1_000_000_000)
+            let configData = try config { object in
+                var session = try XCTUnwrap(object["session"] as? [String: Any])
+                session["idleTimeoutSeconds"] = 60; object["session"] = session
+            }
+            let queue = try await makeCaptureQueue(root: root, clock: clock)
+            _ = await queue.submitCaptureAuthority(configData: configData, effectivePrivacyStateData: try privacy(contextRevision: 0, allowed: true))
+            let before = try await queue.snapshot()
+            let initial = EluNetworkObservationContext(identityRevision: before.identity.revision, contextRevision: before.identity.contextRevision, sessionID: nil)
+            guard case let .accepted(_, first) = await queue.captureNetworkObservation(
+                command(kind: .capture, name: "$network_request", occurredAt: clock.wall()), context: initial, admissionGuard: { true }) else {
+                return XCTFail("Network completion should be able to create the first actual session")
+            }
+            let context = EluNetworkObservationContext(identityRevision: first.identity.revision, contextRevision: first.identity.contextRevision,
+                sessionID: first.identity.session?.id, sessionStartedAt: first.identity.session?.startedAt)
+            guard case .rejected(.authorityWitnessChanged, _) = await queue.captureNetworkObservation(
+                command(kind: .capture, name: "$network_request", occurredAt: clock.wall()), context: initial, admissionGuard: { true }) else {
+                return XCTFail("A request started with no session cannot join a subsequently created session")
+            }
+            clock.advance(seconds: 59)
+            guard case let .accepted(_, sampled) = await queue.captureNetworkObservation(
+                command(kind: .capture, name: "$network_request", occurredAt: clock.wall()), context: context, admissionGuard: { true }) else {
+                return XCTFail("Expected passive request completion")
+            }
+            XCTAssertEqual(sampled.identity.session, first.identity.session)
+            XCTAssertEqual(sampled.identity.updatedAt, first.identity.updatedAt)
+            await queue.close()
+            let reopened = try await makeCaptureQueue(root: root, clock: clock)
+            _ = await reopened.submitCaptureAuthority(configData: configData, effectivePrivacyStateData: try privacy(contextRevision: 0, allowed: true))
+            clock.advance(seconds: 1)
+            guard case .rejected(.invalidEvent, _) = await reopened.captureNetworkObservation(
+                command(kind: .capture, name: "$network_request", occurredAt: clock.wall()), context: context, admissionGuard: { true }) else {
+                return XCTFail("Passive completion cannot resume an expired session")
+            }
+            let unchanged = try await reopened.snapshot()
+            XCTAssertEqual(unchanged.identity.session, first.identity.session)
+            let denied = await reopened.captureNetworkObservation(command(kind: .capture, name: "$network_request", occurredAt: clock.wall()), context: context, admissionGuard: { false })
+            guard case .rejected(.authorityAbsent, _) = denied else { return XCTFail("Withdrawn completion admitted") }
+            await reopened.close()
+        }
+    }
+
     func testCaptureAuthorityOwnsSessionPropertiesConsentAndGeneration() async throws {
         try await withTemporaryDirectory { root in
             let clock = TestCaptureClock(wall: baseDate, continuous: 1_000_000_000)

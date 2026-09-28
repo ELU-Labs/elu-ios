@@ -116,6 +116,7 @@ private final class EluStandaloneDeliveryFence: @unchecked Sendable {
 struct EluStandaloneFlagProjectionIntent: Sendable {
     let flags: EluV1FlagProjectionIntent
     let performance: UUID
+    let network: UUID
 }
 
 actor EluStandaloneRuntime {
@@ -150,6 +151,7 @@ actor EluStandaloneRuntime {
     private let nativeContinuousNow: @Sendable () -> UInt64?
     private nonisolated let deliveryFence = EluStandaloneDeliveryFence()
     private nonisolated let performanceMonitor = EluNativePerformanceMonitor()
+    private nonisolated let networkGate = EluNetworkObservationGate()
     private let performanceOptions: EluPerformanceOptions
     private var performanceForeground = false
     private let configurationGate: EluV2ConfigAuthorityGate?
@@ -309,6 +311,7 @@ actor EluStandaloneRuntime {
         // Destruction only closes local intake; it creates no database task.
         deliveryFence.close()
         performanceMonitor.invalidate()
+        networkGate.invalidate()
         if let viewPrivacyObserver { EluNativeViewPrivacy.shared.removeObserver(viewPrivacyObserver) }
         nativeAuthority.invalidateForOwnerDestruction()
         replayRelay.withdraw()
@@ -389,15 +392,17 @@ actor EluStandaloneRuntime {
 
     nonisolated func beginFlagProjectionIntent() -> EluStandaloneFlagProjectionIntent {
         let performance = performanceMonitor.beginMutation()
-        return .init(flags: queue.beginFlagProjectionIntent(), performance: performance)
+        return .init(flags: queue.beginFlagProjectionIntent(), performance: performance, network: networkGate.beginMutation())
     }
     nonisolated func finishFlagProjectionIntent(_ intent: EluStandaloneFlagProjectionIntent) {
         queue.finishFlagProjectionIntent(intent.flags)
         performanceMonitor.finishMutation(intent.performance)
+        networkGate.finishMutation(intent.network)
         replayRelay.request()
         Task { await self.refreshPerformance() }
     }
     nonisolated func invalidateAuthority() {
+        networkGate.invalidate()
         performanceMonitor.invalidate()
         replayRelay.withdraw()
         nativeAuthority.withdraw()
@@ -501,6 +506,7 @@ actor EluStandaloneRuntime {
     func stopNativeReplay() async throws { try await nativeAuthority.stop() }
 
     func applyConfiguration(_ configData: Data, sourceWitness: EluV2ConfigAuthorityWitness? = nil) async -> EluStandaloneConfigurationOutcome {
+        networkGate.invalidate()
         performanceMonitor.invalidate()
         defer { replayRelay.request(); refreshPerformance() }
         guard phase != .closed else { return .closed }
@@ -787,6 +793,7 @@ actor EluStandaloneRuntime {
     /// the context revision capture authority is bound to, so the stored
     /// document is resubmitted before the next capture can proceed.
     private func commit(_ snapshot: EluRuntimeQueueSnapshot) async -> EluRuntimeQueueSnapshot? {
+        networkGate.invalidate()
         performanceMonitor.invalidate()
         defer { replayRelay.request(); refreshPerformance() }
         lastSnapshot = snapshot
@@ -826,10 +833,12 @@ actor EluStandaloneRuntime {
 
     /// Synchronous lifecycle withdrawal before the ordered runtime lane catches up.
     nonisolated func performanceLifecycleIntent(foreground: Bool) {
+        networkGate.setForeground(foreground)
         performanceMonitor.setForeground(foreground)
     }
 
     private func refreshPerformance() {
+        refreshNetworkObservation()
         performanceMonitor.invalidate()
         guard phase == .capturing, performanceForeground, !lastSnapshot.identity.optedOut,
               let session = lastSnapshot.identity.session, session.lifecycle == .active,
@@ -868,6 +877,48 @@ actor EluStandaloneRuntime {
         _ = await record(command, performanceSample: true, admissionGuard: isCurrent)
     }
 
+    nonisolated func beginNetworkObservation(_ request: URLRequest, excludedHost: String? = nil) -> EluNetworkObservation? {
+        networkGate.begin(request, excludedHost: excludedHost)
+    }
+
+    private func refreshNetworkObservation() {
+        guard phase == .capturing, performanceForeground, !lastSnapshot.identity.optedOut,
+              let data = configurationDocument,
+              let document = try? JSONDecoder().decode(EluV1ConfigDocument.self, from: data),
+              let sessionPolicy = document.session else {
+            networkGate.invalidate(); return
+        }
+        let fence = deliveryFence, decision = fence.token(), source = configurationWitness
+        let gate = configurationGate, readClock = clock
+        let session = lastSnapshot.identity.session
+        let context = EluNetworkObservationContext(identityRevision: lastSnapshot.identity.revision,
+            contextRevision: lastSnapshot.identity.contextRevision, sessionID: lastSnapshot.identity.session?.id,
+            sessionStartedAt: lastSnapshot.identity.session?.startedAt)
+        networkGate.publish(context: context, current: {
+            let now = readClock()
+            guard fence.isCurrent(decision), now >= document.issuedAt.date, now < document.expiresAt.date,
+                  gate?.isCurrent(source, data: data) ?? true else { return false }
+            guard let session else { return true }
+            return session.lifecycle == .active && session.backgroundedAt == nil
+                && now >= session.lastActivityAt
+                && now.timeIntervalSince(session.lastActivityAt) < Double(min(session.timeoutSeconds, sessionPolicy.idleTimeoutSeconds))
+                && now.timeIntervalSince(session.startedAt) < Double(sessionPolicy.maximumDurationSeconds)
+        }) { [weak self] context, fields, current in
+            Task { await self?.captureNetworkObservation(fields, context: context, isCurrent: current) }
+        }
+    }
+
+    private func captureNetworkObservation(_ fields: [String: EluJSONValue], context: EluNetworkObservationContext,
+                                           isCurrent: @escaping @Sendable () -> Bool) async {
+        guard phase == .capturing, performanceForeground, isCurrent(),
+              lastSnapshot.identity.revision == context.identityRevision,
+              lastSnapshot.identity.contextRevision == context.contextRevision,
+              lastSnapshot.identity.session?.id == context.sessionID,
+              lastSnapshot.identity.session?.startedAt == context.sessionStartedAt else { return }
+        let command = EluV1CaptureCommand(kind: .capture, name: "$network_request", occurredAt: clock(), properties: fields, versions: versions)
+        _ = await record(command, networkContext: context, admissionGuard: isCurrent)
+    }
+
     /// Triggers delivery now; without an activated authority nothing is sent.
     func flush() async -> EluStandaloneDeliveryOutcome {
         guard deliveryFence.isCurrent(deliveryFence.token()) else { return .unavailable }
@@ -886,6 +937,7 @@ actor EluStandaloneRuntime {
         nativeAuthority.withdraw()
         replayRelay.withdraw()
         phase = .closed
+        networkGate.invalidate()
         performanceMonitor.invalidate()
         deliveryFence.close()
         configurationDocument = nil
@@ -925,15 +977,18 @@ actor EluStandaloneRuntime {
         return result
     }
 
-    private func record(_ command: EluV1CaptureCommand, performanceSample: Bool = false, admissionGuard: (@Sendable () -> Bool)? = nil) async -> EluV1CaptureResult {
+    private func record(_ command: EluV1CaptureCommand, performanceSample: Bool = false, networkContext: EluNetworkObservationContext? = nil, admissionGuard: (@Sendable () -> Bool)? = nil) async -> EluV1CaptureResult {
+        defer { refreshNetworkObservation() }
         let fence = deliveryFence
         let decision = fence.token()
         let current: @Sendable () -> Bool = {
             fence.isCurrent(decision) && (admissionGuard?() ?? true)
         }
-        let result = performanceSample
-            ? await queue.capturePerformanceSample(command, admissionGuard: current)
-            : await queue.capture(command, admissionGuard: current)
+        let result: EluV1CaptureResult
+        if performanceSample { result = await queue.capturePerformanceSample(command, admissionGuard: current) }
+        else if let networkContext {
+            result = await queue.captureNetworkObservation(command, context: networkContext, admissionGuard: current)
+        } else { result = await queue.capture(command, admissionGuard: current) }
         switch result {
         case let .accepted(_, snapshot):
             lastSnapshot = snapshot
