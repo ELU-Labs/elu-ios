@@ -159,3 +159,21 @@ Elu.setup(siteKey: "YOUR_SITE_KEY",
 ```
 
 Production apps should always use the default host.
+
+## Self-hosted ELU instance
+
+An app that sends to a self-hosted ELU instance declares that instance as its
+`apiHost` and points `configHost` at the same origin:
+
+```swift
+let instance = URL(string: "https://analytics.example.com")!
+Elu.setup(siteKey: "YOUR_SITE_KEY",
+          options: EluSetupOptions(configHost: instance, apiHost: instance))
+```
+
+A `configHost` outside `elu.dev` is accepted only when it is exactly the
+declared `apiHost`: both HTTPS, the same host, the default port, and no
+credentials, path, query or fragment. Anything else (plain HTTP, another port,
+a subdomain, a trailing-dot host, or a host with no declared `apiHost`) leaves
+the SDK idle. The instance serves the same `/v1/<siteKey>/config` document as
+ELU Cloud.

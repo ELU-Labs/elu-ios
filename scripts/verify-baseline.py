@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Verify immutable 0.1.0 package, API, fixture, and dependency snapshots."""
+"""Verify immutable 0.1.0 package, API, fixture, and dependency snapshots.
+
+The current public API must keep every 0.1.0 declaration and match the
+reviewed next-release snapshot in Baselines/current exactly.
+"""
 
 from __future__ import annotations
 
@@ -12,6 +16,7 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 BASELINE = ROOT / "Baselines" / "0.1.0"
+CURRENT = ROOT / "Baselines" / "current"
 TAG = "0.1.0"
 COMMIT = "5825dfb4ca9cd1d104d0a07e33d0394128750391"
 
@@ -57,9 +62,22 @@ def main() -> int:
     if public_declarations(tagged_source) != expected_api:
         fail("public-api.txt does not match the immutable tag")
 
+    # The published surface can only grow: every 0.1.0 declaration must remain,
+    # and the whole current surface must be the reviewed next-release snapshot.
     current_source = (ROOT / "Sources" / "EluAnalytics" / "Elu.swift").read_text(encoding="utf-8")
-    if public_declarations(current_source) != expected_api:
-        fail("current facade differs from the frozen 0.1.0 public API")
+    current_api = public_declarations(current_source)
+    removed = [line for line in expected_api if line not in current_api]
+    if removed:
+        fail("current facade removed or altered frozen 0.1.0 declarations: " + "; ".join(removed))
+    reviewed_api = (CURRENT / "public-api.txt").read_text(encoding="utf-8").splitlines()
+    if current_api != reviewed_api:
+        fail("current facade differs from the reviewed Baselines/current/public-api.txt")
+    reviewed_symbols = json.loads((CURRENT / "public-symbols.json").read_text(encoding="utf-8"))
+    frozen_names = {symbol["name"] for symbol in json.loads((BASELINE / "public-symbols.json").read_text(encoding="utf-8"))["symbols"]}
+    if reviewed_symbols.get("module") != "EluAnalytics" or not frozen_names <= {
+        symbol["name"] for symbol in reviewed_symbols["symbols"]
+    }:
+        fail("Baselines/current/public-symbols.json drops frozen 0.1.0 symbols")
 
     metadata = json.loads((BASELINE / "package-metadata.json").read_text(encoding="utf-8"))
     if metadata["source"]["commit"] != COMMIT:
