@@ -241,6 +241,13 @@ final class EluCore {
                 warn("setup() called with an empty siteKey — ignored")
                 return
             }
+            guard case let .approved(configHost) = EluConfigHostAllowlist.resolve(options) else {
+                warn(
+                    "setup() called with a configHost that is not an approved ELU origin, "
+                        + "the app's self-hosted apiHost, or a loopback origin in a debug build — ignored"
+                )
+                return
+            }
 
             // Marker FIRST: absent-at-setup is the replayNewUsersOnly probe.
             isNewUser = EluDeviceMarkers.recordFirstLaunchIfNeeded()
@@ -248,7 +255,7 @@ final class EluCore {
             self.siteKey = siteKey
             selection = options.runtimeSelection
 
-            let client = EluConfigClient(siteKey: siteKey, configHost: options.configHost, queue: queue)
+            let client = EluConfigClient(siteKey: siteKey, configHost: configHost, queue: queue)
             client.onConfig = { [weak self] cfg, document in
                 self?.applyFetched(cfg, document: document)
             }

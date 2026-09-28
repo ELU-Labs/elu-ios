@@ -21,9 +21,13 @@ enum EluConfigHostResolution: Equatable, Sendable {
 /// Approved origins for `EluSetupOptions.configHost`.
 ///
 /// The option stays source-compatible, but only enumerated ELU HTTPS origins
-/// are accepted. A loopback origin is accepted only when the binary permits
-/// it, which is limited to debug builds; there is no environment variable,
-/// URL scheme, or runtime switch that widens the release allowlist.
+/// are accepted, plus exactly the self-hosted ELU instance an app declares as
+/// `EluSetupOptions.apiHost`: both HTTPS on the default port with the same
+/// host, and no credentials, path, query, fragment or trailing dot, so the
+/// declaration cannot widen the allowlist to any other host. A loopback origin
+/// is accepted only when the binary permits it, which is limited to debug
+/// builds; there is no environment variable, URL scheme, or runtime switch
+/// that widens the release allowlist.
 enum EluConfigHostAllowlist {
     static let productionHost = "elu.dev"
 
@@ -46,12 +50,23 @@ enum EluConfigHostAllowlist {
         static let loopbackPermitted = false
     #endif
 
+    /// Loopback names the self-hosted rule never accepts: they are governed
+    /// by the debug-only loopback rule alone.
+    static let selfHostedExcludedHosts: Set<String> = [
+        "localhost",
+        "127.0.0.1",
+        "::1",
+        "[::1]",
+        "10.0.2.2",
+    ]
+
     static func resolve(_ options: EluSetupOptions) -> EluConfigHostResolution {
-        resolve(configHost: options.configHost)
+        resolve(configHost: options.configHost, apiHost: options.apiHost)
     }
 
     static func resolve(
         configHost: URL,
+        apiHost: URL? = nil,
         loopbackPermitted: Bool = Self.loopbackPermitted
     ) -> EluConfigHostResolution {
         guard let components = URLComponents(url: configHost, resolvingAgainstBaseURL: false),
@@ -87,13 +102,17 @@ enum EluConfigHostAllowlist {
             guard loopbackPermitted else {
                 return .rejected(.loopbackNotPermitted)
             }
-        } else {
-            guard approvedHosts.contains(host) else {
-                return .rejected(.hostNotApproved)
-            }
+        } else if approvedHosts.contains(host) {
             guard components.port == nil || components.port == 443 else {
                 return .rejected(.untrustedPort)
             }
+        } else {
+            guard let apiHost, let declared = selfHostedOrigin(apiHost),
+                  selfHostedOrigin(configHost) == declared
+            else {
+                return .rejected(.hostNotApproved)
+            }
+            return .approved(declared)
         }
 
         var origin = URLComponents()
@@ -106,5 +125,28 @@ enum EluConfigHostAllowlist {
             return .rejected(.missingHost)
         }
         return .approved(url)
+    }
+
+    /// `https://host` for an HTTPS origin on the default port with a plain,
+    /// non-loopback host and no credentials, path, query or fragment, else nil.
+    static func selfHostedOrigin(_ value: URL) -> URL? {
+        guard let components = URLComponents(url: value, resolvingAgainstBaseURL: false),
+              components.scheme?.lowercased() == "https",
+              let rawHost = components.host, !rawHost.isEmpty,
+              components.port == nil,
+              components.user == nil, components.password == nil,
+              components.path.isEmpty || components.path == "/",
+              components.query == nil, components.fragment == nil
+        else {
+            return nil
+        }
+        let host = rawHost.lowercased()
+        guard !host.hasSuffix("."), !host.hasPrefix("."), !selfHostedExcludedHosts.contains(host) else {
+            return nil
+        }
+        var origin = URLComponents()
+        origin.scheme = "https"
+        origin.host = host
+        return origin.url
     }
 }

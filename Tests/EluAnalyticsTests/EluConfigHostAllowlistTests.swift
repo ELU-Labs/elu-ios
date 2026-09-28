@@ -82,4 +82,120 @@ final class EluConfigHostAllowlistTests: XCTestCase {
             XCTAssertFalse(EluConfigHostAllowlist.loopbackPermitted)
         #endif
     }
+
+    // MARK: - Self-hosted instance
+
+    private let cell = URL(string: "https://analytics.example.com")!
+
+    func testASelfHostedConfigHostIsApprovedWhenItIsExactlyTheDeclaredApiHost() {
+        for loopbackPermitted in [false, true] {
+            XCTAssertEqual(
+                EluConfigHostAllowlist.resolve(configHost: cell, apiHost: cell, loopbackPermitted: loopbackPermitted),
+                .approved(cell)
+            )
+            // Case and a bare trailing slash are normalization, not a different origin.
+            XCTAssertEqual(
+                EluConfigHostAllowlist.resolve(
+                    configHost: URL(string: "HTTPS://Analytics.Example.com/")!,
+                    apiHost: URL(string: "https://analytics.example.com/")!,
+                    loopbackPermitted: loopbackPermitted
+                ),
+                .approved(cell)
+            )
+        }
+        XCTAssertEqual(
+            EluConfigHostAllowlist.resolve(EluSetupOptions(configHost: cell, apiHost: cell)),
+            .approved(cell)
+        )
+    }
+
+    func testASelfHostedConfigHostIsRefusedWithoutADeclaredApiHost() {
+        XCTAssertNil(EluSetupOptions().apiHost)
+        XCTAssertNil(EluSetupOptions(configHost: cell).apiHost)
+        XCTAssertEqual(
+            EluConfigHostAllowlist.resolve(EluSetupOptions(configHost: cell)),
+            .rejected(.hostNotApproved)
+        )
+    }
+
+    func testASelfHostedConfigHostIsRefusedWhenItDiffersFromTheApiHostInAnyWay() {
+        let attempts: [(String, String)] = [
+            // plain http, on either side
+            ("http://analytics.example.com", "https://analytics.example.com"),
+            ("https://analytics.example.com", "http://analytics.example.com"),
+            ("http://analytics.example.com", "http://analytics.example.com"),
+            // a different or explicit port, even the https default
+            ("https://analytics.example.com:8443", "https://analytics.example.com"),
+            ("https://analytics.example.com:8443", "https://analytics.example.com:8443"),
+            ("https://analytics.example.com:443", "https://analytics.example.com:443"),
+            // a subdomain or parent of the declared host
+            ("https://evil.analytics.example.com", "https://analytics.example.com"),
+            ("https://example.com", "https://analytics.example.com"),
+            // userinfo that makes the real host another
+            ("https://analytics.example.com@evil.example", "https://analytics.example.com"),
+            ("https://user:pw@analytics.example.com", "https://user:pw@analytics.example.com"),
+            // a trailing-dot host
+            ("https://analytics.example.com.", "https://analytics.example.com"),
+            ("https://analytics.example.com.", "https://analytics.example.com."),
+            // paths, queries and fragments
+            ("https://analytics.example.com/v1", "https://analytics.example.com"),
+            ("https://analytics.example.com?x=1", "https://analytics.example.com"),
+            ("https://analytics.example.com#f", "https://analytics.example.com"),
+            // loopback names stay under the debug-only loopback rule
+            ("https://localhost", "https://localhost"),
+            ("https://127.0.0.1", "https://127.0.0.1"),
+            ("https://10.0.2.2", "https://10.0.2.2"),
+            // a different host altogether
+            ("https://other.example", "https://analytics.example.com"),
+        ]
+        for (configHost, apiHost) in attempts {
+            let resolution = EluConfigHostAllowlist.resolve(
+                configHost: URL(string: configHost)!,
+                apiHost: URL(string: apiHost)!,
+                loopbackPermitted: false
+            )
+            guard case .rejected = resolution else {
+                XCTFail("\(configHost) vs \(apiHost) was \(resolution)")
+                continue
+            }
+        }
+    }
+
+    func testDeclaringAnApiHostLeavesTheEluAndLoopbackRulesUnchanged() {
+        XCTAssertEqual(
+            EluConfigHostAllowlist.resolve(
+                configHost: URL(string: "https://elu.dev")!,
+                apiHost: cell,
+                loopbackPermitted: false
+            ),
+            .approved(URL(string: "https://elu.dev")!)
+        )
+        XCTAssertEqual(
+            EluConfigHostAllowlist.resolve(
+                configHost: URL(string: "http://localhost:8080")!,
+                apiHost: URL(string: "http://localhost:8080")!,
+                loopbackPermitted: false
+            ),
+            .rejected(.loopbackNotPermitted)
+        )
+    }
+
+    // MARK: - Setup enforces the allowlist
+
+    func testSetupWithAnUnapprovedConfigHostLeavesTheSdkIdle() throws {
+        let factory = SelectorSpy()
+        let core = EluCore(backendFactory: factory.factory)
+        core.setup(siteKey: "elu_pk_allowlist_idle", options: EluSetupOptions(configHost: cell))
+        core.dispatch(.capture(event: "held", properties: nil))
+        core.deliverConfigForTesting(
+            try TestConfigFactory.make(blockEu: false),
+            document: Data(#"{"v":1,"enabled":true,"publicToken":"fixture-token","host":"https://ingest.example.test"}"#.utf8)
+        )
+        _ = core.bufferDropCountForTesting()
+
+        // Idle ignores configuration: no runtime was ever built.
+        XCTAssertNil(core.backendForTesting())
+        XCTAssertTrue(factory.requestedSelections().isEmpty)
+    }
 }
+

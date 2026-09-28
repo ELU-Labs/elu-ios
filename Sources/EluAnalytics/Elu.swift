@@ -1,10 +1,19 @@
 import Foundation
 
-/// Options for `Elu.setup(siteKey:options:)`. Dev/staging only — production
-/// apps use the plain `Elu.setup(siteKey:)`.
+/// Options for `Elu.setup(siteKey:options:)`. Production apps on ELU Cloud
+/// use the plain `Elu.setup(siteKey:)`; the options serve dev/staging config
+/// hosts and apps that send to a self-hosted ELU instance.
 public struct EluSetupOptions {
     /// ELU config endpoint origin. Default: `https://elu.dev`.
+    ///
+    /// A config host outside `elu.dev` is accepted only when it is exactly
+    /// `apiHost`: HTTPS, the same host, the default port. Any other value
+    /// leaves the SDK idle.
     public var configHost: URL
+
+    /// The self-hosted ELU instance this app sends to, or `nil` for ELU Cloud.
+    /// Declaring it is what lets `configHost` name that instance.
+    public var apiHost: URL?
 
     /// Which analytics runtime this run drives. Not part of the public API:
     /// a build selects one runtime for its whole fleet, and the selection is
@@ -17,6 +26,13 @@ public struct EluSetupOptions {
 
     public init(configHost: URL = URL(string: "https://elu.dev")!) {
         self.configHost = configHost
+    }
+
+    /// Options for an app that sends to a self-hosted ELU instance: pass the
+    /// instance's origin as both `configHost` and `apiHost`.
+    public init(configHost: URL, apiHost: URL?) {
+        self.configHost = configHost
+        self.apiHost = apiHost
     }
 }
 
@@ -37,7 +53,8 @@ public enum Elu {
         setup(siteKey: siteKey, options: EluSetupOptions())
     }
 
-    /// Initialize with explicit options (dev/staging config host only).
+    /// Initialize with explicit options (a dev/staging config host, or a
+    /// self-hosted ELU instance declared as `apiHost`).
     public static func setup(siteKey: String, options: EluSetupOptions) {
         EluCore.shared.setup(siteKey: siteKey, options: options)
     }

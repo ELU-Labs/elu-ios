@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Compare a built EluAnalytics symbol graph with the frozen public snapshot."""
+"""Compare a built EluAnalytics symbol graph with the reviewed public snapshot.
+
+The graph must match Baselines/current exactly and still carry every symbol of
+the published 0.1.0 snapshot, so the public API can only grow.
+"""
 
 from __future__ import annotations
 
@@ -10,7 +14,8 @@ import sys
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-SNAPSHOT = ROOT / "Baselines" / "0.1.0" / "public-symbols.json"
+FROZEN_SNAPSHOT = ROOT / "Baselines" / "0.1.0" / "public-symbols.json"
+SNAPSHOT = ROOT / "Baselines" / "current" / "public-symbols.json"
 
 
 def parse_args() -> argparse.Namespace:
@@ -45,6 +50,11 @@ def main() -> int:
                 actual.add(".".join(components))
     if not matched_files:
         print("no EluAnalytics symbol graph found", file=sys.stderr)
+        return 1
+    frozen = {symbol["name"] for symbol in json.loads(FROZEN_SNAPSHOT.read_text(encoding="utf-8"))["symbols"]}
+    removed = sorted(frozen - actual)
+    if removed:
+        print("published 0.1.0 symbols removed:", *removed, sep="\n  ", file=sys.stderr)
         return 1
     missing = sorted(expected - actual)
     added = sorted(actual - expected)
