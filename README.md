@@ -233,7 +233,8 @@ Unknown native blocking rules disable replay. Replay remains subject to engine,
 player, privacy, and device qualification before release.
 
 `captureException` records errors explicitly supplied by your app, including
-bounded cause chains. Automatic fatal-crash capture is not currently supplied.
+bounded cause chains. It does not install a synchronous fatal-crash handler.
+Optional delayed numeric OS diagnostics are described below.
 Browser DOM, Web Vitals, and browser long-task APIs do not apply to native apps.
 
 ## Customer networking
@@ -300,6 +301,43 @@ slower of local and server settings. Stall thresholds must be 100–60,000
 milliseconds. Invalid options disable sampling. This does not measure full app
 launch time or automatically report fatal crashes.
 
+## Delayed OS diagnostics and launch summaries
+
+MetricKit collection is separately disabled by default:
+
+```swift
+var options = EluSetupOptions()
+options.diagnostics = EluDiagnosticsOptions(enabled: true, launchSummaries: true)
+Elu.setup(siteKey: "YOUR_SITE_KEY", options: options)
+```
+
+On iOS 14 and later, eligible `$native_diagnostic` events contain numeric crash,
+hang, and CPU diagnostic counts and duration totals. With `launchSummaries`
+enabled, `$native_launch` contains available launch/resume histogram counts and
+lower/upper duration bounds from iOS 13 onward, plus numeric launch diagnostic
+durations on iOS 16 onward. Launch summaries also require the current server
+responsiveness permission (`capturePerformance.long_tasks`). No stack trees,
+raw OS payloads, exception messages, file paths, or process metadata are read.
+
+These are delayed, OS-scheduled interval summaries. They do not guarantee every
+crash is reported or describe an individual launch when only histogram bounds
+are available. The full OS interval must fit inside one persisted consent and
+identity interval. First installation, an account switch, consent action,
+observed capture denial, explicit SDK shutdown, changed diagnostics options, or
+an invalid clock can make a report ineligible. Routine config expiry, refresh,
+backgrounding, and process restart preserve known continuity; current capture
+permission is still required when a report arrives. Disabling collection does
+not later import reports from the disabled interval.
+
+An accepted summary uses an existing live session at receipt time, without
+creating a session, extending its idle timer, or copying groups and registered
+properties. `$diagnostic_interval_start` and `$diagnostic_interval_end` identify
+the historical OS interval; the receipt session is not an assertion that the
+crash or launch happened in that session. Reports with uncertain ownership,
+unavailable OS data, malformed values, excessive size, or duplicate intervals
+are omitted. Typical use requires the app to receive an OS report after a full
+eligible interval; this collector is not a live crash-stack reporter.
+
 ## SDK development
 
 [SDK development status](docs/sdk-development-status.md) tracks validation gaps and related work.
@@ -308,7 +346,7 @@ launch time or automatically report fatal crashes.
 
 The package includes `PrivacyInfo.xcprivacy`. It declares the SDK's linked
 analytics, manual exception, native performance/diagnostic data, and ordinary
-replay text, with tracking disabled. Performance remains disabled by default;
+replay text, with tracking disabled. Performance and OS diagnostics remain disabled by default;
 replay still requires eligible privacy authority, and masked inputs and blocked
 content are excluded. Elapsed-time clocks are used for in-app timers and duration
 measurements; raw system boot time is not sent. Review your app's complete data

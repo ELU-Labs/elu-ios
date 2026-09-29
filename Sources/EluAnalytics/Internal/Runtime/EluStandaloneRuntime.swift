@@ -116,6 +116,7 @@ private final class EluStandaloneDeliveryFence: @unchecked Sendable {
 struct EluStandaloneFlagProjectionIntent: Sendable {
     let flags: EluV1FlagProjectionIntent
     let performance: UUID
+    let diagnostics: UUID
     let network: UUID
 }
 
@@ -147,11 +148,15 @@ actor EluStandaloneRuntime {
     private var replayComposition: EluNativeReplayComposition?
     private var viewPrivacyObserver: UUID?
     private var closeTask: Task<Void, Never>?
+    private(set) var diagnosticsCloseSettlement: EluNativeDiagnosticsCloseSettlement?
     private(set) var nativeReplayCompositionSettlement: EluNativeReplayComposition.CloseOutcome?
     private let nativeContinuousNow: @Sendable () -> UInt64?
     private nonisolated let deliveryFence = EluStandaloneDeliveryFence()
     private nonisolated let performanceMonitor = EluNativePerformanceMonitor()
     private nonisolated let networkGate = EluNetworkObservationGate()
+    private nonisolated let diagnosticsGate = EluNativeDiagnosticsGate()
+    private nonisolated let diagnosticsMonitor = EluNativeDiagnosticsMonitor()
+    private let diagnosticsOptions: EluDiagnosticsOptions
     private let performanceOptions: EluPerformanceOptions
     private var performanceForeground = false
     private let configurationGate: EluV2ConfigAuthorityGate?
@@ -194,9 +199,11 @@ actor EluStandaloneRuntime {
         flushDelayNanoseconds: UInt64,
         configurationGate: EluV2ConfigAuthorityGate?,
         nativeContinuousNow: @escaping @Sendable () -> UInt64?,
-        performance: EluPerformanceOptions
+        performance: EluPerformanceOptions,
+        diagnostics: EluDiagnosticsOptions
     ) {
         self.performanceOptions = performance
+        self.diagnosticsOptions = diagnostics
         self.nativeContinuousNow = nativeContinuousNow
         self.configurationGate = configurationGate
         self.queue = queue
@@ -245,7 +252,9 @@ actor EluStandaloneRuntime {
         sessionIdGenerator: @escaping @Sendable () -> String = {
             "session_\(EluStandaloneRuntime.compactUUID())"
         },
-        performance: EluPerformanceOptions = .init()
+        performance: EluPerformanceOptions = .init(),
+        diagnostics: EluDiagnosticsOptions = .init(),
+        faultInjector: (any EluRuntimeQueueFaultInjecting)? = nil
     ) async throws -> EluStandaloneRuntime {
         guard isHeaderSafeSiteKey(siteKey) else {
             throw EluStandaloneRuntimeError.invalidSiteKey
@@ -278,10 +287,14 @@ actor EluStandaloneRuntime {
             anonymousIdGenerator: anonymousIdGenerator,
             streamIdGenerator: streamIdGenerator,
             sessionIdGenerator: sessionIdGenerator,
-            configurationGate: configurationGate
+            configurationGate: configurationGate,
+            faultInjector: faultInjector
         )
         let initialSnapshot: EluRuntimeQueueSnapshot
         do {
+            // A new setup with collection disabled ends any prior process's
+            // interval before source/config/lifecycle can accept OS telemetry.
+            _ = try await queue.applyDiagnosticsOptions(diagnostics)
             initialSnapshot = try await queue.snapshot()
         } catch {
             await queue.close()
@@ -302,7 +315,7 @@ actor EluStandaloneRuntime {
             flushDelayNanoseconds: flushDelayNanoseconds,
             configurationGate: configurationGate,
             nativeContinuousNow: { nativeContinuousNanoseconds(continuousClock()) },
-            performance: performance
+            performance: performance, diagnostics: diagnostics
         )
     }
 
@@ -310,6 +323,7 @@ actor EluStandaloneRuntime {
         // Original worker tasks retain physical/receipt cleanup independently.
         // Destruction only closes local intake; it creates no database task.
         deliveryFence.close()
+        diagnosticsGate.close(); diagnosticsMonitor.stop()
         performanceMonitor.invalidate()
         networkGate.invalidate()
         if let viewPrivacyObserver { EluNativeViewPrivacy.shared.removeObserver(viewPrivacyObserver) }
@@ -372,6 +386,8 @@ actor EluStandaloneRuntime {
     /// installs a delivery coordinator bound to that config's endpoint, expiry,
     /// and batch limits; anything else retires delivery.
     nonisolated func acceptConsentIntent(_ id: UUID, optedOut: Bool) {
+        diagnosticsGate.beginConsent(id)
+        diagnosticsMonitor.withdraw()
         deliveryFence.acceptConsent(id, optedOut: optedOut)
         if optedOut { invalidateAuthority() }
     }
@@ -381,27 +397,34 @@ actor EluStandaloneRuntime {
     func setOptedOut(_ optedOut: Bool, intent: UUID) async -> EluRuntimeQueueSnapshot? {
         let fence = deliveryFence
         guard phase != .closed, fence.isLatestConsent(intent) else { return nil }
+        let diagnosticIntents = diagnosticsGate.consentIntents()
         guard let generation = try? await queue.snapshot().generation,
               let snapshot = try? await queue.setOptedOut(optedOut, expectedGeneration: generation,
                   admissionGuard: { fence.isLatestConsent(intent) }) else {
             return nil
         }
         deliveryFence.commitConsent(intent, optedOut: optedOut)
+        // Changed consent and diagnostics closure share the existing transaction.
+        // A same-choice call closes metadata without an optional write preceding
+        // (and potentially preventing) a necessary durable consent change.
+        diagnosticsGate.finishConsent(diagnosticIntents)
         return await commit(snapshot)
     }
 
     nonisolated func beginFlagProjectionIntent() -> EluStandaloneFlagProjectionIntent {
         let performance = performanceMonitor.beginMutation()
-        return .init(flags: queue.beginFlagProjectionIntent(), performance: performance, network: networkGate.beginMutation())
+        return .init(flags: queue.beginFlagProjectionIntent(), performance: performance, diagnostics: diagnosticsGate.begin(), network: networkGate.beginMutation())
     }
     nonisolated func finishFlagProjectionIntent(_ intent: EluStandaloneFlagProjectionIntent) {
         queue.finishFlagProjectionIntent(intent.flags)
         performanceMonitor.finishMutation(intent.performance)
+        diagnosticsGate.finish(intent.diagnostics)
         networkGate.finishMutation(intent.network)
         replayRelay.request()
         Task { await self.refreshPerformance() }
     }
     nonisolated func invalidateAuthority() {
+        diagnosticsGate.invalidate(); diagnosticsMonitor.withdraw()
         networkGate.invalidate()
         performanceMonitor.invalidate()
         replayRelay.withdraw()
@@ -585,6 +608,11 @@ actor EluStandaloneRuntime {
                 return .blocked(sourceUnavailable())
             }
         } else { publish() }
+        if case let .terminated(terminal) = result,
+           ![EluV1CaptureAuthorityTerminalReason.expired, .stale].contains(terminal.reason) {
+            diagnosticsMonitor.withdraw()
+            _ = try? await queue.closeDiagnosticsContinuity()
+        }
         // Delivery is derived from configuration/privacy and sealed queue legality.
         // A capture session terminal does not revoke previously lawful records.
         if let projection = handoff.value {
@@ -837,7 +865,54 @@ actor EluStandaloneRuntime {
         performanceMonitor.setForeground(foreground)
     }
 
+    func closeDiagnosticsForInvalidClock() async {
+        let original = diagnosticsGate.begin()
+        diagnosticsMonitor.withdraw()
+        if (try? await queue.closeDiagnosticsContinuity()) != nil { diagnosticsGate.finish(original) }
+    }
+
+    private func refreshDiagnostics() async {
+        guard diagnosticsOptions.enabled, phase == .capturing, !lastSnapshot.identity.optedOut,
+              let token = diagnosticsGate.token(), let data = configurationDocument,
+              let document = try? JSONDecoder().decode(EluV1ConfigDocument.self, from: data)
+        else { diagnosticsMonitor.withdraw(); return }
+        let gate = diagnosticsGate, fence = deliveryFence, decision = fence.token()
+        let source = configurationWitness, configGate = configurationGate, readClock = clock
+        let current: @Sendable () -> Bool = {
+            let now = readClock()
+            return gate.isCurrent(token) && fence.isCurrent(decision)
+                && now >= document.issuedAt.date && now < document.expiresAt.date
+                && (configGate?.isCurrent(source, data: data) ?? true)
+        }
+        guard (try? await queue.reconcileDiagnosticsContinuity(options: diagnosticsOptions, admissionGuard: current)) == true,
+              phase == .capturing, current() else { diagnosticsMonitor.withdraw(); return }
+        let launch = diagnosticsOptions.launchSummaries && document.capturePerformance?.mainThreadStalls == true
+        diagnosticsMonitor.publish(includeLaunch: launch, current: current) { [weak self] summary in
+            Task { await self?.captureNativeDiagnostic(summary, isCurrent: current) }
+        }
+    }
+
+    /// A historical OS summary is received now, under a current live session.
+    /// The queue admits it passively without copying groups/superproperties or
+    /// pretending its entire historical interval belongs to that receipt session.
+    func captureNativeDiagnostic(_ summary: EluNativeDiagnosticSummary,
+        isCurrent: @escaping @Sendable () -> Bool) async {
+        guard diagnosticsOptions.enabled, phase == .capturing, isCurrent(),
+              diagnosticsGate.token() != nil, let data = configurationDocument,
+              let document = try? JSONDecoder().decode(EluV1ConfigDocument.self, from: data),
+              summary.kind != .launch || (diagnosticsOptions.launchSummaries && document.capturePerformance?.mainThreadStalls == true)
+        else { return }
+        let fence = deliveryFence, decision = fence.token()
+        let result = await queue.captureNativeDiagnostic(summary, versions: versions,
+            admissionGuard: { isCurrent() && fence.isCurrent(decision) })
+        switch result {
+        case let .accepted(_, snapshot): lastSnapshot = snapshot; armFlushTimer()
+        case let .rejected(_, snapshot): lastSnapshot = snapshot
+        }
+    }
+
     private func refreshPerformance() {
+        Task { await self.refreshDiagnostics() }
         refreshNetworkObservation()
         performanceMonitor.invalidate()
         guard phase == .capturing, performanceForeground, !lastSnapshot.identity.optedOut,
@@ -937,6 +1012,7 @@ actor EluStandaloneRuntime {
         nativeAuthority.withdraw()
         replayRelay.withdraw()
         phase = .closed
+        diagnosticsGate.close(); diagnosticsMonitor.stop()
         networkGate.invalidate()
         performanceMonitor.invalidate()
         deliveryFence.close()
@@ -949,6 +1025,15 @@ actor EluStandaloneRuntime {
         await task.value
     }
     private func finishClose() async {
+        do {
+            _ = try await queue.closeDiagnosticsContinuity()
+            diagnosticsCloseSettlement = .settled
+        } catch {
+            // The queue retains the original lease after an unresolved restrictive
+            // write. Closing physical observers is not durable closure success.
+            diagnosticsCloseSettlement = .unresolvedStorage
+        }
+        await diagnosticsMonitor.closeAndWait()
         nativeReplayCompositionSettlement = await replayComposition?.closeAndWait()
         await retireDelivery()
         await backgroundHandoff?.cancel()

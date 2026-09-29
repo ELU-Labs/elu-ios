@@ -6,6 +6,8 @@ public struct EluSetupOptions {
     public var configHost: URL
     /// Native performance collection is disabled unless explicitly enabled.
     public var performance = EluPerformanceOptions()
+    /// Delayed numeric OS diagnostics are disabled unless explicitly enabled.
+    public var diagnostics = EluDiagnosticsOptions()
 
     /// Internal construction marker for the owned runtime. Customer code
     /// cannot select or construct another backend.

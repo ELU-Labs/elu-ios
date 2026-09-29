@@ -33,7 +33,8 @@ final class EluStandaloneStack: @unchecked Sendable {
         scheduler: any EluV2ConfigLifecycleScheduler = EluV2TaskConfigScheduler(),
         versions: EluVersionContext? = nil,
         timeZoneIdentifier: @escaping @Sendable () -> String? = { TimeZone.current.identifier },
-        performance: EluPerformanceOptions = .init()
+        performance: EluPerformanceOptions = .init(),
+        diagnostics: EluDiagnosticsOptions = .init()
     ) async throws -> EluStandaloneStack {
         let relay = EluStandaloneConfigRelay()
         let lifecycle = try EluV2ConfigLifecycle(siteKey: siteKey, configHost: configHost,
@@ -48,7 +49,7 @@ final class EluStandaloneStack: @unchecked Sendable {
             time: EluV1BatchTimeSource(wallNow: clock.wallNow,
                 monotonicNow: { clock.floorNanoseconds(clock.continuousNow()) ?? UInt64.max },
                 sleep: { try await Task.sleep(nanoseconds: $0) }),
-            timeZoneIdentifier: timeZoneIdentifier, performance: performance)
+            timeZoneIdentifier: timeZoneIdentifier, performance: performance, diagnostics: diagnostics)
         do {
             let selectedFlags = try flagTransport ?? EluV1URLSessionFlagTransport(siteKey: siteKey)
             let flags = try await runtime.flagClient(transport: selectedFlags)
@@ -122,6 +123,9 @@ final class EluStandaloneStack: @unchecked Sendable {
                 guard self.isCurrent(decision) else { return }
                 _ = await flags.applyConfig(witness.data, sourceWitness: witness)
             } else {
+                if await lifecycle.invalidClock(for: token) {
+                    await runtime.closeDiagnosticsForInvalidClock()
+                }
                 await runtime.withdrawConfiguration(ifCurrent: { self.isCurrent(decision) })
                 guard self.isCurrent(decision) else { return }
                 await flags.withdrawConfiguration()

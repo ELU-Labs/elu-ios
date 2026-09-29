@@ -35,7 +35,7 @@ final class EluV2ReplayStorageTests: XCTestCase {
             let reopened = try await h.reopen()
             let after = try await reopened.storedReplayChunks()
             XCTAssertEqual(before, after)
-            XCTAssertEqual(try h.schemaVersion(), 12)
+            XCTAssertEqual(try h.schemaVersion(), 28)
             try await reopened.ensureFlagSchema()
             await reopened.close(); h.remove()
         }
@@ -208,7 +208,7 @@ final class EluV2ReplayStorageTests: XCTestCase {
             catch { XCTAssertEqual(error as? EluRuntimeQueueError, ambiguous ? .ambiguousCommit : .provenNotCommitted) }
             fault.action = nil
             if !ambiguous { await h.queue.close() }
-            XCTAssertEqual(try h.schemaVersion(), ambiguous ? 11 : 9)
+            XCTAssertEqual(try h.schemaVersion(), ambiguous ? 27 : 25)
             let reopened = try await h.reopen(); try await reopened.ensureReplaySchema(); await reopened.close()
         }
     }

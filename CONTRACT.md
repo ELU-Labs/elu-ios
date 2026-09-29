@@ -131,7 +131,7 @@ the replay request-detail setting. The README documents installation and limits.
 ## Exceptions and native performance
 
 `Elu.captureException` records errors explicitly supplied by the app, including
-bounded cause chains. Automatic fatal-crash reporting is not provided.
+bounded cause chains. It does not install a synchronous fatal-crash handler.
 
 Native performance sampling is disabled by default. Enable it through
 `EluPerformanceOptions` at setup; server policy must also permit the selected
@@ -145,6 +145,30 @@ interval summaries, without inspecting rendered content or changing the app's
 frame rate. It does not claim rendered or dropped frame counts.
 These measurements do not supply browser DOM metrics, Web Vitals, JavaScript
 heap size, browser long tasks, or full application launch time.
+
+`EluDiagnosticsOptions` separately enables delayed numeric MetricKit summaries.
+It defaults off. iOS 14+ crash/hang/CPU diagnostic counts and durations use
+`$native_diagnostic`; optional iOS 13+ launch/resume histogram bounds and iOS 16+
+launch diagnostic durations use `$native_launch`. Launch collection additionally
+requires current server responsiveness permission. No raw payloads, stacks,
+messages, paths, or metadata are collected. OS availability and scheduling do
+not guarantee delivery or coverage of every fatal crash.
+
+The whole OS interval must be covered by one durable consent/identity epoch.
+Every consent action, identity change, observed terminal capture/privacy denial,
+explicit shutdown, changed local diagnostics options, or clock regression
+closes that coverage. Ordinary config refresh/expiry, suspension, and process
+restart do not close it. Current authority and an existing live receipt session
+are required at enqueue; summaries are passive and inherit no groups or super
+properties. Historical interval fields distinguish the OS report from receipt
+context. Unknown history and duplicate, malformed, or oversized reports are
+omitted. Dedupe metadata and its event commit atomically. Restrictive closure
+writes get one retry only after known rollback. If storage still fails or commit
+is ambiguous, shutdown records an unresolved diagnostics settlement and retains
+the original installation lease until process exit; another live owner cannot
+reuse it. No cross-process persistence guarantee is made for an intent when
+storage rejects every write. See the README for installation, availability, and
+attribution limits.
 
 ## Storage upgrades and release evidence
 

@@ -12,8 +12,8 @@ final class EluV2ReplayDeliveryTests: XCTestCase {
             let before = try await h.queue.storedReplayChunks()
             if flagsFirst { try await h.queue.ensureFlagSchema() }
             try await h.queue.ensureReplayDeliverySchema()
-            if !flagsFirst { XCTAssertEqual(try h.schemaVersion(), 13); try await h.queue.ensureFlagSchema() }
-            XCTAssertEqual(try h.schemaVersion(), 14)
+            if !flagsFirst { XCTAssertEqual(try h.schemaVersion(), 29); try await h.queue.ensureFlagSchema() }
+            XCTAssertEqual(try h.schemaVersion(), 30)
             let after = try await h.queue.storedReplayChunks(); XCTAssertEqual(after, before)
             await h.queue.close(); h.queue = try await h.reopen()
             try await h.queue.ensureReplayDeliverySchema()
@@ -287,7 +287,7 @@ final class EluV2ReplayDeliveryTests: XCTestCase {
             catch { XCTAssertEqual(error as? EluRuntimeQueueError,point == .beforeCommit ? .provenNotCommitted : .ambiguousCommit) }
             fault.action = nil; await h.queue.close(); h.queue = try await h.reopen()
             let reopened = try await h.queue.storedReplayChunks(); XCTAssertEqual(reopened,rows)
-            XCTAssertEqual(try h.schemaVersion(),point == .beforeCommit ? 11 : 13)
+            XCTAssertEqual(try h.schemaVersion(),point == .beforeCommit ? 27 : 29)
             await h.queue.close()
         }
     }

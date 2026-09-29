@@ -93,7 +93,7 @@ final class EluReplayAudienceTests: XCTestCase {
         try await h.publish()
         let first = try await capture(h)
         XCTAssertTrue(try history(h).permits(XCTUnwrap(first.identity.session)))
-        XCTAssertEqual(try h.base.schemaVersion(), 9, "History does not depend on replay storage")
+        XCTAssertEqual(try h.base.schemaVersion(), 25, "History does not depend on replay storage")
         try await enableReplay(h)
         let observation = try await h.observe()
         XCTAssertEqual(observation.accounting.sessionId, first.identity.session?.id)
@@ -236,7 +236,7 @@ final class EluReplayAudienceTests: XCTestCase {
         _ = try await capture(h)
         let before = try await h.queue.snapshot()
         await h.queue.close()
-        try h.base.sql("DROP TABLE capture_session_history; PRAGMA user_version=1")
+        try h.base.sql("DROP TABLE native_diagnostics_state; DROP TABLE capture_session_history; PRAGMA user_version=1")
         try await h.reopen(); try await h.publish()
         let reopened = try await h.queue.snapshot(); XCTAssertEqual(reopened, before)
         XCTAssertEqual(try history(h), .unknown)
@@ -253,7 +253,7 @@ final class EluReplayAudienceTests: XCTestCase {
         _ = try await capture(h)
         let before = try await h.queue.snapshot()
         await h.queue.close()
-        try h.base.sql("DROP TABLE capture_session_history; PRAGMA user_version=1")
+        try h.base.sql("DROP TABLE native_diagnostics_state; DROP TABLE capture_session_history; PRAGMA user_version=1")
         fault.action = { if $0 == .beforeCaptureHistoryMigrationCommit { throw EluRuntimeQueueError.faultInjected($0) } }
         do { try await h.reopen(); XCTFail("Expected migration rollback") } catch {}
         XCTAssertEqual(try h.base.schemaVersion(), 1)
@@ -273,13 +273,13 @@ final class EluReplayAudienceTests: XCTestCase {
             if version >= 3 { try await h.queue.ensureReplaySchema() }
             if version >= 5 { try await h.queue.ensureReplayDeliverySchema() }
             if version >= 7 { try await h.queue.ensureNativeReplayAuthoritySchema() }
-            XCTAssertEqual(try h.base.schemaVersion(), Int64(version + 8))
+            XCTAssertEqual(try h.base.schemaVersion(), Int64(version + 24))
             let before = try await h.queue.snapshot()
             let records = try await h.queue.peek(maximumCount: 10, maximumBytes: 1_000_000)
             await h.queue.close()
-            try h.base.sql("DROP TABLE capture_session_history; PRAGMA user_version=\(version)")
+            try h.base.sql("DROP TABLE native_diagnostics_state; DROP TABLE capture_session_history; PRAGMA user_version=\(version)")
             try await h.reopen()
-            XCTAssertEqual(try h.base.schemaVersion(), Int64(version + 8))
+            XCTAssertEqual(try h.base.schemaVersion(), Int64(version + 24))
             XCTAssertEqual(try history(h), .unknown)
             let after = try await h.queue.snapshot(); XCTAssertEqual(after, before)
             let reopenedRecords = try await h.queue.peek(maximumCount: 10, maximumBytes: 1_000_000)

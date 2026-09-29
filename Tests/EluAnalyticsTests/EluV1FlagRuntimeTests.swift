@@ -959,13 +959,13 @@ final class EluV1FlagRuntimeTests: XCTestCase {
             let initial = try await runtime.snapshot()
             await runtime.close()
             let database = try self.databaseURL(root: root)
-            XCTAssertEqual(try self.userVersion(database), 9)
-            XCTAssertEqual(try self.tableNames(database), ["capture_session_history", "queue_records", "runtime_state"])
+            XCTAssertEqual(try self.userVersion(database), 25)
+            XCTAssertEqual(try self.tableNames(database), ["capture_session_history", "native_diagnostics_state", "queue_records", "runtime_state"])
 
             runtime = try await self.makeRuntime(root: root, clock: clock)
             await runtime.close()
-            XCTAssertEqual(try self.userVersion(database), 9)
-            XCTAssertEqual(try self.tableNames(database), ["capture_session_history", "queue_records", "runtime_state"])
+            XCTAssertEqual(try self.userVersion(database), 25)
+            XCTAssertEqual(try self.tableNames(database), ["capture_session_history", "native_diagnostics_state", "queue_records", "runtime_state"])
 
             runtime = try await self.makeRuntime(root: root, clock: clock)
             _ = try await EluV1FlagClient.make(
@@ -976,10 +976,10 @@ final class EluV1FlagRuntimeTests: XCTestCase {
             let migratedSnapshot = try await runtime.snapshot()
             XCTAssertEqual(migratedSnapshot, initial)
             await runtime.close()
-            XCTAssertEqual(try self.userVersion(database), 10)
+            XCTAssertEqual(try self.userVersion(database), 26)
             XCTAssertEqual(
                 try self.tableNames(database),
-                ["capture_session_history", "flag_cache_records", "queue_records", "runtime_state"]
+                ["capture_session_history", "flag_cache_records", "native_diagnostics_state", "queue_records", "runtime_state"]
             )
             XCTAssertEqual(try self.runtimeRecordSchema(database), 1)
             let before = try self.flagRows(database)

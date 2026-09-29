@@ -135,6 +135,30 @@
     {
       "kind": "swift.method",
       "name": "EluURLSession.perform(_:completionHandler:)"
+    },
+    {
+      "kind": "swift.struct",
+      "name": "EluDiagnosticsOptions"
+    },
+    {
+      "kind": "swift.func.op",
+      "name": "EluDiagnosticsOptions.!=(_:_:)"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluDiagnosticsOptions.enabled"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluDiagnosticsOptions.launchSummaries"
+    },
+    {
+      "kind": "swift.init",
+      "name": "EluDiagnosticsOptions.init(enabled:launchSummaries:)"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluSetupOptions.diagnostics"
     }
   ]
 }

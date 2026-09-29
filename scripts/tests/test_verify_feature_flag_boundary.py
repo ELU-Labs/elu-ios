@@ -312,6 +312,7 @@ class FeatureFlagBoundaryScannerTests(unittest.TestCase):
         for mutation in [
             source.replace("configHost: context.configHost", "configHost: otherHost", 1),
             source.replace("performance: context.performance", "performance: otherPerformance", 1),
+            source.replace("diagnostics: context.diagnostics", "diagnostics: otherDiagnostics", 1),
             source.replace("guardedFlagsDidLoad: context.guardedFlagsDidLoad", "guardedFlagsDidLoad: unchecked", 1),
             source.replace("try await EluStandaloneStack.make(", "try await EluStandaloneRuntime.make(", 1),
         ]:

@@ -10,8 +10,11 @@ previous 0.1.0 runtime, and it does not open, rewrite, or delete that runtime's
 files. Applications should call `Elu.identify` after restoring their own login
 state and apply their current consent choice through the public consent APIs.
 
-Supported owned SQLite schemas 1 through 8 upgrade to schemas 9 through 16,
-which add installation capture-session history. Reopen, transaction recovery,
+Supported owned SQLite schemas 1 through 16 upgrade to schemas 25 through 32.
+Schemas 9 through 16 already contain installation capture-session history; the
+new family additionally stores bounded native diagnostics continuity and receipt
+deduplication. An upgrade starts diagnostics coverage closed and does not import
+older OS intervals. Reopen, transaction recovery,
 identity, consent, offline queue, flags, and replay records remain preserved.
 Old SQLite and imported owned JSON stores cannot prove complete first-session
 history. They remain eligible for ordinary analytics and all-device replay,

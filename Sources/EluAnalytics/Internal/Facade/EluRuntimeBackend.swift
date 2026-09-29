@@ -89,6 +89,7 @@ struct EluRuntimeBackendContext {
     let flagsDidLoad: () -> Void
     let configHost: URL
     let performance: EluPerformanceOptions
+    let diagnostics: EluDiagnosticsOptions
     /// Installed synchronously by the constructor, then persisted before any
     /// configuration or lifecycle work can authorize collection.
     let initialConsent: EluConsentOperation?
@@ -99,6 +100,7 @@ struct EluRuntimeBackendContext {
          isNewUser: Bool, flagsDidLoad: @escaping () -> Void,
          configHost: URL = URL(string: "https://elu.dev")!,
          performance: EluPerformanceOptions = .init(),
+         diagnostics: EluDiagnosticsOptions = .init(),
          initialConsent: EluConsentOperation? = nil,
          guardedFlagsDidLoad: (@Sendable (@escaping @Sendable () -> Bool) -> Void)? = nil,
          initialConfigurationReady: @escaping @Sendable (@escaping @Sendable () -> Bool) -> Void = { _ in }) {
@@ -109,6 +111,7 @@ struct EluRuntimeBackendContext {
         self.flagsDidLoad = flagsDidLoad
         self.configHost = configHost
         self.performance = performance
+        self.diagnostics = diagnostics
         self.initialConsent = initialConsent
         self.guardedFlagsDidLoad = guardedFlagsDidLoad ?? { predicate in
             if predicate() { flagsDidLoad() }

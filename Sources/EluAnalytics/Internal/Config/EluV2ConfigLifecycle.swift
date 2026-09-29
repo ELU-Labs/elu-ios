@@ -123,6 +123,14 @@ actor EluV2ConfigLifecycle {
         return true
     }
 
+    /// A clock failure invalidates historical attribution, unlike a routine
+    /// expired lease or app suspension. The original notification must match.
+    func invalidClock(for candidate: EluV2ConfigLifecycleToken) -> Bool {
+        validatePublishedLease()
+        guard candidate == token, case .unavailable(.invalidClock) = state else { return false }
+        return true
+    }
+
     private func launchIfNeeded() {
         guard started, foreground, !closed, !clockFailed,
               refreshWanted, activeFetch == nil, invalidations == 0
