@@ -125,9 +125,10 @@ actor EluStandaloneRuntime {
     // Current server qualification/configuration and local privacy, identity,
     // lifecycle, source, and budget authority must independently permit capture.
     static let readbackProvenReplayCapabilities = EluNativeReplayCapabilities(
-        readbackProvenTransports: [EluV1ReplayTransportSelection(
-            codec: "elu-native-wireframe-v1", compression: .gzip)!],
-        readbackProvenProtocolGenerations: ["protocol-generation-v1"])
+        readbackProvenTransports: [
+            EluV1ReplayTransportSelection(codec: "elu-native-wireframe-v1", compression: .gzip)!,
+            EluV1ReplayTransportSelection(codec: "elu-native-wireframe-v2", compression: .gzip)!],
+        readbackProvenProtocolGenerations: ["protocol-generation-v1", "protocol-generation-v2"])
 
     static let defaultFlushDelayNanoseconds: UInt64 = 10_000_000_000
     static let screenNameProperty = "$screen_name"

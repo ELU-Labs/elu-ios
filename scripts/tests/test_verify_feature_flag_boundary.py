@@ -142,8 +142,14 @@ class FeatureFlagBoundaryScannerTests(unittest.TestCase):
         for before, after in [
             ('codec: "elu-native-wireframe-v1", compression: .gzip', 'codec: "other", compression: .gzip'),
             ('codec: "elu-native-wireframe-v1", compression: .gzip', 'codec: "elu-native-wireframe-v1", compression: .none'),
-            ('readbackProvenProtocolGenerations: ["protocol-generation-v1"]', 'readbackProvenProtocolGenerations: []'),
-            ('readbackProvenProtocolGenerations: ["protocol-generation-v1"]', 'readbackProvenProtocolGenerations: ["protocol-generation-v1", "other"]'),
+            ('codec: "elu-native-wireframe-v2", compression: .gzip', 'codec: "other", compression: .gzip'),
+            ('codec: "elu-native-wireframe-v2", compression: .gzip', 'codec: "elu-native-wireframe-v2", compression: .none'),
+            ('EluV1ReplayTransportSelection(codec: "elu-native-wireframe-v2", compression: .gzip)!', ''),
+            ('readbackProvenProtocolGenerations: ["protocol-generation-v1", "protocol-generation-v2"]', 'readbackProvenProtocolGenerations: []'),
+            ('readbackProvenProtocolGenerations: ["protocol-generation-v1", "protocol-generation-v2"]', 'readbackProvenProtocolGenerations: ["protocol-generation-v1"]'),
+            ('readbackProvenProtocolGenerations: ["protocol-generation-v1", "protocol-generation-v2"]', 'readbackProvenProtocolGenerations: ["protocol-generation-v2"]'),
+            ('readbackProvenProtocolGenerations: ["protocol-generation-v1", "protocol-generation-v2"]', 'readbackProvenProtocolGenerations: ["protocol-generation-v1", "protocol-generation-v2", "other"]'),
+            ('codec: "elu-native-wireframe-v2", compression: .gzip)!]', 'codec: "elu-native-wireframe-v2", compression: .gzip)!, EluV1ReplayTransportSelection(codec: "other", compression: .gzip)!]'),
         ]:
             self.assertIn(before, source)
             self.assertTrue(MODULE.scan_replay_storage_source(path, source.replace(before, after, 1)))

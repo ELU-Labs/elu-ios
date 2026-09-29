@@ -228,9 +228,10 @@ def scan_replay_storage_source(path: pathlib.Path, text: str) -> list[str]:
         normalized = re.sub(r"\s+", " ", text)
         exact_capability = (
             "static let readbackProvenReplayCapabilities = EluNativeReplayCapabilities( "
-            "readbackProvenTransports: [EluV1ReplayTransportSelection( "
-            'codec: "elu-native-wireframe-v1", compression: .gzip)!], '
-            'readbackProvenProtocolGenerations: ["protocol-generation-v1"])'
+            "readbackProvenTransports: [ "
+            'EluV1ReplayTransportSelection(codec: "elu-native-wireframe-v1", compression: .gzip)!, '
+            'EluV1ReplayTransportSelection(codec: "elu-native-wireframe-v2", compression: .gzip)!], '
+            'readbackProvenProtocolGenerations: ["protocol-generation-v1", "protocol-generation-v2"])'
         )
         if normalized.count(exact_capability) != 1 or text.count("static let readbackProvenReplayCapabilities") != 1:
             errors.append(f"{path} changed the exact binary-supported native capabilities")

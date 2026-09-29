@@ -285,11 +285,12 @@ The internal candidate v2 sealing path accepts only the closed tuples
 `elu-native-wireframe-v1` / `gzip` / `protocol-generation-v1` and
 `elu-native-wireframe-v2` / `gzip` / `protocol-generation-v2`, intersected with
 local proof and the original configuration. Mixed codec advertisements cannot
-cross generations. The production runtime still installs only v1. The internal
+cross generations. The runtime's local support set includes both exact tuples;
+it does not enable the engine's default policy or replace server qualification. The internal
 v2 capture branch reuses the original enrollment, physical use and accounting;
 it installs an observer only on an explicit `EluReplayWindow`, after its exact
 minimum-qualified initial append is known committed. Neither constructing that
-window nor the internal observer advertises v2 or grants authority. Generic replay
+window nor the internal observer selects a tuple or grants authority. Generic replay
 append refuses either native codec without the original physical admission. The
 original serial run adopts its candidate encoder only after a known queue commit, preserving
 the exact prepared bytes for retries. Movement envelopes begin at the earliest

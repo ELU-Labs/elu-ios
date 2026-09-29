@@ -296,9 +296,10 @@ configuration can authorize work only within its validity window:
 - Feature flag evaluation
 
 Replay privacy, sampling, and per-session limits are implemented in the owned
-runtime. The binary supports `elu-native-wireframe-v1` with gzip and
-`protocol-generation-v1`; current server qualification must advertise that exact
-support before configuration can authorize capture. Local consent, region,
+runtime. The binary supports the exact tuples `elu-native-wireframe-v1` / gzip /
+`protocol-generation-v1` and `elu-native-wireframe-v2` / gzip /
+`protocol-generation-v2`; current server qualification must advertise the selected
+tuple before configuration can authorize capture. Local consent, region,
 identity, lifecycle, masking, and budget gates also apply. Optional
 `replayAudience: "new-devices"` restricts replay to this installation's first
 successfully captured session, even if that session was not recorded. Restart,
@@ -434,9 +435,10 @@ The final window forwards the original `sendEvent` synchronously exactly once.
 SwiftUI-owned windows and other hosts without this integration are unsupported
 for interaction observation. Existing v1 wireframes do not require this window.
 
-Production capability advertisement still selects **v1 only**. The window alone
-cannot enable v2, consent, recording or a public capability override. The private
-v2 path additionally requires the exact locally supported tuple and original
+The local runtime supports both exact native tuples; this does not enable the
+engine's default replay policy or certify either end-to-end path. The window alone
+cannot enable v2, consent, recording or a public capability override. The
+v2 path requires the exact locally supported tuple and original
 configuration, then a known durable initial-frame commit satisfying the minimum
 duration before observing coordinates. This source integration and authored tests
 are not a released or end-to-end-qualified interaction feature.

@@ -118,6 +118,33 @@ final class EluNativeReplayCompositionTests: XCTestCase {
         await h.base.queue.close()
     }
 
+    func testProductionCapabilitiesDeliverOriginalColdV2BytesOnlyAfterActivation() async throws {
+        let h = try await SealedPolicyTestHarness.make(tuple: .v2); defer { h.base.remove() }
+        let rows = try await h.base.queue.storedReplayChunks()
+        let original = try XCTUnwrap(rows.first).prepared
+        XCTAssertEqual(original.codec, "elu-native-wireframe-v2")
+        let runtime = try await open(h)
+        let state = try await runtime.queueSnapshot(); XCTAssertNil(state.identity.session)
+        let sent = expectation(description: "original v2 sealed bytes")
+        let transport = CompositionTransport { sent.fulfill() }
+        let installed = await runtime.installNativeReplayComposition(lifecycle: EluNativeReplayLifecycle(),
+            capabilities: EluStandaloneRuntime.readbackProvenReplayCapabilities,
+            deferredUntilActivation: true, transport: transport)
+        let composition = try XCTUnwrap(installed)
+        await composition.reevaluate()
+        let before = await transport.count(); XCTAssertEqual(before, 0)
+        XCTAssertFalse(runtime.nativeReplayIsRecording(), "Local format support supplies no current root/session")
+        await runtime.activateNativeReplayComposition()
+        await fulfillment(of: [sent], timeout: 3)
+        await composition.waitForCurrentDelivery()
+        let body = await transport.firstBody(); XCTAssertEqual(body, original.body)
+        XCTAssertFalse(runtime.nativeReplayIsRecording())
+        await runtime.close()
+        h.base.queue = try await h.base.reopen()
+        let remaining = try await h.base.queue.storedReplayChunks(); XCTAssertTrue(remaining.isEmpty)
+        await h.base.queue.close()
+    }
+
     func testRuntimeDoesNotAdoptSourceRenewalAcrossTimezoneObservation() async throws {
         let h = try await SealedPolicyTestHarness.make(); defer { h.base.remove() }
         let zone = CompositionZone(), runtime = try await open(h, zone: zone)

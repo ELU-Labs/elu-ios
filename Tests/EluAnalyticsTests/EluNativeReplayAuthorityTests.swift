@@ -11,6 +11,77 @@ final class EluNativeReplayAuthorityTests: XCTestCase {
             readbackProvenProtocolGenerations: ["protocol-generation-v1"])
     }
 
+    func testProductionCapabilitiesSelectOnlyTheOriginalNativeGeneration() async throws {
+        let supported = EluStandaloneRuntime.readbackProvenReplayCapabilities
+        XCTAssertEqual(supported.transports, [
+            EluV1ReplayTransportSelection(codec: "elu-native-wireframe-v1", compression: .gzip)!,
+            EluV1ReplayTransportSelection(codec: "elu-native-wireframe-v2", compression: .gzip)!])
+        XCTAssertEqual(supported.readbackProvenProtocolGenerations,
+            ["protocol-generation-v1", "protocol-generation-v2"])
+        XCTAssertTrue(supported.transports(for: nil).isEmpty)
+        XCTAssertTrue(supported.transports(for: "replay-v2-generation-1").isEmpty)
+        for tuple in EluNativeReplayProtocol.allCases {
+            let h = try await make(tuple: tuple, mixed: true); defer { h.base.remove() }
+            let owner = EluNativeReplayAuthority(queue: h.queue, clock: { h.base.now })
+            let prepared = try await owner.prepare(source: XCTUnwrap(h.base.witness), capabilities: supported,
+                timeZoneIdentifier: "America/Los_Angeles")
+            XCTAssertEqual(supported.transports(for: tuple.generation), [tuple.transport])
+            XCTAssertEqual(prepared.resolution.replayAuthorization, .authorized(tuple.transport))
+            XCTAssertEqual(prepared.supportedProtocolGeneration, tuple.generation)
+            XCTAssertTrue(prepared.privacy.replayAllowed)
+            let state = try await h.queue.nativeReplaySessionState()
+            XCTAssertNil(state.session?.firstStartAt); XCTAssertNil(state.session?.activeEpoch)
+            await owner.close(); await h.queue.close()
+        }
+    }
+
+    func testProductionV2SupportCannotSupplyRemoteConsentPrivacyOrSourcePermission() async throws {
+        let supported = EluStandaloneRuntime.readbackProvenReplayCapabilities
+        for restriction in ["pair", "disabled", "consent", "privacy", "source", "expiry"] {
+            let h = try await make(tuple: .v2); defer { h.base.remove() }
+            let owner = EluNativeReplayAuthority(queue: h.queue, clock: { h.base.now })
+            let initial = try await owner.prepare(source: XCTUnwrap(h.base.witness), capabilities: supported,
+                timeZoneIdentifier: "America/Los_Angeles")
+            XCTAssertEqual(initial.resolution.replayAuthorization, .authorized(EluNativeReplayProtocol.v2.transport))
+            switch restriction {
+            case "consent":
+                let snapshot = try await h.queue.snapshot()
+                _ = try await h.queue.setOptedOut(true, expectedGeneration: snapshot.generation)
+            case "source": h.base.gate.close()
+            case "expiry": h.base.testClock.advance(601)
+            default:
+                var body = try JSONSerialization.jsonObject(with: h.base.config) as! [String: Any]
+                if restriction == "pair" {
+                    var caps = body["capabilities"] as! [String: Any], replay = caps["replay"] as! [String: Any]
+                    replay["transports"] = [["codec": "elu-native-wireframe-v1", "compression": "gzip"]]
+                    caps["replay"] = replay; body["capabilities"] = caps
+                } else if restriction == "disabled" {
+                    var features = body["features"] as! [String: Any]
+                    features["replay"] = false; body["features"] = features
+                } else {
+                    var privacy = body["privacy"] as! [String: Any], masking = privacy["masking"] as! [String: Any]
+                    masking["platformRules"] = [["platform": "ios", "action": "block", "targetDialect": "elu-unknown-native-v9", "target": "private-target"]]
+                    privacy["masking"] = masking; body["privacy"] = privacy
+                }
+                h.base.testClock.advance(0.001); body["issuedAt"] = EluRFC3339.string(from: h.base.now)
+                h.base.config = try JSONSerialization.data(withJSONObject: body); try await h.publish()
+            }
+            XCTAssertFalse(initial.isCurrent(), restriction)
+            do {
+                let denied = try await owner.prepare(source: XCTUnwrap(h.base.witness), capabilities: supported,
+                    timeZoneIdentifier: "America/Los_Angeles")
+                XCTAssertFalse(denied.privacy.replayAllowed, restriction)
+                if case .authorized = denied.resolution.replayAuthorization { XCTFail("Restriction bypassed: \(restriction)") }
+            } catch {
+                // A source/profile refusal may fail preparation before a denied
+                // projection exists; the same fixture was authorized above.
+            }
+            let state = try await h.queue.nativeReplaySessionState()
+            XCTAssertNil(state.session?.firstStartAt, restriction); XCTAssertNil(state.session?.activeEpoch, restriction)
+            await owner.close(); await h.queue.close()
+        }
+    }
+
     func testMixedNativeAdvertisementIsFilteredByOriginalGenerationBeforeProjection() async throws {
         for tuple in EluNativeReplayProtocol.allCases {
             let h = try await make(tuple: tuple, mixed: true); defer { h.base.remove() }

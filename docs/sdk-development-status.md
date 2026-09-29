@@ -22,8 +22,10 @@ original capture settlement and sealed delivery. They add no automatic screens
 or browser trigger overrides. A separate candidate v2 path now joins the original
 capture run to an explicit `EluReplayWindow` only after a known initial SQLite
 commit. Current privacy plus ordered clip/identity checks bound a primary-finger
-stream and lawful geometry handoffs. The production tuple remains v1-only; no
-actual dispatch, useful-scroll, resource or player qualification is inferred.
+stream and lawful geometry handoffs. The local runtime supports exact v1 and v2
+tuples under the original server configuration; the engine's default policy is
+unchanged. Actual dispatch, useful-scroll, resource and player qualification
+remain separate gates, including a fresh artifact built from this source.
 
 Customer request metrics require the explicit `EluURLSession` wrapper; URLs,
 headers and bodies are omitted. Opt-in native performance includes process

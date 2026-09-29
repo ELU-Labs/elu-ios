@@ -1,7 +1,8 @@
 import Foundation
 
 /// Closed binary formats. This descriptive tuple is not capture authority or a
-/// release advertisement; the installed runtime still selects its proven v1 tuple.
+/// release certification. The runtime intersects support with the original
+/// configuration generation; knowing a tuple cannot grant capture authority.
 enum EluNativeReplayProtocol: CaseIterable, Equatable, Sendable {
     case v1
     case v2
