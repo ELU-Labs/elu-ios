@@ -55,7 +55,9 @@ final class EluCaptureRateQueueTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         let now = Date(timeIntervalSince1970: 1_785_888_090)
         let runtime = try await EluStandaloneRuntime.make(rootDirectoryURL: root, siteKey: key,
-            transport: RateNoNetwork(), backgroundHandoff: .inline, clock: { now }, continuousClock: { 1 },
+            transport: RateNoNetwork(), backgroundHandoff: EluStandaloneBackgroundHandoff(
+                start: { operation in await operation(); return true }, cancel: {}),
+            clock: { now }, continuousClock: { 1 },
             continuousBudgetConverter: { $0 }, timeZoneIdentifier: { "America/Los_Angeles" }, rateLimiting: one)
         let source = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
         _ = try await runtime.applyConfiguration(Data(contentsOf: source.appendingPathComponent("Conformance/V2/fixtures/config-enabled.json")))
