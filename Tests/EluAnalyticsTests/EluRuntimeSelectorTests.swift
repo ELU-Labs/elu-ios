@@ -543,6 +543,7 @@ final class SelectorBackend: EluRuntimeBackend, @unchecked Sendable {
         case let .setGroupPropertiesForFlags(type, _):
             record("setGroupPropertiesForFlags(\(type))")
         case .reset: record("reset")
+        case .resetDeviceIdentity: record("resetDeviceIdentity")
         case .resetGroups: record("resetGroups")
         case .resetPersonPropertiesForFlags: record("resetPersonPropertiesForFlags")
         case .resetGroupPropertiesForFlags: record("resetGroupPropertiesForFlags")

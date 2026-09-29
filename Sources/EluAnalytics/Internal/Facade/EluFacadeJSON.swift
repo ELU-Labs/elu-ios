@@ -19,7 +19,7 @@ enum EluFacadeJSON {
     static let maximumDepth = 16
 
     static func isReservedKey(_ key: String) -> Bool {
-        key.hasPrefix(reservedPropertyPrefix)
+        key.hasPrefix(reservedPropertyPrefix) || ["$device_id", "$is_identified", "$process_person_profile", "$epp"].contains(key)
     }
 
     /// The projected properties plus the number of reserved names removed.

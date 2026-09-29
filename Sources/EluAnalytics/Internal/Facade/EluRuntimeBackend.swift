@@ -91,6 +91,7 @@ struct EluRuntimeBackendContext {
     let endpointPolicy: EluEndpointPolicy
     let performance: EluPerformanceOptions
     let diagnostics: EluDiagnosticsOptions
+    let personProfiles: EluPersonProfilesMode
     /// Installed synchronously by the constructor, then persisted before any
     /// configuration or lifecycle work can authorize collection.
     let initialConsent: EluConsentOperation?
@@ -103,6 +104,7 @@ struct EluRuntimeBackendContext {
          endpointPolicy: EluEndpointPolicy = .cloud,
          performance: EluPerformanceOptions = .init(),
          diagnostics: EluDiagnosticsOptions = .init(),
+         personProfiles: EluPersonProfilesMode = .identifiedOnly,
          initialConsent: EluConsentOperation? = nil,
          guardedFlagsDidLoad: (@Sendable (@escaping @Sendable () -> Bool) -> Void)? = nil,
          initialConfigurationReady: @escaping @Sendable (@escaping @Sendable () -> Bool) -> Void = { _ in }) {
@@ -115,6 +117,7 @@ struct EluRuntimeBackendContext {
         self.endpointPolicy = endpointPolicy
         self.performance = performance
         self.diagnostics = diagnostics
+        self.personProfiles = personProfiles
         self.initialConsent = initialConsent
         self.guardedFlagsDidLoad = guardedFlagsDidLoad ?? { predicate in
             if predicate() { flagsDidLoad() }

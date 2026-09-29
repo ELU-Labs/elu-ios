@@ -17,6 +17,7 @@ enum EluBufferedOp {
     /// Ordered so a pre-config logout replays as capture → reset → capture,
     /// delivering pre-reset events under the pre-reset identity (web parity).
     case reset
+    case resetDeviceIdentity
     case resetGroups
     case resetPersonPropertiesForFlags
     case resetGroupPropertiesForFlags(String?)

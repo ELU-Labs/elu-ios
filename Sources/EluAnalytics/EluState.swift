@@ -26,6 +26,7 @@ final class EluCore {
     private var acceptedConsent: EluConsentOperation? // guarded by backendIntentLock
     private var performance = EluPerformanceOptions()
     private var diagnostics = EluDiagnosticsOptions()
+    private var personProfiles: EluPersonProfilesMode = .identifiedOnly
     private var configHost = URL(string: "https://elu.dev")!
     private var endpointPolicy = EluEndpointPolicy.cloud
     private var buffer = EluEventBuffer()
@@ -68,6 +69,7 @@ final class EluCore {
             endpointPolicy = selectedEndpoints
             performance = options.performance
             diagnostics = options.diagnostics
+            personProfiles = options.personProfiles
 
             // The owned source, including independent flags/privacy, decides
             // readiness. No legacy cache or v1 request participates.
@@ -99,7 +101,7 @@ final class EluCore {
         EluRuntimeBackendContext(siteKey: siteKey, config: config, configDocument: document,
             isNewUser: isNewUser, flagsDidLoad: { [weak self] in
                 self?.dispatchFlagNotification(ifCurrent: { true })
-            }, configHost: configHost, endpointPolicy: endpointPolicy, performance: performance, diagnostics: diagnostics, initialConsent: initialConsent, guardedFlagsDidLoad: { [weak self] predicate in
+            }, configHost: configHost, endpointPolicy: endpointPolicy, performance: performance, diagnostics: diagnostics, personProfiles: personProfiles, initialConsent: initialConsent, guardedFlagsDidLoad: { [weak self] predicate in
                 self?.dispatchFlagNotification(ifCurrent: predicate)
             }, initialConfigurationReady: { [weak self] predicate in
                 guard let self else { return }
@@ -191,8 +193,8 @@ final class EluCore {
         queue.sync { pendingConsent?.optedOut ?? backend?.isOptedOut() ?? false }
     }
 
-    func reset() {
-        dispatch(.reset)
+    func reset(resetDeviceId: Bool = false) {
+        dispatch(resetDeviceId ? .resetDeviceIdentity : .reset)
     }
 
     func beginNetworkObservation(_ request: URLRequest) -> EluNetworkObservation? {

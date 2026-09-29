@@ -34,6 +34,7 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, @unchecked Sendable {
 
     private let flagsDidLoad: () -> Void
     private let networkExcludedHosts: Set<String>
+    private let personProfiles: EluPersonProfilesMode
     private var guardedFlagsDidLoad: (@Sendable (@escaping @Sendable () -> Bool) -> Void)?
     private var stack: EluStandaloneStack?
     private let nativeLifecycle = EluNativeReplayLifecycle()
@@ -75,6 +76,7 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, @unchecked Sendable {
         observeApplicationLifecycle: Bool = false
     ) {
         flagsDidLoad = context.flagsDidLoad
+        personProfiles = context.personProfiles
         networkExcludedHosts = Set([context.configHost.host?.lowercased(), context.endpointPolicy.declaredAPIOrigin?.host].compactMap { $0 })
         self.flagTransport = flagTransport
         if let initialConsent = context.initialConsent { acceptConsent(initialConsent) }
@@ -92,6 +94,7 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, @unchecked Sendable {
         guardedFlagsDidLoad: @escaping @Sendable (@escaping @Sendable () -> Bool) -> Void
     ) {
         flagsDidLoad = context.flagsDidLoad
+        personProfiles = context.personProfiles
         networkExcludedHosts = Set([context.configHost.host?.lowercased(), context.endpointPolicy.declaredAPIOrigin?.host].compactMap { $0 })
         flagTransport = nil
         self.guardedFlagsDidLoad = guardedFlagsDidLoad
@@ -154,7 +157,7 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, @unchecked Sendable {
                     rootDirectoryURL: rootDirectoryURL,
                     siteKey: siteKey,
                     configHost: context.configHost, endpointPolicy: context.endpointPolicy,
-                    performance: context.performance, diagnostics: context.diagnostics
+                    performance: context.performance, diagnostics: context.diagnostics, personProfiles: context.personProfiles
                 )
             },
             guardedFlagsDidLoad: context.guardedFlagsDidLoad
@@ -340,6 +343,7 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, @unchecked Sendable {
             }
 
         case let .identify(distinctId, userProperties, userPropertiesOnce):
+            guard personProfiles != .never else { return }
             guard let userId = EluFacadeJSON.identifier(distinctId, maximumLength: 512) else {
                 count(.invalidInput)
                 return
@@ -355,6 +359,7 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, @unchecked Sendable {
             }
 
         case let .alias(alias):
+            guard personProfiles != .never else { return }
             guard let aliasId = EluFacadeJSON.identifier(alias, maximumLength: 512) else {
                 count(.invalidInput)
                 return
@@ -412,6 +417,7 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, @unchecked Sendable {
             }
 
         case let .setPersonProperties(properties, propertiesOnce):
+            guard personProfiles != .never else { return }
             let projected = project(properties), projectedOnce = project(propertiesOnce)
             guard !projected.isEmpty || !projectedOnce.isEmpty else { return }
             enqueue(affectsFlags: true) { runtime, owner in
@@ -467,13 +473,15 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, @unchecked Sendable {
             enqueue(affectsFlags: true) { runtime, owner in
                 owner.apply(await runtime.updateFlagContext(.resetGroup(type))); owner.scheduleFlagReload()
             }
-        case .reset:
+        case .reset, .resetDeviceIdentity:
+            let resetDeviceId: Bool
+            if case .resetDeviceIdentity = op { resetDeviceId = true } else { resetDeviceId = false }
             // The loaded flags belong to the identity that is ending, so a
             // read before the queued call runs must not report them or
             // attribute an exposure to the identity replacing it.
             projectIdentity { $0.clearFlagsLocked() }
             enqueue(settlesProjection: true, affectsFlags: true) { runtime, owner in
-                owner.apply(await runtime.resetIdentity())
+                owner.apply(await runtime.resetIdentity(resetDeviceId: resetDeviceId))
                 owner.clearFlags()
                 owner.scheduleFlagReload()
             }

@@ -12,9 +12,9 @@ final class EluNativeReplaySessionQueueTests: XCTestCase {
             if flagsFirst { try await h.queue.ensureFlagSchema() }
             try await h.queue.ensureReplayDeliverySchema()
             try await h.queue.ensureNativeReplayAuthoritySchema()
-            XCTAssertEqual(try h.base.schemaVersion(), flagsFirst ? 32 : 31)
+            XCTAssertEqual(try h.base.schemaVersion(), flagsFirst ? 40 : 39)
             if !flagsFirst { try await h.queue.ensureFlagSchema() }
-            XCTAssertEqual(try h.base.schemaVersion(), 32)
+            XCTAssertEqual(try h.base.schemaVersion(), 40)
             let after = try await h.queue.snapshot(); XCTAssertEqual(before, after)
             let afterRows = try await h.queue.storedReplayChunks(); XCTAssertEqual(afterRows, rows)
             await h.queue.close(); try await h.reopen()

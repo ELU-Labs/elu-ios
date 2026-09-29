@@ -45,9 +45,22 @@ does not authorize sending that buffer.
 
 Call `Elu.identify` after login or session restoration using the app's stable
 internal user ID, and `Elu.reset()` on logout. The SDK does not infer identity.
-Reset creates a new anonymous identity, clears group associations and super
-properties, and preserves the consent choice. Already admitted records retain
+Reset creates a new anonymous identity, clears group associations, super
+properties, flag context, session, and remembered profile-processing state, and
+preserves both the independent device ID and consent choice.
+`Elu.reset(resetDeviceId: true)` also rotates that device ID. Already admitted records retain
 their original identity; they are not relabeled as the next user.
+
+`EluSetupOptions.personProfiles` defaults to `.identifiedOnly`. Accepted person
+mutations enable processing; accepted events also retain a processing decision
+based on identified/group context or the `.always` option. These changes commit
+with the event or mutation, so rejected writes do not promote the state.
+`.never` blocks identify, alias, and person-property changes before optimistic
+facade updates and forces event profile processing off. Evaluation-only flag
+context and customer `$epp` properties cannot promote processing. New events,
+including numeric HTTP/performance/OS summaries, receive authoritative device,
+identified, and profile-processing properties; this adds no historical identity
+attribution, customer superproperties, or groups to OS summaries.
 
 The facade exposes events, aliases, groups, person and super properties,
 first-write properties, and feature flags. `registerOnce` preserves existing

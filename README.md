@@ -87,7 +87,30 @@ Elu.reset()
 
 Do not identify with emails or other PII as the id; use your stable internal
 user id. Before `identify`, activity is tracked anonymously and linked on the
-first identify.
+first identify. By default, `personProfiles` is `.identifiedOnly`: anonymous
+captures do not request person-profile processing until an accepted identify,
+alias, person-property change, or an event with group membership enables it.
+That accepted processing state persists across relaunches until reset.
+`ForFlags` context alone never enables it.
+
+```swift
+var options = EluSetupOptions()
+options.personProfiles = .identifiedOnly // default; also .always or .never
+Elu.setup(siteKey: "YOUR_SITE_KEY", options: options)
+
+Elu.reset()                    // logout: new anonymous identity, same device ID
+Elu.reset(resetDeviceId: true)  // also rotate the installation's device ID
+```
+
+`.always` requests person processing on every eligible event. `.never` suppresses
+person processing and ignores identify, alias, and person-property calls; it
+still permits group associations and evaluation-only flag context. These modes
+do not grant capture permission or override consent. Reset clears user, group,
+session, superproperty, flag context, and remembered profile-processing state;
+it preserves consent and records already queued under their original identity.
+Every new event, including native numeric telemetry, carries SDK-owned
+`$device_id`, `$is_identified`, and `$process_person_profile` values. Customer
+properties cannot override them, and `$epp` is never sent as an event property.
 
 The owned runtime uses separate storage. The unused 0.1.0 release is not a
 supported persisted-data import source: version 0.2.0 starts a fresh owned
@@ -119,7 +142,7 @@ about.
 ```swift
 Elu.setup(siteKey:)                      Elu.capture(_:properties:)
 Elu.identify(_:userProperties:)          Elu.screen(_:properties:)
-Elu.reset()                              Elu.captureException(_:properties:)
+Elu.reset() / Elu.reset(resetDeviceId:)  Elu.captureException(_:properties:)
 Elu.alias(_:)                            Elu.register(_:) / Elu.unregister(_:)
 Elu.registerOnce(_:defaultValue:)        Elu.getFeatureFlagResult(_:)
 Elu.optOut() / Elu.optIn()               Elu.isOptedOut()

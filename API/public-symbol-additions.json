@@ -167,6 +167,34 @@
     {
       "kind": "swift.property",
       "name": "EluSetupOptions.diagnostics"
+    },
+    {
+      "kind": "swift.type.method",
+      "name": "Elu.reset(resetDeviceId:)"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluSetupOptions.personProfiles"
+    },
+    {
+      "kind": "swift.enum",
+      "name": "EluPersonProfilesMode"
+    },
+    {
+      "kind": "swift.enum.case",
+      "name": "EluPersonProfilesMode.identifiedOnly"
+    },
+    {
+      "kind": "swift.enum.case",
+      "name": "EluPersonProfilesMode.always"
+    },
+    {
+      "kind": "swift.enum.case",
+      "name": "EluPersonProfilesMode.never"
+    },
+    {
+      "kind": "swift.func.op",
+      "name": "EluPersonProfilesMode.!=(_:_:)"
     }
   ]
 }

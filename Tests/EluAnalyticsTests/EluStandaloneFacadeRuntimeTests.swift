@@ -13,6 +13,58 @@ final class EluStandaloneFacadeRuntimeTests: XCTestCase {
         var errorDescription: String? { "checkout failed" }
     }
 
+    func testNeverModeRejectsPersonIntentBeforeOptimisticGettersAndKeepsForFlagsLocal() async throws {
+        try await withTemporaryDirectory { root in
+            let harness = try await makeHarness(root: root, personProfiles: .never)
+            let original = harness.backend.distinctId()
+            let before = try await harness.runtime.queueSnapshot()
+            harness.backend.execute(.identify(distinctId: "forbidden-user", userProperties: ["tier": "paid"]))
+            XCTAssertEqual(harness.backend.distinctId(), original, "No optimistic forbidden identity")
+            harness.backend.execute(.alias("forbidden-alias"))
+            harness.backend.execute(.setPersonProperties(["tier": "paid"]))
+            await harness.backend.settled()
+            let unchanged = try await harness.runtime.queueSnapshot()
+            XCTAssertEqual(unchanged, before)
+            harness.backend.execute(.setPersonPropertiesForFlags(["tier": "evaluation-only"]))
+            harness.backend.execute(.capture(event: "anonymous", properties: ["$device_id": "forged", "$epp": true,
+                "$is_identified": true, "$process_person_profile": true]))
+            await harness.backend.settled()
+            let changed = try await harness.runtime.queueSnapshot()
+            XCTAssertEqual(changed.flagContext.personProperties["tier"], .string("evaluation-only"))
+            XCTAssertNil(changed.identity.userId)
+            _ = await harness.runtime.flush()
+            let events = try await harness.transport.recordedEvents()
+            let event = try XCTUnwrap(events.first), properties = try XCTUnwrap(event["properties"] as? [String: Any])
+            XCTAssertEqual(properties["$device_id"] as? String, before.identity.anonymousId)
+            XCTAssertEqual(properties["$is_identified"] as? Bool, false)
+            XCTAssertEqual(properties["$process_person_profile"] as? Bool, false)
+            XCTAssertNil(properties["$epp"])
+            await harness.close()
+        }
+    }
+
+    func testFacadeResetVariantKeepsOrRotatesIndependentDeviceIdentity() async throws {
+        try await withTemporaryDirectory { root in
+            let harness = try await makeHarness(root: root)
+            harness.backend.execute(.capture(event: "before", properties: nil))
+            await harness.backend.settled()
+            harness.backend.execute(.reset)
+            harness.backend.execute(.capture(event: "ordinary-reset", properties: nil))
+            await harness.backend.settled()
+            harness.backend.execute(.resetDeviceIdentity)
+            harness.backend.execute(.capture(event: "device-reset", properties: nil))
+            await harness.backend.settled()
+            _ = await harness.runtime.flush()
+            let events = try await harness.transport.recordedEvents()
+            XCTAssertEqual(events.compactMap { $0["name"] as? String }, ["before", "ordinary-reset", "device-reset"])
+            let devices = events.compactMap { ($0["properties"] as? [String: Any])?["$device_id"] as? String }
+            XCTAssertEqual(devices.count, 3)
+            guard devices.count == 3 else { await harness.close(); return }
+            XCTAssertEqual(devices[0], devices[1]); XCTAssertNotEqual(devices[1], devices[2])
+            await harness.close()
+        }
+    }
+
     func testRegisterOncePreservesValuesAndUsesExplicitDefaultAtomically() async throws {
         try await withTemporaryDirectory { root in
             let harness = try await makeHarness(root: root)
@@ -547,7 +599,8 @@ final class EluStandaloneFacadeRuntimeTests: XCTestCase {
         root: URL,
         document: Data? = nil,
         flagTransport: (any EluV1FlagTransport)? = nil,
-        initialConsent: EluConsentOperation? = nil
+        initialConsent: EluConsentOperation? = nil,
+        personProfiles: EluPersonProfilesMode = .identifiedOnly
     ) async throws -> Harness {
         let transport = FacadeBatchTransport()
         let clock = FacadeClock(wall: baseDate)
@@ -572,7 +625,8 @@ final class EluStandaloneFacadeRuntimeTests: XCTestCase {
             replaySampleDraw: { 0.1 },
             anonymousIdGenerator: { "anon_facade_\(identifiers.next())" },
             streamIdGenerator: { "stream_facade" },
-            sessionIdGenerator: { "session_facade_\(identifiers.next())" }
+            sessionIdGenerator: { "session_facade_\(identifiers.next())" },
+            personProfiles: personProfiles
         )
         let announcements = FacadeCounter()
         let context = EluRuntimeBackendContext(
@@ -581,6 +635,7 @@ final class EluStandaloneFacadeRuntimeTests: XCTestCase {
             configDocument: document ?? fixture("config-enabled.json"),
             isNewUser: true,
             flagsDidLoad: { _ = announcements.next() },
+            personProfiles: personProfiles,
             initialConsent: initialConsent
         )
         let backend = EluStandaloneFacadeRuntime(

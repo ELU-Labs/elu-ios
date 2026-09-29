@@ -255,6 +255,7 @@ actor EluStandaloneRuntime {
         },
         performance: EluPerformanceOptions = .init(),
         diagnostics: EluDiagnosticsOptions = .init(),
+        personProfiles: EluPersonProfilesMode = .identifiedOnly,
         faultInjector: (any EluRuntimeQueueFaultInjecting)? = nil
     ) async throws -> EluStandaloneRuntime {
         guard isHeaderSafeSiteKey(siteKey) else {
@@ -281,6 +282,7 @@ actor EluStandaloneRuntime {
             rootDirectoryURL: rootDirectoryURL,
             exactConstructorSiteKey: siteKey,
             endpointPolicy: endpointPolicy,
+            personProfiles: personProfiles,
             limits: resolvedLimits,
             clock: clock,
             continuousClock: continuousClock,
@@ -788,10 +790,10 @@ actor EluStandaloneRuntime {
     /// super properties, session, and flag context are cleared. This local
     /// operation is available without capture authority and enqueues no wire record.
     @discardableResult
-    func resetIdentity() async -> EluRuntimeQueueSnapshot? {
+    func resetIdentity(resetDeviceId: Bool = false) async -> EluRuntimeQueueSnapshot? {
         guard phase != .closed else { return nil }
         guard let generation = try? await queue.snapshot().generation,
-              let snapshot = try? await queue.reset(expectedGeneration: generation)
+              let snapshot = try? await queue.reset(expectedGeneration: generation, resetDeviceId: resetDeviceId)
         else {
             return nil
         }

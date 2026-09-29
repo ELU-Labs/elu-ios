@@ -37,6 +37,7 @@ final class EluEventBufferTests: XCTestCase {
             switch operation {
             case let .capture(event, _): "capture:\(event)"
             case .reset: "reset"
+            case .resetDeviceIdentity: "resetDeviceIdentity"
             case .resetGroups: "resetGroups"
             case .resetPersonPropertiesForFlags: "resetPersonPropertiesForFlags"
             case .resetGroupPropertiesForFlags: "resetGroupPropertiesForFlags"

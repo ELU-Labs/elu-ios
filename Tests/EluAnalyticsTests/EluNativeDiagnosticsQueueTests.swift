@@ -53,6 +53,10 @@ final class EluNativeDiagnosticsQueueTests: XCTestCase {
         XCTAssertEqual(after.identity.session, initial.identity.session)
         XCTAssertEqual(after.identity.updatedAt, initial.identity.updatedAt)
         XCTAssertTrue(event.groups.isEmpty); XCTAssertNil(event.properties["private_context"])
+        XCTAssertEqual(event.properties["$device_id"], .string(initial.identity.anonymousId))
+        XCTAssertEqual(event.properties["$is_identified"], .bool(false))
+        XCTAssertEqual(event.properties["$process_person_profile"], .bool(true))
+        XCTAssertNil(event.properties["$epp"])
         XCTAssertEqual(event.occurredAt, h.base.now); XCTAssertEqual(event.sessionId, initial.identity.session?.id)
         XCTAssertEqual(event.properties["$diagnostic_interval_start"], .string(EluRFC3339.string(from: start)))
         let state = try await h.queue.diagnosticsContinuity()
@@ -241,9 +245,9 @@ final class EluNativeDiagnosticsQueueTests: XCTestCase {
             if base >= 7 { try await h.queue.ensureNativeReplayAuthoritySchema() }
             let before = try await h.queue.snapshot(), records = try await h.queue.peek(maximumCount: 10, maximumBytes: 1_000_000)
             await h.queue.close()
-            try h.base.sql("DROP TABLE native_diagnostics_state; \(version <= 8 ? "DROP TABLE capture_session_history;" : "") PRAGMA user_version=\(version)")
+            try h.base.sql("DROP TABLE person_identity_state; DROP TABLE native_diagnostics_state; \(version <= 8 ? "DROP TABLE capture_session_history;" : "") PRAGMA user_version=\(version)")
             try await h.reopen()
-            XCTAssertEqual(try h.base.schemaVersion(), Int64(base + 24))
+            XCTAssertEqual(try h.base.schemaVersion(), Int64(base + 32))
             let after = try await h.queue.snapshot(), afterRecords = try await h.queue.peek(maximumCount: 10, maximumBytes: 1_000_000)
             let state = try await h.queue.diagnosticsContinuity()
             XCTAssertEqual(before, after); XCTAssertEqual(records, afterRecords); XCTAssertEqual(state, .closed)
@@ -254,14 +258,14 @@ final class EluNativeDiagnosticsQueueTests: XCTestCase {
     func testDiagnosticsMigrationFailureRollsBackAndReopenRecovers() async throws {
         let fault = DeliveryFault(), h = try await make(fault: fault); defer { h.base.remove() }
         _ = await h.base.capture(); let before = try await h.queue.snapshot()
-        await h.queue.close(); try h.base.sql("DROP TABLE native_diagnostics_state; PRAGMA user_version=9")
+        await h.queue.close(); try h.base.sql("DROP TABLE person_identity_state; DROP TABLE native_diagnostics_state; PRAGMA user_version=9")
         fault.action = { if $0 == .beforeDiagnosticsMigrationCommit { throw EluRuntimeQueueError.faultInjected($0) } }
         do { try await h.reopen(); XCTFail("Migration failure was ignored") } catch {}
         XCTAssertEqual(try h.base.schemaVersion(), 9)
         XCTAssertEqual(try h.integer("SELECT count(*) FROM sqlite_master WHERE name='native_diagnostics_state'"), 0)
         fault.action = nil; try await h.reopen()
         let after = try await h.queue.snapshot(); XCTAssertEqual(before, after)
-        XCTAssertEqual(try h.base.schemaVersion(), 25)
+        XCTAssertEqual(try h.base.schemaVersion(), 33)
         await h.queue.close()
     }
 }

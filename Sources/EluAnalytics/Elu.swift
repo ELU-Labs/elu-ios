@@ -11,6 +11,8 @@ public struct EluSetupOptions {
     public var performance = EluPerformanceOptions()
     /// Delayed numeric OS diagnostics are disabled unless explicitly enabled.
     public var diagnostics = EluDiagnosticsOptions()
+    /// New anonymous events do not create a person profile by default.
+    public var personProfiles: EluPersonProfilesMode = .identifiedOnly
 
     /// Internal construction marker for the owned runtime. Customer code
     /// cannot select or construct another backend.
@@ -63,9 +65,14 @@ public enum Elu {
         EluCore.shared.dispatch(.identify(distinctId: distinctId, userProperties: userProperties, userPropertiesOnce: userPropertiesOnce))
     }
 
-    /// Clear identity and stored ids (call on logout).
+    /// End the current user/session while retaining the installation device id and consent.
     public static func reset() {
         EluCore.shared.reset()
+    }
+
+    /// Also rotate the installation device id when explicitly requested.
+    public static func reset(resetDeviceId: Bool) {
+        EluCore.shared.reset(resetDeviceId: resetDeviceId)
     }
 
     public static func alias(_ alias: String) {
