@@ -200,7 +200,68 @@ final class EluCaptureRateQueueTests: XCTestCase {
         XCTAssertEqual(after.identity.session, original.identity.session)
         let rows = try await events(h); XCTAssertEqual(rows.map(\.name), ["event", EluCaptureRateLimiter.warningEvent])
         XCTAssertEqual(rows.last?.sessionId, original.identity.session?.id)
+        XCTAssertEqual(rows.last?.occurredAt, h.base.now)
+        XCTAssertEqual(after.identity.updatedAt, original.identity.updatedAt)
         await h.queue.close()
+        try await reopen(h, options: .init(eventsPerSecond: 0.01, eventsBurstLimit: 1)); try await h.publish()
+        let restored = try await events(h), reopened = try await h.queue.snapshot()
+        XCTAssertEqual(restored, rows)
+        XCTAssertEqual(reopened.identity.session, original.identity.session)
+        // The warning cannot extend the old idle boundary across a restart.
+        let session = try XCTUnwrap(original.identity.session)
+        h.base.testClock.advance(Double(session.timeoutSeconds))
+        // The idle boundary exceeds the original configuration lease. Install
+        // a genuinely later document, rather than extending its old witness.
+        var renewed = try JSONSerialization.jsonObject(with: h.base.config) as! [String: Any]
+        renewed["issuedAt"] = EluRFC3339.string(from: h.base.now)
+        renewed["expiresAt"] = EluRFC3339.string(from: h.base.now.addingTimeInterval(300))
+        h.base.config = try JSONSerialization.data(withJSONObject: renewed)
+        try await h.publish()
+        accepted(try await h.queue.capture(command(h)))
+        let next = try await h.queue.snapshot()
+        XCTAssertNotEqual(next.identity.session?.id, session.id)
+        await h.queue.close()
+    }
+
+    func testPassiveWarningCannotCreateSessionOrOutliveSourceWithdrawal() async throws {
+        let absent = try await make(); defer { absent.base.remove() }
+        rejected(try await absent.queue.capturePerformanceSample(command(absent, name: "$performance_sample"),
+            admissionGuard: { true }), .invalidEvent)
+        rejected(try await absent.queue.capturePerformanceSample(command(absent, name: "$performance_sample"),
+            admissionGuard: { true }), .rateLimited)
+        let empty = try await events(absent), noSession = try await absent.queue.snapshot()
+        XCTAssertTrue(empty.isEmpty); XCTAssertNil(noSession.identity.session)
+        await absent.queue.close()
+
+        let noNetworkSession = try await make(); defer { noNetworkSession.base.remove() }
+        rejected(try await noNetworkSession.queue.capture(command(noNetworkSession, name: "")), .invalidEvent)
+        let unstarted = try await noNetworkSession.queue.snapshot()
+        let unstartedContext = EluNetworkObservationContext(identityRevision: unstarted.identity.revision,
+            contextRevision: unstarted.identity.contextRevision, sessionID: nil, sessionStartedAt: nil)
+        rejected(try await noNetworkSession.queue.captureNetworkObservation(command(noNetworkSession, name: "$network_request"),
+            context: unstartedContext, admissionGuard: { true }), .rateLimited)
+        let noNetworkRows = try await events(noNetworkSession), stillUnstarted = try await noNetworkSession.queue.snapshot()
+        XCTAssertTrue(noNetworkRows.isEmpty); XCTAssertNil(stillUnstarted.identity.session)
+        await noNetworkSession.queue.close()
+
+        let fault = DeliveryFault(), denied = try await make(options: .init(eventsPerSecond: 0.01, eventsBurstLimit: 1), fault: fault)
+        defer { denied.base.remove() }
+        accepted(try await denied.queue.capture(command(denied)))
+        let before = try await denied.queue.snapshot()
+        denied.base.testClock.advance(1)
+        let context = EluNetworkObservationContext(identityRevision: before.identity.revision,
+            contextRevision: before.identity.contextRevision, sessionID: before.identity.session?.id,
+            sessionStartedAt: before.identity.session?.startedAt)
+        // Withdraw the actual original source after the limited debit, before
+        // recursive warning admission; an always-true caller guard cannot help.
+        fault.action = { if $0 == .afterRateLimitCommit { denied.base.gate.close() } }
+        rejected(try await denied.queue.captureNetworkObservation(command(denied, name: "$network_request"),
+            context: context, admissionGuard: { true }), .rateLimited)
+        fault.action = nil
+        let retained = try await events(denied), after = try await denied.queue.snapshot()
+        XCTAssertEqual(retained.map(\.name), ["event"])
+        XCTAssertEqual(after.identity.session, before.identity.session)
+        await denied.queue.close()
     }
 
     func testAmbiguousBucketCommitPoisonsInsteadOfCapturingOrFreshConnectionFallback() async throws {

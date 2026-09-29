@@ -3067,6 +3067,7 @@ private enum EluPreparedRecordDraft: Sendable {
     case performanceSample(EluEventDraft)
     case networkObservation(EluEventDraft)
     case nativeDiagnostic(EluEventDraft)
+    case passiveRateLimitWarning(EluEventDraft)
     case mutation(
         change: EluMutationChange,
         identity: EluIdentityState,
@@ -7475,7 +7476,7 @@ actor EluSQLiteRuntimeQueue {
                             occurredAt: clock(), properties: [EluCaptureRateLimiter.warningProperty: .string(warning)],
                             versions: command.versions)
                         _ = capture(command, performanceSample: false, bypassRateLimit: true,
-                            passiveWarning: performanceSample || diagnosticSummary != nil || (networkObservation && state.identity.session != nil),
+                            passiveWarning: performanceSample || diagnosticSummary != nil || networkObservation,
                             admissionGuard: admissionGuard)
                     }
                     return .rejected(.rateLimited, snapshot: state.snapshot)
@@ -7522,7 +7523,8 @@ actor EluSQLiteRuntimeQueue {
                     expectedGeneration: state.generation,
                     identity: prepared.identity,
                     flagContext: state.flagContext,
-                    drafts: [diagnosticSummary != nil ? .nativeDiagnostic(prepared.draft)
+                    drafts: [passiveWarning ? .passiveRateLimitWarning(prepared.draft)
+                        : diagnosticSummary != nil ? .nativeDiagnostic(prepared.draft)
                         : performanceSample ? .performanceSample(prepared.draft)
                         : networkObservation ? .networkObservation(prepared.draft) : .event(prepared.draft)],
                     maximumQueueBytes: authority.maximumQueueBytes,
@@ -9264,11 +9266,15 @@ actor EluSQLiteRuntimeQueue {
             let sequence = firstSequence + Int64(index)
             let rawRecord: EluQueuedRecord
             switch draft {
-            case let .event(eventDraft), let .performanceSample(eventDraft), let .networkObservation(eventDraft), let .nativeDiagnostic(eventDraft):
+            case let .event(eventDraft), let .performanceSample(eventDraft), let .networkObservation(eventDraft), let .nativeDiagnostic(eventDraft), let .passiveRateLimitWarning(eventDraft):
                 let isPassive: Bool
                 let passiveName: String?
                 let includeGroups: Bool
                 switch draft {
+                case .passiveRateLimitWarning:
+                    // Only the internal limited-transition path constructs this
+                    // draft. A caller naming an event this way gets no bypass.
+                    isPassive = true; passiveName = EluCaptureRateLimiter.warningEvent; includeGroups = true
                 case .performanceSample: isPassive = true; passiveName = "$performance_sample"; includeGroups = true
                 case .networkObservation: isPassive = true; passiveName = "$network_request"; includeGroups = true
                 case .nativeDiagnostic:
