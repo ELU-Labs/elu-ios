@@ -179,7 +179,7 @@ enum EluPrivacyStateProjector {
                 evaluatedAt: evaluatedAt, appliedMasking: .init(text: profile.textMasking, inputs: .all, images: .block),
                 replaySampleDraw: originalDraw, replaySessionEligible: observation.sessionEligible,
                 replayBudgetRemainingSeconds: observation.accounting.remainingWholeSeconds,
-                localReplayTransports: capabilities.pairs), originalNativeSample: sampled)
+                localReplayTransports: capabilities.pairs(for: observation.context.capabilities.replay.replayProtocolGeneration)), originalNativeSample: sampled)
         guard observation.isCurrent() else { throw EluNativeReplayAuthorityError.stale }
         return result
     }

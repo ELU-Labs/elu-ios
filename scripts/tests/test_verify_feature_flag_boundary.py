@@ -19,6 +19,32 @@ SPEC.loader.exec_module(MODULE)
 
 
 class FeatureFlagBoundaryScannerTests(unittest.TestCase):
+    def test_exact_native_tuples_and_original_generation_reach_all_native_boundaries(self) -> None:
+        cases = {
+            MODULE.NATIVE_PROTOCOL_SOURCE: ['case .v2: return "elu-native-wireframe-v2"',
+                'case .v2: return "protocol-generation-v2"', 'compression.utf8.elementsEqual("gzip".utf8)'],
+            MODULE.NATIVE_AUTHORITY_SOURCE: ["capabilities.transports(for: original.context.capabilities.replay.replayProtocolGeneration)",
+                "capabilities.transports(for: prepared.resolution.replayProtocolGeneration).contains(pair)"],
+            "Sources/EluAnalytics/Internal/Runtime/EluPrivacyStateProjector.swift": ["capabilities.pairs(for: observation.context.capabilities.replay.replayProtocolGeneration)"],
+            "Sources/EluAnalytics/Internal/Runtime/EluSQLiteRuntimeQueue.swift": [
+                "if EluNativeReplayProtocol.isNativeCodec(prepared.codec), nativeAdmission == nil",
+                "pair == tuple.transport", "EluV2ReplayText.equal(tuple.generation, admission.permit.resolution.replayProtocolGeneration)",
+                "capabilities.transports(for: document.capabilities?.replay.replayProtocolGeneration)"],
+            "Sources/EluAnalytics/Internal/Config/EluV1ConfigManager.swift": ["generation: generation) != nil &&"],
+        }
+        for relative, controls in cases.items():
+            path = pathlib.Path(relative)
+            source = (ROOT / path).read_text()
+            self.assertEqual([], MODULE.scan_replay_storage_source(path, source))
+            for original in controls:
+                self.assertIn(original, source)
+                self.assertTrue(MODULE.scan_replay_storage_source(path, source.replace(original, "removed_tuple_guard", 1)), original)
+        source = (ROOT / MODULE.NATIVE_PROTOCOL_SOURCE).read_text()
+        for token in ["URLSession", "EluSQLiteRuntimeQueue", "EluNativeReplayPermit"]:
+            self.assertTrue(MODULE.scan_replay_storage_source(pathlib.Path(MODULE.NATIVE_PROTOCOL_SOURCE), source + "\n" + token))
+        self.assertTrue(MODULE.scan_replay_storage_source(pathlib.Path(MODULE.NATIVE_PROTOCOL_SOURCE),
+            source.replace("    case v2", "    case v2\n    case v3", 1)))
+
     def test_public_composition_defers_until_initial_calls_and_uses_owned_capabilities(self) -> None:
         path = pathlib.Path(MODULE.STANDALONE_FACADE_SOURCE)
         source = (ROOT / path).read_text()

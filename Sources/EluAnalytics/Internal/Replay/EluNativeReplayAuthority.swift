@@ -96,17 +96,28 @@ struct EluNativeReplayCapabilities: Sendable {
          readbackProvenProtocolGenerations: Set<String> = []) {
         self.readbackProvenProtocolGenerations = readbackProvenProtocolGenerations
         transports = readbackProvenTransports.filter {
-            $0.codec == "elu-native-wireframe-v1" && $0.compression == .gzip
+            EluNativeReplayProtocol.isNativeCodec($0.codec) && $0.compression == .gzip
         }
     }
+    /// Storage compatibility is separate from permission to dispatch. Missing
+    /// transport proof must not purge lawful rows in a known generation.
     func supportedProtocolGeneration(_ generation: String?) -> String? {
         guard let generation, readbackProvenProtocolGenerations.contains(where: {
             $0.utf8.elementsEqual(generation.utf8)
+        }), EluNativeReplayProtocol.allCases.contains(where: {
+            $0.generation.utf8.elementsEqual(generation.utf8)
         }) else { return nil }
         return generation
     }
-    var pairs: [EluV1ReplayTransportPair] {
-        transports.map { EluV1ReplayTransportPair(codec: $0.codec, compression: $0.compression) }
+    func transports(for generation: String?) -> Set<EluV1ReplayTransportSelection> {
+        guard let supported = supportedProtocolGeneration(generation) else { return [] }
+        return transports.filter {
+            EluNativeReplayProtocol.matching(codec: $0.codec, compression: $0.compression.rawValue,
+                generation: supported) != nil
+        }
+    }
+    func pairs(for generation: String?) -> [EluV1ReplayTransportPair] {
+        transports(for: generation).map { EluV1ReplayTransportPair(codec: $0.codec, compression: $0.compression) }
     }
 }
 
@@ -184,6 +195,8 @@ actor EluNativeReplayAuthority {
         guard !capabilities.transports.isEmpty else { withdraw(); throw EluNativeReplayAuthorityError.unsupportedCapability }
         if let prepared, prepared.projection.source == source,
            fence.current(prepared.invocation), prepared.isCurrent(),
+           case let .authorized(pair) = prepared.resolution.replayAuthorization,
+           capabilities.transports(for: prepared.resolution.replayProtocolGeneration).contains(pair),
            EluV2ReplayText.equal(prepared.supportedProtocolGeneration,
                capabilities.supportedProtocolGeneration(prepared.resolution.replayProtocolGeneration)) { return prepared }
         fence.invalidate(); let invocation = fence.token()
@@ -206,7 +219,8 @@ actor EluNativeReplayAuthority {
         guard fence.current(invocation), original.isCurrent() else { throw EluNativeReplayAuthorityError.stale }
         let installed = try await queue.installNativeReplayPrivacy(original, privacy: privacy)
         guard fence.current(invocation), installed.source == source, installed.isCurrent() else { throw EluNativeReplayAuthorityError.stale }
-        let manager = EluV1ConfigManager(endpointPolicy: queue.endpointPolicy, readbackProvenReplayTransports: capabilities.transports)
+        let manager = EluV1ConfigManager(endpointPolicy: queue.endpointPolicy,
+            readbackProvenReplayTransports: capabilities.transports(for: original.context.capabilities.replay.replayProtocolGeneration))
         _ = try manager.update(configData: source.data, now: clock())
         let resolution = try manager.authorize(effectivePrivacyStateData: privacy.stateData, identity: installed.identity, now: clock())
         guard fence.current(invocation), installed.isCurrent(), resolution.decisionHash == privacy.effectivePolicyHash,

@@ -7,7 +7,34 @@ import UIKit
 
 final class EluNativeReplayAuthorityTests: XCTestCase {
     private var capability: EluNativeReplayCapabilities {
-        .init(readbackProvenTransports: [EluV1ReplayTransportSelection(codec: "elu-native-wireframe-v1", compression: .gzip)!])
+        .init(readbackProvenTransports: [EluV1ReplayTransportSelection(codec: "elu-native-wireframe-v1", compression: .gzip)!],
+            readbackProvenProtocolGenerations: ["protocol-generation-v1"])
+    }
+
+    func testMixedNativeAdvertisementIsFilteredByOriginalGenerationBeforeProjection() async throws {
+        for tuple in EluNativeReplayProtocol.allCases {
+            let h = try await make(tuple: tuple, mixed: true); defer { h.base.remove() }
+            let authority = EluNativeReplayAuthority(queue: h.queue, clock: { h.base.now })
+            let both = EluNativeReplayCapabilities(readbackProvenTransports: Set(EluNativeReplayProtocol.allCases.map(\.transport)),
+                readbackProvenProtocolGenerations: Set(EluNativeReplayProtocol.allCases.map(\.generation)))
+            let prepared = try await authority.prepare(source: XCTUnwrap(h.base.witness), capabilities: both,
+                timeZoneIdentifier: "America/Los_Angeles")
+            XCTAssertEqual(prepared.resolution.replayAuthorization, .authorized(tuple.transport))
+            XCTAssertEqual(prepared.supportedProtocolGeneration, tuple.generation)
+            XCTAssertEqual(prepared.privacy.replayTransport?.codec, tuple.codec)
+            let other = tuple == .v1 ? EluNativeReplayProtocol.v2 : .v1
+            let crossed = EluNativeReplayCapabilities(readbackProvenTransports: [other.transport],
+                readbackProvenProtocolGenerations: [tuple.generation])
+            let denied = try await authority.prepare(source: XCTUnwrap(h.base.witness), capabilities: crossed,
+                timeZoneIdentifier: "America/Los_Angeles")
+            XCTAssertEqual(denied.supportedProtocolGeneration, tuple.generation, "Known storage format is not transport permission")
+            XCTAssertFalse(denied.privacy.replayAllowed)
+            if case .authorized = denied.resolution.replayAuthorization { XCTFail("crossed generation authorized") }
+            XCTAssertFalse(prepared.isCurrent())
+            let state = try await h.queue.nativeReplaySessionState()
+            XCTAssertNil(state.session?.firstStartAt); XCTAssertNil(state.session?.activeEpoch)
+            await authority.close(); await h.queue.close()
+        }
     }
 
     func testViewPrivacyStrengtheningRetiresPreparedAuthority() async throws {
@@ -508,12 +535,15 @@ final class EluNativeReplayAuthorityTests: XCTestCase {
         try EluPrivacyStateProjector.projectNative(observation: input, profile: .blanketMask(), capabilities: capability,
             evaluatedAt: now, timeZoneIdentifier: "America/Los_Angeles")
     }
-    private func make(rate: Double = 1, cap: Int = 60, fault: DeliveryFault? = nil) async throws -> NativeSessionHarness {
+    private func make(rate: Double = 1, cap: Int = 60, fault: DeliveryFault? = nil,
+                      tuple: EluNativeReplayProtocol = .v1, mixed: Bool = false) async throws -> NativeSessionHarness {
         let h = try await NativeSessionHarness.make(rate: rate, cap: cap, fault: fault)
         h.base.testClock.advance(0.001)
         var body = try JSONSerialization.jsonObject(with: h.base.config) as! [String: Any]
         var caps = body["capabilities"] as! [String: Any]; var replay = caps["replay"] as! [String: Any]
-        replay["transports"] = [["codec": "elu-native-wireframe-v1", "compression": "gzip"]]
+        replay["transports"] = (mixed ? EluNativeReplayProtocol.allCases : [tuple]).map { ["codec": $0.codec, "compression": "gzip"] }
+        replay["replayProtocolGeneration"] = tuple.generation
+        h.base.generation = tuple.generation
         caps["replay"] = replay; body["capabilities"] = caps
         body["issuedAt"] = EluRFC3339.string(from: h.base.now)
         h.base.config = try JSONSerialization.data(withJSONObject: body); try await h.publish()

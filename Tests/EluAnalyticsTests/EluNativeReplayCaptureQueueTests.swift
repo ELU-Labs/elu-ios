@@ -3,16 +3,30 @@ import XCTest
 @testable import EluAnalytics
 
 final class EluNativeReplayCaptureQueueTests: XCTestCase {
-    func testProtocolProofDefaultsClosedAndComparesExactBytes() throws {
-        let pair = try XCTUnwrap(EluV1ReplayTransportSelection(codec: "elu-native-wireframe-v1", compression: .gzip))
-        let pairOnly = EluNativeReplayCapabilities(readbackProvenTransports: [pair])
-        XCTAssertNil(pairOnly.supportedProtocolGeneration("native-g1"))
-        let proof = EluNativeReplayCapabilities(readbackProvenTransports: [pair],
-            readbackProvenProtocolGenerations: ["native-g1", "g-\u{00e9}"])
-        XCTAssertEqual(proof.supportedProtocolGeneration("native-g1"), "native-g1")
-        XCTAssertNil(proof.supportedProtocolGeneration("native-g2"))
-        XCTAssertNil(proof.supportedProtocolGeneration("g-e\u{0301}"))
-        XCTAssertNil(proof.supportedProtocolGeneration(nil))
+    func testProtocolProofDefaultsClosedAndComparesExactTuples() throws {
+        let all = Set(EluNativeReplayProtocol.allCases.map(\.transport))
+        let pairsOnly = EluNativeReplayCapabilities(readbackProvenTransports: all)
+        for tuple in EluNativeReplayProtocol.allCases {
+            XCTAssertNil(pairsOnly.supportedProtocolGeneration(tuple.generation))
+            XCTAssertTrue(pairsOnly.transports(for: tuple.generation).isEmpty)
+            let proof = EluNativeReplayCapabilities(readbackProvenTransports: all,
+                readbackProvenProtocolGenerations: [tuple.generation])
+            XCTAssertEqual(proof.transports(for: tuple.generation), [tuple.transport])
+            XCTAssertEqual(proof.supportedProtocolGeneration(tuple.generation), tuple.generation)
+            for wrong: String? in [nil, "native-g1", tuple.generation + " ", "protocol-generation-v3", "g-e\u{0301}"] {
+                XCTAssertNil(proof.supportedProtocolGeneration(wrong))
+                XCTAssertTrue(proof.transports(for: wrong).isEmpty)
+            }
+            for other in EluNativeReplayProtocol.allCases where other != tuple {
+                let crossed = EluNativeReplayCapabilities(readbackProvenTransports: [other.transport],
+                    readbackProvenProtocolGenerations: [tuple.generation])
+                XCTAssertTrue(crossed.transports(for: tuple.generation).isEmpty)
+                XCTAssertNil(EluNativeReplayProtocol.matching(codec: tuple.codec, compression: "gzip", generation: other.generation))
+            }
+            XCTAssertNil(EluNativeReplayProtocol.matching(codec: tuple.codec, compression: "none", generation: tuple.generation))
+        }
+        XCTAssertEqual(EluStandaloneRuntime.readbackProvenReplayCapabilities.transports, [EluNativeReplayProtocol.v1.transport])
+        XCTAssertNil(EluStandaloneRuntime.readbackProvenReplayCapabilities.supportedProtocolGeneration("protocol-generation-v2"))
     }
 
     func testUnusedCancellationIsTerminalAndRequiresNoStartProofBeforeRelease() async throws {
@@ -195,48 +209,54 @@ final class EluNativeReplayCaptureQueueTests: XCTestCase {
     }
 
     func testActualNativeEnvelopeCannotUseGenericAppendWithoutPhysicalAdmission() async throws {
-        let h = try await NativeSessionHarness.make(); defer { h.base.remove() }
-        h.base.testClock.advance(0.001)
-        var body = try XCTUnwrap(JSONSerialization.jsonObject(with: h.base.config) as? [String: Any])
-        var capabilities = body["capabilities"] as! [String: Any], replay = capabilities["replay"] as! [String: Any]
-        replay["transports"] = [["codec": "elu-native-wireframe-v1", "compression": "gzip"]]
-        capabilities["replay"] = replay; body["capabilities"] = capabilities
-        body["issuedAt"] = EluRFC3339.string(from: h.base.now)
-        h.base.config = try JSONSerialization.data(withJSONObject: body); try await h.publish()
-        let pair = try XCTUnwrap(EluV1ReplayTransportSelection(codec: "elu-native-wireframe-v1", compression: .gzip))
-        let proof = EluNativeReplayCapabilities(readbackProvenTransports: [pair],
-            readbackProvenProtocolGenerations: [h.base.generation])
-        let authority = EluNativeReplayAuthority(queue: h.queue, clock: { h.base.now })
-        let original = try await authority.prepare(source: XCTUnwrap(h.base.witness),
-            capabilities: proof, timeZoneIdentifier: "America/Los_Angeles")
-        let snapshot = try await h.queue.snapshot()
-        let identity = EluIdentitySnapshot(identity: snapshot.identity, streamId: snapshot.streamId,
-            nextSequence: snapshot.nextSequence, flagContext: snapshot.flagContext)
-        let versions = try EluVersionContext(runtime: .init(name: "elu-ios", version: "0.1.0"),
-            facade: .init(name: "elu-ios", version: "0.1.0"))
-        var sealer = try EluNativeReplaySealer(replayId: "native-unenrolled-fixture", identity: identity,
-            authorization: original.resolution, privacy: original.privacy, profile: original.profile, versions: versions)
-        let frame = EluNativeMaskedSnapshot(ordinal: 0, timestamp: Int64(h.base.now.timeIntervalSince1970 * 1_000),
-            viewport: try .init(width: 320, height: 640), nodes: [])
-        let request = try sealer.seal([frame])
-        XCTAssertEqual(request.codec, "elu-native-wireframe-v1")
-        // Prove the exact source/profile/protocol storage requirements are current;
-        // the only missing capability is the physical native admission.
-        _ = try await h.queue.reconcileReplayConfiguration(configData: h.base.config,
-            expectedConfigWitness: h.base.configWitness, sourceWitness: h.base.witness,
-            supportedProtocolGeneration: h.base.generation,
-            mayRetainProfile: { $0 == original.profile.canonicalBytes })
-        XCTAssertTrue(original.isCurrent())
-        do {
-            _ = try await h.queue.appendReplay(request, maskingProfile: original.profile.canonicalBytes,
-                authorization: original.resolution, sourceWitness: h.base.witness,
-                isCurrentProfile: { $0 == original.profile.canonicalBytes })
-            XCTFail("native envelope bypassed physical admission")
-        } catch { XCTAssertEqual(error as? EluNativeReplayAuthorityError, .stale) }
-        let rows = try await h.queue.storedReplayChunks(); XCTAssertTrue(rows.isEmpty)
-        let metadata = try await h.queue.nativeReplaySessionState()
-        XCTAssertNil(metadata.session?.activeEpoch); XCTAssertEqual(metadata.nextReplayOrdinal, 0)
-        await authority.close(); await h.queue.close()
+        for tuple in EluNativeReplayProtocol.allCases {
+            let h = try await NativeSessionHarness.make(); defer { h.base.remove() }
+            h.base.testClock.advance(0.001)
+            var body = try XCTUnwrap(JSONSerialization.jsonObject(with: h.base.config) as? [String: Any])
+            var capabilities = body["capabilities"] as! [String: Any], replay = capabilities["replay"] as! [String: Any]
+            replay["transports"] = [["codec": tuple.codec, "compression": "gzip"]]
+            replay["replayProtocolGeneration"] = tuple.generation
+            h.base.generation = tuple.generation
+            capabilities["replay"] = replay; body["capabilities"] = capabilities
+            body["issuedAt"] = EluRFC3339.string(from: h.base.now)
+            h.base.config = try JSONSerialization.data(withJSONObject: body); try await h.publish()
+            let pair = try XCTUnwrap(EluV1ReplayTransportSelection(codec: tuple.codec, compression: .gzip))
+            let proof = EluNativeReplayCapabilities(readbackProvenTransports: [pair],
+                readbackProvenProtocolGenerations: [h.base.generation])
+            let authority = EluNativeReplayAuthority(queue: h.queue, clock: { h.base.now })
+            let original = try await authority.prepare(source: XCTUnwrap(h.base.witness),
+                capabilities: proof, timeZoneIdentifier: "America/Los_Angeles")
+            let snapshot = try await h.queue.snapshot()
+            let identity = EluIdentitySnapshot(identity: snapshot.identity, streamId: snapshot.streamId,
+                nextSequence: snapshot.nextSequence, flagContext: snapshot.flagContext)
+            let versions = try EluVersionContext(runtime: .init(name: "elu-ios", version: "0.1.0"),
+                facade: .init(name: "elu-ios", version: "0.1.0"))
+            var sealer = try EluNativeReplaySealer(replayId: "native-unenrolled-fixture", identity: identity,
+                authorization: original.resolution, privacy: original.privacy, profile: original.profile, versions: versions)
+            let frame = EluNativeMaskedSnapshot(ordinal: 0, timestamp: Int64(h.base.now.timeIntervalSince1970 * 1_000),
+                viewport: try .init(width: 320, height: 640), nodes: [])
+            let request: EluV2ReplayPreparedRequest
+            if tuple == .v1 { request = try sealer.seal([frame]) }
+            else { request = try sealer.seal(records: [.geometry(frame, continuous: 0)]) }
+            XCTAssertEqual(request.codec, tuple.codec)
+            // Prove the exact source/profile/protocol storage requirements are current;
+            // the only missing capability is the physical native admission.
+            _ = try await h.queue.reconcileReplayConfiguration(configData: h.base.config,
+                expectedConfigWitness: h.base.configWitness, sourceWitness: h.base.witness,
+                supportedProtocolGeneration: h.base.generation,
+                mayRetainProfile: { $0 == original.profile.canonicalBytes })
+            XCTAssertTrue(original.isCurrent())
+            do {
+                _ = try await h.queue.appendReplay(request, maskingProfile: original.profile.canonicalBytes,
+                    authorization: original.resolution, sourceWitness: h.base.witness,
+                    isCurrentProfile: { $0 == original.profile.canonicalBytes })
+                XCTFail("native envelope bypassed physical admission")
+            } catch { XCTAssertEqual(error as? EluNativeReplayAuthorityError, .stale) }
+            let rows = try await h.queue.storedReplayChunks(); XCTAssertTrue(rows.isEmpty)
+            let metadata = try await h.queue.nativeReplaySessionState()
+            XCTAssertNil(metadata.session?.activeEpoch); XCTAssertEqual(metadata.nextReplayOrdinal, 0)
+            await authority.close(); await h.queue.close()
+        }
     }
 
     func testSelfHashedNativeProfileMutationAndExtraFieldStillReject() async throws {

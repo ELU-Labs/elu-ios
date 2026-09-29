@@ -20,7 +20,12 @@ struct EluNativeReplaySealer: Sendable {
     private let protocolGeneration: String
     private let maximumRequestBytes: Int
     private let allowsOrdinaryText: Bool
-    private var encoder: EluNativeWireframeEncoder
+    private let tuple: EluNativeReplayProtocol
+    private enum Encoder: Sendable {
+        case v1(EluNativeWireframeEncoder)
+        case v2(EluNativeWireframeV2Encoder)
+    }
+    private var encoder: Encoder
 
     init(replayId: String, identity snapshot: EluIdentitySnapshot,
          authorization: EluV1ConfigResolution, privacy projected: EluProjectedPrivacyState,
@@ -33,8 +38,9 @@ struct EluNativeReplaySealer: Sendable {
               authorization.configSchemaVersion == 2,
               case .authorized = authorization.captureAuthorization,
               case let .authorized(pair) = authorization.replayAuthorization,
-              pair.codec == "elu-native-wireframe-v1", pair.compression == .gzip,
               let generation = authorization.replayProtocolGeneration,
+              let tuple = EluNativeReplayProtocol.matching(codec: pair.codec,
+                  compression: pair.compression.rawValue, generation: generation),
               authorization.decisionHash == projected.effectivePolicyHash,
               authorization.decisionContextRevision == snapshot.identity.contextRevision,
               (1 ... 65_536).contains(projected.stateData.count)
@@ -84,7 +90,11 @@ struct EluNativeReplaySealer: Sendable {
         if let build = versions.build { versionFields.append(("build", Self.string(build))) }
         self.versions = Self.object(versionFields); protocolGeneration = generation
         maximumRequestBytes = min(authorization.limits.replayChunkBytes, EluV2ReplayPreparedRequest.maximumBytes)
-        encoder = try EluNativeWireframeEncoder(limits: limits)
+        self.tuple = tuple
+        switch tuple {
+        case .v1: encoder = .v1(try EluNativeWireframeEncoder(limits: limits))
+        case .v2: encoder = .v2(try EluNativeWireframeV2Encoder(profile: profile, limits: limits))
+        }
     }
 
     /// Serial value operation: only a fully prepared request advances this encoder history.
@@ -92,10 +102,27 @@ struct EluNativeReplaySealer: Sendable {
         if !allowsOrdinaryText && snapshots.contains(where: { frame in
             frame.nodes.contains { node in if case .ordinaryText = node.kind { return true }; return false }
         }) { throw EluNativeReplaySealingError.invalidBinding }
-        var next = encoder
+        guard case var .v1(next) = encoder else { throw EluNativeReplaySealingError.invalidBinding }
         let chunk = try next.encode(snapshots)
+        let request = try prepare(chunk)
+        encoder = .v1(next)
+        return request
+    }
+
+    /// A candidate copy may seal v2 only under its exact original tuple. The
+    /// future capture owner must keep this copy speculative until the original
+    /// native append reports a known commit, then arm collection from that prefix.
+    mutating func seal(records: [EluNativeReplayRecord]) throws -> EluV2ReplayPreparedRequest {
+        guard case var .v2(next) = encoder else { throw EluNativeReplaySealingError.invalidBinding }
+        let chunk = try next.encode(records)
+        let request = try prepare(chunk)
+        encoder = .v2(next)
+        return request
+    }
+
+    private func prepare(_ chunk: EluNativeEncodedChunk) throws -> EluV2ReplayPreparedRequest {
         let chunkIdentity = Self.object([
-            ("domain", Self.string("elu-native-replay-chunk-v1")),
+            ("domain", Self.string(tuple.chunkIdentityDomain)),
             ("replayId", Self.string(replayId)), ("sequence", Self.integer(chunk.sequence)),
         ])
         let chunkID = "chunk_" + Self.digest(try EluV1StrictCanonicalJSON.canonicalData(for: chunkIdentity))
@@ -107,7 +134,7 @@ struct EluNativeReplaySealer: Sendable {
                 ("sequence", Self.integer(chunk.sequence)),
                 ("startedAt", Self.string(start)), ("endedAt", Self.string(end)),
                 ("identity", identity), ("contextRevision", Self.integer(contextRevision)),
-                ("codec", Self.string("elu-native-wireframe-v1")), ("compression", Self.string("gzip")),
+                ("codec", Self.string(tuple.codec)), ("compression", Self.string("gzip")),
                 ("contentEncoding", Self.string("base64")), ("payload", Self.string(payload)),
                 ("privacy", privacy), ("versions", versions),
             ])
@@ -126,9 +153,7 @@ struct EluNativeReplaySealer: Sendable {
         let parsedChunk = try EluV1StrictCanonicalJSON.parse(canonicalChunk)
         let body = try EluV1StrictCanonicalJSON.canonicalData(for: Self.envelope(parsedChunk.value, requestId: requestId))
         guard body.count <= maximumRequestBytes else { throw EluNativeReplaySealingError.requestLimit }
-        let prepared = try EluV2ReplayPreparedRequest(body, captureProtocolGeneration: protocolGeneration)
-        encoder = next
-        return prepared
+        return try EluV2ReplayPreparedRequest(body, captureProtocolGeneration: protocolGeneration)
     }
 
     private static func object(_ fields: [(String, JSON)]) -> JSON {

@@ -4606,7 +4606,12 @@ actor EluSQLiteRuntimeQueue {
         disk: EluStoredRuntimeState) throws {
         try requireNativeCaptureUse(admission.use)
         let receipt = admission.receipt
-        guard admission.input.owner == nativeAccountingOwner, receipt.owner == nativeAccountingOwner,
+        guard let tuple = EluNativeReplayProtocol.matching(codec: prepared.codec,
+                  compression: prepared.compression, generation: prepared.captureProtocolGeneration),
+              case let .authorized(pair) = admission.permit.resolution.replayAuthorization,
+              pair == tuple.transport,
+              EluV2ReplayText.equal(tuple.generation, admission.permit.resolution.replayProtocolGeneration),
+              admission.input.owner == nativeAccountingOwner, receipt.owner == nativeAccountingOwner,
               nativeCaptureReceipt?.epoch == receipt.epoch,
               nativeCaptureReceipt?.replayId == receipt.replayId,
               receipt.key == admission.input.accounting.key,
@@ -4642,7 +4647,7 @@ actor EluSQLiteRuntimeQueue {
     ) throws -> EluV2ReplayAppendResult {
         // Native wire bytes require the original physical permit even when an
         // internal caller already holds config and profile metadata.
-        if EluV2ReplayText.equal(prepared.codec, "elu-native-wireframe-v1"), nativeAdmission == nil {
+        if EluNativeReplayProtocol.isNativeCodec(prepared.codec), nativeAdmission == nil {
             throw EluNativeReplayAuthorityError.stale
         }
         guard EluSQLiteRuntimeSchema.hasReplay(databaseSchemaVersion),
@@ -4732,11 +4737,12 @@ actor EluSQLiteRuntimeQueue {
         let observation = EluSealedReplayPolicyObservation(source: source, identity: identitySnapshot,
             isCurrent: { scope.check(scopeToken) { event.check(eventToken) { gate.isCurrent(source, data: source.data) } } })
         guard observation.isCurrent() else { return nil }
-        let manager = EluV1ConfigManager(endpointPolicy: endpointPolicy, readbackProvenReplayTransports: capabilities.transports)
+        let document = try JSONDecoder().decode(EluV1ConfigDocument.self, from: source.data)
+        let manager = EluV1ConfigManager(endpointPolicy: endpointPolicy,
+            readbackProvenReplayTransports: capabilities.transports(for: document.capabilities?.replay.replayProtocolGeneration))
         let update = try manager.update(configData: source.data, now: clock())
         guard let candidate = manager.validatedCandidateIdentity(), observation.isCurrent() else { return nil }
         let configWitness = EluV2ReplayConfigWitness(issuedAt: candidate.issuedAt, semanticHash: candidate.semanticHash)
-        let document = try JSONDecoder().decode(EluV1ConfigDocument.self, from: source.data)
         let supported = capabilities.supportedProtocolGeneration(document.capabilities?.replay.replayProtocolGeneration)
         switch update {
         case .enabled:

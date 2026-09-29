@@ -63,6 +63,7 @@ REPLAY_DELIVERY_SOURCES = frozenset({
 })
 REPLAY_TRANSPORT_SOURCE = "Sources/EluAnalytics/Internal/Replay/EluV2URLSessionReplayTransport.swift"
 REPLAY_TRANSPORT_NAME = "EluV2URLSessionReplayTransport"
+NATIVE_PROTOCOL_SOURCE = "Sources/EluAnalytics/Internal/Replay/EluNativeReplayProtocol.swift"
 NATIVE_AUTHORITY_SOURCE = "Sources/EluAnalytics/Internal/Replay/EluNativeReplayAuthority.swift"
 NATIVE_SEALER_SOURCE = "Sources/EluAnalytics/Internal/Replay/EluNativeReplaySealer.swift"
 NATIVE_CAPTURE_SOURCE = "Sources/EluAnalytics/Internal/Replay/EluNativeReplayCaptureOwner.swift"
@@ -76,6 +77,34 @@ def scan_replay_storage_source(path: pathlib.Path, text: str) -> list[str]:
     errors: list[str] = []
     exact = path.as_posix()
     allowed = REPLAY_STORAGE_SOURCES | REPLAY_DELIVERY_SOURCES | {NATIVE_AUTHORITY_SOURCE, NATIVE_SEALER_SOURCE, NATIVE_CAPTURE_SOURCE, NATIVE_COMPOSITION_SOURCE, NATIVE_RUNTIME_SOURCE}
+    if exact == NATIVE_PROTOCOL_SOURCE:
+        required = [
+            'case .v1: return "elu-native-wireframe-v1"', 'case .v2: return "elu-native-wireframe-v2"',
+            'case .v1: return "protocol-generation-v1"', 'case .v2: return "protocol-generation-v2"',
+            'compression.utf8.elementsEqual("gzip".utf8)',
+            '$0.codec.utf8.elementsEqual(codec.utf8) && $0.generation.utf8.elementsEqual(generation.utf8)',
+        ]
+        cases = re.findall(r"^    case (v[0-9]+)$", text, re.MULTILINE)
+        if cases != ["v1", "v2"] or any(token not in text for token in required) or re.search(r"\b(URLSession|EluSQLiteRuntimeQueue|EluNativeReplayPermit)\b", text):
+            errors.append(f"{path} weakens the closed descriptive native protocol tuples")
+    tuple_guards = {
+        NATIVE_AUTHORITY_SOURCE: ["capabilities.transports(for: original.context.capabilities.replay.replayProtocolGeneration)",
+            "capabilities.transports(for: prepared.resolution.replayProtocolGeneration).contains(pair)"],
+        "Sources/EluAnalytics/Internal/Runtime/EluPrivacyStateProjector.swift": ["capabilities.pairs(for: observation.context.capabilities.replay.replayProtocolGeneration)"],
+        "Sources/EluAnalytics/Internal/Runtime/EluSQLiteRuntimeQueue.swift": [
+            "if EluNativeReplayProtocol.isNativeCodec(prepared.codec), nativeAdmission == nil",
+            "let tuple = EluNativeReplayProtocol.matching(codec: prepared.codec",
+            "pair == tuple.transport", "EluV2ReplayText.equal(tuple.generation, admission.permit.resolution.replayProtocolGeneration)",
+            "capabilities.transports(for: document.capabilities?.replay.replayProtocolGeneration)",
+        ],
+        "Sources/EluAnalytics/Internal/Config/EluV1ConfigManager.swift": [
+            "EluNativeReplayProtocol.matching(codec: $0.codec, compression: $0.compression.rawValue,", "generation: generation) != nil &&",
+        ],
+    }
+    # Inspect real complete owners, not the token-only boundary negative controls.
+    if exact in tuple_guards and ("import Foundation" in text):
+        if any(token not in text for token in tuple_guards[exact]):
+            errors.append(f"{path} weakens original-generation native tuple selection or admission")
     if re.search(r"\bEluNativeReplayCapture\w*\b", text) and exact not in NATIVE_CAPTURE_CALLERS:
         errors.append(f"{path} references native capture ownership outside its exact internal files")
     physical = set(re.findall(r"\bEluNativeReplayCapture(?:Owner|Run|Fence)\b", text))

@@ -509,6 +509,135 @@ final class EluNativeReplayCaptureUIKitTests: XCTestCase {
         }
     }
 
+    @MainActor func testV2KnownPrefixCommitRetryMovementAndReopenUseOriginalNativeAdmission() async throws {
+        let fault = DeliveryFault(), h = try await make(textMasking: "sensitive", fault: fault, tuple: .v2)
+        let setup = try await selected(h, tuple: .v2)
+        var settled = false
+        defer { setup.root.removeFromSuperview(); if settled { h.base.remove() } }
+        let pending = try await h.queue.enrollNativeReplayCapture()
+        let enrollment = try XCTUnwrap(pending), use = try XCTUnwrap(enrollment.takePhysicalUse())
+        do {
+            let started = try await setup.authority.start(setup.prepared, selection: setup.selection, physicalUse: use)
+            let permit = try XCTUnwrap(started), admission = try await setup.authority.captureAdmission(for: permit, physicalUse: use)
+            let versions = try EluVersionContext(runtime: .init(name: "elu-ios", version: "0.1.0"), facade: .init(name: "elu-ios", version: "0.1.0"))
+            var owner = try EluNativeReplaySealer(replayId: permit.replayId, identity: permit.identity,
+                authorization: permit.resolution, privacy: permit.privacy, profile: permit.profile, versions: versions)
+            let identity = UUID(), rect = try EluNativeRect(x: 0, y: 0, width: 100, height: 100)
+            let time = try EluNativeReplayCaptureClock.milliseconds(h.base.now)
+            let frame = EluNativeMaskedSnapshot(ordinal: 0, timestamp: time, viewport: try .init(width: 320, height: 640),
+                nodes: [.init(identity: identity, kind: .rectangle, bounds: rect, clip: rect, style: try .init())])
+            func point(_ offset: Int64) -> EluNativeInteractionPoint {
+                .init(identity: identity, geometryOrdinal: 0,
+                    time: .init(timestamp: time + offset, continuous: UInt64(offset) * 1_000_000), x: 10, y: 10)
+            }
+            var candidate = owner
+            let first = try candidate.seal(records: [.geometry(frame, continuous: 0)])
+            fault.action = { if $0 == .beforeCommit { throw EluRuntimeQueueError.faultInjected($0) } }
+            do { _ = try await h.queue.appendNativeReplay(first, admission: admission, physicalUse: use); XCTFail("expected rollback") }
+            catch { XCTAssertEqual(error as? EluRuntimeQueueError, .provenNotCommitted) }
+            fault.action = nil
+            let empty = try await h.queue.storedReplayChunks(); XCTAssertTrue(empty.isEmpty)
+            XCTAssertThrowsError(try owner.seal(records: [.interaction(.start(point(100)))])) {
+                XCTAssertEqual($0 as? EluNativeInteractionError, .initialCommitRequired)
+            }
+            var retry = owner
+            XCTAssertEqual(try retry.seal(records: [.geometry(frame, continuous: 0)]), first)
+            let committed = try await h.queue.appendNativeReplay(first, admission: admission, physicalUse: use)
+            guard case .committed(.inserted) = committed else { return XCTFail("known initial commit required") }
+            owner = candidate
+            let duplicate = try await h.queue.appendNativeReplay(first, admission: admission, physicalUse: use)
+            guard case .committed(.duplicate) = duplicate else { return XCTFail("exact retry must retain the original row") }
+            h.base.testClock.advance(0.1)
+            let start = try owner.seal(records: [.interaction(.start(point(100)))])
+            _ = try await h.queue.appendNativeReplay(start, admission: admission, physicalUse: use)
+            h.base.testClock.advance(0.2)
+            let movement = try owner.seal(records: [.interaction(.moves([point(200), point(300)])), .interaction(.end(point(300)))])
+            _ = try await h.queue.appendNativeReplay(movement, admission: admission, physicalUse: use)
+            let rows = try await h.queue.storedReplayChunks()
+            XCTAssertEqual(rows.map { $0.prepared.body }, [first.body, start.body, movement.body])
+            XCTAssertEqual(rows.map { $0.prepared.sequence }, [0, 1, 2])
+            XCTAssertEqual(try EluNativeReplayCaptureClock.milliseconds(movement.startedAt), time + 200)
+            use.settle()
+            let stopped = try await setup.authority.stop(); XCTAssertEqual(stopped, .settled)
+            let finished = try await h.queue.finishNativeReplayCapture(enrollment); XCTAssertEqual(finished, .settled)
+            await h.queue.close(); try await h.reopen()
+            let reopened = try await h.queue.storedReplayChunks(); XCTAssertEqual(reopened, rows)
+            let state = try await h.queue.nativeReplaySessionState(); XCTAssertNil(state.session?.activeEpoch)
+            XCTAssertNotNil(state.session?.firstStartAt)
+            await h.queue.close(); settled = true
+        } catch {
+            fault.action = nil; use.settle(); _ = try? await setup.authority.stop()
+            if (try? await h.queue.finishNativeReplayCapture(enrollment)) == .settled { settled = true }
+            else { enrollment.quarantine() }
+            await h.queue.close(); throw error
+        }
+    }
+
+    @MainActor func testV2WithdrawalBeforeAndAfterKnownCommitPreservesOriginalOutcome() async throws {
+        for afterCommit in [false, true] {
+            let fault = DeliveryFault(), h = try await make(fault: fault, tuple: .v2), setup = try await selected(h, tuple: .v2)
+            var settled = false
+            defer { setup.root.removeFromSuperview(); if settled { h.base.remove() } }
+            let pending = try await h.queue.enrollNativeReplayCapture()
+            let enrollment = try XCTUnwrap(pending), use = try XCTUnwrap(enrollment.takePhysicalUse())
+            do {
+                let started = try await setup.authority.start(setup.prepared, selection: setup.selection, physicalUse: use)
+                let permit = try XCTUnwrap(started), admission = try await setup.authority.captureAdmission(for: permit, physicalUse: use)
+                let versions = try EluVersionContext(runtime: .init(name: "elu-ios", version: "0.1.0"), facade: .init(name: "elu-ios", version: "0.1.0"))
+                var sealer = try EluNativeReplaySealer(replayId: permit.replayId, identity: permit.identity,
+                    authorization: permit.resolution, privacy: permit.privacy, profile: permit.profile, versions: versions)
+                let frame = EluNativeMaskedSnapshot(ordinal: 0, timestamp: try EluNativeReplayCaptureClock.milliseconds(h.base.now),
+                    viewport: try .init(width: 320, height: 640), nodes: [])
+                let request = try sealer.seal(records: [.geometry(frame, continuous: 0)])
+                fault.action = { point in
+                    if point == (afterCommit ? .afterCommit : .beforeCommit) { setup.authority.withdraw() }
+                }
+                do {
+                    let result = try await h.queue.appendNativeReplay(request, admission: admission, physicalUse: use)
+                    guard afterCommit, case .committedThenWithdrawn(.inserted) = result else { return XCTFail("known withdrawn commit") }
+                } catch { if afterCommit { throw error } }
+                fault.action = nil
+                XCTAssertFalse(admission.isCurrent())
+                let rows = try await h.queue.storedReplayChunks()
+                XCTAssertEqual(rows.map { $0.prepared.body }, afterCommit ? [request.body] : [])
+                do { _ = try await h.queue.appendNativeReplay(request, admission: admission, physicalUse: use); XCTFail("stale admission reused") } catch {}
+                use.settle(); _ = try await setup.authority.stop()
+                let finished = try await h.queue.finishNativeReplayCapture(enrollment); XCTAssertEqual(finished, .settled)
+                await h.queue.close(); try await h.reopen()
+                let reopened = try await h.queue.storedReplayChunks(); XCTAssertEqual(reopened, rows)
+                await h.queue.close(); settled = true
+            } catch {
+                fault.action = nil; use.settle(); _ = try? await setup.authority.stop()
+                if (try? await h.queue.finishNativeReplayCapture(enrollment)) == .settled { settled = true }
+                else { enrollment.quarantine() }
+                await h.queue.close(); throw error
+            }
+        }
+    }
+
+    @MainActor func testV2UnknownAppendRetainsOriginalPhysicalAndDurableQuarantine() async throws {
+        let fault = DeliveryFault(), h = try await make(fault: fault, tuple: .v2), setup = try await selected(h, tuple: .v2)
+        defer { setup.root.removeFromSuperview() } // original poisoned lease and directory remain retained
+        let pending = try await h.queue.enrollNativeReplayCapture()
+        let enrollment = try XCTUnwrap(pending), use = try XCTUnwrap(enrollment.takePhysicalUse())
+        let started = try await setup.authority.start(setup.prepared, selection: setup.selection, physicalUse: use)
+        let permit = try XCTUnwrap(started), admission = try await setup.authority.captureAdmission(for: permit, physicalUse: use)
+        let versions = try EluVersionContext(runtime: .init(name: "elu-ios", version: "0.1.0"), facade: .init(name: "elu-ios", version: "0.1.0"))
+        var sealer = try EluNativeReplaySealer(replayId: permit.replayId, identity: permit.identity,
+            authorization: permit.resolution, privacy: permit.privacy, profile: permit.profile, versions: versions)
+        let frame = EluNativeMaskedSnapshot(ordinal: 0, timestamp: try EluNativeReplayCaptureClock.milliseconds(h.base.now),
+            viewport: try .init(width: 320, height: 640), nodes: [])
+        let request = try sealer.seal(records: [.geometry(frame, continuous: 0)])
+        fault.action = { if $0 == .afterCommit { throw EluRuntimeQueueError.faultInjected($0) } }
+        do { _ = try await h.queue.appendNativeReplay(request, admission: admission, physicalUse: use); XCTFail("unknown commit") }
+        catch { XCTAssertEqual(error as? EluRuntimeQueueError, .ambiguousCommit) }
+        fault.action = nil; use.settle(); await h.queue.close()
+        do { _ = try await setup.authority.stop(); XCTFail("unknown accounting released") } catch {}
+        let finished = try await h.queue.finishNativeReplayCapture(enrollment); XCTAssertEqual(finished, .accountingPending)
+        do { try await h.reopen(); XCTFail("unknown append released installation") }
+        catch { XCTAssertEqual(error as? EluRuntimeQueueError, .ownershipConflict) }
+    }
+
     private struct Selection {
         let root: UIView
         let probe: CaptureRoot
@@ -516,7 +645,8 @@ final class EluNativeReplayCaptureUIKitTests: XCTestCase {
         var prepared: EluNativeReplayPreparedAuthority
         let selection: EluNativeReplaySelection
     }
-    @MainActor private func selected(_ h: NativeSessionHarness, generations: Set<String>? = nil) async throws -> Selection {
+    @MainActor private func selected(_ h: NativeSessionHarness, generations: Set<String>? = nil,
+                                     tuple: EluNativeReplayProtocol = .v1) async throws -> Selection {
         let window = try EluUIKitTestHost.window(), root = UIView(frame: window.bounds)
         window.addSubview(root)
         let probe = CaptureRoot(frame: CGRect(x: 0, y: 0, width: 2, height: 2)); root.addSubview(probe)
@@ -524,14 +654,12 @@ final class EluNativeReplayCaptureUIKitTests: XCTestCase {
         let lifecycle = EluNativeReplayLifecycle(); lifecycle.observeWithdrawal { authority.withdraw() }
         lifecycle.attached(UUID())
         let selection = try XCTUnwrap(lifecycle.select(root: root, window: window))
-        let prepared = try await prepare(h, authority: authority, generations: generations)
+        let prepared = try await prepare(h, authority: authority, generations: generations, tuple: tuple)
         return Selection(root: root, probe: probe, authority: authority, prepared: prepared, selection: selection)
     }
     private func prepare(_ h: NativeSessionHarness, authority: EluNativeReplayAuthority,
-                         generations: Set<String>? = nil) async throws -> EluNativeReplayPreparedAuthority {
-        let capabilities = EluNativeReplayCapabilities(readbackProvenTransports: [
-            EluV1ReplayTransportSelection(codec: "elu-native-wireframe-v1", compression: .gzip)!
-        ], readbackProvenProtocolGenerations: generations ?? [h.base.generation])
+                         generations: Set<String>? = nil, tuple: EluNativeReplayProtocol = .v1) async throws -> EluNativeReplayPreparedAuthority {
+        let capabilities = EluNativeReplayCapabilities(readbackProvenTransports: [tuple.transport], readbackProvenProtocolGenerations: generations ?? [h.base.generation])
         return try await authority.prepare(source: XCTUnwrap(h.base.witness),
             capabilities: capabilities, timeZoneIdentifier: "America/Los_Angeles")
     }
@@ -542,12 +670,14 @@ final class EluNativeReplayCaptureUIKitTests: XCTestCase {
             prepared: setup.prepared, selection: setup.selection, versions: versions,
             wallClock: { h.base.now }, continuousNanoseconds: { h.base.testClock.ticks() })
     }
-    private func make(minimum: Int = 0, textMasking: String = "all", fault: DeliveryFault? = nil) async throws -> NativeSessionHarness {
+    private func make(minimum: Int = 0, textMasking: String = "all", fault: DeliveryFault? = nil, tuple: EluNativeReplayProtocol = .v1) async throws -> NativeSessionHarness {
         let h = try await NativeSessionHarness.make(fault: fault)
         h.base.testClock.advance(0.001)
         var body = try JSONSerialization.jsonObject(with: h.base.config) as! [String: Any]
         var capabilities = body["capabilities"] as! [String: Any], replay = capabilities["replay"] as! [String: Any]
-        replay["transports"] = [["codec": "elu-native-wireframe-v1", "compression": "gzip"]]
+        replay["transports"] = [["codec": tuple.codec, "compression": "gzip"]]
+        replay["replayProtocolGeneration"] = tuple.generation
+        h.base.generation = tuple.generation
         capabilities["replay"] = replay; body["capabilities"] = capabilities
         var privacy = body["privacy"] as! [String: Any], policy = privacy["replay"] as! [String: Any]
         var masking = privacy["masking"] as! [String: Any]

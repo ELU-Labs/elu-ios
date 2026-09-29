@@ -695,7 +695,8 @@ final class EluV1ConfigManager: @unchecked Sendable {
               policyObservation.profileCompatibility == .compatible,
               policyObservation.profile.compatibility(with: policy.masking, platform: .ios) == .compatible else { return nil }
         let selected = readbackProvenReplayTransports.first {
-            $0.codec == "elu-native-wireframe-v1" && $0.compression == .gzip &&
+            EluNativeReplayProtocol.matching(codec: $0.codec, compression: $0.compression.rawValue,
+                generation: generation) != nil &&
                 capabilities.replay.advertises(codec: $0.codec, compression: $0.compression)
         }
         guard Self.sealedPolicyAllows(features: features, policy: policy, decision: decision.decision,

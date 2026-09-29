@@ -279,3 +279,19 @@ consume no token, backward wall time accrues debt, and ambiguous SQL commits
 stop the owner. Bounded native JSON conversion precedes actor admission; there
 are no native customer capture hooks. See README for persistence fallback and
 warning omission behavior.
+
+
+The internal candidate v2 sealing path accepts only the closed tuples
+`elu-native-wireframe-v1` / `gzip` / `protocol-generation-v1` and
+`elu-native-wireframe-v2` / `gzip` / `protocol-generation-v2`, intersected with
+local proof and the original configuration. Mixed codec advertisements cannot
+cross generations. The production runtime still installs only v1. The v2 encoder,
+value-copy sealer and original native queue path do not enable interaction capture
+or advertise v2 support; observer wiring and exact artifact qualification remain
+required. Generic replay append refuses either native codec without the original
+physical admission. A future v2 capture owner must adopt its candidate encoder
+and arm interaction collection only after a known initial queue commit, preserving
+the exact prepared bytes for retries. Movement envelopes begin at the earliest
+logical sample, even when the first outer event uses the last sample timestamp.
+Original identity, privacy, source, budget, physical settlement, and ambiguous
+commit quarantine continue to apply. No database schema changes are needed.

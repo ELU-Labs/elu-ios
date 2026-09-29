@@ -23,6 +23,8 @@ final class EluNativeReplayMixedStartUIKitTests: XCTestCase {
         var config = try XCTUnwrap(JSONSerialization.jsonObject(with: h.base.config) as? [String: Any])
         var capabilities = config["capabilities"] as! [String: Any], replay = capabilities["replay"] as! [String: Any]
         replay["transports"] = [["codec": "elu-native-wireframe-v1", "compression": "gzip"]]
+        replay["replayProtocolGeneration"] = "protocol-generation-v1"
+        h.base.generation = "protocol-generation-v1"
         capabilities["replay"] = replay; config["capabilities"] = capabilities
         config["issuedAt"] = EluRFC3339.string(from: h.base.now)
         h.base.config = try JSONSerialization.data(withJSONObject: config)

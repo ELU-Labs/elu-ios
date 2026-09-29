@@ -22,6 +22,37 @@ final class EluSealedReplayPolicyQueueTests: XCTestCase {
         await h.base.queue.close()
     }
 
+    func testV2SealedOriginalBytesSurviveReopenAndMixedAdvertisementSelectsExactGeneration() async throws {
+        let h = try await SealedPolicyTestHarness.make(tuple: .v2); defer { h.base.remove() }
+        let originalRows = try await h.base.queue.storedReplayChunks()
+        XCTAssertEqual(originalRows.count, 1)
+        let original = try XCTUnwrap(originalRows.first)
+        XCTAssertEqual(original.prepared.codec, "elu-native-wireframe-v2")
+        XCTAssertEqual(original.captureProtocolGeneration, "protocol-generation-v2")
+        let beforeSchema = try h.base.schemaVersion()
+        try h.changeConfig { root in
+            var caps = root["capabilities"] as! [String: Any], replay = caps["replay"] as! [String: Any]
+            replay["transports"] = EluNativeReplayProtocol.allCases.map { ["codec": $0.codec, "compression": "gzip"] }
+            caps["replay"] = replay; root["capabilities"] = caps
+        }
+        try h.publish()
+        let both = EluNativeReplayCapabilities(readbackProvenTransports: Set(EluNativeReplayProtocol.allCases.map(\.transport)),
+            readbackProvenProtocolGenerations: Set(EluNativeReplayProtocol.allCases.map(\.generation)))
+        let authority = try await h.authority(proof: both), permission = try XCTUnwrap(authority)
+        guard case let .claimed(claim) = try await h.base.queue.claimNextReplay(permission) else { return XCTFail("v2 original claim") }
+        XCTAssertEqual(claim.row.prepared.body, original.prepared.body)
+        _ = try await h.base.queue.finishReplayClaim(claim, completion: .released)
+        await h.base.queue.close(); h.base.queue = try await h.base.reopen()
+        let reopened = try await h.base.queue.storedReplayChunks()
+        XCTAssertEqual(reopened, originalRows); XCTAssertEqual(try h.base.schemaVersion(), beforeSchema)
+        let fresh = try await h.authority(proof: both), current = try XCTUnwrap(fresh)
+        guard case let .claimed(retry) = try await h.base.queue.claimNextReplay(current) else { return XCTFail("v2 retry") }
+        XCTAssertEqual(retry.row.prepared, original.prepared)
+        _ = try await h.base.queue.finishReplayClaim(retry, completion: .response(.accepted))
+        let remaining = try await h.base.queue.storedReplayChunks(); XCTAssertTrue(remaining.isEmpty)
+        await h.base.queue.close()
+    }
+
     func testOriginalIdentityIsNotReboundAndPendingIntentRevokesCurrentPermission() async throws {
         let h = try await SealedPolicyTestHarness.make(); defer { h.base.remove() }
         let rows = try await h.base.queue.storedReplayChunks(), first = try await h.authority()
@@ -183,11 +214,12 @@ final class EluSealedReplayPolicyQueueTests: XCTestCase {
 final class SealedPolicyTestHarness: @unchecked Sendable {
     let base: DeliveryHarness
     let zone = "America/Los_Angeles"
-    let pair = EluV1ReplayTransportSelection(codec: "elu-native-wireframe-v1", compression: .gzip)!
+    let tuple: EluNativeReplayProtocol
+    var pair: EluV1ReplayTransportSelection { tuple.transport }
     var proof: EluNativeReplayCapabilities { .init(readbackProvenTransports: [pair], readbackProvenProtocolGenerations: [base.generation]) }
-    init(_ base: DeliveryHarness) { self.base = base }
-    static func make(seed: Bool = true, clearSession: Bool = true, fault: DeliveryFault? = nil) async throws -> SealedPolicyTestHarness {
-        let base = try await DeliveryHarness.make(fault: fault), h = SealedPolicyTestHarness(base)
+    init(_ base: DeliveryHarness, tuple: EluNativeReplayProtocol = .v1) { self.base = base; self.tuple = tuple }
+    static func make(seed: Bool = true, clearSession: Bool = true, fault: DeliveryFault? = nil, tuple: EluNativeReplayProtocol = .v1) async throws -> SealedPolicyTestHarness {
+        let base = try await DeliveryHarness.make(fault: fault), h = SealedPolicyTestHarness(base, tuple: tuple)
         var phase = "install"
         do {
         if seed { try await base.install() }
@@ -201,15 +233,18 @@ final class SealedPolicyTestHarness: @unchecked Sendable {
             let projected = try EluPrivacyStateProjector.project(context: manager.activePrivacyProjectionContext(now: base.now),
                 input: .init(contextRevision: identity.identity.contextRevision, identityOptedOut: false, timeZoneIdentifier: h.zone,
                     evaluatedAt: base.now, appliedMasking: .init(text: .all, inputs: .all, images: .block),
-                    replaySampleDraw: 0, replaySessionEligible: true, replayBudgetRemainingSeconds: 60, localReplayTransports: h.proof.pairs))
+                    replaySampleDraw: 0, replaySessionEligible: true, replayBudgetRemainingSeconds: 60, localReplayTransports: h.proof.pairs(for: h.base.generation)))
             let auth = try manager.authorize(effectivePrivacyStateData: projected.stateData, identity: identity, now: base.now)
             let versions = try EluVersionContext(runtime: .init(name: "elu-ios", version: "0.1.0"), facade: .init(name: "elu-ios", version: "0.1.0"))
             phase = "sealer init"
             var sealer = try EluNativeReplaySealer(replayId: "sealed-current-policy", identity: identity, authorization: auth,
                 privacy: projected, profile: .blanketMask(), versions: versions)
             phase = "seal"
-            let request = try sealer.seal([EluNativeMaskedSnapshot(ordinal: 0, timestamp: Int64(base.now.timeIntervalSince1970 * 1000),
-                viewport: try .init(width: 320, height: 640), nodes: [])])
+            let frame = EluNativeMaskedSnapshot(ordinal: 0, timestamp: Int64(base.now.timeIntervalSince1970 * 1000),
+                viewport: try .init(width: 320, height: 640), nodes: [])
+            let request: EluV2ReplayPreparedRequest
+            if tuple == .v1 { request = try sealer.seal([frame]) }
+            else { request = try sealer.seal(records: [.geometry(frame, continuous: 0)]) }
             let doc = try JSONDecoder().decode(EluV1ConfigDocument.self, from: base.config)
             phase = "stored row"
             let row = try EluV2ReplayStoredChunk(ordinal: 0, siteId: XCTUnwrap(doc.site?.id), captureProtocolGeneration: base.generation,
@@ -243,9 +278,11 @@ final class SealedPolicyTestHarness: @unchecked Sendable {
         base.config = try JSONSerialization.data(withJSONObject: root)
     }
     func useNativeConfig() throws {
+        base.generation = tuple.generation
         try changeConfig { root in
             var caps = root["capabilities"] as! [String: Any], replay = caps["replay"] as! [String: Any]
-            replay["transports"] = [["codec": "elu-native-wireframe-v1", "compression": "gzip"]]
+            replay["transports"] = [["codec": tuple.codec, "compression": "gzip"]]
+            replay["replayProtocolGeneration"] = tuple.generation
             caps["replay"] = replay; root["capabilities"] = caps
         }
     }
