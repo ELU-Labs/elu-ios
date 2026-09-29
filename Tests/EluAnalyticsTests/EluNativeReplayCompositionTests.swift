@@ -333,7 +333,7 @@ final class EluNativeReplayCompositionTests: XCTestCase {
     @MainActor func testSameWindowRootReplacementAndViewportChangeStartNewStreamsAutomatically() async throws {
         let f = try await makeUIKitFixture()
         do {
-            try await waitUIKit("initial authorized frame reaches delivery") { await f.transport.count() == 1 }
+            try await waitUIKit("initial authorized frame reaches delivery", diagnostics: { await f.captureDiagnostics() }) { await f.transport.count() == 1 }
             let first = try await f.transport.requests()[0], ledger = try await f.queue.nativeReplaySessionState()
             f.h.base.testClock.advance(1)
             let replacement = UIViewController()
@@ -360,7 +360,7 @@ final class EluNativeReplayCompositionTests: XCTestCase {
     @MainActor func testMissingRootObserverRecoversWithoutConfigurationOrLocalStart() async throws {
         let f = try await makeUIKitFixture()
         do {
-            try await waitUIKit("initial authorized frame reaches delivery") { await f.transport.count() == 1 }
+            try await waitUIKit("initial authorized frame reaches delivery", diagnostics: { await f.captureDiagnostics() }) { await f.transport.count() == 1 }
             let first = try await f.transport.requests()[0]
             f.h.base.testClock.advance(1); f.window.rootViewController = nil
             try await waitUIKit("original capture settles and missing-root observation begins") { await f.composition.isObservingRootForTesting() }
@@ -380,7 +380,7 @@ final class EluNativeReplayCompositionTests: XCTestCase {
         for mode in ["local-stop", "expiry", "consent"] {
             let f = try await makeUIKitFixture()
             do {
-                try await waitUIKit("initial authorized frame reaches delivery") { await f.transport.count() == 1 }
+                try await waitUIKit("initial authorized frame reaches delivery", diagnostics: { await f.captureDiagnostics() }) { await f.transport.count() == 1 }
                 f.window.rootViewController = nil
                 try await waitUIKit("original capture settles and missing-root observation begins") { await f.composition.isObservingRootForTesting() }
                 if mode == "local-stop" {
@@ -407,7 +407,7 @@ final class EluNativeReplayCompositionTests: XCTestCase {
         let fault = DeliveryFault(), f = try await makeUIKitFixture(fault: fault)
         let release = DispatchSemaphore(value: 0), once = CompositionOnce()
         do {
-            try await waitUIKit("initial authorized frame reaches delivery") { await f.transport.count() == 1 }
+            try await waitUIKit("initial authorized frame reaches delivery", diagnostics: { await f.captureDiagnostics() }) { await f.transport.count() == 1 }
             await f.composition.waitForCurrentDelivery()
             let entered = expectation(description: "original stop owns accounting transaction")
             fault.action = { point in
@@ -429,7 +429,7 @@ final class EluNativeReplayCompositionTests: XCTestCase {
     @MainActor func testUnknownRootStopQuarantinesWithoutObserverOrReplacement() async throws {
         let fault = DeliveryFault(), f = try await makeUIKitFixture(fault: fault), once = CompositionOnce()
         do {
-            try await waitUIKit("initial authorized frame reaches delivery") { await f.transport.count() == 1 }
+            try await waitUIKit("initial authorized frame reaches delivery", diagnostics: { await f.captureDiagnostics() }) { await f.transport.count() == 1 }
             await f.composition.waitForCurrentDelivery()
             fault.action = { point in
                 if point == .afterCommit, once.take() { throw EluRuntimeQueueError.faultInjected(point) }
@@ -494,14 +494,15 @@ final class EluNativeReplayCompositionTests: XCTestCase {
         } catch { _ = await fixture.close(); throw error }
     }
 
-    @MainActor private func waitUIKit(_ stage: String, diagnostics: (() -> String)? = nil,
+    @MainActor private func waitUIKit(_ stage: String, diagnostics: (() async -> String)? = nil,
                                       _ predicate: () async throws -> Bool) async throws {
         let start = DispatchTime.now().uptimeNanoseconds
         while DispatchTime.now().uptimeNanoseconds - start < 6_000_000_000 {
             if try await predicate() { return }
             try await Task.sleep(nanoseconds: 20_000_000)
         }
-        throw CompositionUIKitWaitFailure(stage: stage, diagnostics: diagnostics?())
+        let facts = await diagnostics?()
+        throw CompositionUIKitWaitFailure(stage: stage, diagnostics: facts)
     }
     #endif
 
@@ -622,6 +623,44 @@ private struct CompositionUIKitWaitFailure: Error, CustomStringConvertible {
         self.composition = composition; self.transport = transport; self.window = window
         self.previous = previous; self.controller = controller
     }
+    /// Failure-only observations of the original owners. No prepare/start,
+    /// configuration publication, identity values, payloads or authority grant.
+    func captureDiagnostics() async -> String {
+        let phase: Int
+        switch await runtime.currentPhase {
+        case .awaitingConfiguration: phase = 0
+        case .capturing: phase = 1
+        case .blocked: phase = 2
+        case .closed: phase = 3
+        }
+        let snapshot = try? await queue.snapshot()
+        let ledger = try? await queue.nativeReplaySessionState()
+        let inventory = try? await queue.replayInventory()
+        let delivered = await transport.count()
+        let session = ledger?.session
+        return [
+            "runtimePhase=\(phase)",
+            "sourceCurrent=\(h.base.gate.isCurrent(h.base.witness))",
+            "queueReadable=\(snapshot != nil)",
+            "hasAnalyticsSession=\(snapshot?.identity.session != nil)",
+            "optedOut=\(snapshot?.identity.optedOut == true)",
+            "nativeLedgerReadable=\(ledger != nil)",
+            "hasNativeSession=\(session != nil)",
+            "sampleSelected=\(session?.originalSelected == true)",
+            "hasFirstStart=\(session?.firstStartAt != nil)",
+            "hasActiveEpoch=\(session?.activeEpoch != nil)",
+            "clockDenied=\(session?.clockDenied == true)",
+            "interrupted=\(session?.interrupted == true)",
+            "remainingSeconds=\(session?.remainingWholeSeconds ?? -1)",
+            "nextReplayOrdinal=\(ledger?.nextReplayOrdinal ?? -1)",
+            "inventoryReadable=\(inventory != nil)",
+            "sealedCount=\(inventory?.replayCount ?? -1)",
+            "recording=\(runtime.nativeReplayIsRecording())",
+            "transportCount=\(delivered)",
+            "lifecycleReadiness=\(lifecycle.observeRootReadiness())"
+        ].joined(separator: ";")
+    }
+
     func close() async -> EluNativeReplayComposition.CloseOutcome {
         let outcome = await composition.closeAndWait()
         await runtime.close(); lifecycle.close(); window.rootViewController = previous
