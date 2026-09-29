@@ -89,8 +89,7 @@ final class EluReplayWindowTests: XCTestCase {
             ";strictWitnessCurrent=\(originalWitness.isCurrent(deadline: 100, now: { 0 }))" +
             ";geometryWitnessCurrent=\(originalWitness.isCurrent(deadline: 100, now: { 0 }, allowingGeometry: true))" +
             ";currentGeometryAvailable=\(originalWitness.currentGeometry(deadline: 100, now: { 0 }) != nil)" +
-            ";currentPointAvailable=\(firstProjection.point(location: CGPoint(x: 50, y: 50),
-                time: .init(timestamp: wall, continuous: UInt64(wall) * 1_000_000), deadline: 100, now: { 0 }) != nil)" +
+            ";currentPointAvailable=\(firstProjection.point(location: CGPoint(x: 50, y: 50), time: .init(timestamp: wall, continuous: UInt64(wall) * 1_000_000), deadline: 100, now: { 0 }) != nil)" +
             ";observerOrdinalAvailable=\(value.originalProjectionOrdinal != nil);contactActive=\(value.contactIsActive)")
         XCTAssertEqual(old.count, 2)
         XCTAssertTrue(value.contactIsActive)
