@@ -37,22 +37,42 @@ final class EluUIKitReplayCollectedProjection {
     weak var root: UIView?
     weak var window: UIWindow?
     fileprivate let checks: [EluUIKitReplayInteractionCheck]
+    fileprivate let currentGeometryChecks: [EluUIKitReplayInteractionCheck]
+    fileprivate let scrollActivity: [@MainActor () -> Bool]
+    fileprivate let profile: EluNativeMaskingProfile
+    fileprivate let restrictions: [EluUIKitReplayRestriction]
     fileprivate let privacyRevision: UUID
     fileprivate let generation: UUID
     fileprivate weak var collector: EluUIKitReplayCollector?
     fileprivate init(snapshot: EluNativeMaskedSnapshot, eligible: Set<UUID>, paintVetoes: [UUID: EluNativeRect], root: UIView,
-                     window: UIWindow, checks: [EluUIKitReplayInteractionCheck], privacyRevision: UUID,
+                     window: UIWindow, checks: [EluUIKitReplayInteractionCheck],
+                     currentGeometryChecks: [EluUIKitReplayInteractionCheck], scrollActivity: [@MainActor () -> Bool], profile: EluNativeMaskingProfile,
+                     restrictions: [EluUIKitReplayRestriction], privacyRevision: UUID,
                      generation: UUID, collector: EluUIKitReplayCollector) {
         self.snapshot = snapshot; self.eligible = eligible; self.root = root; self.window = window
         self.paintVetoes = paintVetoes
-        self.checks = checks; self.privacyRevision = privacyRevision; self.generation = generation
+        self.checks = checks; self.currentGeometryChecks = currentGeometryChecks; self.scrollActivity = scrollActivity
+        self.profile = profile; self.restrictions = restrictions; self.privacyRevision = privacyRevision; self.generation = generation
         self.collector = collector
     }
     var privacyIsCurrent: Bool { EluNativeViewPrivacy.shared.isCurrent(privacyRevision) }
-    func isCurrent(deadline: UInt64, now: () -> UInt64) -> Bool {
+    // Activity selects a bounded sampling interval only. It never proves point
+    // privacy, authorizes retention, or reads text/children. Weak original views
+    // cover public drag/deceleration after the physical finger lifts.
+    var hasActiveScroll: Bool {
+        guard collector?.ownsInteractionProjection(self) == true, privacyIsCurrent else { return false }
+        return scrollActivity.contains { $0() }
+    }
+    func currentGeometry(deadline: UInt64, now: () -> UInt64) -> (EluNativeMaskedSnapshot, [UUID: EluNativeRect])? {
+        collector?.currentInteractionGeometry(self, deadline: deadline, now: now)
+    }
+
+    func isCurrent(deadline: UInt64, now: () -> UInt64, allowingGeometry: Bool = false) -> Bool {
         guard let collector, collector.ownsInteractionProjection(self), now() <= deadline,
               EluNativeViewPrivacy.shared.isCurrent(privacyRevision), root != nil, window != nil else { return false }
-        for check in checks { guard now() <= deadline, check(deadline, now) else { return false } }
+        for check in (allowingGeometry ? currentGeometryChecks : checks) {
+            guard now() <= deadline, check(deadline, now) else { return false }
+        }
         return now() <= deadline && collector.ownsInteractionProjection(self)
             && EluNativeViewPrivacy.shared.isCurrent(privacyRevision)
     }
@@ -115,13 +135,28 @@ final class EluUIKitReplayCollector {
                  profile: EluNativeMaskingProfile = .blanketMask(),
                  retainInteractionProjection: Bool = false,
                  isCurrent: () -> Bool) throws -> EluNativeMaskedSnapshot {
-        // Any attempted collection invalidates the prior point witness. A failed
-        // frame must not leave coordinates attached to an older projection.
-        if retainInteractionProjection || interactionProjection != nil {
+        try collectOriginal(root: root, ordinal: ordinal, timestamp: timestamp,
+            hasUnresolvedConfiguredBlockRules: hasUnresolvedConfiguredBlockRules, restrictions: restrictions,
+            profile: profile, retainInteractionProjection: retainInteractionProjection, query: nil, isCurrent: isCurrent)
+    }
+
+    private func collectOriginal(root: UIView, ordinal: Int64, timestamp: Int64,
+                 hasUnresolvedConfiguredBlockRules: Bool, restrictions: [EluUIKitReplayRestriction],
+                 profile: EluNativeMaskingProfile, retainInteractionProjection: Bool,
+                 query: EluUIKitReplayCollectedProjection?, queryDeadline: UInt64 = .max, queryNow: () -> UInt64 = { 0 },
+                 queryPaint: (([UUID: EluNativeRect]) -> Void)? = nil,
+                 isCurrent: () -> Bool) throws -> EluNativeMaskedSnapshot {
+        // Any new geometry collection invalidates the prior point witness. A
+        // read-only current-geometry query retains the original ordinal/identity
+        // and never grants a new projection or allocates an identity.
+        if query == nil && (retainInteractionProjection || interactionProjection != nil) {
             interactionGeneration = UUID(); interactionProjection = nil
         }
         let viewPrivacyRevision = EluNativeViewPrivacy.shared.snapshot()
+        let queryNodes = query.map { Dictionary(uniqueKeysWithValues: $0.snapshot.nodes.map { ($0.identity, $0.kind) }) }
         var interactionChecks: [EluUIKitReplayInteractionCheck] = []
+        var currentGeometryChecks: [EluUIKitReplayInteractionCheck] = []
+        var scrollActivity: [@MainActor () -> Bool] = []
         var interactionEligible: Set<UUID> = []
         var interactionPaintVetoes: [UUID: EluNativeRect] = [:]
         var interactionOverflow = false
@@ -130,10 +165,16 @@ final class EluUIKitReplayCollector {
             guard interactionChecks.count < maximumViews * 3 + maximumDepth * 2 else {
                 interactionOverflow = true; return
             }
-            interactionChecks.append(value)
+            interactionChecks.append(value); currentGeometryChecks.append(value)
         }
         func remember(_ view: UIView) {
-            if retainInteractionProjection { addInteractionCheck(interactionCheck(view)) }
+            if retainInteractionProjection {
+                if let scroll = view as? UIScrollView, scrollActivity.count < maximumViews + maximumDepth {
+                    scrollActivity.append { [weak scroll] in scroll.map { $0.isDragging || $0.isDecelerating } ?? false }
+                }
+                addInteractionCheck(interactionCheck(view))
+                if !interactionOverflow { currentGeometryChecks[currentGeometryChecks.count - 1] = interactionCheck(view, allowingGeometry: true) }
+            }
         }
         func check() throws {
             guard EluNativeViewPrivacy.shared.isCurrent(viewPrivacyRevision), fence.current(), isCurrent(), fence.current() else { throw EluUIKitReplayCollectionError.withdrawn }
@@ -255,14 +296,20 @@ final class EluUIKitReplayCollector {
             } else if let label = view as? UILabel {
                 // Subclasses can expose custom-sensitive state through getters.
                 // Only exact system controls are eligible for ordinary text.
-                kind = !masked && type(of: label) == UILabel.self && visible == converted
-                    && hasVisiblePlainText(label)
-                    ? ordinaryText(label.text ?? "") : .text
+                if let query {
+                    kind = !masked && visible == converted ? queryKind(view, original: query, nodes: queryNodes ?? [:]) : .text
+                } else {
+                    kind = !masked && type(of: label) == UILabel.self && visible == converted
+                        && hasVisiblePlainText(label) ? ordinaryText(label.text ?? "") : .text
+                }
                 traversable = false
             } else if let button = view as? UIButton, type(of: button) == UIButton.self {
                 // Read the actually rendered label, never a stale underlying
                 // plain title overridden by an attributed/configured title.
                 let titleLabel = button.titleLabel
+                if let query {
+                    kind = !masked && visible == converted ? queryKind(view, original: query, nodes: queryNodes ?? [:]) : .text
+                } else {
                 kind = !masked && visible == converted
                     && titleLabel.map({ label in
                         label.eluReplayRestriction == nil
@@ -271,6 +318,7 @@ final class EluUIKitReplayCollector {
                             && hasVisiblePlainText(label)
                     }) == true
                     ? ordinaryText(titleLabel?.text ?? "") : .text
+                }
                 traversable = false
             } else if let table = view as? UITableView, type(of: table) == UITableView.self {
                 kind = .rectangle; traversable = true; projectedChildren = table.visibleCells
@@ -292,6 +340,7 @@ final class EluUIKitReplayCollector {
             let projection: Projection
             if let existing = projections[key], existing.view === view { projection = existing }
             else {
+                guard query == nil else { throw EluUIKitReplayCollectionError.withdrawn }
                 guard nextIssued.count < maximumLifetimeIdentities else { throw EluUIKitReplayCollectionError.treeLimit }
                 let value = identity()
                 guard nextIssued.insert(value).inserted else { throw EluUIKitReplayCollectionError.identityCollision }
@@ -395,18 +444,56 @@ final class EluUIKitReplayCollector {
         guard root.window === window, root.bounds == rootBounds, !root.isHidden, root.alpha == 1,
               !window.isHidden, window.alpha == 1 else { throw EluUIKitReplayCollectionError.invalidRoot }
         let result = EluNativeMaskedSnapshot(ordinal: ordinal, timestamp: timestamp, viewport: viewport, nodes: nodes)
+        if let query {
+            guard ownsInteractionProjection(query), isCurrent() else {
+                throw EluUIKitReplayCollectionError.withdrawn
+            }
+            guard !interactionOverflow else { throw EluUIKitReplayCollectionError.treeLimit }
+            for check in interactionChecks {
+                guard queryNow() <= queryDeadline, check(queryDeadline, queryNow) else { throw EluUIKitReplayCollectionError.withdrawn }
+            }
+            guard isCurrent() else { throw EluUIKitReplayCollectionError.withdrawn }
+            queryPaint?(interactionPaintVetoes)
+            return result
+        }
         guard fence.commit({
             projections = nextProjections; issued = nextIssued
             if retainInteractionProjection, !interactionOverflow {
                 interactionProjection = EluUIKitReplayCollectedProjection(snapshot: result,
                     eligible: interactionEligible, paintVetoes: interactionPaintVetoes,
-                    root: root, window: window, checks: interactionChecks,
-                    privacyRevision: viewPrivacyRevision, generation: interactionGeneration, collector: self)
+                    root: root, window: window, checks: interactionChecks, currentGeometryChecks: currentGeometryChecks, scrollActivity: scrollActivity,
+                    profile: profile, restrictions: restrictions, privacyRevision: viewPrivacyRevision, generation: interactionGeneration, collector: self)
             }
         }) else { throw EluUIKitReplayCollectionError.withdrawn }
         return result
     }
 
+
+    /// Reuses the exact collection traversal in a no-content/no-new-ID mode.
+    /// The result is descriptive current geometry; it never advances an ordinal,
+    /// changes the original projection, or supplies permission to serialize it.
+    fileprivate func currentInteractionGeometry(_ original: EluUIKitReplayCollectedProjection,
+        deadline: UInt64, now: () -> UInt64) -> (EluNativeMaskedSnapshot, [UUID: EluNativeRect])? {
+        guard original.isCurrent(deadline: deadline, now: now, allowingGeometry: true), let root = original.root else { return nil }
+        var paint: [UUID: EluNativeRect] = [:]
+        do {
+            let frame = try collectOriginal(root: root, ordinal: original.snapshot.ordinal,
+                timestamp: original.snapshot.timestamp, hasUnresolvedConfiguredBlockRules: false,
+                restrictions: original.restrictions, profile: original.profile, retainInteractionProjection: true,
+                query: original, queryDeadline: deadline, queryNow: now, queryPaint: { paint = $0 },
+                isCurrent: { now() <= deadline && self.ownsInteractionProjection(original) && original.privacyIsCurrent })
+            guard original.isCurrent(deadline: deadline, now: now, allowingGeometry: true) else { return nil }
+            return (frame, paint)
+        } catch { return nil }
+    }
+
+    private func queryKind(_ view: UIView, original: EluUIKitReplayCollectedProjection,
+                           nodes: [UUID: EluNativeMaskedKind]) -> EluNativeMaskedKind {
+        guard let prior = projections[ObjectIdentifier(view)], prior.view === view,
+              original.eligible.contains(prior.identity),
+              let kind = nodes[prior.identity] else { return .text }
+        return kind
+    }
 
     /// Only the exact last successful snapshot can recover its original witness.
     /// Copying snapshot values cannot invent a collector generation or view ID.
@@ -465,12 +552,13 @@ final class EluUIKitReplayCollector {
         weak var originalFont = label.font
         let alignment = label.textAlignment, lineBreak = label.lineBreakMode, lines = label.numberOfLines
         let shrink = label.adjustsFontSizeToFitWidth, tighten = label.allowsDefaultTighteningForTruncation
+        let size = label.bounds.size
         let highlighted = label.isHighlighted
         let color = highlighted ? (label.highlightedTextColor ?? label.textColor) : label.textColor
         let alpha = color?.resolvedColor(with: label.traitCollection).cgColor.alpha
         return { [weak label] _, _ in
             guard let label, let originalText, originalFont != nil,
-                  label.attributedText === originalText, label.font === originalFont,
+                  label.attributedText === originalText, label.font === originalFont, label.bounds.size == size,
                   label.textAlignment == alignment, label.lineBreakMode == lineBreak,
                   label.numberOfLines == lines, label.adjustsFontSizeToFitWidth == shrink,
                   label.allowsDefaultTighteningForTruncation == tighten, label.isHighlighted == highlighted else { return false }
@@ -481,7 +569,7 @@ final class EluUIKitReplayCollector {
 
     /// This base stamp reads geometry, hierarchy and explicit restrictions only.
     /// It invokes no text/input/image/accessibility getter or hitTest callback.
-    private func interactionCheck(_ view: UIView) -> EluUIKitReplayInteractionCheck {
+    private func interactionCheck(_ view: UIView, allowingGeometry: Bool = false) -> EluUIKitReplayInteractionCheck {
         weak var originalParent = view.superview
         weak var originalWindow = view.window
         let hadParent = view.superview != nil, hadWindow = view.window != nil
@@ -498,7 +586,7 @@ final class EluUIKitReplayCollector {
         return { [weak view] _, _ in
             guard let view, (!hadParent || originalParent != nil), (!hadWindow || originalWindow != nil),
                   view.superview === originalParent, view.window === originalWindow,
-                  view.bounds == bounds, view.center == center, view.transform == transform,
+                  (allowingGeometry || view.bounds == bounds && view.center == center), view.transform == transform,
                   view.isHidden == hidden, view.alpha == alpha, view.clipsToBounds == clips,
                   view.eluReplayRestriction == restriction else { return false }
             let current = view.layer
@@ -507,7 +595,7 @@ final class EluUIKitReplayCollector {
                 && current.zPosition == z && current.opacity == opacity && current.masksToBounds == masks
                 && current.cornerRadius == radius && (current.mask != nil) == hadMask
                 && (current.animationKeys() ?? []) == animationKeys
-                && (view as? UIScrollView)?.zoomScale == zoom && (view as? UIScrollView)?.contentOffset == offset
+                && (view as? UIScrollView)?.zoomScale == zoom && (allowingGeometry || (view as? UIScrollView)?.contentOffset == offset)
         }
     }
 

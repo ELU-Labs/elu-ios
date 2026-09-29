@@ -175,6 +175,46 @@ enum EluNativeReplayCaptureOutcome: Sendable {
     case quarantined
 }
 
+/// One coalesced signal and reusable timer for the existing capture task.
+/// A callback never creates a task and never waits for the serial consumer.
+private final class EluNativeReplayCaptureWake: @unchecked Sendable {
+    private let lock = NSLock()
+    private var pending = false
+    private var closed = false
+    private var waiter: CheckedContinuation<Void, Never>?
+    private let timer: DispatchSourceTimer
+    init() {
+        timer = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
+        timer.setEventHandler { [weak self] in self?.signal() }
+        timer.resume()
+    }
+    func signal() {
+        lock.lock(); pending = true
+        let original = waiter; waiter = nil
+        lock.unlock(); original?.resume()
+    }
+    func wait(_ nanoseconds: UInt64) async {
+        await withTaskCancellationHandler(operation: {
+            await withCheckedContinuation { continuation in
+                lock.lock()
+                if closed || pending || Task.isCancelled {
+                    pending = false; lock.unlock(); continuation.resume(); return
+                }
+                precondition(waiter == nil, "One original serial capture consumer")
+                waiter = continuation
+                timer.schedule(deadline: .now() + .nanoseconds(Int(min(nanoseconds, 1_000_000_000))))
+                lock.unlock()
+            }
+        }, onCancel: { self.signal() })
+    }
+    func close() {
+        lock.lock(); closed = true
+        let original = waiter; waiter = nil
+        lock.unlock(); timer.cancel(); original?.resume()
+    }
+    deinit { timer.cancel() }
+}
+
 /// No UIKit, SQL, await or callback executes under this local cancellation lock.
 private final class EluNativeReplayCaptureFence: @unchecked Sendable {
     private let lock = NSLock()
@@ -271,6 +311,28 @@ final class EluNativeReplayCaptureOwner: @unchecked Sendable {
     deinit { fence.withdraw(); task.cancel() }
 }
 
+@MainActor
+private final class EluNativeReplayInteractionAttachment {
+    private weak var window: EluReplayWindow?
+    private let observer: EluUIKitReplayTouchObserver
+    init(window: EluReplayWindow, observer: EluUIKitReplayTouchObserver) { self.window = window; self.observer = observer }
+    func install() -> Bool { window?.installReplayObserver(observer) ?? false }
+    func drain() -> [EluNativeInteraction]? { observer.drainCurrent() }
+    func handoff(_ projection: EluUIKitReplayInteractionProjection, at time: EluNativeInteractionTime) -> [EluNativeInteraction]? { observer.handoff(projection, at: time) }
+    func active() -> Bool { observer.contactIsActive }
+    func stopAndDrain() -> [EluNativeInteraction]? {
+        guard let original = observer.drainCurrent() else { return nil }
+        observer.stop()
+        return original + observer.drainStoppedTerminal()
+    }
+    func close() async {
+        // No replacement lookup, source permission or cancellation-dependent
+        // early return is allowed during original physical cleanup.
+        if let window { await window.closeReplayObserver(observer) }
+        else { observer.withdraw() }
+    }
+}
+
 private final class EluNativeReplayCaptureRun: @unchecked Sendable {
     let fence = EluNativeReplayCaptureFence()
     private let queue: EluSQLiteRuntimeQueue
@@ -322,11 +384,205 @@ private final class EluNativeReplayCaptureRun: @unchecked Sendable {
         else { throw EluNativeReplayCaptureError.withdrawn }
     }
 
+    private func captureInteractions(permit: EluNativeReplayPermit, admission: EluNativeReplayCaptureAdmission,
+        use: EluNativeReplayCapturePhysicalUse, collector: EluUIKitReplayCollector, wake: EluNativeReplayCaptureWake,
+        sealer originalSealer: inout EluNativeReplaySealer, pendingRequest originalRequest: inout EluV2ReplayPreparedRequest?,
+        attachment originalAttachment: inout EluNativeReplayInteractionAttachment?) async throws {
+        // This original serial invocation owns these values throughout all awaits.
+        // Closures never capture the caller's inout storage. Even a thrown append
+        // returns its exact pending bytes and installed handle for final quarantine.
+        var sealer = originalSealer
+        var pendingRequest = originalRequest
+        var attachment = originalAttachment
+        defer { originalSealer = sealer; originalRequest = pendingRequest; originalAttachment = attachment }
+        var buffer = try EluNativeReplayInteractionBuffer(minimumDurationSeconds: admission.minimumDurationSeconds)
+        var viewport: EluNativeViewport?
+        var latestProjection: EluUIKitReplayInteractionProjection?
+        var lastGeometry: EluNativeInteractionTime?
+        var active = false
+        let mailbox = EluNativeReplayInteractionMailbox()
+        defer { buffer.withdraw(); mailbox.withdraw() }
+
+        func commit(_ seal: EluNativeReplayInteractionBuffer.Seal) async throws {
+            try check(permit)
+            guard admission.isCurrent() else { throw EluNativeReplayCaptureError.withdrawn }
+            // The exact candidate and original bytes stay owned until SQLite
+            // reports a known result; no speculative history becomes current.
+            var candidate = sealer
+            pendingRequest = try candidate.seal(records: seal.records)
+            try check(permit)
+            guard admission.isCurrent(), let request = pendingRequest else { throw EluNativeReplayCaptureError.withdrawn }
+            switch try await queue.appendNativeReplay(request, admission: admission, physicalUse: use) {
+            case .committed:
+                pendingRequest = nil; onCommitted()
+            case .committedThenWithdrawn:
+                pendingRequest = nil; onCommitted()
+                throw EluNativeReplayCaptureError.withdrawn
+            }
+            try check(permit)
+            guard admission.isCurrent() else { throw EluNativeReplayCaptureError.withdrawn }
+            sealer = candidate
+            try buffer.committed(seal)
+            if attachment == nil, permit.profile.allowsOrdinaryText, fence.isCollecting(), mayCollect(), let originalProjection = latestProjection {
+                // This branch is reachable only after THIS run's exact initial
+                // minimum-qualified native append committed under original use.
+                let original = try await MainActor.run {
+                    try self.checkCollection(permit); try self.checkSelectedRoot()
+                    guard admission.isCurrent(), permit.isCurrentForCollection() else { throw EluNativeReplayCaptureError.withdrawn }
+                    return try self.selection.consumeRoot { root in
+                        guard let window = root.window as? EluReplayWindow, originalProjection.root === root,
+                              originalProjection.window === window, originalProjection.privacyIsCurrent else {
+                            throw EluNativeReplayCaptureError.withdrawn
+                        }
+                        let observer = EluUIKitReplayTouchObserver(projection: originalProjection, mailbox: mailbox,
+                            isCurrent: { (try? self.check(permit)) != nil && admission.isCurrent() && permit.isCurrentForCollection() },
+                            intakeCurrent: { self.fence.isCollecting() && self.mayCollect() }, wake: { wake.signal() },
+                            sample: {
+                                guard (try? self.check(permit)) != nil, admission.isCurrent(),
+                                      let continuous = self.continuousNanoseconds(),
+                                      let wall = try? EluNativeReplayCaptureClock.milliseconds(self.wallClock()) else { return nil }
+                                return .init(timestamp: wall, continuous: continuous)
+                            }, continuous: { self.continuousNanoseconds() ?? UInt64.max })
+                        return EluNativeReplayInteractionAttachment(window: window, observer: observer)
+                    }
+                }
+                // Retain the original handle before any installation side effect.
+                attachment = original
+                try await MainActor.run {
+                    try self.checkCollection(permit); try self.checkSelectedRoot()
+                    guard admission.isCurrent(), original.install() else { throw EluNativeReplayCaptureError.withdrawn }
+                }
+            }
+        }
+        func accept(_ values: [EluNativeInteraction]) async throws {
+            for value in values {
+                try check(permit)
+                if try buffer.appendInteraction(value) == .sealRequired {
+                    guard let seal = try buffer.beginSealing() else { throw EluNativeInteractionError.invalidSeal }
+                    try await commit(seal)
+                    guard try buffer.appendInteraction(value) == .appended else { throw EluNativeInteractionError.bufferLimit }
+                }
+            }
+        }
+        do {
+            while true {
+                try checkCollection(permit)
+                guard admission.isCurrent(), let now = continuousNanoseconds() else { throw EluNativeReplayCaptureError.withdrawn }
+                let wall = try EluNativeReplayCaptureClock.milliseconds(wallClock())
+                let interval: UInt64 = active ? 200_000_000 : 1_000_000_000
+                if let lastGeometry {
+                    guard now >= lastGeometry.continuous, wall >= lastGeometry.timestamp else { throw EluNativeInteractionError.invalidOrder }
+                    if now - lastGeometry.continuous < interval || wall - lastGeometry.timestamp < Int64(interval / 1_000_000) {
+                        if let attachment {
+                            let drained = try await MainActor.run {
+                                try self.checkCollection(permit); try self.checkSelectedRoot()
+                                guard admission.isCurrent(), let values = attachment.drain() else { throw EluNativeReplayCaptureError.withdrawn }
+                                return (values, attachment.active())
+                            }
+                            try await accept(drained.0); active = drained.1
+                            if buffer.isReady, let seal = try buffer.beginSealing() { try await commit(seal) }
+                        }
+                        let next: UInt64 = active ? 200_000_000 : 1_000_000_000
+                        let elapsed = now - lastGeometry.continuous
+                        await wake.wait(elapsed < next ? next - elapsed : next)
+                        continue
+                    }
+                }
+                let ordinal = buffer.nextFrameOrdinal
+                let originalAttachment = attachment
+                var preceding: [EluNativeInteraction] = []
+                let captured: (EluNativeMaskedSnapshot, UInt64, EluUIKitReplayInteractionProjection, [EluNativeInteraction], Bool)
+                do {
+                    captured = try await MainActor.run {
+                        try self.checkCollection(permit); try self.checkSelectedRoot()
+                        guard admission.isCurrent(), permit.isCurrentForCollection(),
+                              let continuous = self.continuousNanoseconds() else { throw EluNativeReplayCaptureError.withdrawn }
+                        if let originalAttachment {
+                            guard let rows = originalAttachment.drain() else { throw EluNativeReplayCaptureError.withdrawn }
+                            preceding = rows
+                        }
+                        // No event can interleave this old-points/geometry/new-projection handoff.
+                        let timestamp = try EluNativeReplayCaptureClock.milliseconds(self.wallClock())
+                        let frame = try self.selection.consumeRoot { root in
+                            guard root.window is EluReplayWindow else { throw EluNativeReplayAuthorityError.unsupportedCapability }
+                            return try collector.collect(root: root, ordinal: ordinal, timestamp: timestamp,
+                                hasUnresolvedConfiguredBlockRules: admission.hasUnresolvedBlockRules, profile: permit.profile,
+                                retainInteractionProjection: true, isCurrent: {
+                                    self.fence.isCollecting() && self.mayCollect() && permit.isCurrentForCollection() && admission.isCurrent()
+                                })
+                        }
+                        if let viewport, viewport != frame.viewport { throw EluNativeReplayCaptureError.rootChanged }
+                        guard let projection = EluUIKitReplayInteractionProjection(collector: collector, snapshot: frame) else {
+                            throw EluNativeReplayCaptureError.withdrawn
+                        }
+                        var terminal: [EluNativeInteraction] = []
+                        if let originalAttachment {
+                            guard let rows = originalAttachment.handoff(projection, at: .init(timestamp: timestamp, continuous: continuous)) else { throw EluNativeReplayCaptureError.withdrawn }
+                            terminal = rows
+                        }
+                        try self.checkCollection(permit)
+                        guard admission.isCurrent() else { throw EluNativeReplayCaptureError.withdrawn }
+                        return (frame, continuous, projection, terminal, originalAttachment?.active() ?? false)
+                    }
+                } catch EluUIKitReplayCollectionError.unsupportedGeometry {
+                    // Failed geometry cannot grant new coordinates or ordinal.
+                    // Old proven points keep their order; the original observer
+                    // will refuse its invalidated projection until the next frame.
+                    try checkCollection(permit)
+                    try await accept(preceding)
+                    if buffer.isReady, let seal = try buffer.beginSealing() { try await commit(seal) }
+                    await wake.wait(1_000_000_000)
+                    continue
+                } catch EluNativeReplayAuthorityError.stale {
+                    // Match the original v1 boundary: a root detached during a
+                    // getter can request recovery only after original settlement.
+                    // Unchanged root plus stale authority remains terminal.
+                    try await MainActor.run { try self.checkSelectedRoot() }
+                    throw EluNativeReplayAuthorityError.stale
+                } catch EluUIKitReplayCollectionError.withdrawn {
+                    try checkCollection(permit)
+                    try await MainActor.run { try self.checkSelectedRoot() }
+                    throw EluUIKitReplayCollectionError.withdrawn
+                }
+                try checkCollection(permit)
+                try await accept(preceding + captured.3)
+                if try buffer.appendGeometry(captured.0, continuous: captured.1, scrolling: active || captured.4) == .sealRequired {
+                    guard let seal = try buffer.beginSealing() else { throw EluNativeInteractionError.invalidSeal }
+                    try await commit(seal)
+                    guard try buffer.appendGeometry(captured.0, continuous: captured.1, scrolling: active || captured.4) == .appended else {
+                        throw EluNativeInteractionError.bufferLimit
+                    }
+                }
+                viewport = captured.0.viewport; latestProjection = captured.2; active = captured.4
+                lastGeometry = .init(timestamp: captured.0.timestamp, continuous: captured.1)
+                fence.didCollectFrame()
+                if buffer.isReady, let seal = try buffer.beginSealing() { try await commit(seal) }
+                await wake.wait(active ? 200_000_000 : 1_000_000_000)
+            }
+        } catch EluNativeReplayCaptureError.locallyStopped {
+            try check(permit)
+            let tail = try await MainActor.run {
+                try self.check(permit); try self.checkSelectedRoot()
+                guard admission.isCurrent(), permit.isCurrentForCollection() else { throw EluNativeReplayCaptureError.withdrawn }
+                return try attachment.map { original in
+                    guard let values = original.stopAndDrain() else { throw EluNativeReplayCaptureError.withdrawn }
+                    return values
+                } ?? []
+            }
+            try await accept(tail)
+            if let seal = try buffer.beginSealing(graceful: true) { try await commit(seal) }
+        }
+    }
+
     func execute() async -> EluNativeReplayCaptureOutcome {
         var enrollment: EluNativeReplayCaptureEnrollment?
         var physicalUse: EluNativeReplayCapturePhysicalUse?
         var pendingRequest: EluV2ReplayPreparedRequest?
         var buffer: EluNativeReplayFrameBuffer?
+        var interactionAttachment: EluNativeReplayInteractionAttachment?
+        var interactionCollector: EluUIKitReplayCollector?
+        var interactionWake: EluNativeReplayCaptureWake?
+        defer { interactionWake?.close() }
         do {
             // Source guards may record a durable clock denial. Do not consume
             // one before owning the physical+accounting settlement path.
@@ -340,29 +596,61 @@ private final class EluNativeReplayCaptureRun: @unchecked Sendable {
             guard let use = enrolled.takePhysicalUse() else { throw EluNativeReplayCaptureError.occupied }
             physicalUse = use
             try check()
+            if case let .authorized(pair) = prepared.resolution.replayAuthorization,
+               EluNativeReplayProtocol.matching(codec: pair.codec, compression: pair.compression.rawValue,
+                   generation: prepared.resolution.replayProtocolGeneration) == .v2 {
+                // An unsupported window cannot start an epoch or spend the
+                // session's first-start budget merely by selecting the v2 pair.
+                try await MainActor.run {
+                    try self.checkCollection(); try self.checkSelectedRoot()
+                    try self.selection.consumeRoot { root in
+                        guard root.window is EluReplayWindow else { throw EluNativeReplayAuthorityError.unsupportedCapability }
+                    }
+                }
+            }
             guard let permit = try await authority.start(prepared, selection: selection, physicalUse: use)
             else { throw EluNativeReplayCaptureError.withdrawn }
             try check(permit)
             let admission = try await authority.captureAdmission(for: permit, physicalUse: use)
             try check(permit)
             guard admission.isCurrent() else { throw EluNativeReplayCaptureError.withdrawn }
-            buffer = try EluNativeReplayFrameBuffer(minimumDurationSeconds: admission.minimumDurationSeconds)
+            guard case let .authorized(pair) = permit.resolution.replayAuthorization,
+                  let tuple = EluNativeReplayProtocol.matching(codec: pair.codec, compression: pair.compression.rawValue,
+                      generation: permit.resolution.replayProtocolGeneration) else { throw EluNativeReplayAuthorityError.unsupportedCapability }
+            if tuple == .v1 { buffer = try EluNativeReplayFrameBuffer(minimumDurationSeconds: admission.minimumDurationSeconds) }
             var sealer = try EluNativeReplaySealer(replayId: permit.replayId, identity: permit.identity,
                 authorization: permit.resolution, privacy: permit.privacy, profile: permit.profile, versions: versions)
+            if tuple == .v2 { interactionWake = EluNativeReplayCaptureWake() }
+            let originalWake = interactionWake
             let collector = try await MainActor.run {
                 try self.checkCollection(permit)
                 try self.checkSelectedRoot()
                 guard permit.isCurrentForCollection(), admission.isCurrent() else {
                     throw EluNativeReplayCaptureError.withdrawn
                 }
+                if tuple == .v2 {
+                    try self.selection.consumeRoot { root in
+                        guard root.window is EluReplayWindow else { throw EluNativeReplayAuthorityError.unsupportedCapability }
+                    }
+                }
                 let collector = try EluUIKitReplayCollector()
-                guard self.fence.installCollector({ collector.withdraw() }, isCurrent: {
+                guard self.fence.installCollector({
+                    if tuple == .v1 { collector.withdraw() }
+                    originalWake?.signal()
+                }, isCurrent: {
                     permit.isCurrent() && admission.isCurrent() && self.mayCollect()
                 }) else {
                     throw EluNativeReplayCaptureError.withdrawn
                 }
                 return collector
             }
+            if tuple == .v2 {
+                interactionCollector = collector
+                guard let wake = interactionWake else { throw EluNativeReplayCaptureError.withdrawn }
+                try await captureInteractions(permit: permit, admission: admission, use: use,
+                    collector: collector, wake: wake, sealer: &sealer, pendingRequest: &pendingRequest,
+                    attachment: &interactionAttachment)
+            } else {
             func commit(_ prefix: [EluNativeMaskedSnapshot]) async throws {
                 try check(permit)
                 guard admission.isCurrent() else { throw EluNativeReplayCaptureError.withdrawn }
@@ -462,6 +750,7 @@ private final class EluNativeReplayCaptureRun: @unchecked Sendable {
                 guard stillVisible, admission.isCurrent() else { throw EluNativeReplayCaptureError.withdrawn }
                 if let prefix = try buffer?.beginGracefulSealing() { try await commit(prefix) }
             }
+            }
 
         } catch EluNativeReplayCaptureError.rootChanged {
             // Remember intent before stop invalidates the original projection.
@@ -478,6 +767,10 @@ private final class EluNativeReplayCaptureRun: @unchecked Sendable {
             buffer?.withdraw()
         }
         fence.withdraw()
+        // Await the original MainActor dispatch/detachment before asserting
+        // physical completion. Cancellation never abandons this join.
+        if let interactionAttachment { await interactionAttachment.close() }
+        if let interactionCollector { interactionCollector.withdraw() }
         guard let enrollment else { return .settled }
         if let physicalUse {
             physicalUse.settle()

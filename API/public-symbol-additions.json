@@ -251,6 +251,14 @@
     {
       "kind": "swift.type.method",
       "name": "Elu.sessionRecordingStarted()"
+    },
+    {
+      "kind": "swift.class",
+      "name": "EluReplayWindow"
+    },
+    {
+      "kind": "swift.method",
+      "name": "EluReplayWindow.sendEvent(_:)"
     }
   ]
 }

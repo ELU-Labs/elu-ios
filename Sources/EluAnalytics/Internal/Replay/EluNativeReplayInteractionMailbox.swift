@@ -76,3 +76,13 @@ final class EluNativeReplayInteractionMailbox: @unchecked Sendable {
         return true
     }
 }
+
+extension EluNativeInteraction {
+    var points: [EluNativeInteractionPoint] {
+        switch self {
+        case let .start(point), let .end(point): return [point]
+        case let .moves(points): return points
+        case .cancel: return []
+        }
+    }
+}

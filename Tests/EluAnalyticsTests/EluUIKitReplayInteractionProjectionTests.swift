@@ -172,11 +172,12 @@ final class EluUIKitReplayInteractionProjectionTests: XCTestCase {
         XCTAssertNil(point(third))
     }
 
-    func testFreshPrivacyScrollGeometryAndDetachRefuse() throws {
+    func testLawfulGeometryMovementKeepsBothClipsWhileFreshPrivacyAndDetachRefuse() throws {
         let child = view()
         var original = try XCTUnwrap(projection())
         child.center.x += 1
-        XCTAssertNil(point(original))
+        XCTAssertNotNil(point(original), "The same lawful identity remains inside both current and serialized clips")
+        XCTAssertNil(point(original, CGPoint(x: 10.5, y: 20)), "Current clip still excludes the old edge")
         original = try XCTUnwrap(projection(1))
         Elu.maskView(child)
         XCTAssertNil(point(original))

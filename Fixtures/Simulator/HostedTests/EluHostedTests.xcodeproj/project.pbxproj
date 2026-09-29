@@ -7,6 +7,8 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		6AAE3D8F7F23A6FE2E3A9068 /* EluReplayWindowTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DD73A1A69A3B576CF3631F00 /* EluReplayWindowTests.swift */; };
+		A0CB662675FD3E7A9F5F6409 /* EluNativeReplayInteractionCaptureTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C83557409E2C6DE11A377D0C /* EluNativeReplayInteractionCaptureTests.swift */; };
 		23CB5307D5AC20DC38D31F52 /* EluUIKitReplayTouchObserverTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9378999BFE02081482532291 /* EluUIKitReplayTouchObserverTests.swift */; };
 		5DCABA154F16556A08087983 /* EluUIKitReplayInteractionProjectionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 961FB96A7C2107CD57512DC6 /* EluUIKitReplayInteractionProjectionTests.swift */; };
 		A390C3B0DA95729193F38AE8 /* EluPersonIdentityQueueTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3EEB48084DBACB9D330FD9E0 /* EluPersonIdentityQueueTests.swift */; };
@@ -94,6 +96,8 @@
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
+		DD73A1A69A3B576CF3631F00 /* EluReplayWindowTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluReplayWindowTests.swift; sourceTree = "<group>"; };
+		C83557409E2C6DE11A377D0C /* EluNativeReplayInteractionCaptureTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluNativeReplayInteractionCaptureTests.swift; sourceTree = "<group>"; };
 		9378999BFE02081482532291 /* EluUIKitReplayTouchObserverTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluUIKitReplayTouchObserverTests.swift; sourceTree = "<group>"; };
 		961FB96A7C2107CD57512DC6 /* EluUIKitReplayInteractionProjectionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluUIKitReplayInteractionProjectionTests.swift; sourceTree = "<group>"; };
 		3EEB48084DBACB9D330FD9E0 /* EluPersonIdentityQueueTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluPersonIdentityQueueTests.swift; sourceTree = "<group>"; };
@@ -212,6 +216,8 @@
 		A0928195822C53907FA0C692 /* EluAnalyticsTests */ = {
 			isa = PBXGroup;
 			children = (
+				DD73A1A69A3B576CF3631F00 /* EluReplayWindowTests.swift */,
+				C83557409E2C6DE11A377D0C /* EluNativeReplayInteractionCaptureTests.swift */,
 				9378999BFE02081482532291 /* EluUIKitReplayTouchObserverTests.swift */,
 				961FB96A7C2107CD57512DC6 /* EluUIKitReplayInteractionProjectionTests.swift */,
 				3EEB48084DBACB9D330FD9E0 /* EluPersonIdentityQueueTests.swift */,
@@ -386,6 +392,8 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				6AAE3D8F7F23A6FE2E3A9068 /* EluReplayWindowTests.swift in Sources */,
+				A0CB662675FD3E7A9F5F6409 /* EluNativeReplayInteractionCaptureTests.swift in Sources */,
 				23CB5307D5AC20DC38D31F52 /* EluUIKitReplayTouchObserverTests.swift in Sources */,
 				5DCABA154F16556A08087983 /* EluUIKitReplayInteractionProjectionTests.swift in Sources */,
 				A390C3B0DA95729193F38AE8 /* EluPersonIdentityQueueTests.swift in Sources */,

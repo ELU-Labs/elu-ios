@@ -54,15 +54,17 @@ struct EluUIKitReplayTouchFact {
     let allTouchesLifted: Bool
 }
 
-/// Dormant internal component for a future explicit UIWindow.sendEvent bridge.
-/// It is not installed by the SDK, adds no recognizer, and does not establish a
-/// durable initial-frame commit. Only the future original capture owner may
-/// construct it after that commit and publish the exact serialized projection.
+/// Internal component of the explicit UIWindow.sendEvent bridge. It adds no
+/// recognizer and establishes no authority. The original capture run installs it
+/// only after its initial minimum-qualified frame append is known committed.
+/// Production capability advertisement remains separately gated.
 @MainActor
 final class EluUIKitReplayTouchObserver {
     static let maximumTouches = 10
     private let mailbox: EluNativeReplayInteractionMailbox
     private let isCurrent: @MainActor () -> Bool
+    private let intakeCurrent: @MainActor () -> Bool
+    private let wake: @Sendable () -> Void
     private let sample: @MainActor () -> EluNativeInteractionTime?
     private let continuous: @MainActor () -> UInt64
     private var projection: EluUIKitReplayInteractionProjection?
@@ -75,14 +77,64 @@ final class EluUIKitReplayTouchObserver {
     private var reentered = false
     private var closed = false
     private var lastMove: EluNativeInteractionTime?
+    private var physicalContact = false
 
     init(projection: EluUIKitReplayInteractionProjection,
          mailbox: EluNativeReplayInteractionMailbox,
          isCurrent: @escaping @MainActor () -> Bool,
+         intakeCurrent: @escaping @MainActor () -> Bool = { true },
+         wake: @escaping @Sendable () -> Void = {},
          sample: @escaping @MainActor () -> EluNativeInteractionTime?,
          continuous: @escaping @MainActor () -> UInt64) {
         self.projection = projection; self.mailbox = mailbox; self.isCurrent = isCurrent
         self.sample = sample; self.continuous = continuous
+        self.intakeCurrent = intakeCurrent; self.wake = wake
+    }
+
+    func belongs(to window: UIWindow) -> Bool {
+        !closed && !delivering && projection?.window === window && isCurrent() && intakeCurrent()
+    }
+    var contactIsActive: Bool { !closed && (physicalContact || projection?.hasActiveScroll == true) }
+    var originalProjectionOrdinal: Int64? { projection?.ordinal }
+
+    /// One serial MainActor handoff. The owner retains these old records before
+    /// the new geometry. An unsafe target is cancelled while the old ordinal is
+    /// still selected; suppress-through-lift is never reset by a fresh frame.
+    func handoff(_ value: EluUIKitReplayInteractionProjection, at time: EluNativeInteractionTime) -> [EluNativeInteraction]? {
+        guard !closed, !delivering, let original = projection,
+              original.root === value.root, original.window === value.window,
+              value.ordinal > original.ordinal, isCurrent(), value.privacyIsCurrent else {
+            withdraw(); return nil
+        }
+        let removed = activeIdentity.map { !value.containsEligibleIdentity($0) } ?? false
+        // The new original projection proves the same live root/privacy. A
+        // coordinate-free cancel belongs before its geometry and uses that exact
+        // geometry clock, never a later callback clock.
+        projection = value
+        if removed { cancelAndIgnore(at: time) }
+        return closed ? nil : mailbox.drain()
+    }
+
+    /// Current privacy is checked again before the original serial consumer
+    /// receives queued coordinates. Failure discards the entire unsealed tail.
+    func drainCurrent() -> [EluNativeInteraction]? {
+        guard !closed, !delivering, isCurrent(), let projection, projection.privacyIsCurrent else { withdraw(); return nil }
+        let values = mailbox.drain()
+        guard !values.isEmpty else { return [] }
+        let begun = continuous()
+        guard let allowance = budget.allowance(at: begun), allowance > 0 else { withdraw(); return nil }
+        let (deadline, overflow) = begun.addingReportingOverflow(allowance)
+        guard !overflow else { withdraw(); return nil }
+        for value in values {
+            for point in value.points {
+                guard let root = projection.root,
+                      let current = projection.point(location: CGPoint(x: CGFloat(point.x) + root.bounds.minX,
+                          y: CGFloat(point.y) + root.bounds.minY), time: point.time, deadline: deadline, now: continuous),
+                      current == point else { withdraw(); return nil }
+            }
+        }
+        guard budget.charge(from: begun, through: continuous()), isCurrent(), projection.privacyIsCurrent else { withdraw(); return nil }
+        return values
     }
 
     /// The future serial owner orders pending points before this exact serialized
@@ -100,7 +152,8 @@ final class EluUIKitReplayTouchObserver {
     /// The caller supplies original super.sendEvent(event). Every path invokes
     /// it once, synchronously. No event/UIKit reference leaves MainActor.
     func observe(_ event: UIEvent, deliver: () -> Void) {
-        observeDelivery(prepare: { self.prepare(event, deadline: $0) }, deliver: deliver)
+        observeDelivery(lifted: { self.lifted(event) },
+            prepare: { self.prepare(event, deadline: $0) }, deliver: deliver)
     }
 
     /// Deterministic shared-decision seam only. Facts are detached and the view,
@@ -108,7 +161,7 @@ final class EluUIKitReplayTouchObserver {
     /// UIKit dispatch, recognition, multitouch selection or scrolling.
     func observeForTesting(_ fact: EluUIKitReplayTouchFact, originalView: UIView,
                            deliver: () -> Void) {
-        observeDelivery(prepare: { deadline in
+        observeDelivery(lifted: { fact.allTouchesLifted }, prepare: { deadline in
             guard let projection = self.projection, let root = projection.root, let window = projection.window,
                   originalView.window === window, self.descendant(originalView, of: root) else {
                 self.cancelAndIgnore(); return nil
@@ -119,13 +172,21 @@ final class EluUIKitReplayTouchObserver {
         }, deliver: deliver)
     }
 
-    private func observeDelivery(prepare: (UInt64) -> Prepared?, deliver: () -> Void) {
-        if delivering { reentered = true; deliver(); return }
-        guard !closed else { deliver(); return }
-        delivering = true; reentered = false
-        defer { delivering = false }
+    private func observeDelivery(lifted: () -> Bool?, prepare: (UInt64) -> Prepared?, deliver: () -> Void) {
+        guard !closed, intakeCurrent() else { deliver(); return }
         let begun = continuous()
         guard let allowance = budget.allowance(at: begun) else { withdraw(); deliver(); return }
+        // Bounded phase facts survive zero coordinate allowance. This reads at
+        // most ten phases, never a location, view hierarchy or text. Its work is
+        // charged too; an exhausted budget cannot admit coordinate preparation.
+        if let lifted = lifted() { notePhysicalContact(!lifted) }
+        if delivering {
+            reentered = true
+            if !budget.charge(from: begun, through: continuous()) { withdraw() }
+            deliver(); return
+        }
+        delivering = true; reentered = false
+        defer { delivering = false }
         let (preDeadline, overflow) = begun.addingReportingOverflow(allowance)
         let prepared = allowance == 0 || overflow ? nil : prepare(preDeadline)
         let preEnd = continuous()
@@ -136,8 +197,13 @@ final class EluUIKitReplayTouchObserver {
         guard !closed else { return }
         let postBegin = continuous()
         guard let rollingAllowance = budget.allowance(at: postBegin) else { withdraw(); return }
-        defer { if !budget.charge(from: postBegin, through: continuous()) { withdraw() } }
+        defer {
+            settlePhysicalLift()
+            if !budget.charge(from: postBegin, through: continuous()) { withdraw() }
+        }
         guard isCurrent(), projection?.privacyIsCurrent == true else { withdraw(); return }
+        // Local stop cannot retain the callback that crossed its intake fence.
+        guard intakeCurrent() else { cancelAndIgnore(); return }
         guard !reentered, !overflow, allowance > preElapsed, rollingAllowance > 0 else { cancelAndIgnore(); return }
         guard let prepared else { return }
         let remaining = min(allowance - preElapsed, rollingAllowance)
@@ -148,6 +214,8 @@ final class EluUIKitReplayTouchObserver {
 
     /// Order cancellation with old geometry before removing its active target.
     func cancelForGeometryChange() { if !closed { cancelAndIgnore() } }
+
+    func drainStoppedTerminal() -> [EluNativeInteraction] { closed ? mailbox.drain() : [] }
 
     func stop() {
         guard !closed else { return }
@@ -166,6 +234,12 @@ final class EluUIKitReplayTouchObserver {
         let retain: Bool
         let projection: EluUIKitReplayInteractionProjection
         let afterDelivery: @MainActor () -> Bool
+    }
+
+    private func lifted(_ event: UIEvent) -> Bool? {
+        guard event.type == .touches, let window = projection?.window,
+              let touches = event.touches(for: window), touches.count <= Self.maximumTouches else { return nil }
+        return touches.allSatisfy { $0.phase == .ended || $0.phase == .cancelled }
     }
 
     private func prepare(_ event: UIEvent, deadline: UInt64) -> Prepared? {
@@ -275,15 +349,29 @@ final class EluUIKitReplayTouchObserver {
         if case let .start(point) = value { activeIdentity = point.identity }
         if case let .moves(points) = value { activeIdentity = points.last?.identity }
         if value.isTerminal { active = false; activeIdentity = nil; primary = nil }
+        wake()
     }
 
-    private func cancelAndIgnore() {
+    private func notePhysicalContact(_ value: Bool) {
+        if physicalContact != value { physicalContact = value; wake() }
+    }
+
+    private func settlePhysicalLift() {
+        guard !closed, !physicalContact else { return }
+        // Missing coordinate allowance may replace END with a coordinate-free
+        // cancel, but cannot make physical activity or suppression permanent.
+        if active { cancelAndIgnore() }
+        ignoredUntilLift = false; primary = nil
+    }
+
+    private func cancelAndIgnore(at orderedTime: EluNativeInteractionTime? = nil) {
         if active {
-            if isCurrent(), projection?.privacyIsCurrent == true, let time = sample(), mailbox.offer(.cancel(time)) == .retained {
+            if isCurrent(), projection?.privacyIsCurrent == true, let time = orderedTime ?? sample(), mailbox.offer(.cancel(time)) == .retained {
                 active = false
             } else { mailbox.withdraw(); active = false }
         }
         ignoredUntilLift = true; primary = nil; activeIdentity = nil
+        wake()
     }
 
     private func descendant(_ view: UIView?, of root: UIView) -> Bool {

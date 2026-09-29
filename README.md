@@ -408,6 +408,52 @@ visual snapshots; they do not produce touch or scroll interaction markers. Order
 multi-stream viewport changes and player forward/backward seeking still require
 end-to-end qualification; source recovery alone is not that evidence.
 
+### Explicit UIKit interaction bridge (candidate)
+
+The source candidate adds `EluReplayWindow` for applications that own their UIKit
+window creation. Replace the existing `UIWindow` constructor in the scene
+delegate, preserving the same root controller, stored window and key-window
+setup. Do not create a second window:
+
+```swift
+let window = EluReplayWindow(windowScene: windowScene)
+window.rootViewController = AppViewController()
+self.window = window
+window.makeKeyAndVisible()
+```
+
+For an application that already creates its window without scenes, the equivalent
+constructor is `EluReplayWindow(frame: UIScreen.main.bounds)`; keep that
+application's existing root, window ownership and presentation code. Both
+construction paths run on the main actor and are included in the UIKit consumer
+compile fixture.
+
+This is an explicit window choice; the SDK does not replace existing windows,
+add gesture recognizers, swizzle methods or adopt custom `UIWindow` subclasses.
+The final window forwards the original `sendEvent` synchronously exactly once.
+SwiftUI-owned windows and other hosts without this integration are unsupported
+for interaction observation. Existing v1 wireframes do not require this window.
+
+Production capability advertisement still selects **v1 only**. The window alone
+cannot enable v2, consent, recording or a public capability override. The private
+v2 path additionally requires the exact locally supported tuple and original
+configuration, then a known durable initial-frame commit satisfying the minimum
+duration before observing coordinates. This source integration and authored tests
+are not a released or end-to-end-qualified interaction feature.
+
+The bounded primary direct-finger stream records start, at most ten movement
+samples per second, and end/cancel; it does not infer clicks, recognize gestures,
+or render multiple finger trails. Geometry samples at most five times per second
+during contact or public scroll dragging/deceleration and once per second while
+idle. Activity alone grants no point retention. Each point must be lawful in both
+the current privacy hierarchy and the last ordered serialized clip/identity.
+Pending old points precede fresh geometry; a continuing lawful identity can then
+use the new geometry. Private/opaque crossing, unsafe clipping, changed text or
+uncertain hierarchy cancels coordinates through physical lift. Opaque paint may
+veto its full unclipped ancestor extent; coordinates are not clamped or assigned
+a fallback target. Actual UIKit gesture delivery, useful scrolling, resource cost
+and customer-player rendering remain separate hosted qualification gates.
+
 `captureException` records errors explicitly supplied by your app, including
 bounded cause chains. It does not install a synchronous fatal-crash handler.
 Optional delayed numeric OS diagnostics are described below.

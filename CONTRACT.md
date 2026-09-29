@@ -285,13 +285,36 @@ The internal candidate v2 sealing path accepts only the closed tuples
 `elu-native-wireframe-v1` / `gzip` / `protocol-generation-v1` and
 `elu-native-wireframe-v2` / `gzip` / `protocol-generation-v2`, intersected with
 local proof and the original configuration. Mixed codec advertisements cannot
-cross generations. The production runtime still installs only v1. The v2 encoder,
-value-copy sealer and original native queue path do not enable interaction capture
-or advertise v2 support; observer wiring and exact artifact qualification remain
-required. Generic replay append refuses either native codec without the original
-physical admission. A future v2 capture owner must adopt its candidate encoder
-and arm interaction collection only after a known initial queue commit, preserving
+cross generations. The production runtime still installs only v1. The internal
+v2 capture branch reuses the original enrollment, physical use and accounting;
+it installs an observer only on an explicit `EluReplayWindow`, after its exact
+minimum-qualified initial append is known committed. Neither constructing that
+window nor the internal observer advertises v2 or grants authority. Generic replay
+append refuses either native codec without the original physical admission. The
+original serial run adopts its candidate encoder only after a known queue commit, preserving
 the exact prepared bytes for retries. Movement envelopes begin at the earliest
 logical sample, even when the first outer event uses the last sample timestamp.
 Original identity, privacy, source, budget, physical settlement, and ambiguous
 commit quarantine continue to apply. No database schema changes are needed.
+
+The explicit final `EluReplayWindow` forwards each original event synchronously
+once and participates in no gesture-recognizer dependencies. The original run
+retains its installed observer until synchronous delivery and detachment are
+joined, before physical/accounting settlement. Local stop freezes intake and
+may retain an already lawful tail under unchanged authority; restrictive source,
+privacy or identity withdrawal discards unsealed values. Ambiguous storage keeps
+the original request/lease quarantined.
+
+Current geometry queries reuse the collector's original UUIDs and ordinal,
+read no private child contents or text, and never allocate a wire ID. The encoder
+alone maps a detached point to its exact ordered node/positive clip. Both actual
+and floored coordinates must also pass the current hierarchy/privacy paint veto.
+Old points, any required coordinate-free cancel and new geometry stay ordered in
+one serial buffer. A still-lawful target survives a geometry handoff; failure
+suppresses coordinates through lift. Callbacks retain one bounded mailbox with a
+reserved terminal slot, no per-event tasks, and the existing 2ms callback/20ms
+rolling-second SDK-work budget excluding original host dispatch. Geometry uses
+at most 5Hz during physical contact or public drag/deceleration and 1Hz idle;
+movement retention is capped at 10Hz. These are maxima, not coverage promises.
+The current source remains unqualified for actual UIKit dispatch/scroll cost and
+player interaction/seek behavior until the original hosted Lab path executes.

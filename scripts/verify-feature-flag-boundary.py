@@ -67,6 +67,7 @@ NATIVE_PROTOCOL_SOURCE = "Sources/EluAnalytics/Internal/Replay/EluNativeReplayPr
 NATIVE_AUTHORITY_SOURCE = "Sources/EluAnalytics/Internal/Replay/EluNativeReplayAuthority.swift"
 NATIVE_SEALER_SOURCE = "Sources/EluAnalytics/Internal/Replay/EluNativeReplaySealer.swift"
 NATIVE_CAPTURE_SOURCE = "Sources/EluAnalytics/Internal/Replay/EluNativeReplayCaptureOwner.swift"
+NATIVE_WINDOW_SOURCE = "Sources/EluAnalytics/EluReplayWindow.swift"
 NATIVE_COLLECTOR_SOURCE = "Sources/EluAnalytics/Internal/Replay/EluUIKitReplayCollector.swift"
 NATIVE_INTERACTION_PROJECTION_SOURCE = "Sources/EluAnalytics/Internal/Replay/EluUIKitReplayInteractionProjection.swift"
 NATIVE_TOUCH_OBSERVER_SOURCE = "Sources/EluAnalytics/Internal/Replay/EluUIKitReplayTouchObserver.swift"
@@ -137,15 +138,16 @@ def scan_replay_storage_source(path: pathlib.Path, text: str) -> list[str]:
         errors.append(f"{path} references the native collector outside its physical owner or exact detached projection")
     interaction_callers = {
         "EluUIKitReplayCollectedProjection": {NATIVE_COLLECTOR_SOURCE, NATIVE_INTERACTION_PROJECTION_SOURCE},
-        "EluUIKitReplayInteractionProjection": {NATIVE_INTERACTION_PROJECTION_SOURCE, NATIVE_TOUCH_OBSERVER_SOURCE},
-        "EluUIKitReplayTouchObserver": {NATIVE_TOUCH_OBSERVER_SOURCE},
+        "EluUIKitReplayInteractionProjection": {NATIVE_INTERACTION_PROJECTION_SOURCE, NATIVE_TOUCH_OBSERVER_SOURCE, NATIVE_CAPTURE_SOURCE},
+        "EluUIKitReplayTouchObserver": {NATIVE_TOUCH_OBSERVER_SOURCE, NATIVE_CAPTURE_SOURCE, NATIVE_WINDOW_SOURCE},
         "EluUIKitReplayTouchWorkBudget": {NATIVE_TOUCH_OBSERVER_SOURCE},
         "EluUIKitReplayTouchFact": {NATIVE_TOUCH_OBSERVER_SOURCE},
-        "EluNativeReplayInteractionMailbox": {NATIVE_INTERACTION_MAILBOX_SOURCE, NATIVE_TOUCH_OBSERVER_SOURCE},
+        "EluNativeReplayInteractionMailbox": {NATIVE_INTERACTION_MAILBOX_SOURCE, NATIVE_TOUCH_OBSERVER_SOURCE, NATIVE_CAPTURE_SOURCE},
+        "EluReplayWindow": {NATIVE_WINDOW_SOURCE, NATIVE_CAPTURE_SOURCE},
     }
     for token, callers in interaction_callers.items():
         if re.search(rf"\b{token}\b", text) and exact not in callers:
-            errors.append(f"{path} installs or escapes dormant native interaction ownership")
+            errors.append(f"{path} escapes original native interaction ownership")
     if exact in {NATIVE_INTERACTION_PROJECTION_SOURCE, NATIVE_TOUCH_OBSERVER_SOURCE, NATIVE_INTERACTION_MAILBOX_SOURCE}:
         forbidden = ("EluSQLiteRuntimeQueue", "EluNativeReplayAuthority", "EluNativeReplayCapabilities",
             "EluNativeReplayPermit", "EluNativeWireframeV2Encoder", "EluNativeReplaySealer",
@@ -160,7 +162,9 @@ def scan_replay_storage_source(path: pathlib.Path, text: str) -> list[str]:
                       "interactionInheritedClip: interactionClip"]:
             if token not in text: errors.append(f"{path} loses private/unknown paint confinement in dormant interaction projection")
     if exact == NATIVE_INTERACTION_PROJECTION_SOURCE and "final class EluUIKitReplayInteractionProjection" in text:
-        if any(token not in text for token in ["for clip in original.paintVetoes.values",
+        if any(token not in text for token in ["for clip in current.1.values",
+                "original.currentGeometry(deadline: deadline, now: now)",
+                "let ordered = encoded[node.identity]", "Double(x) < ordered.clip.x + ordered.clip.width",
                 "let emittedInside = Double(x) >= clip.x", "if actualInside || emittedInside { return nil }"]):
             errors.append(f"{path} loses private/unknown paint footprint vetoes")
     if exact == NATIVE_TOUCH_OBSERVER_SOURCE and "final class EluUIKitReplayTouchObserver" in text:
@@ -174,6 +178,29 @@ def scan_replay_storage_source(path: pathlib.Path, text: str) -> list[str]:
             "guard original.retain else { return }"]
         if any(token not in text for token in required):
             errors.append(f"{path} weakens dormant original delivery, privacy, or bounded work guards")
+    if exact == NATIVE_WINDOW_SOURCE:
+        required = ["public final class EluReplayWindow: UIWindow", "public override func sendEvent(_ event: UIEvent)",
+            "original.observe(event) { super.sendEvent(event) }", "replayDeliveryDepth += 1", "replayDeliveryDepth -= 1",
+            "pendingReplayDetach", "await withCheckedContinuation", "original.belongs(to: self)",
+            "if replayObserver === original", "original.withdraw()"]
+        forbidden = ["EluSQLiteRuntimeQueue", "EluNativeReplayAuthority", "EluNativeReplayPermit", "EluNativeReplayCapabilities",
+            "EluNativeReplaySealer", "UIGestureRecognizer", "addGestureRecognizer", "method_exchangeImplementations", "URLSession"]
+        if any(token not in text for token in required) or any(token in text for token in forbidden) or re.search(r"\bTask(?:\.detached)?\s*\{|\bTask\s*\(", text):
+            errors.append(f"{path} widens explicit synchronous window delivery or loses original physical detachment")
+        if re.findall(r"public\s+(?:override\s+)?func\s+(\w+)", text) != ["sendEvent"]:
+            errors.append(f"{path} exposes a public interaction installation or authority bypass")
+    if exact == NATIVE_CAPTURE_SOURCE and "private func captureInteractions" in text:
+        required = ["switch try await queue.appendNativeReplay(request, admission: admission, physicalUse: use)",
+            "try buffer.committed(seal)", "attachment = original", "original.install()",
+            "originalAttachment.drain()", "originalAttachment.handoff(projection, at:",
+            "try await accept(preceding + captured.3)", "buffer.appendGeometry(captured.0",
+            "if let interactionAttachment { await interactionAttachment.close() }", "physicalUse.settle()",
+            "enrollment.quarantine(retaining: pendingRequest)", "root.window is EluReplayWindow"]
+        if any(token not in text for token in required):
+            errors.append(f"{path} loses original commit, ordered projection, explicit window or physical settlement")
+        append = text.find("switch try await queue.appendNativeReplay(request, admission: admission, physicalUse: use)")
+        if not (append < text.find("try buffer.committed(seal)") < text.find("attachment = original\n") < text.find("original.install()")):
+            errors.append(f"{path} installs touch observation before original known initial commit")
     if exact == NATIVE_SEALER_SOURCE:
         references = set(re.findall(r"\bEluV2(?:Replay|SealedReplay)\w*\b", text))
         state_operations = ("EluSQLiteRuntimeQueue", "EluNativeReplayAuthority", "EluNativeReplayScope",

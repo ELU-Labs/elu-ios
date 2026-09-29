@@ -222,6 +222,42 @@ final class EluUIKitReplayTouchObserverTests: XCTestCase {
         XCTAssertEqual(kinds(mailbox.drain()), ["start", "end"])
     }
 
+    func testExhaustedRollingBudgetStillConsumesLiftAndAllowsLaterFreshContact() throws {
+        let safe = UIView(frame: CGRect(x: 10, y: 10, width: 90, height: 90))
+        root.addSubview(safe); try refreshProjection()
+        var ticks: UInt64 = 0, wall: Int64 = 1_000, expensive = false, deliveries = 0
+        let finger = NSObject(), freshFinger = NSObject()
+        let value = EluUIKitReplayTouchObserver(projection: projection, mailbox: mailbox,
+            isCurrent: { true }, sample: { .init(timestamp: wall, continuous: UInt64(wall) * 1_000_000) },
+            continuous: { if expensive { ticks += 1_000_000 }; return ticks })
+        value.observeForTesting(fact(.began, finger: finger), originalView: safe) { deliveries += 1 }
+        XCTAssertTrue(value.contactIsActive)
+        expensive = true
+        for _ in 0 ..< 15 {
+            wall += 1
+            value.observeForTesting(fact(.stationary, finger: finger), originalView: safe) { deliveries += 1 }
+        }
+        expensive = false
+        // Inspect a value copy only: the original ledger is consumed by the
+        // actual callback path, with no production test hook or budget grant.
+        var originalBudget = try XCTUnwrap(Mirror(reflecting: value).children.first {
+            $0.label == "budget"
+        }?.value as? EluUIKitReplayTouchWorkBudget)
+        XCTAssertEqual(originalBudget.allowance(at: ticks), 0)
+        XCTAssertEqual(kinds(mailbox.drain()), ["start", "cancel"])
+        XCTAssertTrue(value.contactIsActive)
+        wall += 1
+        value.observeForTesting(fact(.ended, finger: finger, lifted: true), originalView: safe) { deliveries += 1 }
+        XCTAssertFalse(value.contactIsActive, "Zero allowance must still return geometry cadence to idle")
+        XCTAssertEqual(mailbox.drain(), [], "An exhausted terminal callback cannot retain coordinates")
+        ticks += 1_100_000_000; wall += 1_100
+        value.observeForTesting(fact(.began, finger: freshFinger), originalView: safe) { deliveries += 1 }
+        XCTAssertTrue(value.contactIsActive)
+        XCTAssertEqual(kinds(mailbox.drain()), ["start"], "The observed lift must clear suppression for a new gesture")
+        XCTAssertEqual(deliveries, 18)
+        value.stop()
+    }
+
     func testRollingBudgetDoesNotRefillAtFixedWindowBoundary() {
         var budget = EluUIKitReplayTouchWorkBudget()
         XCTAssertEqual(budget.allowance(at: 0), 2_000_000)

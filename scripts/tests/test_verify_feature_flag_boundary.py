@@ -19,6 +19,29 @@ SPEC.loader.exec_module(MODULE)
 
 
 class FeatureFlagBoundaryScannerTests(unittest.TestCase):
+    def test_explicit_window_and_original_commit_owner_are_closed(self) -> None:
+        path = pathlib.Path(MODULE.NATIVE_WINDOW_SOURCE)
+        source = (ROOT / path).read_text()
+        self.assertEqual([], MODULE.scan_replay_storage_source(path, source))
+        for token in ["original.observe(event) { super.sendEvent(event) }", "original.belongs(to: self)",
+                      "if replayObserver === original", "await withCheckedContinuation"]:
+            self.assertIn(token, source)
+            self.assertTrue(MODULE.scan_replay_storage_source(path, source.replace(token, "removed_original_join")))
+        for added in ["public func install() {}", "Task { collect() }", "EluNativeReplayPermit", "UIGestureRecognizer()"]:
+            self.assertTrue(MODULE.scan_replay_storage_source(path, source + "\n" + added))
+        capture_path = pathlib.Path(MODULE.NATIVE_CAPTURE_SOURCE)
+        capture = (ROOT / capture_path).read_text()
+        self.assertEqual([], MODULE.scan_replay_storage_source(capture_path, capture))
+        for token in ["try buffer.committed(seal)", "attachment = original", "originalAttachment.drain()",
+                      "originalAttachment.handoff(projection, at:", "try await accept(preceding + captured.3)",
+                      "if let interactionAttachment { await interactionAttachment.close() }",
+                      "enrollment.quarantine(retaining: pendingRequest)"]:
+            self.assertIn(token, capture)
+            self.assertTrue(MODULE.scan_replay_storage_source(capture_path, capture.replace(token, "removed_capture_guard")))
+        for relative in [MODULE.NATIVE_RUNTIME_SOURCE, MODULE.NATIVE_COMPOSITION_SOURCE,
+                         "Sources/EluAnalytics/Elu.swift", "Sources/EluAnalytics/Internal/Replay/Other.swift"]:
+            self.assertTrue(MODULE.scan_replay_storage_source(pathlib.Path(relative), "EluReplayWindow"))
+
     def test_dormant_touch_projection_cannot_install_capture_or_intercept_host(self) -> None:
         paths = [MODULE.NATIVE_INTERACTION_PROJECTION_SOURCE, MODULE.NATIVE_TOUCH_OBSERVER_SOURCE,
                  MODULE.NATIVE_INTERACTION_MAILBOX_SOURCE]
@@ -31,7 +54,7 @@ class FeatureFlagBoundaryScannerTests(unittest.TestCase):
                           "URLSession", "UIGestureRecognizer", "addGestureRecognizer", "method_exchangeImplementations",
                           "UUID()", "Task { work() }", "class Hidden: UIWindow {}"]:
                 self.assertTrue(MODULE.scan_replay_storage_source(path, source + "\n" + token), (relative, token))
-        for relative in [MODULE.NATIVE_RUNTIME_SOURCE, MODULE.NATIVE_CAPTURE_SOURCE, MODULE.NATIVE_COMPOSITION_SOURCE,
+        for relative in [MODULE.NATIVE_RUNTIME_SOURCE, MODULE.NATIVE_COMPOSITION_SOURCE,
                          "Sources/EluAnalytics/Elu.swift", "Sources/EluAnalytics/Internal/Replay/Other.swift"]:
             for token in ["EluUIKitReplayTouchObserver", "EluUIKitReplayTouchWorkBudget", "EluUIKitReplayTouchFact",
                           "EluUIKitReplayInteractionProjection", "EluNativeReplayInteractionMailbox"]:
@@ -47,7 +70,7 @@ class FeatureFlagBoundaryScannerTests(unittest.TestCase):
         projection_path = pathlib.Path(MODULE.NATIVE_INTERACTION_PROJECTION_SOURCE)
         projection = (ROOT / projection_path).read_text()
         self.assertTrue(MODULE.scan_replay_storage_source(projection_path,
-            projection.replace("for clip in original.paintVetoes.values", "for clip in []")))
+            projection.replace("for clip in current.1.values", "for clip in []")))
         for token in ["let emittedInside = Double(x) >= clip.x", "if actualInside || emittedInside { return nil }"]:
             self.assertIn(token, projection)
             self.assertTrue(MODULE.scan_replay_storage_source(projection_path,
