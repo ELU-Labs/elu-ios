@@ -146,10 +146,15 @@ final class EluNativeReplayLifecycleTests: XCTestCase {
         next.view.isHidden = true; XCTAssertEqual(lifecycle.observeRootReadiness(), .waiting)
         next.view.isHidden = false
         let modal = UIViewController(); modal.view = UIView(frame: window.bounds)
+        // The fixture exercises a real modal relationship, not adaptive sheet
+        // hosting. Keep the original presenter's view attached throughout.
+        modal.modalPresentationStyle = .overFullScreen
         // Hostless UIKit may not run presentation completion callbacks. The
         // lifecycle guard consumes these public relationships, so wait for those
-        // actual relationships with a bounded deadline instead of suspending on
-        // an unbounded animation-completion continuation.
+        // actual relationships AND transition settlement with a bounded deadline
+        // instead of suspending on an unbounded completion continuation. Links
+        // alone can exist while presentation is still in flight; issuing dismiss
+        // at that point does not establish a completed dismissal.
         defer { next.dismiss(animated: false) }
         next.present(modal, animated: false)
         try await settlePresentationRelationship(modal, presenter: next, in: window,
@@ -209,10 +214,16 @@ final class EluNativeReplayLifecycleTests: XCTestCase {
         lifecycle: EluNativeReplayLifecycle, stage: String) async throws {
         let start = DispatchTime.now().uptimeNanoseconds
         while DispatchTime.now().uptimeNanoseconds - start < 6_000_000_000 {
+            let transitionSettled = !modal.isBeingPresented && !modal.isBeingDismissed &&
+                !presenter.isBeingPresented && !presenter.isBeingDismissed &&
+                modal.transitionCoordinator == nil && presenter.transitionCoordinator == nil
             let exact = presented
-                ? presenter.presentedViewController === modal && modal.presentingViewController === presenter
-                : presenter.presentedViewController == nil && modal.presentingViewController == nil
-            if window.rootViewController === presenter, presenter.viewIfLoaded?.window === window, exact {
+                ? presenter.presentedViewController === modal && modal.presentingViewController === presenter &&
+                    modal.viewIfLoaded?.window === window
+                : presenter.presentedViewController == nil && modal.presentingViewController == nil &&
+                    modal.viewIfLoaded?.window == nil
+            if window.rootViewController === presenter, presenter.viewIfLoaded?.window === window,
+               exact, transitionSettled {
                 return
             }
             try await Task.sleep(nanoseconds: 20_000_000)
@@ -221,7 +232,11 @@ final class EluNativeReplayLifecycleTests: XCTestCase {
             diagnostics: EluUIKitTestHost.readinessDiagnostics(window: window, controller: presenter) +
                 ";lifecycleReadiness=\(lifecycle.observeRootReadiness())" +
                 ";expectedPresented=\(presented);exactPresented=\(presenter.presentedViewController === modal)" +
-                ";exactPresenter=\(modal.presentingViewController === presenter)")
+                ";exactPresenter=\(modal.presentingViewController === presenter)" +
+                ";modalAttached=\(modal.viewIfLoaded?.window === window)" +
+                ";modalPresenting=\(modal.isBeingPresented);modalDismissing=\(modal.isBeingDismissed)" +
+                ";presenterPresenting=\(presenter.isBeingPresented);presenterDismissing=\(presenter.isBeingDismissed)" +
+                ";modalTransition=\(modal.transitionCoordinator != nil);presenterTransition=\(presenter.transitionCoordinator != nil)")
     }
 
     @MainActor private func activeWindow() throws -> UIWindow {
