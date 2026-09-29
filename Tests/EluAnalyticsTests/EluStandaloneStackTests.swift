@@ -3,6 +3,31 @@ import XCTest
 @testable import EluAnalytics
 
 final class EluStandaloneStackTests: XCTestCase {
+    func testSelfHostedStackCarriesLocalPolicyThroughSourceEventAndFlagOwners() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("elu-selfhost-stack-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let host = URL(string: "https://analytics.example.test")!
+        let policy = try EluEndpointPolicy(apiHost: host)
+        let h = try await StackHarness(root: root, endpointPolicy: policy)
+        var document = try XCTUnwrap(JSONSerialization.jsonObject(with: fixture()) as? [String: Any])
+        let endpoints = try XCTUnwrap(document["endpoints"] as? [String: String])
+        document["endpoints"] = endpoints.mapValues {
+            $0.replacingOccurrences(of: "https://ingest.elu.dev", with: host.absoluteString)
+                .replacingOccurrences(of: "https://assets.elu.dev", with: host.absoluteString)
+        }
+        XCTAssertEqual((document["endpoints"] as? [String: String])?["events"], host.appendingPathComponent("v1/events").absoluteString)
+        let data = try JSONSerialization.data(withJSONObject: document, options: [.sortedKeys])
+        try await h.install(data)
+        let urls = await h.config.urls
+        XCTAssertEqual(urls, [host.appendingPathComponent("sdk/v2/" + StackHarness.siteKey + "/config")])
+        guard case .accepted = await h.stack.runtime.capture("self-hosted") else { await h.close(); return XCTFail("Capture rejected") }
+        _ = await h.stack.runtime.flush()
+        let sentEndpoints = await h.events.endpoints
+        XCTAssertEqual(sentEndpoints, [host.appendingPathComponent("v1/events")])
+        let flags = await h.stack.flags.reloadProjection(); XCTAssertNotNil(flags)
+        await h.close()
+    }
+
     func testStartupRemainsClosedUntilObservedForegroundAndCoalescesActivation() async throws {
         try await withHarness { h in
             h.stack.start()
@@ -378,7 +403,8 @@ final class EluStandaloneStackTests: XCTestCase {
 
     func testCoreOwnedBootstrapPropagatesHostAndPreservesInitialCallOrder() async throws {
         try await withHarness { h in
-            let selectedHost = URL(string: "https://www.elu.dev")!
+            let selectedHost = URL(string: "https://staging.elu.dev")!
+            XCTAssertEqual(EluConfigHostAllowlist.resolve(configHost: selectedHost), .approved(selectedHost))
             let core = EluCore(backendFactory: EluRuntimeBackendFactory { selection, context in
                 XCTAssertEqual(selection, .standalone)
                 XCTAssertEqual(context.configHost, selectedHost)
@@ -505,11 +531,11 @@ private struct StackHarness: Sendable {
     let config = StackConfigTransport()
     let events = StackEventTransport()
     let clock = StackClock()
-    init(root: URL) async throws {
+    init(root: URL, endpointPolicy: EluEndpointPolicy = .cloud) async throws {
         self.root = root
         stack = try await EluStandaloneStack.make(rootDirectoryURL: root, siteKey: Self.siteKey,
-            configHost: URL(string: "https://elu.dev")!, configTransport: config,
-            eventTransport: events, flagTransport: StackFlagTransport(), clock: clock.source,
+            configHost: endpointPolicy.declaredAPIOrigin ?? URL(string: "https://elu.dev")!, endpointPolicy: endpointPolicy, configTransport: config,
+            eventTransport: events, flagTransport: StackFlagTransport(expectedHost: endpointPolicy.declaredAPIOrigin?.host), clock: clock.source,
             scheduler: StackScheduler(), timeZoneIdentifier: { "America/New_York" })
     }
     func install(_ data: Data) async throws {
@@ -534,9 +560,11 @@ private extension EluV1FlagCacheReadResult {
 }
 
 private actor StackConfigTransport: EluV2ConfigTransport {
+    private(set) var urls: [URL] = []
     private(set) var count = 0
     private var pending: [CheckedContinuation<Data, Error>] = []
     func fetch(_ request: EluV2ConfigRequest) async throws -> Data {
+        urls.append(request.url)
         count += 1
         return try await withCheckedThrowingContinuation { pending.append($0) }
     }
@@ -545,6 +573,7 @@ private actor StackConfigTransport: EluV2ConfigTransport {
 }
 
 private actor StackEventTransport: EluV1AuthorizedBatchTransport {
+    private(set) var endpoints: [URL] = []
     private(set) var count = 0
     private(set) var names: [String] = []
     private let delegate = FacadeBatchTransport()
@@ -564,6 +593,7 @@ private actor StackEventTransport: EluV1AuthorizedBatchTransport {
         }
         guard authority.isCurrent() else { throw EluV1BoundTransportError.staleAuthority }
         count += 1
+        endpoints.append(request.url)
         let body = try JSONSerialization.jsonObject(with: request.body) as! [String: Any]
         names += (body["records"] as! [[String: Any]]).compactMap { ($0["event"] as? [String: Any])?["name"] as? String }
         return try await delegate.send(request)
@@ -571,9 +601,11 @@ private actor StackEventTransport: EluV1AuthorizedBatchTransport {
 }
 
 private struct StackFlagTransport: EluV1AuthorizedFlagTransport {
+    var expectedHost: String? = nil
     func send(endpoint: URL, requestBody: Data) async throws -> Data { throw EluV1BoundTransportError.staleAuthority }
     func send(endpoint: URL, requestBody: Data, authority: EluV1TransportAuthority) async throws -> Data {
         guard await authority.revalidate(), authority.isCurrent() else { throw EluV1BoundTransportError.staleAuthority }
+        if let expectedHost { XCTAssertEqual(endpoint.host, expectedHost); XCTAssertEqual(endpoint.path, "/v1/flags") }
         let request = try JSONSerialization.jsonObject(with: requestBody) as! [String: Any]
         let identity = request["identity"] as! [String: Any]
         return try JSONSerialization.data(withJSONObject: [

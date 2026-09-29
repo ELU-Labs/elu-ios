@@ -60,12 +60,13 @@ actor EluV2ConfigLifecycle {
     init(
         siteKey: String,
         configHost: URL = URL(string: "https://elu.dev")!,
-        transport: any EluV2ConfigTransport = EluV2URLSessionConfigTransport(),
+        endpointPolicy: EluEndpointPolicy = .cloud,
+        transport: (any EluV2ConfigTransport)? = nil,
         clock: EluV2ConfigClock = .live,
         scheduler: any EluV2ConfigLifecycleScheduler = EluV2TaskConfigScheduler(),
         onChange: @escaping @Sendable (EluV2ConfigLifecycleToken) -> Void
     ) throws {
-        source = try EluV2ConfigSource(siteKey: siteKey, configHost: configHost, transport: transport, clock: clock)
+        source = try EluV2ConfigSource(siteKey: siteKey, configHost: configHost, endpointPolicy: endpointPolicy, transport: transport, clock: clock)
         authorityGate = EluV2ConfigAuthorityGate(siteKey: siteKey, clock: clock)
         self.clock = clock
         self.scheduler = scheduler

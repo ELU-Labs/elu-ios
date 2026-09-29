@@ -26,8 +26,9 @@ final class EluStandaloneStack: @unchecked Sendable {
         rootDirectoryURL: URL,
         siteKey: String,
         configHost: URL,
-        configTransport: any EluV2ConfigTransport = EluV2URLSessionConfigTransport(),
-        eventTransport: any EluV1AuthorizedBatchTransport = EluV1URLSessionBatchTransport(),
+        endpointPolicy: EluEndpointPolicy = .cloud,
+        configTransport: (any EluV2ConfigTransport)? = nil,
+        eventTransport: (any EluV1AuthorizedBatchTransport)? = nil,
         flagTransport: (any EluV1AuthorizedFlagTransport)? = nil,
         clock: EluV2ConfigClock = .live,
         scheduler: any EluV2ConfigLifecycleScheduler = EluV2TaskConfigScheduler(),
@@ -37,12 +38,13 @@ final class EluStandaloneStack: @unchecked Sendable {
         diagnostics: EluDiagnosticsOptions = .init()
     ) async throws -> EluStandaloneStack {
         let relay = EluStandaloneConfigRelay()
-        let lifecycle = try EluV2ConfigLifecycle(siteKey: siteKey, configHost: configHost,
+        let lifecycle = try EluV2ConfigLifecycle(siteKey: siteKey, configHost: configHost, endpointPolicy: endpointPolicy,
             transport: configTransport, clock: clock, scheduler: scheduler,
             onChange: { relay.publish($0) })
         _ = lifecycle.authorityGate.suspend()
         let runtime = try await EluStandaloneRuntime.make(rootDirectoryURL: rootDirectoryURL,
-            siteKey: siteKey, versions: versions, transport: eventTransport,
+            siteKey: siteKey, endpointPolicy: endpointPolicy, versions: versions,
+            transport: eventTransport ?? EluV1URLSessionBatchTransport(endpointPolicy: endpointPolicy),
             configurationGate: lifecycle.authorityGate, clock: clock.wallNow,
             continuousClock: clock.continuousNow, continuousBudgetConverter: clock.floorTicks,
             nativeContinuousNanoseconds: clock.floorNanoseconds,
@@ -51,7 +53,7 @@ final class EluStandaloneStack: @unchecked Sendable {
                 sleep: { try await Task.sleep(nanoseconds: $0) }),
             timeZoneIdentifier: timeZoneIdentifier, performance: performance, diagnostics: diagnostics)
         do {
-            let selectedFlags = try flagTransport ?? EluV1URLSessionFlagTransport(siteKey: siteKey)
+            let selectedFlags = try flagTransport ?? EluV1URLSessionFlagTransport(siteKey: siteKey, endpointPolicy: endpointPolicy)
             let flags = try await runtime.flagClient(transport: selectedFlags)
             let stack = EluStandaloneStack(runtime: runtime, flags: flags, lifecycle: lifecycle)
             relay.attach(stack)

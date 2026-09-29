@@ -12,13 +12,15 @@ enum EluV1FlagTransportError: Error, Equatable {
 final class EluV1URLSessionFlagTransport: EluV1AuthorizedFlagTransport, @unchecked Sendable {
     private let slot = EluV1PhysicalTransportSlot()
     private let siteKey: String
+    private let endpointPolicy: EluEndpointPolicy
     private let protocolClasses: [AnyClass]?
     static let timeoutSeconds: TimeInterval = 10
 
-    init(siteKey: String, protocolClasses: [AnyClass]? = nil) throws {
+    init(siteKey: String, endpointPolicy: EluEndpointPolicy = .cloud, protocolClasses: [AnyClass]? = nil) throws {
         // Reuse the canonical issued-key boundary without fetching config.
         _ = try EluV2ConfigRequest(siteKey: siteKey, configHost: URL(string: "https://elu.dev")!)
         self.siteKey = siteKey
+        self.endpointPolicy = endpointPolicy
         self.protocolClasses = protocolClasses
     }
 
@@ -36,13 +38,7 @@ final class EluV1URLSessionFlagTransport: EluV1AuthorizedFlagTransport, @uncheck
         try Task.checkCancellation()
         if let binding, !(await binding.revalidate()) { throw EluV1BoundTransportError.staleAuthority }
         try Task.checkCancellation()
-        guard EluV1Validation.isAbsoluteHTTPSURI(endpoint.absoluteString),
-              let parts = URLComponents(url: endpoint, resolvingAgainstBaseURL: false),
-              parts.scheme == "https", parts.host?.lowercased() == "ingest.elu.dev",
-              parts.port == nil || parts.port == 443,
-              parts.user == nil, parts.password == nil, parts.fragment == nil,
-              parts.percentEncodedPath == "/v1/flags",
-              parts.queryItems?.contains(where: { $0.name == "site_key" }) != true
+        guard endpointPolicy.endpoint(endpoint.absoluteString, role: .flags) != nil
         else { throw EluV1FlagTransportError.untrustedEndpoint }
         guard requestBody.count <= EluV1FlagJSON.maximumWireBytes else {
             throw EluV1FlagContractError.requestTooLarge

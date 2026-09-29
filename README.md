@@ -217,9 +217,18 @@ Elu.setup(siteKey: "YOUR_SITE_KEY",
 
 Both origins must match exactly and use HTTPS without an explicit port,
 credentials, path beyond `/`, query, fragment or trailing-dot hostname.
-The instance must serve the owned `/sdk/v2/<siteKey>/config` contract. Declaring
-an origin does not bypass configuration or delivery authorization. The owned
-self-hosted delivery path still requires separate release qualification.
+The instance must serve the owned `/sdk/v2/<siteKey>/config`, `/v1/events`,
+`/v1/flags` and `/v2/replay` contracts. Returned endpoints must use the declared
+API origin and each maintained role path; redirects are refused. Declaring an
+origin does not bypass configuration, consent or delivery authorization.
+
+Each canonical self-hosted API origin has separate durable identity, consent,
+feature flags and queued events/replay. Changing servers starts a separate
+installation; returning to the same normalized origin reopens its own store.
+Cloud installations keep their existing storage. SDK config/API requests are
+excluded from the optional customer URLSession metrics, including redirects
+into either configured host. Self-hosted service compatibility still requires
+its own end-to-end verification.
 
 ## UIKit replay coverage
 

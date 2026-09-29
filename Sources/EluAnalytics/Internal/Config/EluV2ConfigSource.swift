@@ -22,7 +22,7 @@ struct EluV2ConfigRequest: Sendable {
     static let maximumResponseBytes = 65_536
     static let timeoutSeconds: TimeInterval = 10
 
-    init(siteKey: String, configHost: URL) throws {
+    init(siteKey: String, configHost: URL, endpointPolicy: EluEndpointPolicy = .cloud) throws {
         // Matches the public config service boundary. Do not trim or rewrite a
         // credential, and never permit it to become URL syntax.
         guard siteKey.range(
@@ -30,7 +30,7 @@ struct EluV2ConfigRequest: Sendable {
             options: .regularExpression
         ) != nil else { throw EluV2ConfigSourceError.invalidSiteKey }
         guard case let .approved(origin) = EluConfigHostAllowlist.resolve(
-            configHost: configHost
+            configHost: configHost, apiHost: endpointPolicy.declaredAPIOrigin
         ) else { throw EluV2ConfigSourceError.untrustedConfigHost }
         url = origin.appendingPathComponent("sdk/v2/\(siteKey)/config")
     }
@@ -96,7 +96,7 @@ actor EluV2ConfigSource {
     private let request: EluV2ConfigRequest
     private let transport: any EluV2ConfigTransport
     private let clock: EluV2ConfigClock
-    private let manager = EluV1ConfigManager(readbackProvenReplayTransports: EluStandaloneRuntime.readbackProvenReplayCapabilities.transports)
+    private let manager: EluV1ConfigManager
     private var lease: EluV2ConfigLease?
     private var acceptedIssuedAt: EluV1Timestamp?
     private var acceptedDeadline: UInt64?
@@ -110,11 +110,13 @@ actor EluV2ConfigSource {
     init(
         siteKey: String,
         configHost: URL = URL(string: "https://elu.dev")!,
-        transport: any EluV2ConfigTransport = EluV2URLSessionConfigTransport(),
+        endpointPolicy: EluEndpointPolicy = .cloud,
+        transport: (any EluV2ConfigTransport)? = nil,
         clock: EluV2ConfigClock = .live
     ) throws {
-        request = try EluV2ConfigRequest(siteKey: siteKey, configHost: configHost)
-        self.transport = transport
+        request = try EluV2ConfigRequest(siteKey: siteKey, configHost: configHost, endpointPolicy: endpointPolicy)
+        manager = EluV1ConfigManager(endpointPolicy: endpointPolicy, readbackProvenReplayTransports: EluStandaloneRuntime.readbackProvenReplayCapabilities.transports)
+        self.transport = transport ?? EluV2URLSessionConfigTransport(expectedRequestURL: request.url)
         self.clock = clock
     }
 

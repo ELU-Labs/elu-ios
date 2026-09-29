@@ -211,7 +211,7 @@ actor EluStandaloneRuntime {
         lastSnapshot = initialSnapshot
         self.siteKey = siteKey
         self.versions = versions
-        configManager = EluV1ConfigManager(readbackProvenReplayTransports: Self.readbackProvenReplayCapabilities.transports)
+        configManager = EluV1ConfigManager(endpointPolicy: queue.endpointPolicy, readbackProvenReplayTransports: Self.readbackProvenReplayCapabilities.transports)
         self.transport = transport
         self.backgroundHandoff = backgroundHandoff
         self.clock = clock
@@ -228,9 +228,10 @@ actor EluStandaloneRuntime {
     static func make(
         rootDirectoryURL: URL,
         siteKey: String,
+        endpointPolicy: EluEndpointPolicy = .cloud,
         versions: EluVersionContext? = nil,
         limits: EluRuntimeQueueLimits? = nil,
-        transport: any EluV1BatchHTTPTransport = EluV1URLSessionBatchTransport(),
+        transport: (any EluV1BatchHTTPTransport)? = nil,
         configurationGate: EluV2ConfigAuthorityGate? = nil,
         backgroundHandoff: EluStandaloneBackgroundHandoff? = nil,
         clock: @escaping @Sendable () -> Date = { Date() },
@@ -279,6 +280,7 @@ actor EluStandaloneRuntime {
         let queue = try await EluSQLiteRuntimeQueue.openCaptureRuntime(
             rootDirectoryURL: rootDirectoryURL,
             exactConstructorSiteKey: siteKey,
+            endpointPolicy: endpointPolicy,
             limits: resolvedLimits,
             clock: clock,
             continuousClock: continuousClock,
@@ -305,7 +307,7 @@ actor EluStandaloneRuntime {
             initialSnapshot: initialSnapshot,
             siteKey: siteKey,
             versions: resolvedVersions,
-            transport: transport,
+            transport: transport ?? EluV1URLSessionBatchTransport(endpointPolicy: endpointPolicy),
             backgroundHandoff: resolvedHandoff,
             clock: clock,
             time: time,
@@ -481,11 +483,12 @@ actor EluStandaloneRuntime {
     func installNativeReplayComposition(lifecycle: EluNativeReplayLifecycle,
         capabilities: EluNativeReplayCapabilities = EluNativeReplayCapabilities(),
         deferredUntilActivation: Bool = false,
-        transport: any EluV2ReplayHTTPTransport = EluV2URLSessionReplayTransport()) -> EluNativeReplayComposition? {
+        transport: (any EluV2ReplayHTTPTransport)? = nil) -> EluNativeReplayComposition? {
         guard phase != .closed else { return nil }
         if let replayComposition { return replayComposition }
         viewPrivacyObserver = EluNativeViewPrivacy.shared.observe { [weak self] in self?.nativePrivacyContextChanged() }
-        let delivery = EluV2ReplayDeliveryCoordinator(queue: queue, transport: transport,
+        let delivery = EluV2ReplayDeliveryCoordinator(queue: queue,
+            transport: transport ?? EluV2URLSessionReplayTransport(endpointPolicy: queue.endpointPolicy),
             wallNow: clock, sleep: time.sleep)
         let composition = EluNativeReplayComposition(runtime: self, lifecycle: lifecycle,
             capabilities: capabilities, delivery: delivery, initiallyActive: !deferredUntilActivation)
@@ -952,8 +955,8 @@ actor EluStandaloneRuntime {
         _ = await record(command, performanceSample: true, admissionGuard: isCurrent)
     }
 
-    nonisolated func beginNetworkObservation(_ request: URLRequest, excludedHost: String? = nil) -> EluNetworkObservation? {
-        networkGate.begin(request, excludedHost: excludedHost)
+    nonisolated func beginNetworkObservation(_ request: URLRequest, excludedHost: String? = nil, excludedHosts: Set<String> = []) -> EluNetworkObservation? {
+        networkGate.begin(request, excludedHost: excludedHost, excludedHosts: excludedHosts)
     }
 
     private func refreshNetworkObservation() {
@@ -1143,6 +1146,7 @@ actor EluStandaloneRuntime {
             let authorization = try EluV1BatchAuthorizationSnapshot(
                 siteKey: siteKey,
                 eventsEndpoint: eventsEndpoint,
+                endpointPolicy: queue.endpointPolicy,
                 expiresAt: resolution.expiresAt,
                 eventBatchCount: resolution.limits.eventBatchCount,
                 eventBatchBytes: resolution.limits.eventBatchBytes

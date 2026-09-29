@@ -289,7 +289,8 @@ class FeatureFlagBoundaryScannerTests(unittest.TestCase):
         original = (ROOT / path).read_text()
         for text in [
             original + "\nlet another = EluV1URLSessionFlagTransport(siteKey: siteKey)",
-            original.replace("EluV1URLSessionFlagTransport(siteKey: siteKey)", "EluV1URLSessionFlagTransport(siteKey: otherKey)"),
+            original.replace("EluV1URLSessionFlagTransport(siteKey: siteKey, endpointPolicy: endpointPolicy)", "EluV1URLSessionFlagTransport(siteKey: otherKey, endpointPolicy: endpointPolicy)"),
+            original.replace("EluV1URLSessionFlagTransport(siteKey: siteKey, endpointPolicy: endpointPolicy)", "EluV1URLSessionFlagTransport(siteKey: siteKey, endpointPolicy: .cloud)"),
             original + "\nlet client = EluV1FlagClient.make(runtime: queue, transport: transport, versions: versions)",
             original + "\nfinal class Extra: EluV1AuthorizedFlagTransport {}",
         ]:
@@ -311,6 +312,7 @@ class FeatureFlagBoundaryScannerTests(unittest.TestCase):
         self.assertEqual(MODULE.scan_outside_source(path, source), [])
         for mutation in [
             source.replace("configHost: context.configHost", "configHost: otherHost", 1),
+            source.replace("endpointPolicy: context.endpointPolicy", "endpointPolicy: .cloud", 1),
             source.replace("performance: context.performance", "performance: otherPerformance", 1),
             source.replace("diagnostics: context.diagnostics", "diagnostics: otherDiagnostics", 1),
             source.replace("guardedFlagsDidLoad: context.guardedFlagsDidLoad", "guardedFlagsDidLoad: unchecked", 1),

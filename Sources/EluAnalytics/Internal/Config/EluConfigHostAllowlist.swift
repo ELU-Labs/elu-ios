@@ -69,6 +69,7 @@ enum EluConfigHostAllowlist {
         apiHost: URL? = nil,
         loopbackPermitted: Bool = Self.loopbackPermitted
     ) -> EluConfigHostResolution {
+        if let apiHost, selfHostedOrigin(apiHost) == nil { return .rejected(.hostNotApproved) }
         guard let components = URLComponents(url: configHost, resolvingAgainstBaseURL: false),
               let scheme = components.scheme?.lowercased(),
               scheme == "https" || scheme == "http"

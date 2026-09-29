@@ -161,7 +161,7 @@ final class EluConfigHostAllowlistTests: XCTestCase {
         }
     }
 
-    func testDeclaringAnApiHostLeavesTheEluAndLoopbackRulesUnchanged() {
+    func testValidApiDeclarationPreservesCloudAndInvalidLoopbackDeclarationFailsClosed() {
         XCTAssertEqual(
             EluConfigHostAllowlist.resolve(
                 configHost: URL(string: "https://elu.dev")!,
@@ -176,7 +176,7 @@ final class EluConfigHostAllowlistTests: XCTestCase {
                 apiHost: URL(string: "http://localhost:8080")!,
                 loopbackPermitted: false
             ),
-            .rejected(.loopbackNotPermitted)
+            .rejected(.hostNotApproved)
         )
     }
 

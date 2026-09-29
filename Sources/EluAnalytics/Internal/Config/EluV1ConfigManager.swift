@@ -386,6 +386,7 @@ final class EluV1ConfigManager: @unchecked Sendable {
     // replay authorization always requires recorded fallback proof.
     private static let recognizedIOSMaskingRuleDialects: Set<String> = []
 
+    private let endpointPolicy: EluEndpointPolicy
     private let lock = NSLock()
     private let readbackProvenReplayTransports: Set<EluV1ReplayTransportSelection>
     private let flagOwner: (siteKey: String, namespaceDigest: String)?
@@ -397,8 +398,10 @@ final class EluV1ConfigManager: @unchecked Sendable {
     private var flagActivationCounter: EluV1FlagActivationCounter
 
     init(
+        endpointPolicy: EluEndpointPolicy = .cloud,
         readbackProvenReplayTransports: Set<EluV1ReplayTransportSelection> = []
     ) {
+        self.endpointPolicy = endpointPolicy
         self.readbackProvenReplayTransports = readbackProvenReplayTransports
         flagOwner = nil
         flagActivationCounter = EluV1FlagActivationCounter()
@@ -406,9 +409,11 @@ final class EluV1ConfigManager: @unchecked Sendable {
 
     init(
         exactConstructorSiteKey: String,
+        endpointPolicy: EluEndpointPolicy = .cloud,
         readbackProvenReplayTransports: Set<EluV1ReplayTransportSelection> = [],
         flagActivationCounter: EluV1FlagActivationCounter = EluV1FlagActivationCounter()
     ) throws {
+        self.endpointPolicy = endpointPolicy
         self.readbackProvenReplayTransports = readbackProvenReplayTransports
         flagOwner = (
             exactConstructorSiteKey,
@@ -437,7 +442,7 @@ final class EluV1ConfigManager: @unchecked Sendable {
 
         do {
             try Self.validateClock(now)
-            let prepared = try Self.prepareFlagProjection(configData)
+            let prepared = try Self.prepareFlagProjection(configData, endpointPolicy: endpointPolicy)
             let restriction: EluV1FlagRestriction?
             switch prepared.status {
             case .disabled:
@@ -557,7 +562,7 @@ final class EluV1ConfigManager: @unchecked Sendable {
         do {
             lastValidatedCandidateIdentity = nil
             try Self.validateClock(now)
-            let prepared = try Self.prepareConfig(configData)
+            let prepared = try Self.prepareConfig(configData, endpointPolicy: endpointPolicy)
             lastValidatedCandidateIdentity = ValidatedCandidateIdentity(
                 issuedAt: prepared.document.issuedAt,
                 semanticHash: prepared.semanticHash,
@@ -1041,7 +1046,7 @@ final class EluV1ConfigManager: @unchecked Sendable {
         }
     }
 
-    private static func prepareConfig(_ data: Data) throws -> PreparedConfig {
+    private static func prepareConfig(_ data: Data, endpointPolicy: EluEndpointPolicy) throws -> PreparedConfig {
         let (document, strictDocument) = try decodeConfig(data)
         guard document.issuedAt < document.expiresAt else {
             throw EluV1ConfigResolutionError.invalidConfigValidityWindow
@@ -1053,7 +1058,7 @@ final class EluV1ConfigManager: @unchecked Sendable {
             }
             trustedEndpoints = try validateAllEndpoints(
                 endpoints,
-                schemaVersion: document.schemaVersion
+                schemaVersion: document.schemaVersion, endpointPolicy: endpointPolicy
             )
         } else {
             trustedEndpoints = nil
@@ -1072,13 +1077,13 @@ final class EluV1ConfigManager: @unchecked Sendable {
     /// Flags consume only their own endpoint role. Known unrelated channel
     /// values remain part of the semantic document when present, but are not
     /// required or interpreted and cannot grant or deny flag authority.
-    private static func prepareFlagProjection(_ data: Data) throws -> PreparedFlagProjection {
+    private static func prepareFlagProjection(_ data: Data, endpointPolicy: EluEndpointPolicy) throws -> PreparedFlagProjection {
         let (projection, strictDocument) = try decodeFlagProjection(data)
         guard projection.issuedAt < projection.expiresAt else {
             throw EluV1ConfigResolutionError.invalidConfigValidityWindow
         }
         let endpoint = try projection.flagsEndpoint.map {
-            try validateEndpoint($0, role: .flags, schemaVersion: projection.schemaVersion)
+            try validateEndpoint($0, role: .flags, schemaVersion: projection.schemaVersion, endpointPolicy: endpointPolicy)
         }
         return PreparedFlagProjection(
             schemaVersion: projection.schemaVersion,
@@ -1170,17 +1175,17 @@ final class EluV1ConfigManager: @unchecked Sendable {
 
     private static func validateAllEndpoints(
         _ endpoints: EluV1RawEndpoints,
-        schemaVersion: Int
+        schemaVersion: Int, endpointPolicy: EluEndpointPolicy
     ) throws -> [EluV1EndpointRole: URL] {
         var validated: [EluV1EndpointRole: URL] = [
-            .events: try validateEndpoint(endpoints.events, role: .events, schemaVersion: schemaVersion),
-            .flags: try validateEndpoint(endpoints.flags, role: .flags, schemaVersion: schemaVersion),
+            .events: try validateEndpoint(endpoints.events, role: .events, schemaVersion: schemaVersion, endpointPolicy: endpointPolicy),
+            .flags: try validateEndpoint(endpoints.flags, role: .flags, schemaVersion: schemaVersion, endpointPolicy: endpointPolicy),
         ]
         if let replay = endpoints.replay {
-            validated[.replay] = try validateEndpoint(replay, role: .replay, schemaVersion: schemaVersion)
+            validated[.replay] = try validateEndpoint(replay, role: .replay, schemaVersion: schemaVersion, endpointPolicy: endpointPolicy)
         }
         if let assets = endpoints.assets {
-            validated[.assets] = try validateEndpoint(assets, role: .assets, schemaVersion: schemaVersion)
+            validated[.assets] = try validateEndpoint(assets, role: .assets, schemaVersion: schemaVersion, endpointPolicy: endpointPolicy)
         }
         return validated
     }
@@ -1189,41 +1194,10 @@ final class EluV1ConfigManager: @unchecked Sendable {
     /// standalone replay endpoint accepts replay v2 only, so a v2 document must
     /// never advertise the v1 path and a v1 document must never advertise v2.
     private static func validateEndpoint(
-        _ value: String,
-        role: EluV1EndpointRole,
-        schemaVersion: Int
+        _ value: String, role: EluV1EndpointRole, schemaVersion: Int,
+        endpointPolicy: EluEndpointPolicy
     ) throws -> URL {
-        let expectedHost: String
-        let expectedPath: String
-        switch role {
-        case .events:
-            expectedHost = "ingest.elu.dev"
-            expectedPath = "/v1/events"
-        case .replay:
-            expectedHost = "ingest.elu.dev"
-            expectedPath = schemaVersion == EluV1ConfigDocument.v2SchemaVersion
-                ? "/v2/replay"
-                : "/v1/replay"
-        case .flags:
-            expectedHost = "ingest.elu.dev"
-            expectedPath = "/v1/flags"
-        case .assets:
-            expectedHost = "assets.elu.dev"
-            expectedPath = "/sdk/"
-        }
-
-        guard EluV1Validation.isAbsoluteHTTPSURI(value),
-              let components = URLComponents(string: value),
-              components.scheme == "https",
-              components.host?.lowercased() == expectedHost,
-              components.port == nil || components.port == 443,
-              components.user == nil,
-              components.password == nil,
-              components.fragment == nil,
-              components.percentEncodedPath == expectedPath,
-              components.queryItems?.contains(where: { $0.name == "site_key" }) != true,
-              let url = components.url
-        else {
+        guard let url = endpointPolicy.endpoint(value, role: role, schemaVersion: schemaVersion) else {
             throw EluV1ConfigResolutionError.untrustedEndpoint(role)
         }
         return url

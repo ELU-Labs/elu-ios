@@ -586,6 +586,7 @@ final class DeliveryFault: EluRuntimeQueueFaultInjecting, @unchecked Sendable {
 
 final class DeliveryHarness: @unchecked Sendable {
     let root: URL
+    let endpointPolicy: EluEndpointPolicy
     var queue: EluSQLiteRuntimeQueue
     let gate: EluV2ConfigAuthorityGate
     let limits: EluRuntimeQueueLimits
@@ -602,18 +603,19 @@ final class DeliveryHarness: @unchecked Sendable {
         return EluV2ReplayConfigWitness(issuedAt: parsed.issuedAt, semanticHash: EluV1StrictCanonicalJSON.hash(document.canonicalData))
     }
     let profile = Data("{\"imageRule\":\"block\",\"inputRule\":\"all\",\"platformFallbackApplied\":false,\"resolvedBlockSelectors\":[],\"resolvedMaskSelectors\":[],\"schemaVersion\":1,\"secureInputsMasked\":true,\"targetDialect\":\"elu-css-selector-v1\",\"textRule\":\"all\"}".utf8)
-    init(root: URL, queue: EluSQLiteRuntimeQueue, gate: EluV2ConfigAuthorityGate, limits: EluRuntimeQueueLimits, config: Data, testClock: DeliveryClock, fault: DeliveryFault?) {
+    init(root: URL, endpointPolicy: EluEndpointPolicy = .cloud, queue: EluSQLiteRuntimeQueue, gate: EluV2ConfigAuthorityGate, limits: EluRuntimeQueueLimits, config: Data, testClock: DeliveryClock, fault: DeliveryFault?) {
+        self.endpointPolicy = endpointPolicy
         self.root = root; self.queue = queue; self.gate = gate; self.limits = limits; self.config = config; self.testClock = testClock; self.fault = fault
     }
-    static func make(limits: EluRuntimeQueueLimits? = nil, fault: DeliveryFault? = nil) async throws -> DeliveryHarness {
+    static func make(endpointPolicy: EluEndpointPolicy = .cloud, limits: EluRuntimeQueueLimits? = nil, fault: DeliveryFault? = nil) async throws -> DeliveryHarness {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("elu-replay-storage-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
         let testClock = DeliveryClock()
         let gate = EluV2ConfigAuthorityGate(siteKey: "elu_pk_test_aaaaaaaaaaaaaaaaaaaaaa", clock: EluV2ConfigClock(wallNow: { testClock.read() }, continuousNow: { testClock.ticks() }, floorTicks: { testClock.convert($0) }, floorNanoseconds: { $0 }))
         let limits = try limits ?? EluRuntimeQueueLimits()
-        let queue = try await EluSQLiteRuntimeQueue.openCaptureRuntime(rootDirectoryURL: root, exactConstructorSiteKey: "elu_pk_test_aaaaaaaaaaaaaaaaaaaaaa", limits: limits,
+        let queue = try await EluSQLiteRuntimeQueue.openCaptureRuntime(rootDirectoryURL: root, exactConstructorSiteKey: "elu_pk_test_aaaaaaaaaaaaaaaaaaaaaa", endpointPolicy: endpointPolicy, limits: limits,
             clock: { testClock.read() }, continuousClock: { testClock.ticks() }, continuousBudgetConverter: { testClock.convert($0) }, anonymousIdGenerator: { "anon-storage" }, sessionIdGenerator: { "session-storage" }, configurationGate: gate, faultInjector: fault)
-        return DeliveryHarness(root: root, queue: queue, gate: gate, limits: limits, config: try fixture("config-enabled.json"), testClock: testClock, fault: fault)
+        return DeliveryHarness(root: root, endpointPolicy: endpointPolicy, queue: queue, gate: gate, limits: limits, config: try fixture("config-enabled.json"), testClock: testClock, fault: fault)
     }
     func install() async throws {
         try await queue.ensureReplaySchema()
@@ -627,7 +629,7 @@ final class DeliveryHarness: @unchecked Sendable {
         gate.publish(token: token, lease: EluV2ConfigLease(data: config, expiresAt: document.expiresAt, continuousDeadline: testClock.ticks() + testClock.convert(600_000_000_000)!))
         witness = try XCTUnwrap(gate.witness(for: token))
         let pair = EluV1ReplayTransportSelection(codec: "elu-browser-dom-v1", compression: .gzip)!
-        let manager = EluV1ConfigManager(readbackProvenReplayTransports: [pair])
+        let manager = EluV1ConfigManager(endpointPolicy: endpointPolicy, readbackProvenReplayTransports: [pair])
         _ = try manager.update(configData: config, now: now)
         let snapshot = try await queue.snapshot()
         let input = EluPrivacyProjectionInput(contextRevision: snapshot.identity.contextRevision, identityOptedOut: snapshot.identity.optedOut,
@@ -690,7 +692,7 @@ final class DeliveryHarness: @unchecked Sendable {
     func count() async throws -> Int64 { try await queue.replayInventory().replayCount }
     func reopen() async throws -> EluSQLiteRuntimeQueue {
         let clock = testClock
-        return try await EluSQLiteRuntimeQueue.openCaptureRuntime(rootDirectoryURL: root, exactConstructorSiteKey: "elu_pk_test_aaaaaaaaaaaaaaaaaaaaaa", limits: limits, clock: { clock.read() }, continuousClock: { clock.ticks() }, continuousBudgetConverter: { clock.convert($0) }, configurationGate: gate, faultInjector: fault)
+        return try await EluSQLiteRuntimeQueue.openCaptureRuntime(rootDirectoryURL: root, exactConstructorSiteKey: "elu_pk_test_aaaaaaaaaaaaaaaaaaaaaa", endpointPolicy: endpointPolicy, limits: limits, clock: { clock.read() }, continuousClock: { clock.ticks() }, continuousBudgetConverter: { clock.convert($0) }, configurationGate: gate, faultInjector: fault)
     }
     func seedSessionForReopen(_ transform: (inout EluSessionState) -> Void) async throws {
         var identity = try await queue.snapshot().identity
@@ -699,7 +701,7 @@ final class DeliveryHarness: @unchecked Sendable {
         let data = try EluStateCoding.encoder().encode(identity)
         await queue.close()
         let namespace = try EluV1SiteNamespace.directoryComponent(exactConstructorSiteKey: "elu_pk_test_aaaaaaaaaaaaaaaaaaaaaa")
-        let path = root.appendingPathComponent(namespace).appendingPathComponent("runtime-state-v1.sqlite3").path
+        let path = endpointPolicy.storageRoot(under: root).appendingPathComponent(namespace).appendingPathComponent("runtime-state-v1.sqlite3").path
         var db: OpaquePointer?; XCTAssertEqual(sqlite3_open(path, &db), SQLITE_OK)
         var statement: OpaquePointer?; XCTAssertEqual(sqlite3_prepare_v2(db, "UPDATE runtime_state SET identity_json=? WHERE singleton=1", -1, &statement, nil), SQLITE_OK)
         let result = data.withUnsafeBytes { buffer -> Int32 in
@@ -712,7 +714,7 @@ final class DeliveryHarness: @unchecked Sendable {
     }
     func deliveryPrivacy(budget: Int = 0, eligible: Bool = false, sampled: Double = 0.99) async throws -> Data {
         let pair = EluV1ReplayTransportSelection(codec: "elu-browser-dom-v1", compression: .gzip)!
-        let manager = EluV1ConfigManager(readbackProvenReplayTransports: [pair])
+        let manager = EluV1ConfigManager(endpointPolicy: endpointPolicy, readbackProvenReplayTransports: [pair])
         _ = try manager.update(configData: config, now: now)
         let snapshot = try await queue.snapshot()
         let input = EluPrivacyProjectionInput(contextRevision: snapshot.identity.contextRevision, identityOptedOut: snapshot.identity.optedOut,
@@ -733,13 +735,13 @@ final class DeliveryHarness: @unchecked Sendable {
     }
     func sql(_ query: String) throws {
         let namespace = try EluV1SiteNamespace.directoryComponent(exactConstructorSiteKey: "elu_pk_test_aaaaaaaaaaaaaaaaaaaaaa")
-        let path = root.appendingPathComponent(namespace).appendingPathComponent("runtime-state-v1.sqlite3").path
+        let path = endpointPolicy.storageRoot(under: root).appendingPathComponent(namespace).appendingPathComponent("runtime-state-v1.sqlite3").path
         var db: OpaquePointer?; XCTAssertEqual(sqlite3_open(path, &db), SQLITE_OK); defer { sqlite3_close(db) }
         XCTAssertEqual(sqlite3_exec(db, query, nil, nil, nil), SQLITE_OK)
     }
     func storedBodyFromDisk() throws -> Data {
         let namespace = try EluV1SiteNamespace.directoryComponent(exactConstructorSiteKey: "elu_pk_test_aaaaaaaaaaaaaaaaaaaaaa")
-        let path = root.appendingPathComponent(namespace).appendingPathComponent("runtime-state-v1.sqlite3").path
+        let path = endpointPolicy.storageRoot(under: root).appendingPathComponent(namespace).appendingPathComponent("runtime-state-v1.sqlite3").path
         var db: OpaquePointer?; XCTAssertEqual(sqlite3_open(path, &db), SQLITE_OK); defer { sqlite3_close(db) }
         var statement: OpaquePointer?; XCTAssertEqual(sqlite3_prepare_v2(db,"SELECT body FROM replay_chunks ORDER BY ordinal",-1,&statement,nil),SQLITE_OK)
         defer { sqlite3_finalize(statement) }; XCTAssertEqual(sqlite3_step(statement),SQLITE_ROW)
@@ -749,7 +751,7 @@ final class DeliveryHarness: @unchecked Sendable {
     }
     func schemaVersion() throws -> Int64 {
         let namespace = try EluV1SiteNamespace.directoryComponent(exactConstructorSiteKey: "elu_pk_test_aaaaaaaaaaaaaaaaaaaaaa")
-        let path = root.appendingPathComponent(namespace).appendingPathComponent("runtime-state-v1.sqlite3").path
+        let path = endpointPolicy.storageRoot(under: root).appendingPathComponent(namespace).appendingPathComponent("runtime-state-v1.sqlite3").path
         var db: OpaquePointer?; XCTAssertEqual(sqlite3_open(path, &db), SQLITE_OK); defer { sqlite3_close(db) }
         var statement: OpaquePointer?; XCTAssertEqual(sqlite3_prepare_v2(db, "PRAGMA user_version", -1, &statement, nil), SQLITE_OK)
         defer { sqlite3_finalize(statement) }; XCTAssertEqual(sqlite3_step(statement), SQLITE_ROW)

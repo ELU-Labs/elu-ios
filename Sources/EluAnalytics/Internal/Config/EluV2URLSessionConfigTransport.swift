@@ -3,13 +3,18 @@ import Foundation
 /// The path credential stays on the configured ELU origin. Responses are never
 /// cached, redirects never followed, and non-200 bodies are never buffered.
 final class EluV2URLSessionConfigTransport: EluV2ConfigTransport, @unchecked Sendable {
+    private let expectedRequestURL: URL?
     private let protocolClasses: [AnyClass]?
 
-    init(protocolClasses: [AnyClass]? = nil) {
+    init(expectedRequestURL: URL? = nil, protocolClasses: [AnyClass]? = nil) {
+        self.expectedRequestURL = expectedRequestURL
         self.protocolClasses = protocolClasses
     }
 
     func fetch(_ request: EluV2ConfigRequest) async throws -> Data {
+        guard expectedRequestURL == nil || expectedRequestURL == request.url else {
+            throw EluV2ConfigSourceError.untrustedConfigHost
+        }
         var urlRequest = URLRequest(
             url: request.url,
             cachePolicy: .reloadIgnoringLocalAndRemoteCacheData,

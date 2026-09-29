@@ -13,9 +13,9 @@ import sys
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 PINNED = {
     "Sources/EluAnalytics/Elu.swift": "67b0731764a76d1406e326937e65cf0c0bed335117909a12cd755510bd0f2355",
-    "Sources/EluAnalytics/EluState.swift": "28465bf4a548ae779ca5c1e5fd3f30e419b1653d201ff6a7921da4aaaa8dbc65",
+    "Sources/EluAnalytics/EluState.swift": "2add60e3031db942911aab134130b40699c0b7fe1f7b10fc06945e694f4053a0",
     "Sources/EluAnalytics/EluConfigClient.swift": "152abfb01a6d0aa81e470d3185ecd4db3aeeef26d8626e67bab8f0a41e20d43d",
-    "Sources/EluAnalytics/Internal/Facade/EluRuntimeBackend.swift": "756b00a54d49488f9c1122b804b54d2ec0051a66119bb3e96ba90d8bf0460e5a",
+    "Sources/EluAnalytics/Internal/Facade/EluRuntimeBackend.swift": "8c18a53b440d1ea93b471b2cacf9a8ca6cc6a6c0c3ba6e350d2e9df5f44b3312",
     "Package.swift": "86701aa42833ddfff4b928e8ed59608cfe46f54e2765656f8166a75633219398",
     "Conformance/V1/manifest.json": "98152d8725c286f29402ba3e420bda8dd364200fb6fdf1cfe49b2da9b8f63e54",
 }
@@ -205,7 +205,7 @@ def scan_outside_source(path: pathlib.Path, text: str) -> list[str]:
         # One reviewed construction site, with no platform networking or direct
         # client/schema activation. Caller-supplied transports stay injectable.
         references = re.findall(rf"\b{FLAG_TRANSPORT_NAME}\b", text)
-        construction = re.findall(rf"\b{FLAG_TRANSPORT_NAME}\(siteKey: siteKey\)", text)
+        construction = re.findall(rf"\b{FLAG_TRANSPORT_NAME}\(siteKey: siteKey, endpointPolicy: endpointPolicy\)", text)
         if len(references) != 1 or len(construction) != 1:
             errors.append(f"{path} changed the exact owned flag transport construction")
         if re.search(r"\b(?:URLSession|URLRequest|NWConnection)\b|import\s+(?:Network|CFNetwork)\b", text):
@@ -234,7 +234,7 @@ def scan_outside_source(path: pathlib.Path, text: str) -> list[str]:
         owned_factory = (
             "openStack: { try await EluStandaloneStack.make( "
             "rootDirectoryURL: rootDirectoryURL, siteKey: siteKey, "
-            "configHost: context.configHost, performance: context.performance, diagnostics: context.diagnostics ) }, "
+            "configHost: context.configHost, endpointPolicy: context.endpointPolicy, performance: context.performance, diagnostics: context.diagnostics ) }, "
             "guardedFlagsDidLoad: context.guardedFlagsDidLoad"
         )
         if normalized.count(owned_factory) != 1:

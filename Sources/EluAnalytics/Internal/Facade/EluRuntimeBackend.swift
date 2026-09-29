@@ -88,6 +88,7 @@ struct EluRuntimeBackendContext {
     /// callbacks. Called from the backend's own execution context.
     let flagsDidLoad: () -> Void
     let configHost: URL
+    let endpointPolicy: EluEndpointPolicy
     let performance: EluPerformanceOptions
     let diagnostics: EluDiagnosticsOptions
     /// Installed synchronously by the constructor, then persisted before any
@@ -99,6 +100,7 @@ struct EluRuntimeBackendContext {
     init(siteKey: String, config: EluRemoteConfig? = nil, configDocument: Data? = nil,
          isNewUser: Bool, flagsDidLoad: @escaping () -> Void,
          configHost: URL = URL(string: "https://elu.dev")!,
+         endpointPolicy: EluEndpointPolicy = .cloud,
          performance: EluPerformanceOptions = .init(),
          diagnostics: EluDiagnosticsOptions = .init(),
          initialConsent: EluConsentOperation? = nil,
@@ -110,6 +112,7 @@ struct EluRuntimeBackendContext {
         self.isNewUser = isNewUser
         self.flagsDidLoad = flagsDidLoad
         self.configHost = configHost
+        self.endpointPolicy = endpointPolicy
         self.performance = performance
         self.diagnostics = diagnostics
         self.initialConsent = initialConsent

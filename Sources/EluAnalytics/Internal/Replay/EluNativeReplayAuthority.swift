@@ -206,7 +206,7 @@ actor EluNativeReplayAuthority {
         guard fence.current(invocation), original.isCurrent() else { throw EluNativeReplayAuthorityError.stale }
         let installed = try await queue.installNativeReplayPrivacy(original, privacy: privacy)
         guard fence.current(invocation), installed.source == source, installed.isCurrent() else { throw EluNativeReplayAuthorityError.stale }
-        let manager = EluV1ConfigManager(readbackProvenReplayTransports: capabilities.transports)
+        let manager = EluV1ConfigManager(endpointPolicy: queue.endpointPolicy, readbackProvenReplayTransports: capabilities.transports)
         _ = try manager.update(configData: source.data, now: clock())
         let resolution = try manager.authorize(effectivePrivacyStateData: privacy.stateData, identity: installed.identity, now: clock())
         guard fence.current(invocation), installed.isCurrent(), resolution.decisionHash == privacy.effectivePolicyHash,

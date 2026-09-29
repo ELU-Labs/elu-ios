@@ -63,15 +63,15 @@ final class EluNetworkObservationGate: @unchecked Sendable {
         guard foreground, mutations.isEmpty else { return }
         publication = Publication(context: context, current: current, emit: emit)
     }
-    func begin(_ request: URLRequest, excludedHost: String? = nil) -> EluNetworkObservation? {
+    func begin(_ request: URLRequest, excludedHost: String? = nil, excludedHosts: Set<String> = []) -> EluNetworkObservation? {
         guard let url = request.url, ["https", "http"].contains(url.scheme?.lowercased() ?? ""),
               let host = url.host?.lowercased(), !host.isEmpty,
-              host != excludedHost, host != "elu.dev", !host.hasSuffix(".elu.dev") else { return nil }
+              host != excludedHost, !excludedHosts.contains(host), host != "elu.dev", !host.hasSuffix(".elu.dev") else { return nil }
         lock.lock(); let value = publication; let token = generation; let allowed = foreground && mutations.isEmpty; lock.unlock()
         guard allowed, let value, value.current(), isCurrent(token), budget.take() else { return nil }
         let current: @Sendable () -> Bool = { [weak self] in self?.isCurrent(token) == true && value.current() }
         return EluNetworkObservation(method: request.httpMethod ?? "GET", now: now, current: current,
-                                     excludedHost: excludedHost) { fields in
+                                     excludedHost: excludedHost, excludedHosts: excludedHosts) { fields in
             value.emit(value.context, fields, current)
         }
     }
@@ -92,14 +92,16 @@ final class EluNetworkObservation: @unchecked Sendable {
     private let current: @Sendable () -> Bool
     private let emit: @Sendable ([String: EluJSONValue]) -> Void
     private let excludedHost: String?
+    private let excludedHosts: Set<String>
     init(method: String, now: @escaping @Sendable () -> UInt64,
          current: @escaping @Sendable () -> Bool,
-         excludedHost: String? = nil,
+         excludedHost: String? = nil, excludedHosts: Set<String> = [],
          emit: @escaping @Sendable ([String: EluJSONValue]) -> Void) {
         let normalized = method.uppercased()
         self.method = ["GET", "HEAD", "POST", "PUT", "DELETE", "CONNECT", "OPTIONS", "TRACE", "PATCH"].contains(normalized)
             ? normalized : "UNKNOWN"
         self.excludedHost = excludedHost
+        self.excludedHosts = excludedHosts
         self.now = now; self.current = current; self.emit = emit
     }
     func start() {
@@ -113,7 +115,7 @@ final class EluNetworkObservation: @unchecked Sendable {
         let ended = now()
         guard current(), ended >= began else { return }
         if let host = response?.url?.host?.lowercased(),
-           host == excludedHost || host == "elu.dev" || host.hasSuffix(".elu.dev") { return }
+           host == excludedHost || excludedHosts.contains(host) || host == "elu.dev" || host.hasSuffix(".elu.dev") { return }
         let elapsed = Double(ended - began) / 1_000_000
         guard elapsed.isFinite, elapsed <= 86_400_000 else { return }
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0

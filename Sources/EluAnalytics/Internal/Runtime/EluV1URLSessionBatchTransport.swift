@@ -5,9 +5,13 @@ import Foundation
 /// stops buffering as soon as the response ceiling is crossed.
 final class EluV1URLSessionBatchTransport: EluV1AuthorizedBatchTransport, @unchecked Sendable {
     private let slot = EluV1PhysicalTransportSlot()
+    private let endpointPolicy: EluEndpointPolicy
     private let protocolClasses: [AnyClass]?
 
-    init(protocolClasses: [AnyClass]? = nil) { self.protocolClasses = protocolClasses }
+    init(endpointPolicy: EluEndpointPolicy = .cloud, protocolClasses: [AnyClass]? = nil) {
+        self.endpointPolicy = endpointPolicy
+        self.protocolClasses = protocolClasses
+    }
 
     func send(_ request: EluV1BatchHTTPRequest) async throws -> EluV1BatchHTTPResponse {
         try await send(request, binding: nil)
@@ -23,13 +27,7 @@ final class EluV1URLSessionBatchTransport: EluV1AuthorizedBatchTransport, @unche
         try Task.checkCancellation()
         if let binding, !(await binding.revalidate()) { throw EluV1BoundTransportError.staleAuthority }
         try Task.checkCancellation()
-        guard EluV1Validation.isAbsoluteHTTPSURI(request.url.absoluteString),
-              let parts = URLComponents(url: request.url, resolvingAgainstBaseURL: false),
-              parts.scheme == "https", parts.host?.lowercased() == "ingest.elu.dev",
-              parts.port == nil || parts.port == 443,
-              parts.user == nil, parts.password == nil, parts.fragment == nil,
-              parts.percentEncodedPath == "/v1/events",
-              parts.queryItems?.contains(where: { $0.name == "site_key" }) != true,
+        guard endpointPolicy.endpoint(request.url.absoluteString, role: .events) != nil,
               !request.body.isEmpty,
               request.body.count <= EluV1BatchAuthorizationSnapshot.maximumBatchBytes,
               request.timeoutSeconds.isFinite,

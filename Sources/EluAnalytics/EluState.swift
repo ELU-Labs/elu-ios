@@ -27,6 +27,7 @@ final class EluCore {
     private var performance = EluPerformanceOptions()
     private var diagnostics = EluDiagnosticsOptions()
     private var configHost = URL(string: "https://elu.dev")!
+    private var endpointPolicy = EluEndpointPolicy.cloud
     private var buffer = EluEventBuffer()
     private var pendingConsent: EluConsentOperation?
     private var deliveredConsentId: UUID?
@@ -53,7 +54,8 @@ final class EluCore {
                 warn("setup() called with an empty siteKey — ignored")
                 return
             }
-            guard case let .approved(approvedConfigHost) = EluConfigHostAllowlist.resolve(options) else {
+            guard case let .approved(approvedConfigHost) = EluConfigHostAllowlist.resolve(options),
+                  let selectedEndpoints = try? EluEndpointPolicy(apiHost: options.apiHost) else {
                 warn("setup() called with an unapproved configHost — ignored")
                 return
             }
@@ -63,6 +65,7 @@ final class EluCore {
             self.siteKey = siteKey
             selection = options.runtimeSelection
             configHost = approvedConfigHost
+            endpointPolicy = selectedEndpoints
             performance = options.performance
             diagnostics = options.diagnostics
 
@@ -96,7 +99,7 @@ final class EluCore {
         EluRuntimeBackendContext(siteKey: siteKey, config: config, configDocument: document,
             isNewUser: isNewUser, flagsDidLoad: { [weak self] in
                 self?.dispatchFlagNotification(ifCurrent: { true })
-            }, configHost: configHost, performance: performance, diagnostics: diagnostics, initialConsent: initialConsent, guardedFlagsDidLoad: { [weak self] predicate in
+            }, configHost: configHost, endpointPolicy: endpointPolicy, performance: performance, diagnostics: diagnostics, initialConsent: initialConsent, guardedFlagsDidLoad: { [weak self] predicate in
                 self?.dispatchFlagNotification(ifCurrent: predicate)
             }, initialConfigurationReady: { [weak self] predicate in
                 guard let self else { return }

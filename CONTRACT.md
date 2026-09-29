@@ -17,6 +17,10 @@ origin: HTTPS with no explicit port, credentials, path beyond `/`, query, fragme
 or trailing-dot hostname. Undeclared origins are refused before runtime setup.
 This origin declaration does not itself authorize configuration or ingestion;
 the owned runtime's endpoint and configuration authority checks still apply.
+The declaration fixes the event, flag and replay API origin for this setup;
+remote configuration cannot widen it. Each role retains its maintained path,
+and transports refuse redirects. Durable stores are isolated by canonical
+self-hosted API origin and site key; the existing Cloud storage path is unchanged.
 
 The runtime obtains configuration from `GET /sdk/v2/<siteKey>/config`. An HTTP
 success alone does not authorize analytics: the document must pass validation

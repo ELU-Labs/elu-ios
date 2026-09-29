@@ -3322,6 +3322,7 @@ actor EluSQLiteRuntimeQueue {
     private let flagConfigManager: EluV1ConfigManager?
     private let exactConstructorSiteKey: String?
     private let ownerNamespaceHash: String?
+    nonisolated let endpointPolicy: EluEndpointPolicy
     private let continuousClock: @Sendable () -> UInt64
     private let continuousBudgetConverter: @Sendable (UInt64) -> UInt64?
     private let flagStoreEpochGenerator: @Sendable () -> String
@@ -3428,6 +3429,7 @@ actor EluSQLiteRuntimeQueue {
     static func openCaptureRuntime(
         rootDirectoryURL: URL,
         exactConstructorSiteKey: String,
+        endpointPolicy: EluEndpointPolicy = .cloud,
         limits: EluRuntimeQueueLimits,
         clock: @escaping @Sendable () -> Date = { Date() },
         continuousClock: @escaping @Sendable () -> UInt64 = EluMachContinuousClock.now,
@@ -3455,7 +3457,7 @@ actor EluSQLiteRuntimeQueue {
         let namespaceHash = try EluV1SiteNamespace.digest(
             exactConstructorSiteKey: exactConstructorSiteKey
         )
-        let directoryURL = rootDirectoryURL.appendingPathComponent(
+        let directoryURL = endpointPolicy.storageRoot(under: rootDirectoryURL).appendingPathComponent(
             "site-\(namespaceHash)",
             isDirectory: true
         )
@@ -3485,6 +3487,7 @@ actor EluSQLiteRuntimeQueue {
             databaseSchemaVersion: opened.databaseSchemaVersion,
             exactConstructorSiteKey: exactConstructorSiteKey,
             ownerNamespaceHash: namespaceHash,
+            endpointPolicy: endpointPolicy,
             continuousClock: continuousClock,
             continuousBudgetConverter: continuousBudgetConverter,
             nativeContinuousNanoseconds: nativeContinuousNanoseconds,
@@ -3569,6 +3572,7 @@ actor EluSQLiteRuntimeQueue {
         databaseSchemaVersion: Int64,
         exactConstructorSiteKey: String?,
         ownerNamespaceHash: String?,
+        endpointPolicy: EluEndpointPolicy = .cloud,
         continuousClock: @escaping @Sendable () -> UInt64,
         continuousBudgetConverter: @escaping @Sendable (UInt64) -> UInt64?,
         nativeContinuousNanoseconds: @escaping @Sendable (UInt64) -> UInt64? = EluV2ConfigClock.live.floorNanoseconds,
@@ -3593,9 +3597,10 @@ actor EluSQLiteRuntimeQueue {
         flagCacheDeadline = nil
         self.exactConstructorSiteKey = exactConstructorSiteKey
         self.ownerNamespaceHash = ownerNamespaceHash
-        captureConfigManager = ownerNamespaceHash == nil ? nil : EluV1ConfigManager(readbackProvenReplayTransports: EluStandaloneRuntime.readbackProvenReplayCapabilities.transports)
+        self.endpointPolicy = endpointPolicy
+        captureConfigManager = ownerNamespaceHash == nil ? nil : EluV1ConfigManager(endpointPolicy: endpointPolicy, readbackProvenReplayTransports: EluStandaloneRuntime.readbackProvenReplayCapabilities.transports)
         flagConfigManager = exactConstructorSiteKey.flatMap {
-            try? EluV1ConfigManager(exactConstructorSiteKey: $0, readbackProvenReplayTransports: EluStandaloneRuntime.readbackProvenReplayCapabilities.transports)
+            try? EluV1ConfigManager(exactConstructorSiteKey: $0, endpointPolicy: endpointPolicy, readbackProvenReplayTransports: EluStandaloneRuntime.readbackProvenReplayCapabilities.transports)
         }
         self.continuousClock = continuousClock
         self.continuousBudgetConverter = continuousBudgetConverter
@@ -4229,7 +4234,7 @@ actor EluSQLiteRuntimeQueue {
     ) throws -> Int {
         replayDispatchFence.invalidate()
         guard EluSQLiteRuntimeSchema.hasReplay(databaseSchemaVersion), sourceIsCurrent(sourceWitness, data: configData) else { throw EluRuntimeQueueError.sourceAuthorityUnavailable }
-        let manager = EluV1ConfigManager(readbackProvenReplayTransports: EluStandaloneRuntime.readbackProvenReplayCapabilities.transports)
+        let manager = EluV1ConfigManager(endpointPolicy: endpointPolicy, readbackProvenReplayTransports: EluStandaloneRuntime.readbackProvenReplayCapabilities.transports)
         _ = try manager.update(configData: configData, now: clock())
         guard let candidate = manager.validatedCandidateIdentity(), candidate.issuedAt == expectedConfigWitness.issuedAt,
               candidate.semanticHash == expectedConfigWitness.semanticHash else { throw EluRuntimeQueueError.generationMismatch }
@@ -4415,7 +4420,7 @@ actor EluSQLiteRuntimeQueue {
         let observation = EluSealedReplayPolicyObservation(source: source, identity: identitySnapshot,
             isCurrent: { scope.check(scopeToken) { event.check(eventToken) { gate.isCurrent(source, data: source.data) } } })
         guard observation.isCurrent() else { return nil }
-        let manager = EluV1ConfigManager(readbackProvenReplayTransports: capabilities.transports)
+        let manager = EluV1ConfigManager(endpointPolicy: endpointPolicy, readbackProvenReplayTransports: capabilities.transports)
         let update = try manager.update(configData: source.data, now: clock())
         guard let candidate = manager.validatedCandidateIdentity(), observation.isCurrent() else { return nil }
         let configWitness = EluV2ReplayConfigWitness(issuedAt: candidate.issuedAt, semanticHash: candidate.semanticHash)
@@ -4466,7 +4471,7 @@ actor EluSQLiteRuntimeQueue {
         mayRetainProfile: @escaping @Sendable (Data) -> Bool
     ) throws -> EluV2ReplayDeliveryAuthority? {
         guard EluSQLiteRuntimeSchema.hasReplayDelivery(databaseSchemaVersion), sourceIsCurrent(sourceWitness, data: configData) else { return nil }
-        let manager = EluV1ConfigManager(readbackProvenReplayTransports: readbackProvenTransports)
+        let manager = EluV1ConfigManager(endpointPolicy: endpointPolicy, readbackProvenReplayTransports: readbackProvenTransports)
         _ = try manager.update(configData: configData, now: clock())
         guard let policy = try manager.authorizeSealedReplayDelivery(effectivePrivacyStateData: effectivePrivacyStateData, identity: identitySnapshot, now: clock()),
               EluV2ReplayText.equal(policy.protocolGeneration, supportedProtocolGeneration),

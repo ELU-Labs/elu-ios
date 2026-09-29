@@ -5,9 +5,13 @@ import Foundation
 /// stops buffering as soon as the response ceiling is crossed.
 final class EluV2URLSessionReplayTransport: EluV2ReplayHTTPTransport, @unchecked Sendable {
     private let slot = EluV1PhysicalTransportSlot()
+    private let endpointPolicy: EluEndpointPolicy
     private let protocolClasses: [AnyClass]?
 
-    init(protocolClasses: [AnyClass]? = nil) { self.protocolClasses = protocolClasses }
+    init(endpointPolicy: EluEndpointPolicy = .cloud, protocolClasses: [AnyClass]? = nil) {
+        self.endpointPolicy = endpointPolicy
+        self.protocolClasses = protocolClasses
+    }
 
     func send(_ dispatch: EluV2ReplayDispatch) async throws -> EluV1BatchHTTPResponse {
         guard let use = dispatch.takePhysicalUse() else { throw EluV1BoundTransportError.occupied }
@@ -19,13 +23,7 @@ final class EluV2URLSessionReplayTransport: EluV2ReplayHTTPTransport, @unchecked
         try Task.checkCancellation()
         if !(await binding.revalidate()) { throw EluV1BoundTransportError.staleAuthority }
         try Task.checkCancellation()
-        guard EluV1Validation.isAbsoluteHTTPSURI(request.url.absoluteString),
-              let parts = URLComponents(url: request.url, resolvingAgainstBaseURL: false),
-              parts.scheme == "https", parts.host?.lowercased() == "ingest.elu.dev",
-              parts.port == nil || parts.port == 443,
-              parts.user == nil, parts.password == nil, parts.fragment == nil,
-              parts.percentEncodedPath == "/v2/replay",
-              parts.queryItems?.contains(where: { $0.name == "site_key" }) != true,
+        guard endpointPolicy.endpoint(request.url.absoluteString, role: .replay) != nil,
               Set(request.headers.keys) == ["Authorization", "Content-Type"],
               request.headers["Content-Type"] == "application/json",
               request.headers["Authorization"]?.range(of: #"\ABearer elu_pk_(live|test)_[A-Za-z0-9]{22,64}\z"#, options: .regularExpression) != nil,
