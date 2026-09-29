@@ -81,6 +81,25 @@ final class EluNativeReplayLifecycle: @unchecked Sendable {
     private var reevaluate: (@Sendable () -> Void)?
     private var privacyChanged: (@Sendable () -> Void)?
 
+    #if canImport(UIKit)
+    private let windowInventory: @MainActor @Sendable () -> [UIWindow]?
+    #endif
+
+    init() {
+        #if canImport(UIKit)
+        // Resolve current application state on every pass, never a saved inventory.
+        windowInventory = { Self.applicationWindowInventory() }
+        #endif
+    }
+
+    #if canImport(UIKit)
+    /// Internal init-only fixture seam for hostless runners. It supplies raw
+    /// candidates only; all selection and currentness checks remain downstream.
+    init(windowInventoryForTesting: @escaping @MainActor @Sendable () -> [UIWindow]?) {
+        windowInventory = windowInventoryForTesting
+    }
+    #endif
+
     func observePrivacyChange(_ listener: (@Sendable () -> Void)?) {
         lock.lock(); privacyChanged = listener; lock.unlock()
     }
@@ -143,8 +162,8 @@ final class EluNativeReplayLifecycle: @unchecked Sendable {
         return .available
     }
 
-    /// Main-only discovery never loads a view or chooses the first ambiguous window.
-    @MainActor fileprivate func discoveredRoot() -> (UIView, UIWindow)? {
+    /// Production inventory remains the current public application/scene view.
+    @MainActor private static func applicationWindowInventory() -> [UIWindow]? {
         let application = UIApplication.shared
         let scenes = application.connectedScenes.filter { $0.activationState == .foregroundActive }
         let windows: [UIWindow]
@@ -152,6 +171,12 @@ final class EluNativeReplayLifecycle: @unchecked Sendable {
         else if scenes.isEmpty, application.connectedScenes.isEmpty, application.applicationState == .active {
             windows = application.windows
         } else { return nil }
+        return windows
+    }
+
+    /// Main-only discovery never loads a view or chooses the first ambiguous window.
+    @MainActor fileprivate func discoveredRoot() -> (UIView, UIWindow)? {
+        guard let windows = windowInventory() else { return nil }
         let eligible = windows.filter { $0.isKeyWindow && !$0.isHidden && $0.alpha == 1 && $0.windowLevel == .normal }
         guard eligible.count == 1, let window = eligible.first,
               let controller = window.rootViewController, controller.presentedViewController == nil,

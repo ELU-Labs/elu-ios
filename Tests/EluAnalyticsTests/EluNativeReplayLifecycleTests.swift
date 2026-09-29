@@ -125,9 +125,10 @@ final class EluNativeReplayLifecycleTests: XCTestCase {
     }
 
     @MainActor func testRootReadinessIsReadOnlyAcrossReplacementHiddenAndPresentedRoots() async throws {
-        let lifecycle = EluNativeReplayLifecycle(), attachment = UUID(), calls = NativeLifecycleCalls()
-        lifecycle.attached(attachment); lifecycle.observeWithdrawal { calls.increment() }
+        let attachment = UUID(), calls = NativeLifecycleCalls()
         let window = try activeWindow(), previous = window.rootViewController, first = UIViewController()
+        let lifecycle = EluNativeReplayLifecycle(windowInventoryForTesting: EluUIKitTestHost.inventory(for: window))
+        lifecycle.attached(attachment); lifecycle.observeWithdrawal { calls.increment() }
         first.view = UIView(frame: window.bounds); window.rootViewController = first
         defer { lifecycle.close(); window.rootViewController = previous }
         // Unlike explicit-root fixtures, discovery requires the sole key window
@@ -151,6 +152,26 @@ final class EluNativeReplayLifecycleTests: XCTestCase {
         XCTAssertEqual(lifecycle.observeRootReadiness(), .available)
         window.rootViewController = nil; XCTAssertEqual(lifecycle.observeRootReadiness(), .waiting)
         lifecycle.detached(attachment); XCTAssertEqual(lifecycle.observeRootReadiness(), .inactive)
+    }
+
+    @MainActor func testInjectedInventoryRejectsAbsentAndDuplicateWindowCandidates() throws {
+        let window = try activeWindow(), previous = window.rootViewController
+        let controller = UIViewController(); controller.view = UIView(frame: window.bounds)
+        window.rootViewController = controller; window.windowLevel = .normal; window.alpha = 1
+        window.makeKeyAndVisible(); window.layoutIfNeeded(); controller.view.layoutIfNeeded(); CATransaction.flush()
+        defer { window.rootViewController = previous }
+        let unavailable = EluNativeReplayLifecycle(windowInventoryForTesting: { nil })
+        let empty = EluNativeReplayLifecycle(windowInventoryForTesting: { [] })
+        let duplicate = EluNativeReplayLifecycle(windowInventoryForTesting: { [window, window] })
+        let original = EluNativeReplayLifecycle(windowInventoryForTesting: EluUIKitTestHost.inventory(for: window))
+        defer { [unavailable, empty, duplicate, original].forEach { $0.close() } }
+        for lifecycle in [unavailable, empty, duplicate, original] { lifecycle.attached(UUID()) }
+        XCTAssertEqual(original.observeRootReadiness(), .available)
+        XCTAssertNotNil(original.selectCurrentRoot(reusing: nil))
+        for lifecycle in [unavailable, empty, duplicate] {
+            XCTAssertEqual(lifecycle.observeRootReadiness(), .waiting)
+            XCTAssertNil(lifecycle.selectCurrentRoot(reusing: nil))
+        }
     }
 
     @MainActor private func settleDiscoveredRoot(_ controller: UIViewController, in window: UIWindow,

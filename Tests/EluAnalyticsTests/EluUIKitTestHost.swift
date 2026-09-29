@@ -2,8 +2,10 @@
 import UIKit
 import XCTest
 
-/// Own a visible test window when the local Swift package runner has no scenes.
-/// This uses the same legacy application-window path supported by the SDK.
+/// Own an actual visible UIKit window. A hostless Swift package runner may attach
+/// a scene without listing the window in UIApplication's public inventory. The
+/// continuity fixtures inject this original window explicitly; default application
+/// discovery remains a separate real hosted/Lab qualification gate.
 @MainActor
 enum EluUIKitTestHost {
     private static var retainedWindow: UIWindow?
@@ -18,6 +20,11 @@ enum EluUIKitTestHost {
         XCTAssertEqual(UIApplication.shared.applicationState, .active)
         retainedWindow = window
         return window
+    }
+
+    /// Weak original candidates only, with no selected-root or permission override.
+    static func inventory(for window: UIWindow) -> @MainActor @Sendable () -> [UIWindow]? {
+        { [weak window] in window.map { [$0] } }
     }
 
     /// Failure-only public fixture facts. No view text, object descriptions,

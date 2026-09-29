@@ -462,7 +462,8 @@ final class EluNativeReplayCompositionTests: XCTestCase {
             throw EluRuntimeQueueError.invalidState
         }
         let queue = try XCTUnwrap(Mirror(reflecting: runtime).children.first { $0.label == "queue" }?.value as? EluSQLiteRuntimeQueue)
-        let lifecycle = EluNativeReplayLifecycle(); lifecycle.attached(UUID()); runtime.bindNativeLifecycle(lifecycle)
+        let lifecycle = EluNativeReplayLifecycle(windowInventoryForTesting: EluUIKitTestHost.inventory(for: window))
+        lifecycle.attached(UUID()); runtime.bindNativeLifecycle(lifecycle)
         let transport = CompositionTransport {}
         let installed = await runtime.installNativeReplayComposition(lifecycle: lifecycle, capabilities: h.proof,
             deferredUntilActivation: true, transport: transport)
@@ -470,8 +471,9 @@ final class EluNativeReplayCompositionTests: XCTestCase {
         let fixture = CompositionUIKitFixture(h: h, runtime: runtime, queue: queue, lifecycle: lifecycle,
             composition: composition, transport: transport, window: window, previous: previous, controller: controller)
         do {
-            // Direct-root collector fixtures do not require key-window discovery. This
-            // composition does: establish the original public UIKit host before activation.
+            // This hostless fixture supplies only its original real window. The
+            // composition still selects/checks the key window and attached root.
+            // Default UIApplication discovery is not qualified by this fixture.
             window.windowLevel = .normal; window.alpha = 1
             window.makeKeyAndVisible()
             window.setNeedsLayout(); window.layoutIfNeeded(); controller.view.layoutIfNeeded()
