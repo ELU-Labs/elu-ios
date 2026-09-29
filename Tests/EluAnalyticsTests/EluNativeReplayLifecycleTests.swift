@@ -146,9 +146,18 @@ final class EluNativeReplayLifecycleTests: XCTestCase {
         next.view.isHidden = true; XCTAssertEqual(lifecycle.observeRootReadiness(), .waiting)
         next.view.isHidden = false
         let modal = UIViewController(); modal.view = UIView(frame: window.bounds)
-        await withCheckedContinuation { continuation in next.present(modal, animated: false) { continuation.resume() } }
+        // Hostless UIKit may not run presentation completion callbacks. The
+        // lifecycle guard consumes these public relationships, so wait for those
+        // actual relationships with a bounded deadline instead of suspending on
+        // an unbounded animation-completion continuation.
+        defer { next.dismiss(animated: false) }
+        next.present(modal, animated: false)
+        try await settlePresentationRelationship(modal, presenter: next, in: window,
+            presented: true, lifecycle: lifecycle, stage: "modal relationship installed")
         XCTAssertEqual(lifecycle.observeRootReadiness(), .waiting)
-        await withCheckedContinuation { continuation in next.dismiss(animated: false) { continuation.resume() } }
+        next.dismiss(animated: false)
+        try await settlePresentationRelationship(modal, presenter: next, in: window,
+            presented: false, lifecycle: lifecycle, stage: "modal relationship removed")
         XCTAssertEqual(lifecycle.observeRootReadiness(), .available)
         window.rootViewController = nil; XCTAssertEqual(lifecycle.observeRootReadiness(), .waiting)
         lifecycle.detached(attachment); XCTAssertEqual(lifecycle.observeRootReadiness(), .inactive)
@@ -193,6 +202,26 @@ final class EluNativeReplayLifecycleTests: XCTestCase {
         throw NativeLifecycleFixtureFailure(stage: stage,
             diagnostics: EluUIKitTestHost.readinessDiagnostics(window: window, controller: controller) +
                 ";lifecycleReadiness=\(lifecycle.observeRootReadiness())")
+    }
+
+    @MainActor private func settlePresentationRelationship(_ modal: UIViewController,
+        presenter: UIViewController, in window: UIWindow, presented: Bool,
+        lifecycle: EluNativeReplayLifecycle, stage: String) async throws {
+        let start = DispatchTime.now().uptimeNanoseconds
+        while DispatchTime.now().uptimeNanoseconds - start < 6_000_000_000 {
+            let exact = presented
+                ? presenter.presentedViewController === modal && modal.presentingViewController === presenter
+                : presenter.presentedViewController == nil && modal.presentingViewController == nil
+            if window.rootViewController === presenter, presenter.viewIfLoaded?.window === window, exact {
+                return
+            }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        throw NativeLifecycleFixtureFailure(stage: stage,
+            diagnostics: EluUIKitTestHost.readinessDiagnostics(window: window, controller: presenter) +
+                ";lifecycleReadiness=\(lifecycle.observeRootReadiness())" +
+                ";expectedPresented=\(presented);exactPresented=\(presenter.presentedViewController === modal)" +
+                ";exactPresenter=\(modal.presentingViewController === presenter)")
     }
 
     @MainActor private func activeWindow() throws -> UIWindow {
