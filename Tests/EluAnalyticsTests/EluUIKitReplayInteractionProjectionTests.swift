@@ -90,8 +90,13 @@ final class EluUIKitReplayInteractionProjectionTests: XCTestCase {
         field.removeFromSuperview()
         let opaque = InteractionOpaqueView(frame: CGRect(x: 10, y: 10, width: 100, height: 100))
         root.addSubview(opaque); settle()
-        XCTAssertNil(point(try XCTUnwrap(projection(1))))
-        XCTAssertEqual(opaque.childReads, 0)
+        // UIKit setup/layout may inspect this test view. Measure only the SDK
+        // collection and subsequent no-content projection proof below.
+        opaque.childReads = 0
+        let opaqueProjection = try XCTUnwrap(projection(1))
+        XCTAssertEqual(opaque.childReads, 0, "Collection must not open opaque children")
+        XCTAssertNil(point(opaqueProjection))
+        XCTAssertEqual(opaque.childReads, 0, "Point validation must not open opaque children")
     }
 
     func testUnclippedCustomOverflowVetoesLawfulSiblingWithoutOpeningPrivateChildren() throws {
@@ -226,9 +231,11 @@ final class EluUIKitReplayInteractionProjectionTests: XCTestCase {
         cell.contentView.addSubview(ordinary)
         let overlay = InteractionOpaqueView(frame: cell.bounds)
         cell.addSubview(overlay); settle()
+        overlay.childReads = 0 // Exclude the preceding real UIKit layout only.
         let original = try XCTUnwrap(projection())
+        XCTAssertEqual(overlay.childReads, 0, "Collection must not open the opaque overlay")
         XCTAssertNil(point(original))
-        XCTAssertEqual(overlay.childReads, 0)
+        XCTAssertEqual(overlay.childReads, 0, "Point validation must not open the opaque overlay")
     }
 
     func testWithdrawnCollectorAndForeignSnapshotCannotSupplyWitness() throws {
