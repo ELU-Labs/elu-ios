@@ -18,15 +18,24 @@ final class EluNativeReplayInteractionCaptureTests: XCTestCase {
         let safe = UIView(frame: CGRect(x: 10, y: 0, width: 100, height: 300))
         scroll.addSubview(safe); fixture.root.addSubview(scroll)
         fixture.root.layoutIfNeeded(); CATransaction.flush()
+        let originalChildren = scroll.subviews.prefix(17).map(ObjectIdentifier.init)
         let owner = try start(fixture)
+        let diagnostics = {
+            ReplayScrollFixtureDiagnostics.describe(root: fixture.root, scroll: scroll, target: safe,
+                originalChildren: originalChildren) +
+                ";collectedFrames=\(owner.collectedFrameCountForTesting());recording=\(owner.isRecording())" +
+                ";observerPresent=\(self.observer(fixture.window) != nil)" +
+                ";observerOrdinal=\(self.observer(fixture.window)?.originalProjectionOrdinal ?? -1)" +
+                ";contactActive=\(self.observer(fixture.window)?.contactIsActive == true)"
+        }
         var settled = false
         defer { fixture.removeWindow(); if settled { h.base.remove() } }
         do {
-            try await wait { owner.collectedFrameCountForTesting() == 1 }
+            try await wait("initial original geometry", diagnostics: diagnostics) { owner.collectedFrameCountForTesting() == 1 }
             XCTAssertNil(observer(fixture.window))
             let early = try await h.queue.storedReplayChunks(); XCTAssertTrue(early.isEmpty)
             h.base.testClock.advance(3)
-            try await wait { self.observer(fixture.window) != nil }
+            try await wait("known minimum-qualified commit installs observer", diagnostics: diagnostics) { self.observer(fixture.window) != nil }
             let first = try await h.queue.storedReplayChunks()
             XCTAssertEqual(first.count, 1)
             let original = try XCTUnwrap(observer(fixture.window)), finger = NSObject()
@@ -34,7 +43,7 @@ final class EluNativeReplayInteractionCaptureTests: XCTestCase {
             original.observeForTesting(fact(.began, finger), originalView: safe) {}
             h.base.testClock.advance(0.25)
             original.observeForTesting(fact(.moved, finger), originalView: safe) { scroll.contentOffset.y = 20 }
-            try await wait { owner.collectedFrameCountForTesting() >= 3 }
+            try await wait("first geometry after original scroll delivery", diagnostics: diagnostics) { owner.collectedFrameCountForTesting() >= 3 }
             XCTAssertTrue(observer(fixture.window) === original)
             h.base.testClock.advance(0.25)
             original.observeForTesting(fact(.moved, finger, y: 60), originalView: safe) {}
@@ -271,11 +280,13 @@ final class EluNativeReplayInteractionCaptureTests: XCTestCase {
         .init(phase: phase, identity: ObjectIdentifier(finger), location: CGPoint(x: 50, y: y),
             liveDirectTouches: phase == .ended ? 0 : 1, allTouchesLifted: phase == .ended)
     }
-    private func wait(_ predicate: () async throws -> Bool) async throws {
+    private func wait(_ phase: String = "original capture condition", diagnostics: (() -> String)? = nil,
+                      _ predicate: () async throws -> Bool) async throws {
         let start = DispatchTime.now().uptimeNanoseconds
         while DispatchTime.now().uptimeNanoseconds - start < 6_000_000_000 {
             if try await predicate() { return }; try await Task.sleep(nanoseconds: 20_000_000)
         }
+        if let diagnostics { throw InteractionCaptureWaitFailure(phase: phase, diagnostics: diagnostics()) }
         throw EluNativeReplayCaptureError.settlementPending
     }
     private func decoded(_ request: EluV2ReplayPreparedRequest) throws -> [[String: Any]] {
@@ -293,6 +304,14 @@ final class EluNativeReplayInteractionCaptureTests: XCTestCase {
         } }
         guard result == Z_STREAM_END else { throw EluNativeReplaySealingError.compression }
         return try XCTUnwrap(JSONSerialization.jsonObject(with: Data(output.prefix(Int(stream.total_out)))) as? [[String: Any]])
+    }
+}
+
+private struct InteractionCaptureWaitFailure: Error, CustomStringConvertible {
+    let phase: String
+    let diagnostics: String?
+    var description: String {
+        "Timed out waiting for interaction fixture phase: \(phase)" + (diagnostics.map { ";" + $0 } ?? "")
     }
 }
 #endif

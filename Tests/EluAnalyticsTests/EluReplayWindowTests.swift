@@ -71,6 +71,8 @@ final class EluReplayWindowTests: XCTestCase {
         let safe = UIView(frame: CGRect(x: 10, y: 0, width: 100, height: 300))
         scroll.addSubview(safe); root.addSubview(scroll); settle()
         let (initial, firstProjection) = try frame(0)
+        let originalChildren = scroll.subviews.prefix(17).map(ObjectIdentifier.init)
+        let originalWitness = try XCTUnwrap(collector.collectedInteractionProjection(for: initial))
         var encoder = try EluNativeWireframeV2Encoder(profile: .sensitiveMask())
         _ = try encoder.encode([.geometry(initial, continuous: 1_000_000_000)])
         let mailbox = EluNativeReplayInteractionMailbox(), value = observer(firstProjection, mailbox), finger = NSObject()
@@ -81,7 +83,15 @@ final class EluReplayWindowTests: XCTestCase {
         value.observeForTesting(fact(.moved, finger), originalView: safe) {
             deliveries += 1; scroll.contentOffset.y = 20
         }
-        let old = try XCTUnwrap(value.drainCurrent())
+        let old = try XCTUnwrap(value.drainCurrent(),
+            "Old points after original scroll delivery;" + ReplayScrollFixtureDiagnostics.describe(
+                root: root, scroll: scroll, target: safe, originalChildren: originalChildren) +
+            ";strictWitnessCurrent=\(originalWitness.isCurrent(deadline: 100, now: { 0 }))" +
+            ";geometryWitnessCurrent=\(originalWitness.isCurrent(deadline: 100, now: { 0 }, allowingGeometry: true))" +
+            ";currentGeometryAvailable=\(originalWitness.currentGeometry(deadline: 100, now: { 0 }) != nil)" +
+            ";currentPointAvailable=\(firstProjection.point(location: CGPoint(x: 50, y: 50),
+                time: .init(timestamp: wall, continuous: UInt64(wall) * 1_000_000), deadline: 100, now: { 0 }) != nil)" +
+            ";observerOrdinalAvailable=\(value.originalProjectionOrdinal != nil);contactActive=\(value.contactIsActive)")
         XCTAssertEqual(old.count, 2)
         XCTAssertTrue(value.contactIsActive)
         XCTAssertEqual(scroll.contentOffset.y, 20)
@@ -135,6 +145,48 @@ final class EluReplayWindowTests: XCTestCase {
         XCTAssertNotNil(collector.collectedInteractionProjection(for: initial), "Queries must retain original identity and ordinal")
         live = false; collector.withdraw()
         XCTAssertNil(projection.point(location: CGPoint(x: 50, y: 50), time: time, deadline: 100, now: { 0 }))
+    }
+}
+
+/// Failure-only diagnostics shared by the two real-scroll fixtures. No text,
+/// class names, view identifiers or child content is emitted. Identity values
+/// stay local solely to compare the original ordered direct children.
+@MainActor
+enum ReplayScrollFixtureDiagnostics {
+    static func describe(root: UIView, scroll: UIScrollView, target: UIView,
+                         originalChildren: [ObjectIdentifier]) -> String {
+        let children = scroll.subviews
+        let sameOrder = children.count == originalChildren.count && children.count <= 16 &&
+            zip(children, originalChildren).allSatisfy { ObjectIdentifier($0.0) == $0.1 }
+        var facts = [
+            "rootAttached=\(root.window != nil)", "scrollParentOriginal=\(scroll.superview === root)",
+            "targetParentOriginal=\(target.superview === scroll)", "sameWindow=\(scroll.window === root.window && target.window === root.window)",
+            "originalChildren=\(min(originalChildren.count, 17))", "currentChildren=\(min(children.count, 17))",
+            "sameOrderedChildren=\(sameOrder)", "targetInChildren=\(children.prefix(16).contains { $0 === target })",
+            "offsetX=\(number(scroll.contentOffset.x))", "offsetY=\(number(scroll.contentOffset.y))",
+            "zoomIsOne=\(scroll.zoomScale == 1)", "dragging=\(scroll.isDragging)", "decelerating=\(scroll.isDecelerating)"
+        ]
+        facts += viewFacts("root", root) + viewFacts("scroll", scroll) + viewFacts("target", target)
+        for (index, child) in children.prefix(16).enumerated() { facts += viewFacts("child\(index)", child) }
+        return facts.joined(separator: ";")
+    }
+
+    private static func number(_ value: CGFloat) -> Double {
+        value.isFinite ? Double(max(-100_000, min(value, 100_000))) : 0
+    }
+
+    private static func viewFacts(_ prefix: String, _ view: UIView) -> [String] {
+        let layer = view.layer
+        return [
+            "\(prefix)Hidden=\(view.isHidden)", "\(prefix)AlphaOne=\(view.alpha == 1)", "\(prefix)AlphaZero=\(view.alpha == 0)",
+            "\(prefix)TransformIdentity=\(view.transform.isIdentity)", "\(prefix)LayerTransformIdentity=\(CATransform3DIsIdentity(layer.transform))",
+            "\(prefix)SublayerTransformIdentity=\(CATransform3DIsIdentity(layer.sublayerTransform))",
+            "\(prefix)ZZero=\(layer.zPosition == 0)", "\(prefix)OpacityOne=\(layer.opacity == 1)",
+            "\(prefix)HasMask=\(layer.mask != nil)", "\(prefix)AnimationCount=\(min(layer.animationKeys()?.count ?? 0, 17))",
+            "\(prefix)Clips=\(view.clipsToBounds)", "\(prefix)Masks=\(layer.masksToBounds)", "\(prefix)CornerZero=\(layer.cornerRadius == 0)",
+            "\(prefix)Restricted=\(view.eluReplayRestriction != nil)", "\(prefix)BoundsX=\(number(view.bounds.minX))",
+            "\(prefix)BoundsY=\(number(view.bounds.minY))", "\(prefix)Width=\(number(view.bounds.width))", "\(prefix)Height=\(number(view.bounds.height))"
+        ]
     }
 }
 #endif
