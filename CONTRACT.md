@@ -240,3 +240,18 @@ qualification separately requires exact distribution checks, supported upgrades,
 device testing, Lab engine readback and customer-player rendering, privacy and
 resource measurements. Compilation or stored replay bytes alone are not those
 checks.
+
+
+Capture admission uses `EluRateLimitingOptions` (default 10/second, burst 100),
+scoped to the site and canonical API base. The independently persisted bucket
+survives identity/reset/consent changes; `.memory` retains it only for that SQL
+connection. Consent/configuration and duplicate-exposure checks precede debit;
+canonical event validation, enrichment and quota follow it without refunds.
+Identity mutations/replay chunks are exempt. One ordinary authorized
+`$$client_ingestion_warning` is attempted on transition into limiting, bypassing
+only the limiter; customer events cannot request that bypass. Warnings from
+passive native telemetry cannot create or extend its existing session. Constructor checks
+consume no token, backward wall time accrues debt, and ambiguous SQL commits
+stop the owner. Bounded native JSON conversion precedes actor admission; there
+are no native customer capture hooks. See README for persistence fallback and
+warning omission behavior.

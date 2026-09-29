@@ -73,6 +73,7 @@ enum EluV1CaptureRejection: Equatable, Sendable {
     case optedOut
     case invalidEvent
     case queueLimit
+    case rateLimited
     case exposureAlreadyRecorded
     case exposureLedgerFull
     case storageProvenNotCommitted

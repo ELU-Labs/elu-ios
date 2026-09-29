@@ -245,6 +245,45 @@ When analytics is disabled or a device is EU-blocked, `Elu.*` event calls are
 no-ops and no analytics events or replay leave the device. ELU config checks
 continue so a re-enabled site can recover.
 
+
+### Capture rate limiting
+
+The default site/API-base token bucket allows 10 events per second with a burst
+of 100. Configure it before setup without changing existing initializer forms:
+
+```swift
+var options = EluSetupOptions()
+options.rateLimiting = EluRateLimitingOptions(eventsPerSecond: 5, eventsBurstLimit: 25)
+Elu.setup(siteKey: "<SITE_KEY>", options: options)
+```
+
+Positive finite fractional rates are supported; invalid values use defaults and
+burst is clamped to at least the rate. Captures, screens, manual exceptions,
+accepted lifecycle calls, flag exposures and native numeric telemetry share the
+bucket. Identity/group/property mutations and replay chunks do not consume it.
+Duplicate flag exposures are rejected before a token is taken. Current consent
+and configuration are required; rate limiting never grants capture permission.
+
+A token is taken before canonical event validation, enrichment or queue admission
+and is not refunded if those later steps reject the event. Customer `Any`/`Error`
+values are converted to bounded JSON before crossing into the runtime; this SDK
+has no customer capture-hook API. On the first limited call after accepted calls,
+the SDK attempts one `$$client_ingestion_warning` through normal event authority
+and storage, bypassing only its own limiter. Consecutive drops do not repeat it;
+warning delivery is not guaranteed if consent, configuration or storage rejects it.
+A customer event with that name still consumes a token. Warnings triggered by
+passive native telemetry retain its existing-session requirement and do not
+extend user-activity time.
+
+Persistent mode keeps bucket state across restarts, identify, reset (including
+device reset), and consent changes. Memory mode discards the bucket with the
+analytics connection and does not change a dormant persistent bucket. Wall-clock
+regression creates token debt; forward refill stops at the burst limit. Startup
+refills/checks the bucket without consuming a token or repeating an existing
+limited-state warning. Known storage read/write failures use an in-process
+fallback as in the browser; a later readable durable bucket takes precedence.
+An ambiguous SQL commit stops the owner instead of continuing with fresh state.
+
 ## Remote-controlled vs baked-in
 
 Controlled from the ELU dashboard without an app update. Changes apply after

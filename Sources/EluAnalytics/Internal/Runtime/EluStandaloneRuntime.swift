@@ -257,6 +257,7 @@ actor EluStandaloneRuntime {
         diagnostics: EluDiagnosticsOptions = .init(),
         personProfiles: EluPersonProfilesMode = .identifiedOnly,
         persistence: EluPersistenceMode = .persistent,
+        rateLimiting: EluRateLimitingOptions = .init(),
         faultInjector: (any EluRuntimeQueueFaultInjecting)? = nil
     ) async throws -> EluStandaloneRuntime {
         guard isHeaderSafeSiteKey(siteKey) else {
@@ -285,6 +286,7 @@ actor EluStandaloneRuntime {
             endpointPolicy: endpointPolicy,
             personProfiles: personProfiles,
             persistence: persistence,
+            rateLimiting: rateLimiting,
             limits: resolvedLimits,
             clock: clock,
             continuousClock: continuousClock,
@@ -920,7 +922,9 @@ actor EluStandaloneRuntime {
             admissionGuard: { isCurrent() && fence.isCurrent(decision) })
         switch result {
         case let .accepted(_, snapshot): lastSnapshot = snapshot; armFlushTimer()
-        case let .rejected(_, snapshot): lastSnapshot = snapshot
+        case let .rejected(_, snapshot):
+            if snapshot.queuedCount > lastSnapshot.queuedCount { armFlushTimer() }
+            lastSnapshot = snapshot
         }
     }
 
@@ -1059,7 +1063,8 @@ actor EluStandaloneRuntime {
         guard phase != .closed else {
             return .rejected(.authorityAbsent, snapshot: lastSnapshot)
         }
-        var result = await record(command, flagExposure: flagExposure, admissionGuard: admissionGuard)
+        let rateAttempt = EluCaptureRateAttempt()
+        var result = await record(command, flagExposure: flagExposure, rateAttempt: rateAttempt, admissionGuard: admissionGuard)
         // Authority is bound to the identity witness it was derived from. If
         // that witness moved under this call, one renewal decides whether the
         // call proceeds or is discarded with the new reason.
@@ -1070,12 +1075,12 @@ actor EluStandaloneRuntime {
             guard phase != .closed else {
                 return .rejected(.authorityAbsent, snapshot: lastSnapshot)
             }
-            result = await record(command, flagExposure: flagExposure, admissionGuard: admissionGuard)
+            result = await record(command, flagExposure: flagExposure, rateAttempt: rateAttempt, admissionGuard: admissionGuard)
         }
         return result
     }
 
-    private func record(_ command: EluV1CaptureCommand, flagExposure: EluFlagExposureRequest? = nil, performanceSample: Bool = false, networkContext: EluNetworkObservationContext? = nil, admissionGuard: (@Sendable () -> Bool)? = nil) async -> EluV1CaptureResult {
+    private func record(_ command: EluV1CaptureCommand, flagExposure: EluFlagExposureRequest? = nil, rateAttempt: EluCaptureRateAttempt? = nil, performanceSample: Bool = false, networkContext: EluNetworkObservationContext? = nil, admissionGuard: (@Sendable () -> Bool)? = nil) async -> EluV1CaptureResult {
         defer { refreshNetworkObservation() }
         let fence = deliveryFence
         let decision = fence.token()
@@ -1084,16 +1089,17 @@ actor EluStandaloneRuntime {
         }
         let result: EluV1CaptureResult
         if let flagExposure {
-            result = await queue.captureFlagExposure(command, exposure: flagExposure, admissionGuard: current)
+            result = await queue.captureFlagExposure(command, exposure: flagExposure, rateAttempt: rateAttempt, admissionGuard: current)
         } else if performanceSample { result = await queue.capturePerformanceSample(command, admissionGuard: current) }
         else if let networkContext {
             result = await queue.captureNetworkObservation(command, context: networkContext, admissionGuard: current)
-        } else { result = await queue.capture(command, admissionGuard: current) }
+        } else { result = await queue.capture(command, rateAttempt: rateAttempt, admissionGuard: current) }
         switch result {
         case let .accepted(_, snapshot):
             lastSnapshot = snapshot
             armFlushTimer()
         case let .rejected(_, snapshot):
+            if snapshot.queuedCount > lastSnapshot.queuedCount { armFlushTimer() }
             lastSnapshot = snapshot
         }
         return result

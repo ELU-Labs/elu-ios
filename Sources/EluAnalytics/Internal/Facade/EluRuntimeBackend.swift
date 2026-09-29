@@ -20,6 +20,8 @@ enum EluFacadeDropReason: String, Equatable, Sendable {
     case unauthorized
     /// The runtime accepted no record because its store could not take one.
     case storage
+    /// The site-scoped capture bucket declined this attempt.
+    case rateLimited
 }
 
 /// Visual-replay controls. Only a runtime that renders replay frames offers
@@ -93,6 +95,7 @@ struct EluRuntimeBackendContext {
     let diagnostics: EluDiagnosticsOptions
     let personProfiles: EluPersonProfilesMode
     let persistence: EluPersistenceMode
+    let rateLimiting: EluRateLimitingOptions
     /// Installed synchronously by the constructor, then persisted before any
     /// configuration or lifecycle work can authorize collection.
     let initialConsent: EluConsentOperation?
@@ -107,6 +110,7 @@ struct EluRuntimeBackendContext {
          diagnostics: EluDiagnosticsOptions = .init(),
          personProfiles: EluPersonProfilesMode = .identifiedOnly,
          persistence: EluPersistenceMode = .persistent,
+         rateLimiting: EluRateLimitingOptions = .init(),
          initialConsent: EluConsentOperation? = nil,
          guardedFlagsDidLoad: (@Sendable (@escaping @Sendable () -> Bool) -> Void)? = nil,
          initialConfigurationReady: @escaping @Sendable (@escaping @Sendable () -> Bool) -> Void = { _ in }) {
@@ -121,6 +125,7 @@ struct EluRuntimeBackendContext {
         self.diagnostics = diagnostics
         self.personProfiles = personProfiles
         self.persistence = persistence
+        self.rateLimiting = rateLimiting.normalized
         self.initialConsent = initialConsent
         self.guardedFlagsDidLoad = guardedFlagsDidLoad ?? { predicate in
             if predicate() { flagsDidLoad() }

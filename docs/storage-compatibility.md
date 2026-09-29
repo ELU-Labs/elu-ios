@@ -96,3 +96,17 @@ historical evidence definitions are retained for provenance. They do not make
 the retired preview continuity runner a current release gate. Current gates
 cover clean installation, supported owned-store upgrades, unsupported-store
 refusal, no-touch behavior, and the full SDK Lab delivery and rendering checks.
+
+
+Capture-selected schemas **49–56** retain every 41–48 feature combination and add
+one exact stream-bound `capture_rate_limit` row (canonical numeric tokens/last
+wall milliseconds, at most 256 bytes). Every production capture opener selects
+it, including memory mode. Raw internal queue seams may retain prior schemas.
+All forty supported prior combinations (1–16, 25–48) remain readable and migrate
+before selected capture; 17–24 and unknown future versions remain refused.
+Migration preserves identity, record order/bytes, exposure history and privacy
+state. Bucket writes do not advance the core generation or create a session.
+Debits commit separately before event writes and remain after later event
+rollback/quota rejection; reset and consent do not clear the row. Missing or
+foreign rows and malformed/noncanonical metadata fail closed. Memory connections
+use this same SQL table entirely in memory; dormant persistent state is untouched.

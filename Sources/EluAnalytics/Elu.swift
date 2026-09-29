@@ -16,6 +16,9 @@ public struct EluSetupOptions {
     /// Analytics storage lifetime. Explicit consent is retained separately in both modes.
     public var persistence: EluPersistenceMode = .persistent
 
+    /// Site-scoped capture token bucket; identity reset does not reset this budget.
+    public var rateLimiting = EluRateLimitingOptions()
+
     /// Internal construction marker for the owned runtime. Customer code
     /// cannot select or construct another backend.
     var runtimeSelection: EluRuntimeSelection = .standalone

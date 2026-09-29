@@ -158,7 +158,7 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, @unchecked Sendable {
                     rootDirectoryURL: rootDirectoryURL,
                     siteKey: siteKey,
                     configHost: context.configHost, endpointPolicy: context.endpointPolicy,
-                    performance: context.performance, diagnostics: context.diagnostics, personProfiles: context.personProfiles, persistence: context.persistence
+                    performance: context.performance, diagnostics: context.diagnostics, personProfiles: context.personProfiles, persistence: context.persistence, rateLimiting: context.rateLimiting
                 )
             },
             guardedFlagsDidLoad: context.guardedFlagsDidLoad
@@ -314,20 +314,16 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, @unchecked Sendable {
     func execute(_ op: EluBufferedOp) {
         switch op {
         case let .capture(event, properties):
-            guard let name = EluFacadeJSON.identifier(event, maximumLength: 512) else {
-                count(.invalidInput)
-                return
-            }
+            // Canonical rejection happens after rate admission in the queue.
+            // Bound and detach customer values here before the actor handoff.
+            let name = event
             let projected = project(properties)
             enqueue { runtime, owner in
                 owner.record(await runtime.capture(name, properties: projected))
             }
 
         case let .screen(name, properties):
-            guard let screen = EluFacadeJSON.identifier(name, maximumLength: 512) else {
-                count(.invalidInput)
-                return
-            }
+            let screen = name
             let projected = project(properties)
             enqueue { runtime, owner in
                 owner.record(await runtime.screen(screen, properties: projected))
@@ -842,6 +838,8 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, @unchecked Sendable {
                 count(.invalidInput)
             case .queueLimit, .storageProvenNotCommitted, .storageOutcomeUnknown:
                 count(.storage)
+            case .rateLimited:
+                count(.rateLimited)
             default:
                 count(.unauthorized)
             }

@@ -37,7 +37,8 @@ final class EluStandaloneStack: @unchecked Sendable {
         performance: EluPerformanceOptions = .init(),
         diagnostics: EluDiagnosticsOptions = .init(),
         personProfiles: EluPersonProfilesMode = .identifiedOnly,
-        persistence: EluPersistenceMode = .persistent
+        persistence: EluPersistenceMode = .persistent,
+        rateLimiting: EluRateLimitingOptions = .init()
     ) async throws -> EluStandaloneStack {
         let relay = EluStandaloneConfigRelay()
         let lifecycle = try EluV2ConfigLifecycle(siteKey: siteKey, configHost: configHost, endpointPolicy: endpointPolicy,
@@ -53,7 +54,7 @@ final class EluStandaloneStack: @unchecked Sendable {
             time: EluV1BatchTimeSource(wallNow: clock.wallNow,
                 monotonicNow: { clock.floorNanoseconds(clock.continuousNow()) ?? UInt64.max },
                 sleep: { try await Task.sleep(nanoseconds: $0) }),
-            timeZoneIdentifier: timeZoneIdentifier, performance: performance, diagnostics: diagnostics, personProfiles: personProfiles, persistence: persistence)
+            timeZoneIdentifier: timeZoneIdentifier, performance: performance, diagnostics: diagnostics, personProfiles: personProfiles, persistence: persistence, rateLimiting: rateLimiting)
         do {
             let selectedFlags = try flagTransport ?? EluV1URLSessionFlagTransport(siteKey: siteKey, endpointPolicy: endpointPolicy)
             let flags = try await runtime.flagClient(transport: selectedFlags)

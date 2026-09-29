@@ -28,6 +28,7 @@ final class EluCore {
     private var diagnostics = EluDiagnosticsOptions()
     private var personProfiles: EluPersonProfilesMode = .identifiedOnly
     private var persistence: EluPersistenceMode = .persistent
+    private var rateLimiting = EluRateLimitingOptions()
     private var configHost = URL(string: "https://elu.dev")!
     private var endpointPolicy = EluEndpointPolicy.cloud
     private var buffer = EluEventBuffer()
@@ -72,6 +73,7 @@ final class EluCore {
             diagnostics = options.diagnostics
             personProfiles = options.personProfiles
             persistence = options.persistence
+            rateLimiting = options.rateLimiting.normalized
 
             // The owned source, including independent flags/privacy, decides
             // readiness. No legacy cache or v1 request participates.
@@ -103,7 +105,7 @@ final class EluCore {
         EluRuntimeBackendContext(siteKey: siteKey, config: config, configDocument: document,
             isNewUser: isNewUser, flagsDidLoad: { [weak self] in
                 self?.dispatchFlagNotification(ifCurrent: { true })
-            }, configHost: configHost, endpointPolicy: endpointPolicy, performance: performance, diagnostics: diagnostics, personProfiles: personProfiles, persistence: persistence, initialConsent: initialConsent, guardedFlagsDidLoad: { [weak self] predicate in
+            }, configHost: configHost, endpointPolicy: endpointPolicy, performance: performance, diagnostics: diagnostics, personProfiles: personProfiles, persistence: persistence, rateLimiting: rateLimiting, initialConsent: initialConsent, guardedFlagsDidLoad: { [weak self] predicate in
                 self?.dispatchFlagNotification(ifCurrent: predicate)
             }, initialConfigurationReady: { [weak self] predicate in
                 guard let self else { return }

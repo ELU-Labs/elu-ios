@@ -215,6 +215,30 @@
     {
       "kind": "swift.func.op",
       "name": "EluPersistenceMode.!=(_:_:)"
+    },
+    {
+      "kind": "swift.struct",
+      "name": "EluRateLimitingOptions"
+    },
+    {
+      "kind": "swift.func.op",
+      "name": "EluRateLimitingOptions.!=(_:_:)"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluRateLimitingOptions.eventsPerSecond"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluRateLimitingOptions.eventsBurstLimit"
+    },
+    {
+      "kind": "swift.init",
+      "name": "EluRateLimitingOptions.init(eventsPerSecond:eventsBurstLimit:)"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluSetupOptions.rateLimiting"
     }
   ]
 }

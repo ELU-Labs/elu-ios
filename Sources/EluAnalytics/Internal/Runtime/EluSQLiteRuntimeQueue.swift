@@ -39,6 +39,11 @@ enum EluRuntimeQueueFaultPoint: Equatable, Sendable {
     case afterInspectionCopy
     case beforeCaptureHistoryMigrationCommit
     case beforeDiagnosticsMigrationCommit
+    case beforeRateLimitMigrationCommit
+    case beforeRateLimitRead
+    case beforeRateLimitWrite
+    case beforeRateLimitCommit
+    case afterRateLimitCommit
     case beforeExposureMigrationCommit
     case beforePersonIdentityMigrationCommit
     case beforeBegin
@@ -148,19 +153,31 @@ private enum EluSQLiteRuntimeSchema {
     // Schemas 9...16 add installation capture history to owned schemas 1...8.
     // Unpublished import-ledger schemas 17...24 remain unsupported.
     static func baseVersion(_ version: Int64) -> Int64 {
+        if hasRateLimiter(version) { return version - 48 }
         if hasFlagExposures(version) { return version - 40 }
         if hasPersonIdentity(version) { return version - 32 }
         if hasDiagnostics(version) { return version - 24 }
         return version > 8 ? version - 8 : version
     }
     static func supports(_ version: Int64) -> Bool { (1...16).contains(version) || hasDiagnostics(version) }
-    static func hasFlagExposures(_ version: Int64) -> Bool { (41...48).contains(version) }
-    static func hasPersonIdentity(_ version: Int64) -> Bool { (33...48).contains(version) }
-    static func hasDiagnostics(_ version: Int64) -> Bool { (25...48).contains(version) }
+    static func hasRateLimiter(_ version: Int64) -> Bool { (49...56).contains(version) }
+    static func hasFlagExposures(_ version: Int64) -> Bool { (41...56).contains(version) }
+    static func hasPersonIdentity(_ version: Int64) -> Bool { (33...56).contains(version) }
+    static func hasDiagnostics(_ version: Int64) -> Bool { (25...56).contains(version) }
     static func hasCaptureHistory(_ version: Int64) -> Bool { (9...16).contains(version) || hasDiagnostics(version) }
     static func preservingCaptureHistory(_ base: Int64, from version: Int64) -> Int64 {
-        base + (hasFlagExposures(version) ? 40 : hasPersonIdentity(version) ? 32 : hasDiagnostics(version) ? 24 : hasCaptureHistory(version) ? 8 : 0)
+        base + (hasRateLimiter(version) ? 48 : hasFlagExposures(version) ? 40 : hasPersonIdentity(version) ? 32 : hasDiagnostics(version) ? 24 : hasCaptureHistory(version) ? 8 : 0)
     }
+    // Selected capture runtimes add a site/base-scoped token bucket. Raw owned
+    // queue fixtures may retain 41...48; all production openers select a limiter.
+    static let createRateLimitState = """
+    CREATE TABLE capture_rate_limit (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        stream_id TEXT NOT NULL,
+        metadata BLOB NOT NULL CHECK (length(metadata) > 0 AND length(metadata) <= 256)
+    )
+    """
+    static let rateLimitStateColumns = ["singleton": "INTEGER", "stream_id": "TEXT", "metadata": "BLOB"]
     // Schemas 41...48 add a bounded visitor exposure ledger to every feature combination.
     static let createFlagExposureState = """
     CREATE TABLE flag_exposure_state (
@@ -2368,6 +2385,11 @@ private enum EluRuntimeDatabase {
             try verifyCreateSQL(connection, table: "capture_session_history", expected: EluSQLiteRuntimeSchema.createCaptureSessionHistory)
             _ = try loadState(connection, validateQueue: false)
         }
+        if EluSQLiteRuntimeSchema.hasRateLimiter(databaseVersion) {
+            expectedObjects["capture_rate_limit"] = "table"
+            try verifyColumns(connection, table: "capture_rate_limit", expected: EluSQLiteRuntimeSchema.rateLimitStateColumns)
+            try verifyCreateSQL(connection, table: "capture_rate_limit", expected: EluSQLiteRuntimeSchema.createRateLimitState)
+        }
         if EluSQLiteRuntimeSchema.hasFlagExposures(databaseVersion) {
             expectedObjects["flag_exposure_state"] = "table"
             try verifyColumns(connection, table: "flag_exposure_state", expected: EluSQLiteRuntimeSchema.flagExposureStateColumns)
@@ -2528,6 +2550,9 @@ private enum EluRuntimeDatabase {
                 ? try readPersonIdentityState(connection, stream: streamId) : EluPersonIdentityState(deviceId: identity.anonymousId)
             let exposures = EluSQLiteRuntimeSchema.hasFlagExposures(try connection.integerPragma("user_version"))
                 ? try readFlagExposureState(connection, stream: streamId) : EluFlagExposureLedger(anonymousId: identity.anonymousId)
+            if EluSQLiteRuntimeSchema.hasRateLimiter(try connection.integerPragma("user_version")) {
+                _ = try readRateLimitState(connection, stream: streamId)
+            }
             let state = EluStoredRuntimeState(
                 personIdentity: person,
                 flagExposures: exposures,
@@ -2634,6 +2659,29 @@ private enum EluRuntimeDatabase {
         try connection.withStatement(sql) { statement in
             try connection.bind(stream, at: 1, to: statement)
             try connection.bind(history.encoded(), at: 2, to: statement)
+            try connection.step(statement)
+        }
+        guard try connection.changes() == 1 else { throw EluRuntimeQueueError.corruptStorage }
+    }
+
+    static func readRateLimitState(_ connection: EluSQLiteConnection, stream: String) throws -> EluCaptureRateBucket? {
+        try connection.withStatement("SELECT singleton,stream_id,metadata FROM capture_rate_limit") { statement in
+            try connection.step(statement, expecting: SQLITE_ROW)
+            guard try connection.requiredInteger(statement, column: 0) == 1,
+                  try connection.requiredString(statement, column: 1).utf8.elementsEqual(stream.utf8)
+            else { throw EluRuntimeQueueError.corruptStorage }
+            let data = try connection.requiredData(statement, column: 2, maximumBytes: 256)
+            guard sqlite3_step(statement) == SQLITE_DONE else { throw EluRuntimeQueueError.corruptStorage }
+            return try EluCaptureRateBucket.decode(data)
+        }
+    }
+    static func writeRateLimitState(_ connection: EluSQLiteConnection, stream: String,
+                                   bucket: EluCaptureRateBucket?, inserting: Bool = false) throws {
+        let sql = inserting ? "INSERT INTO capture_rate_limit(singleton,stream_id,metadata) VALUES(1,?,?)"
+            : "UPDATE capture_rate_limit SET stream_id=?,metadata=? WHERE singleton=1"
+        try connection.withStatement(sql) { statement in
+            try connection.bind(stream, at: 1, to: statement)
+            try connection.bind(try bucket?.encoded() ?? Data("null".utf8), at: 2, to: statement)
             try connection.step(statement)
         }
         guard try connection.changes() == 1 else { throw EluRuntimeQueueError.corruptStorage }
@@ -3614,6 +3662,8 @@ actor EluSQLiteRuntimeQueue {
         }
     }
     private var isPoisoned = false
+    private var rateLimiter: EluCaptureRateLimiter?
+    private let rateLimitOwner = UUID()
 
     static func open(
         directoryURL: URL,
@@ -3670,6 +3720,7 @@ actor EluSQLiteRuntimeQueue {
         endpointPolicy: EluEndpointPolicy = .cloud,
         personProfiles: EluPersonProfilesMode = .identifiedOnly,
         persistence: EluPersistenceMode = .persistent,
+        rateLimiting: EluRateLimitingOptions? = nil,
         limits: EluRuntimeQueueLimits,
         clock: @escaping @Sendable () -> Date = { Date() },
         continuousClock: @escaping @Sendable () -> UInt64 = EluMachContinuousClock.now,
@@ -3737,6 +3788,10 @@ actor EluSQLiteRuntimeQueue {
             configurationGate: configurationGate
         )
         try await queue.reconcileStoredConsent()
+        if let rateLimiting {
+            do { try await queue.initializeRateLimiting(rateLimiting) }
+            catch { await queue.close(); throw error }
+        }
         return queue
     }
 
@@ -3745,6 +3800,7 @@ actor EluSQLiteRuntimeQueue {
         exactConstructorSiteKey: String,
         personProfiles: EluPersonProfilesMode = .identifiedOnly,
         persistence: EluPersistenceMode = .persistent,
+        rateLimiting: EluRateLimitingOptions? = nil,
         clock: @escaping @Sendable () -> Date = { Date() },
         continuousClock: @escaping @Sendable () -> UInt64 = EluMachContinuousClock.now,
         continuousBudgetConverter: @escaping @Sendable (UInt64) -> UInt64? =
@@ -3770,6 +3826,7 @@ actor EluSQLiteRuntimeQueue {
             exactConstructorSiteKey: exactConstructorSiteKey,
             personProfiles: personProfiles,
             persistence: persistence,
+            rateLimiting: rateLimiting,
             limits: EluRuntimeQueueLimits(),
             clock: clock,
             continuousClock: continuousClock,
@@ -7165,17 +7222,90 @@ actor EluSQLiteRuntimeQueue {
 
     /// Creates and consumes admission entirely inside this actor operation.
     /// No authority token or detached resolution is returned to the caller.
-    func capture(_ command: EluV1CaptureCommand, admissionGuard: (@Sendable () -> Bool)? = nil) -> EluV1CaptureResult {
-        capture(command, performanceSample: false, admissionGuard: admissionGuard)
+    /// Selected only by the capture runtime, before any configuration or event.
+    /// No runtime-state generation, identity or queue record changes here.
+    private func initializeRateLimiting(_ options: EluRateLimitingOptions) throws {
+        let connection = try requireResources().connection
+        if !EluSQLiteRuntimeSchema.hasRateLimiter(databaseSchemaVersion) {
+            let target = EluSQLiteRuntimeSchema.baseVersion(databaseSchemaVersion) + 48
+            var attemptedCommit = false
+            try connection.execute("BEGIN IMMEDIATE")
+            do {
+                try EluRuntimeDatabase.verifySchema(connection, databaseVersion: databaseSchemaVersion)
+                guard try EluRuntimeDatabase.loadState(connection, validateQueue: false) == state else {
+                    throw EluRuntimeQueueError.generationMismatch
+                }
+                try connection.execute(EluSQLiteRuntimeSchema.createRateLimitState)
+                try EluRuntimeDatabase.writeRateLimitState(connection, stream: state.streamId, bucket: nil, inserting: true)
+                try connection.execute("PRAGMA user_version = \(target)")
+                try EluRuntimeDatabase.verifySchema(connection, databaseVersion: target)
+                try faultInjector?.hit(.beforeRateLimitMigrationCommit)
+                attemptedCommit = true
+                try connection.execute("COMMIT")
+                databaseSchemaVersion = target
+            } catch {
+                if attemptedCommit { poisonAndRelease(); throw EluRuntimeQueueError.ambiguousCommit }
+                do { try connection.execute("ROLLBACK") }
+                catch { poisonAndRelease(); throw EluRuntimeQueueError.databaseUnavailable }
+                throw error
+            }
+        }
+        rateLimiter = EluCaptureRateLimiter(settings: options)
+        _ = try rateLimitDecision(checkOnly: true)
     }
 
-    func captureFlagExposure(_ command: EluV1CaptureCommand, exposure: EluFlagExposureRequest,
+    private func rateLimitDecision(checkOnly: Bool = false) throws -> EluCaptureRateDecision {
+        guard var limiter = rateLimiter else { return .init(limited: false, warning: nil) }
+        let connection = try requireResources().connection
+        let stored: EluCaptureRateBucket?
+        do {
+            try faultInjector?.hit(.beforeRateLimitRead)
+            stored = try EluRuntimeDatabase.readRateLimitState(connection, stream: state.streamId)
+        }
+        catch is EluSQLiteFailure { stored = nil } // A failed read uses this owner's held bucket.
+        catch EluRuntimeQueueError.faultInjected(.beforeRateLimitRead) { stored = nil }
+        catch { poisonAndRelease(); throw error }
+        let decision = try limiter.context(stored: stored, at: clock(), checkOnly: checkOnly)
+        rateLimiter = limiter // Write failure never refunds an attempted token.
+        var began = false, commitAttempted = false
+        do {
+            try faultInjector?.hit(.beforeRateLimitWrite)
+            try connection.execute("BEGIN IMMEDIATE"); began = true
+            guard try EluRuntimeDatabase.loadState(connection, validateQueue: false) == state else {
+                throw EluRuntimeQueueError.generationMismatch
+            }
+            try EluRuntimeDatabase.writeRateLimitState(connection, stream: state.streamId, bucket: limiter.held)
+            try faultInjector?.hit(.beforeRateLimitCommit)
+            commitAttempted = true
+            try connection.execute("COMMIT")
+            try faultInjector?.hit(.afterRateLimitCommit)
+        } catch {
+            if commitAttempted { poisonAndRelease(); throw EluRuntimeQueueError.ambiguousCommit }
+            if began {
+                do { try connection.execute("ROLLBACK") }
+                catch { poisonAndRelease(); throw EluRuntimeQueueError.databaseUnavailable }
+            }
+            // Only a known non-commit can degrade to the held bucket. Unknown
+            // transaction outcomes and structural disagreement are never live.
+            let mapped = mapOperationError(error)
+            if case .faultInjected = mapped { return decision }
+            if mapped == .databaseUnavailable { return decision }
+            poisonAndRelease(); throw mapped
+        }
+        return decision
+    }
+
+    func capture(_ command: EluV1CaptureCommand, rateAttempt: EluCaptureRateAttempt? = nil, admissionGuard: (@Sendable () -> Bool)? = nil) -> EluV1CaptureResult {
+        capture(command, performanceSample: false, rateAttempt: rateAttempt, admissionGuard: admissionGuard)
+    }
+
+    func captureFlagExposure(_ command: EluV1CaptureCommand, exposure: EluFlagExposureRequest, rateAttempt: EluCaptureRateAttempt? = nil,
                              admissionGuard: @escaping @Sendable () -> Bool) -> EluV1CaptureResult {
         guard command.kind == .capture, command.name == "$feature_flag_called",
               EluFlagExposureLedger.validDigest(exposure.digest) else {
             return .rejected(.invalidEvent, snapshot: state.snapshot)
         }
-        return capture(command, performanceSample: false, flagExposure: exposure, admissionGuard: admissionGuard)
+        return capture(command, performanceSample: false, flagExposure: exposure, rateAttempt: rateAttempt, admissionGuard: admissionGuard)
     }
 
     /// A passive sample requires an existing live foreground session. It may
@@ -7297,21 +7427,10 @@ actor EluSQLiteRuntimeQueue {
         return capture(command, performanceSample: false, networkObservation: true, admissionGuard: admissionGuard)
     }
 
-    private func capture(_ command: EluV1CaptureCommand, performanceSample: Bool, networkObservation: Bool = false, diagnosticSummary: EluNativeDiagnosticSummary? = nil, flagExposure: EluFlagExposureRequest? = nil, admissionGuard: (@Sendable () -> Bool)?) -> EluV1CaptureResult {
+    private func capture(_ command: EluV1CaptureCommand, performanceSample: Bool, networkObservation: Bool = false, diagnosticSummary: EluNativeDiagnosticSummary? = nil, flagExposure: EluFlagExposureRequest? = nil, rateAttempt: EluCaptureRateAttempt? = nil, bypassRateLimit: Bool = false, passiveWarning: Bool = false, admissionGuard: (@Sendable () -> Bool)?) -> EluV1CaptureResult {
         let before = state.snapshot
         let sourceWitness = captureSourceWitness
         guard sourceIsCurrent(sourceWitness), admissionGuard?() ?? true else { return .rejected(.authorityAbsent, snapshot: before) }
-        // Diagnostic events are runtime-internal and never admitted through a
-        // capture command.
-        guard command.kind != .diagnostic,
-              validCaptureName(command.name),
-              validateCaptureProperties(command.properties),
-              let occurredAt = canonicalDate(command.occurredAt),
-              occurredAt >= state.identity.updatedAt
-        else {
-            return .rejected(.invalidEvent, snapshot: before)
-        }
-
         let authority: EluV1CaptureAuthoritySnapshot
         switch captureAuthority {
         case .absent:
@@ -7344,6 +7463,34 @@ actor EluSQLiteRuntimeQueue {
                 return .rejected(.exposureLedgerFull, snapshot: before)
             }
         }
+        // Consent/authority and duplicate flag reports are decided first. Token
+        // consumption then precedes event validation, enrichment and queue quota.
+        // Neither later refusal nor a retry of the event transaction refunds it.
+        if !bypassRateLimit {
+            do {
+                let consume = try rateAttempt?.claim(owner: rateLimitOwner, command: command) ?? true
+                let decision: EluCaptureRateDecision
+                if consume { decision = try rateLimitDecision() }
+                else { decision = .init(limited: false, warning: nil) }
+                if decision.limited {
+                    if let warning = decision.warning {
+                        let command = EluV1CaptureCommand(kind: .capture, name: EluCaptureRateLimiter.warningEvent,
+                            occurredAt: clock(), properties: [EluCaptureRateLimiter.warningProperty: .string(warning)],
+                            versions: command.versions)
+                        _ = capture(command, performanceSample: false, bypassRateLimit: true,
+                            passiveWarning: performanceSample || diagnosticSummary != nil || (networkObservation && state.identity.session != nil),
+                            admissionGuard: admissionGuard)
+                    }
+                    return .rejected(.rateLimited, snapshot: state.snapshot)
+                }
+            } catch {
+                return .rejected(isPoisoned ? .storageOutcomeUnknown : .invalidEvent, snapshot: state.snapshot)
+            }
+        }
+        // Diagnostic-kind records are runtime internal, never caller commands.
+        guard command.kind != .diagnostic, validCaptureName(command.name),
+              validateCaptureProperties(command.properties), let occurredAt = canonicalDate(command.occurredAt),
+              occurredAt >= state.identity.updatedAt else { return .rejected(.invalidEvent, snapshot: state.snapshot) }
         let diagnosticsUpdate: EluNativeDiagnosticsState?
         if let diagnosticSummary {
             guard let next = try? state.diagnostics.accepting(diagnosticSummary, at: occurredAt,
@@ -7359,7 +7506,7 @@ actor EluSQLiteRuntimeQueue {
                 command: command,
                 occurredAt: occurredAt,
                 authority: authority,
-                performanceSample: performanceSample || diagnosticSummary != nil || (networkObservation && state.identity.session != nil),
+                performanceSample: passiveWarning || performanceSample || diagnosticSummary != nil || (networkObservation && state.identity.session != nil),
                 includeContext: diagnosticSummary == nil
             )
         } catch {
