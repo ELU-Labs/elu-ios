@@ -113,6 +113,29 @@ jobs:
             --input "$PWD/.build/interface-derived-data/Build/Products" \
             --input "$PWD/.build/symbol-graphs" \
             --input "$PWD/.build/release-evidence"
+      - name: Retain tested source and release evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ios-tested-source-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            .build/artifacts/elu-ios-source.zip
+            .build/package-metadata.json
+            .build/symbol-graphs/
+            .build/release-evidence/
+            .build/interface-derived-data/Build/Products/**/*.swiftinterface
+            .build/interface-derived-data/Build/Products/**/*.abi.json
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 14
+      - name: Retain original Swift test results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ios-swift-test-results-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .build/test-derived-data/Logs/Test/*.xcresult
+          if-no-files-found: warn
+          include-hidden-files: true
+          retention-days: 14
       - name: Delete iOS simulator
         if: always() && env.ELU_SIMULATOR_UDID != ''
         run: xcrun simctl delete "$ELU_SIMULATOR_UDID"
