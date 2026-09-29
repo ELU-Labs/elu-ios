@@ -136,6 +136,41 @@ final class EluCaptureRateQueueTests: XCTestCase {
         await h.queue.close()
     }
 
+    func testDispatchedLedgerQuotaConsumesTokenWhileDuplicateAndStaleReportsRemainFree() async throws {
+        let h = try await make(); defer { h.base.remove() }
+        let visitor = try await h.queue.snapshot().identity.anonymousId
+        let recorded = try EluFlagExposureLedger.digest(key: "recorded", value: .bool(true))
+        let newDigest = try EluFlagExposureLedger.digest(key: "new", value: .bool(true))
+        var entries = Set((0..<(EluFlagExposureLedger.maximumEntries - 1)).map { String(format: "%064x", $0) })
+        entries.insert(recorded)
+        XCTAssertEqual(entries.count, EluFlagExposureLedger.maximumEntries)
+        XCTAssertFalse(entries.contains(newDigest))
+        let full = EluFlagExposureLedger(anonymousId: visitor, digests: entries)
+        await h.queue.close()
+        let hex = try full.encoded().map { String(format: "%02x", $0) }.joined()
+        try h.base.sql("UPDATE flag_exposure_state SET metadata=X'\(hex)'")
+        try await reopen(h, options: one); try await h.publish()
+        let report = try command(h, name: "$feature_flag_called")
+        let newExposure = EluFlagExposureRequest(anonymousId: visitor, digest: newDigest)
+        rejected(await h.queue.captureFlagExposure(report, exposure: newExposure, admissionGuard: { false }), .authorityAbsent)
+        rejected(await h.queue.captureFlagExposure(report, exposure: .init(anonymousId: visitor, digest: recorded),
+            admissionGuard: { true }), .exposureAlreadyRecorded)
+        XCTAssertEqual(try bucket(h).tokens, 1)
+        rejected(await h.queue.captureFlagExposure(report, exposure: newExposure, admissionGuard: { true }), .exposureLedgerFull)
+        XCTAssertEqual(try bucket(h).tokens, 0, "Dispatched quota rejection is not refunded")
+        XCTAssertEqual(try EluFlagExposureLedger.decode(h.bytes("SELECT metadata FROM flag_exposure_state")), full)
+        let empty = try await events(h); XCTAssertTrue(empty.isEmpty)
+        rejected(try await h.queue.capture(command(h)), .rateLimited)
+        let warning = try await events(h)
+        XCTAssertEqual(warning.map(\.name), [EluCaptureRateLimiter.warningEvent])
+        await h.queue.close(); try await reopen(h, options: one); try await h.publish()
+        XCTAssertEqual(try bucket(h).tokens, 0, "The debit survives reopening")
+        rejected(await h.queue.captureFlagExposure(report, exposure: .init(anonymousId: visitor, digest: recorded),
+            admissionGuard: { true }), .exposureAlreadyRecorded)
+        let unchanged = try await events(h); XCTAssertEqual(unchanged, warning)
+        await h.queue.close()
+    }
+
     func testDuplicateExposureDoesNotDebitAndStalePermissionDoesNotEmitWarning() async throws {
         let h = try await make(); defer { h.base.remove() }
         let visitor = try await h.queue.snapshot().identity.anonymousId

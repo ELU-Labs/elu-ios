@@ -7459,9 +7459,6 @@ actor EluSQLiteRuntimeQueue {
             if state.flagExposures.digests.contains(exposure.digest) {
                 return .rejected(.exposureAlreadyRecorded, snapshot: before)
             }
-            if state.flagExposures.digests.count >= EluFlagExposureLedger.maximumEntries {
-                return .rejected(.exposureLedgerFull, snapshot: before)
-            }
         }
         // Consent/authority and duplicate flag reports are decided first. Token
         // consumption then precedes event validation, enrichment and queue quota.
@@ -7486,6 +7483,12 @@ actor EluSQLiteRuntimeQueue {
             } catch {
                 return .rejected(isPoisoned ? .storageOutcomeUnknown : .invalidEvent, snapshot: state.snapshot)
             }
+        }
+        // A dispatched new exposure rejected by durable ledger capacity is an
+        // admission failure, like queue quota: its token remains consumed.
+        // Facade coalescing/memory bounds can avoid dispatching a call entirely.
+        if flagExposure != nil, state.flagExposures.digests.count >= EluFlagExposureLedger.maximumEntries {
+            return .rejected(.exposureLedgerFull, snapshot: state.snapshot)
         }
         // Diagnostic-kind records are runtime internal, never caller commands.
         guard command.kind != .diagnostic, validCaptureName(command.name),
