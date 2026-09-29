@@ -19,6 +19,52 @@ SPEC.loader.exec_module(MODULE)
 
 
 class FeatureFlagBoundaryScannerTests(unittest.TestCase):
+    def test_dormant_touch_projection_cannot_install_capture_or_intercept_host(self) -> None:
+        paths = [MODULE.NATIVE_INTERACTION_PROJECTION_SOURCE, MODULE.NATIVE_TOUCH_OBSERVER_SOURCE,
+                 MODULE.NATIVE_INTERACTION_MAILBOX_SOURCE]
+        for relative in paths:
+            path = pathlib.Path(relative)
+            source = (ROOT / path).read_text()
+            self.assertEqual([], MODULE.scan_replay_storage_source(path, source))
+            for token in ["EluSQLiteRuntimeQueue", "EluNativeReplayAuthority", "EluNativeReplayCapabilities",
+                          "EluNativeReplayPermit", "EluNativeWireframeV2Encoder", "EluNativeReplaySealer",
+                          "URLSession", "UIGestureRecognizer", "addGestureRecognizer", "method_exchangeImplementations",
+                          "UUID()", "Task { work() }", "class Hidden: UIWindow {}"]:
+                self.assertTrue(MODULE.scan_replay_storage_source(path, source + "\n" + token), (relative, token))
+        for relative in [MODULE.NATIVE_RUNTIME_SOURCE, MODULE.NATIVE_CAPTURE_SOURCE, MODULE.NATIVE_COMPOSITION_SOURCE,
+                         "Sources/EluAnalytics/Elu.swift", "Sources/EluAnalytics/Internal/Replay/Other.swift"]:
+            for token in ["EluUIKitReplayTouchObserver", "EluUIKitReplayTouchWorkBudget", "EluUIKitReplayTouchFact",
+                          "EluUIKitReplayInteractionProjection", "EluNativeReplayInteractionMailbox"]:
+                self.assertTrue(MODULE.scan_replay_storage_source(pathlib.Path(relative), token), (relative, token))
+        path = pathlib.Path(MODULE.NATIVE_COLLECTOR_SOURCE)
+        source = (ROOT / path).read_text()
+        self.assertTrue(MODULE.scan_replay_storage_source(path, source.replace("retainInteractionProjection: Bool = false", "retainInteractionProjection: Bool = true")))
+        for token in ["paintVetoes: interactionPaintVetoes", "let confined = view.clipsToBounds || layer.masksToBounds",
+                      "interactionPaintVetoes[projection.identity] = try rect(veto)",
+                      "interactionInheritedClip: interactionClip"]:
+            self.assertIn(token, source)
+            self.assertTrue(MODULE.scan_replay_storage_source(path, source.replace(token, "removed_paint_guard")), token)
+        projection_path = pathlib.Path(MODULE.NATIVE_INTERACTION_PROJECTION_SOURCE)
+        projection = (ROOT / projection_path).read_text()
+        self.assertTrue(MODULE.scan_replay_storage_source(projection_path,
+            projection.replace("for clip in original.paintVetoes.values", "for clip in []")))
+        for token in ["let emittedInside = Double(x) >= clip.x", "if actualInside || emittedInside { return nil }"]:
+            self.assertIn(token, projection)
+            self.assertTrue(MODULE.scan_replay_storage_source(projection_path,
+                projection.replace(token, "removed_quantized_paint_guard")))
+        path = pathlib.Path(MODULE.NATIVE_TOUCH_OBSERVER_SOURCE)
+        source = (ROOT / path).read_text()
+        for token in ["maximumWorkNanoseconds: UInt64 = 2_000_000", "maximumWorkPerSecond: UInt64 = 20_000_000",
+                      "if delivering", "reentered = true", "original.projection === projection", "projection.privacyIsCurrent",
+                      "mailbox.withdraw()", "time.timestamp - old.timestamp < 100", "maximumCharges = 128",
+                      "charges.removeAll { now - $0.ended >= 1_000_000_000 }",
+                      "Charge(ended: second.ended, cost: merged)", "budget.charge(from: begun, through: preEnd)",
+                      "budget.charge(from: postBegin, through: continuous())",
+                      "time.continuous - old.continuous < 100_000_000 { retain = false }",
+                      "guard original.retain else { return }"]:
+            self.assertIn(token, source)
+            self.assertTrue(MODULE.scan_replay_storage_source(path, source.replace(token, "removed_guard")), token)
+
     def test_exact_native_tuples_and_original_generation_reach_all_native_boundaries(self) -> None:
         cases = {
             MODULE.NATIVE_PROTOCOL_SOURCE: ['case .v2: return "elu-native-wireframe-v2"',

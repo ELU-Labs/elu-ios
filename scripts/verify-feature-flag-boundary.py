@@ -68,6 +68,9 @@ NATIVE_AUTHORITY_SOURCE = "Sources/EluAnalytics/Internal/Replay/EluNativeReplayA
 NATIVE_SEALER_SOURCE = "Sources/EluAnalytics/Internal/Replay/EluNativeReplaySealer.swift"
 NATIVE_CAPTURE_SOURCE = "Sources/EluAnalytics/Internal/Replay/EluNativeReplayCaptureOwner.swift"
 NATIVE_COLLECTOR_SOURCE = "Sources/EluAnalytics/Internal/Replay/EluUIKitReplayCollector.swift"
+NATIVE_INTERACTION_PROJECTION_SOURCE = "Sources/EluAnalytics/Internal/Replay/EluUIKitReplayInteractionProjection.swift"
+NATIVE_TOUCH_OBSERVER_SOURCE = "Sources/EluAnalytics/Internal/Replay/EluUIKitReplayTouchObserver.swift"
+NATIVE_INTERACTION_MAILBOX_SOURCE = "Sources/EluAnalytics/Internal/Replay/EluNativeReplayInteractionMailbox.swift"
 NATIVE_COMPOSITION_SOURCE = "Sources/EluAnalytics/Internal/Replay/EluNativeReplayComposition.swift"
 NATIVE_RUNTIME_SOURCE = "Sources/EluAnalytics/Internal/Runtime/EluStandaloneRuntime.swift"
 NATIVE_CAPTURE_CALLERS = frozenset({NATIVE_CAPTURE_SOURCE, NATIVE_AUTHORITY_SOURCE, NATIVE_COMPOSITION_SOURCE, NATIVE_RUNTIME_SOURCE, "Sources/EluAnalytics/Internal/Runtime/EluSQLiteRuntimeQueue.swift"})
@@ -130,8 +133,47 @@ def scan_replay_storage_source(path: pathlib.Path, text: str) -> list[str]:
         errors.append(f"{path} consumes sealed local authority outside its exact runtime")
     if "ownsPrepared" in text and exact not in {NATIVE_RUNTIME_SOURCE, NATIVE_AUTHORITY_SOURCE}:
         errors.append(f"{path} consumes native prepared ownership outside its exact runtime")
-    if re.search(r"\bEluUIKitReplayCollector\b", text) and exact not in {NATIVE_CAPTURE_SOURCE, NATIVE_COLLECTOR_SOURCE}:
-        errors.append(f"{path} references the native collector outside its physical owner")
+    if re.search(r"\bEluUIKitReplayCollector\b", text) and exact not in {NATIVE_CAPTURE_SOURCE, NATIVE_COLLECTOR_SOURCE, NATIVE_INTERACTION_PROJECTION_SOURCE}:
+        errors.append(f"{path} references the native collector outside its physical owner or exact detached projection")
+    interaction_callers = {
+        "EluUIKitReplayCollectedProjection": {NATIVE_COLLECTOR_SOURCE, NATIVE_INTERACTION_PROJECTION_SOURCE},
+        "EluUIKitReplayInteractionProjection": {NATIVE_INTERACTION_PROJECTION_SOURCE, NATIVE_TOUCH_OBSERVER_SOURCE},
+        "EluUIKitReplayTouchObserver": {NATIVE_TOUCH_OBSERVER_SOURCE},
+        "EluUIKitReplayTouchWorkBudget": {NATIVE_TOUCH_OBSERVER_SOURCE},
+        "EluUIKitReplayTouchFact": {NATIVE_TOUCH_OBSERVER_SOURCE},
+        "EluNativeReplayInteractionMailbox": {NATIVE_INTERACTION_MAILBOX_SOURCE, NATIVE_TOUCH_OBSERVER_SOURCE},
+    }
+    for token, callers in interaction_callers.items():
+        if re.search(rf"\b{token}\b", text) and exact not in callers:
+            errors.append(f"{path} installs or escapes dormant native interaction ownership")
+    if exact in {NATIVE_INTERACTION_PROJECTION_SOURCE, NATIVE_TOUCH_OBSERVER_SOURCE, NATIVE_INTERACTION_MAILBOX_SOURCE}:
+        forbidden = ("EluSQLiteRuntimeQueue", "EluNativeReplayAuthority", "EluNativeReplayCapabilities",
+            "EluNativeReplayPermit", "EluNativeWireframeV2Encoder", "EluNativeReplaySealer",
+            "URLSession", "URLRequest", "UIGestureRecognizer", "addGestureRecognizer", "method_exchangeImplementations")
+        if any(re.search(rf"\b{token}\b", text) for token in forbidden) or re.search(r"\b(?:UUID|Task)\s*\(|\bTask(?:\.detached)?\s*\{|\bclass\s+\w+\s*:\s*UIWindow\b", text):
+            errors.append(f"{path} adds authority, IDs, async work or automatic host interception to dormant interaction values")
+    if exact == NATIVE_COLLECTOR_SOURCE and "final class EluUIKitReplayCollector" in text and "retainInteractionProjection: Bool = false" not in text:
+        errors.append(f"{path} adds interaction witness work to ordinary v1 capture")
+    if exact == NATIVE_COLLECTOR_SOURCE and "final class EluUIKitReplayCollector" in text:
+        for token in ["paintVetoes: interactionPaintVetoes", "let confined = view.clipsToBounds || layer.masksToBounds",
+                      "interactionPaintVetoes[projection.identity] = try rect(veto)",
+                      "interactionInheritedClip: interactionClip"]:
+            if token not in text: errors.append(f"{path} loses private/unknown paint confinement in dormant interaction projection")
+    if exact == NATIVE_INTERACTION_PROJECTION_SOURCE and "final class EluUIKitReplayInteractionProjection" in text:
+        if any(token not in text for token in ["for clip in original.paintVetoes.values",
+                "let emittedInside = Double(x) >= clip.x", "if actualInside || emittedInside { return nil }"]):
+            errors.append(f"{path} loses private/unknown paint footprint vetoes")
+    if exact == NATIVE_TOUCH_OBSERVER_SOURCE and "final class EluUIKitReplayTouchObserver" in text:
+        required = ["maximumWorkNanoseconds: UInt64 = 2_000_000", "maximumWorkPerSecond: UInt64 = 20_000_000",
+            "if delivering", "reentered = true", "original.projection === projection", "projection.privacyIsCurrent",
+            "mailbox.withdraw()", "cancelAndIgnore()", "time.timestamp - old.timestamp < 100",
+            "maximumCharges = 128", "charges.removeAll { now - $0.ended >= 1_000_000_000 }",
+            "Charge(ended: second.ended, cost: merged)", "budget.charge(from: begun, through: preEnd)",
+            "budget.charge(from: postBegin, through: continuous())",
+            "time.continuous - old.continuous < 100_000_000 { retain = false }",
+            "guard original.retain else { return }"]
+        if any(token not in text for token in required):
+            errors.append(f"{path} weakens dormant original delivery, privacy, or bounded work guards")
     if exact == NATIVE_SEALER_SOURCE:
         references = set(re.findall(r"\bEluV2(?:Replay|SealedReplay)\w*\b", text))
         state_operations = ("EluSQLiteRuntimeQueue", "EluNativeReplayAuthority", "EluNativeReplayScope",
