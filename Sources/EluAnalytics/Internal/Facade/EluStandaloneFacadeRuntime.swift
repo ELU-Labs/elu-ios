@@ -16,7 +16,7 @@ import Foundation
 /// under a new ELU anonymous id. Carrying an existing identity across is a
 /// separate reader with its own review, and must not be inferred from this
 /// selection.
-final class EluStandaloneFacadeRuntime: EluRuntimeBackend, @unchecked Sendable {
+final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @unchecked Sendable {
     /// Attempts a superseded flag reload makes before giving up. A reload is
     /// superseded when the identity or configuration it was evaluated against
     /// changed while it was in flight.
@@ -28,9 +28,8 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, @unchecked Sendable {
     }
 
     let selection: EluRuntimeSelection = .standalone
-    /// Public replay controls remain disabled. Internal composition starts
-    /// capture only with separately qualified local proof and durable policy.
-    let replayControl: (any EluReplayControl)? = nil
+    var replayControl: (any EluReplayControl)? { self }
+    private var replayLocallyEnabled = true
 
     private let flagsDidLoad: () -> Void
     private let networkExcludedHosts: Set<String>
@@ -129,6 +128,33 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, @unchecked Sendable {
             foregroundGeneration = UUID()
         }
         applyForegroundIntent()
+    }
+
+    func startReplay() { setReplayEnabled(true) }
+    func stopReplay() { setReplayEnabled(false) }
+    private func setReplayEnabled(_ enabled: Bool) {
+        withLock {
+            guard !isShutDown else { return }
+            replayLocallyEnabled = enabled
+            started?.runtime.setNativeReplayRecordingEnabled(enabled)
+        }
+    }
+    func currentSessionId() -> String? {
+        withLock {
+            isShutDown || consentProjection?.optedOut == true || identity?.optedOut == true ? nil : identity?.session?.id
+        }
+    }
+    func replayIsActive() -> Bool {
+        let runtime = withLock { () -> EluStandaloneRuntime? in
+            guard !isShutDown, replayLocallyEnabled, pendingIdentityOperations == 0,
+                  consentProjection?.optedOut != true else { return nil }
+            return started?.runtime
+        }
+        guard let runtime, runtime.nativeReplayIsRecording() else { return false }
+        return withLock {
+            !isShutDown && replayLocallyEnabled && pendingIdentityOperations == 0
+                && consentProjection?.optedOut != true && started?.runtime === runtime
+        }
     }
 
     func beginNetworkObservation(_ request: URLRequest) -> EluNetworkObservation? {
@@ -904,6 +930,7 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, @unchecked Sendable {
 
     /// Called only while the facade lock is held; no database work occurs.
     private func bindPendingIntents(to runtime: EluStandaloneRuntime) {
+        runtime.setNativeReplayRecordingEnabled(replayLocallyEnabled)
         runtime.performanceLifecycleIntent(foreground: foregroundIntent)
         runtime.bindNativeLifecycle(nativeLifecycle)
         for intent in pendingFlagIntents.values { intent.bind(runtime) }

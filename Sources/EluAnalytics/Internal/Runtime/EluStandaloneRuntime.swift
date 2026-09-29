@@ -497,7 +497,8 @@ actor EluStandaloneRuntime {
             transport: transport ?? EluV2URLSessionReplayTransport(endpointPolicy: queue.endpointPolicy),
             wallNow: clock, sleep: time.sleep)
         let composition = EluNativeReplayComposition(runtime: self, lifecycle: lifecycle,
-            capabilities: capabilities, delivery: delivery, initiallyActive: !deferredUntilActivation)
+            capabilities: capabilities, delivery: delivery, initiallyActive: !deferredUntilActivation,
+            localControl: replayRelay.localControl)
         replayComposition = composition
         replayRelay.attach(composition)
         lifecycle.observeReevaluation { [weak composition] in composition?.requestReevaluation() }
@@ -507,15 +508,18 @@ actor EluStandaloneRuntime {
     }
     func activateNativeReplayComposition() async { await replayComposition?.activate() }
     nonisolated func reevaluateNativeReplay() { replayRelay.request() }
+    nonisolated func setNativeReplayRecordingEnabled(_ enabled: Bool) { replayRelay.setRecordingEnabled(enabled) }
+    nonisolated func nativeReplayIsRecording() -> Bool { replayRelay.isRecording() }
 
     #if canImport(UIKit)
     func makeNativeReplayCapture(prepared: EluNativeReplayPreparedAuthority,
-        selection: EluNativeReplaySelection, onCommitted: @escaping @Sendable () -> Void) -> EluNativeReplayCaptureOwner? {
+        selection: EluNativeReplaySelection, mayCollect: @escaping @Sendable () -> Bool = { true },
+        onCommitted: @escaping @Sendable () -> Void) -> EluNativeReplayCaptureOwner? {
         guard phase != .closed, nativeAuthority.ownsPrepared(prepared),
               prepared.isCurrent(), selection.isCurrent(), prepared.supportedProtocolGeneration != nil else { return nil }
         return EluNativeReplayCaptureOwner(queue: queue, authority: nativeAuthority,
             prepared: prepared, selection: selection, versions: versions, wallClock: clock,
-            continuousNanoseconds: nativeContinuousNow, onCommitted: onCommitted)
+            continuousNanoseconds: nativeContinuousNow, mayCollect: mayCollect, onCommitted: onCommitted)
     }
     #endif
 

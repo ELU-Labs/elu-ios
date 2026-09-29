@@ -4,12 +4,61 @@ import Foundation
 /// new observation after the owner has completed its ordered mutation.
 final class EluNativeReplayCompositionRelay: @unchecked Sendable {
     private let lock = NSLock()
+    let localControl = EluNativeReplayLocalControl()
     private weak var composition: EluNativeReplayComposition?
     func attach(_ value: EluNativeReplayComposition) { lock.lock(); composition = value; lock.unlock() }
     private func value() -> EluNativeReplayComposition? { lock.lock(); defer { lock.unlock() }; return composition }
     func withdraw() { value()?.withdraw() }
     func withdrawCapture() { value()?.withdrawCapture() }
     func request() { value()?.requestReevaluation() }
+    func setRecordingEnabled(_ enabled: Bool) { localControl.setEnabled(enabled); request() }
+    func isRecording() -> Bool { localControl.isRecording() }
+}
+
+/// Per-runtime local preference only, never capture/delivery authority. The
+/// original collector callback is copied under lock and invoked outside it.
+final class EluNativeReplayLocalControl: @unchecked Sendable {
+    private let lock = NSLock()
+    private var enabled = true
+    private var generation = UUID()
+    private var captureID: UUID?
+    private var captureGeneration: UUID?
+    private var stop: (@Sendable () -> Void)?
+    private var recording: (@Sendable () -> Bool)?
+
+    func token() -> UUID { lock.lock(); defer { lock.unlock() }; return generation }
+    func permits(_ token: UUID) -> Bool {
+        lock.lock(); defer { lock.unlock() }; return enabled && generation == token
+    }
+    func setEnabled(_ value: Bool) {
+        lock.lock()
+        if value != enabled { generation = UUID() }
+        enabled = value
+        let original = value ? nil : stop
+        lock.unlock(); original?()
+    }
+    func install(id: UUID, token: UUID, stop: @escaping @Sendable () -> Void,
+                 recording: @escaping @Sendable () -> Bool) {
+        lock.lock()
+        captureID = id; captureGeneration = token; self.stop = stop; self.recording = recording
+        let allowed = enabled && generation == token
+        lock.unlock()
+        if !allowed { stop() }
+    }
+    func remove(id: UUID) {
+        lock.lock(); defer { lock.unlock() }
+        guard captureID == id else { return }
+        captureID = nil; captureGeneration = nil; stop = nil; recording = nil
+    }
+    func isRecording() -> Bool {
+        lock.lock()
+        let original = enabled && captureGeneration == generation ? recording : nil
+        let id = captureID, token = generation
+        lock.unlock()
+        guard original?() == true else { return false }
+        lock.lock(); defer { lock.unlock() }
+        return enabled && generation == token && captureGeneration == token && id == captureID
+    }
 }
 
 private final class EluNativeReplayCompositionFence: @unchecked Sendable {
@@ -41,6 +90,7 @@ actor EluNativeReplayComposition {
     private let capabilities: EluNativeReplayCapabilities
     private let delivery: EluV2ReplayDeliveryCoordinator
     private nonisolated let fence = EluNativeReplayCompositionFence()
+    private nonisolated let localControl: EluNativeReplayLocalControl
     private var closed = false
     private var active: Bool
     private var evaluating = false
@@ -61,14 +111,21 @@ actor EluNativeReplayComposition {
 
     init(runtime: EluStandaloneRuntime, lifecycle: EluNativeReplayLifecycle,
          capabilities: EluNativeReplayCapabilities, delivery: EluV2ReplayDeliveryCoordinator,
-         initiallyActive: Bool = true) {
+         initiallyActive: Bool = true,
+         localControl: EluNativeReplayLocalControl = EluNativeReplayLocalControl()) {
         active = initiallyActive
+        self.localControl = localControl
         self.runtime = runtime; self.lifecycle = lifecycle
         self.capabilities = capabilities; self.delivery = delivery
     }
 
     deinit { fence.withdraw(terminal: true) }
 
+    nonisolated func setRecordingEnabled(_ enabled: Bool) {
+        localControl.setEnabled(enabled)
+        requestReevaluation()
+    }
+    nonisolated func isRecording() -> Bool { localControl.isRecording() }
     nonisolated func withdraw() { fence.withdraw() }
     nonisolated func withdrawCapture() { fence.withdrawCapture() }
     nonisolated func requestReevaluation() { Task { await self.reevaluate() } }
@@ -138,29 +195,57 @@ actor EluNativeReplayComposition {
     private func evaluateCapture(_ runtime: EluStandaloneRuntime, token: UUID) async {
         guard !captureQuarantined, !capabilities.transports.isEmpty,
               !capabilities.readbackProvenProtocolGenerations.isEmpty else { return }
+        let localToken = localControl.token()
+        // Local stop leaves the sealed-delivery lane above fully operational.
+        if !localControl.permits(localToken) || capture?.isDraining() == true {
+            if let original = capture, let id = captureID {
+                let outcome = await original.finishGracefully()
+                if captureID == id {
+                    capture = nil; capturePrepared = nil; captureID = nil
+                    fence.installCapture(nil); localControl.remove(id: id)
+                }
+                if case .quarantined = outcome { captureQuarantined = true; return }
+            }
+            guard localControl.permits(localToken) else { return }
+        }
         let discovered = await lifecycle.selectCurrentRoot(reusing: selection)
+        if !localControl.permits(localToken) || capture?.isDraining() == true {
+            // A local stop racing the MainActor observation must join its
+            // graceful path on the next pass, never substitute withdrawal.
+            needsEvaluation = true
+            return
+        }
         if let capture, let prepared = capturePrepared, let selection,
            prepared.isCurrent(), selection.isCurrent() {
-            if !closed, fence.current(token), discovered?.isCurrent() == true, prepared.isCurrent() { return }
+            if !closed, fence.current(token), localControl.permits(localToken),
+               !capture.isDraining(), discovered?.isCurrent() == true, prepared.isCurrent() { return }
             capture.withdraw()
         }
         if let original = capture {
             let outcome = await original.stop()
+            if let id = captureID { localControl.remove(id: id) }
             capture = nil; capturePrepared = nil; captureID = nil
             fence.installCapture(nil)
             if case .quarantined = outcome { captureQuarantined = true; return }
         }
         guard !closed, fence.current(token), !capabilities.transports.isEmpty,
               !capabilities.readbackProvenProtocolGenerations.isEmpty else { return }
-        guard !closed, fence.current(token), let selected = discovered, selected.isCurrent() else { return }
+        guard !closed, fence.current(token), localControl.permits(localToken),
+              let selected = discovered, selected.isCurrent() else { return }
         selection = selected
         guard let prepared = try? await runtime.prepareNativeReplay(capabilities: capabilities),
-              !closed, fence.current(token), prepared.isCurrent(), selected.isCurrent() else { return }
+              !closed, fence.current(token), localControl.permits(localToken),
+              prepared.isCurrent(), selected.isCurrent() else { return }
+        let localControl = self.localControl
         let original = await runtime.makeNativeReplayCapture(prepared: prepared, selection: selected,
+            mayCollect: { localControl.permits(localToken) },
             onCommitted: { [weak self] in self?.requestReevaluation() })
         guard let original else { return }
         capture = original; capturePrepared = prepared
         let id = UUID(); captureID = id
+        localControl.install(id: id, token: localToken,
+            stop: { [weak original] in original?.requestGracefulStop() },
+            recording: { [weak original] in original?.isRecording() ?? false })
         fence.installCapture { [weak original] in original?.withdraw() }
         if closed || !fence.current(token) { original.withdraw() }
         Task { [weak self] in
@@ -170,9 +255,13 @@ actor EluNativeReplayComposition {
     }
     private func captureFinished(_ id: UUID, outcome: EluNativeReplayCaptureOutcome) {
         guard captureID == id else { return }
+        let wasDraining = capture?.isDraining() == true
+        localControl.remove(id: id)
         capture = nil; capturePrepared = nil; captureID = nil
         fence.installCapture(nil)
         if case .quarantined = outcome { captureQuarantined = true }
+        // A start accepted while the previous original drained cannot overlap it.
+        if wasDraining, !closed, !captureQuarantined { requestReevaluation() }
     }
     #endif
 
@@ -200,6 +289,7 @@ actor EluNativeReplayComposition {
         if evaluating { await withCheckedContinuation { evaluationWaiters.append($0) } }
         #if canImport(UIKit)
         if let capture, case .quarantined = await capture.stop() { captureQuarantined = true }
+        if let id = captureID { localControl.remove(id: id) }
         self.capture = nil; capturePrepared = nil; captureID = nil
         #endif
         let delivered = await delivery.closeAndWait()

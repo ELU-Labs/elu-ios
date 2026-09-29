@@ -239,6 +239,18 @@
     {
       "kind": "swift.property",
       "name": "EluSetupOptions.rateLimiting"
+    },
+    {
+      "kind": "swift.type.method",
+      "name": "Elu.startSessionRecording()"
+    },
+    {
+      "kind": "swift.type.method",
+      "name": "Elu.stopSessionRecording()"
+    },
+    {
+      "kind": "swift.type.method",
+      "name": "Elu.sessionRecordingStarted()"
     }
   ]
 }

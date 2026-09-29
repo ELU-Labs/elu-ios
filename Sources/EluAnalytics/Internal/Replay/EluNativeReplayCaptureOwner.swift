@@ -5,6 +5,7 @@ import UIKit
 
 enum EluNativeReplayCaptureError: Error, Equatable {
     case withdrawn
+    case locallyStopped
     case occupied
     case invalidClock
     case frameOrder
@@ -142,6 +143,15 @@ struct EluNativeReplayFrameBuffer: Sendable {
         return frames
     }
 
+    /// A local stop may seal a later partial chunk, but cannot manufacture the
+    /// first chunk's minimum duration from a timer or the stop's wall clock.
+    mutating func beginGracefulSealing() throws -> [EluNativeMaskedSnapshot]? {
+        guard !terminal, !sealing else { throw EluNativeReplayCaptureError.withdrawn }
+        guard !frames.isEmpty, firstChunkCommitted || ready else { return nil }
+        sealing = true
+        return frames
+    }
+
     mutating func committed() throws {
         guard !terminal, sealing, let last = frames.last, let lastContinuous,
               last.ordinal < EluNativeWireframeEncoder.maximumSafeInteger else {
@@ -168,22 +178,46 @@ enum EluNativeReplayCaptureOutcome: Sendable {
 private final class EluNativeReplayCaptureFence: @unchecked Sendable {
     private let lock = NSLock()
     private var active = true
+    private var draining = false
+    private var collectedFrames = 0
+    private var currentCollector: (@Sendable () -> Bool)?
     private var stopCollector: (@Sendable () -> Void)?
 
     func isCurrent() -> Bool {
         lock.lock(); defer { lock.unlock() }; return active
     }
-    func installCollector(_ stop: @escaping @Sendable () -> Void) -> Bool {
+    func isCollecting() -> Bool {
+        lock.lock(); defer { lock.unlock() }; return active && !draining
+    }
+    func didCollectFrame() { lock.lock(); collectedFrames += 1; lock.unlock() }
+    func frameCount() -> Int { lock.lock(); defer { lock.unlock() }; return collectedFrames }
+    func isDraining() -> Bool {
+        lock.lock(); defer { lock.unlock() }; return draining
+    }
+    func isRecording() -> Bool {
         lock.lock()
-        let accepted = active && stopCollector == nil
-        if accepted { stopCollector = stop }
+        let current = active && !draining ? currentCollector : nil
+        lock.unlock()
+        guard current?() == true else { return false }
+        return isCollecting()
+    }
+    func stopGracefully() {
+        lock.lock(); draining = true
+        let stop = stopCollector; stopCollector = nil; currentCollector = nil
+        lock.unlock(); stop?()
+    }
+    func installCollector(_ stop: @escaping @Sendable () -> Void,
+                          isCurrent: @escaping @Sendable () -> Bool) -> Bool {
+        lock.lock()
+        let accepted = active && !draining && stopCollector == nil
+        if accepted { stopCollector = stop; currentCollector = isCurrent }
         lock.unlock()
         if !accepted { stop() }
         return accepted
     }
     func withdraw() {
         lock.lock(); active = false
-        let stop = stopCollector; stopCollector = nil
+        let stop = stopCollector; stopCollector = nil; currentCollector = nil
         lock.unlock(); stop?()
     }
 }
@@ -198,16 +232,26 @@ final class EluNativeReplayCaptureOwner: @unchecked Sendable {
          prepared: EluNativeReplayPreparedAuthority, selection: EluNativeReplaySelection,
          versions: EluVersionContext, wallClock: @escaping @Sendable () -> Date,
          continuousNanoseconds: @escaping @Sendable () -> UInt64?,
+         mayCollect: @escaping @Sendable () -> Bool = { true },
          onCommitted: @escaping @Sendable () -> Void = {}) {
         let run = EluNativeReplayCaptureRun(queue: queue, authority: authority,
             prepared: prepared, selection: selection, versions: versions,
-            wallClock: wallClock, continuousNanoseconds: continuousNanoseconds, onCommitted: onCommitted)
+            wallClock: wallClock, continuousNanoseconds: continuousNanoseconds, mayCollect: mayCollect, onCommitted: onCommitted)
         fence = run.fence
         // This task owns physical completion independently of the handle. It
         // deliberately captures run, never self, so deinit can withdraw intake.
         task = Task { await run.execute() }
     }
 
+    /// Read-only causal observation; never supplies capture or commit permission.
+    func collectedFrameCountForTesting() -> Int { fence.frameCount() }
+    func requestGracefulStop() { fence.stopGracefully() }
+    func isDraining() -> Bool { fence.isDraining() }
+    func isRecording() -> Bool { fence.isRecording() }
+    func finishGracefully() async -> EluNativeReplayCaptureOutcome {
+        requestGracefulStop()
+        return await task.value
+    }
     func withdraw() { fence.withdraw(); task.cancel() }
     func stop() async -> EluNativeReplayCaptureOutcome {
         withdraw()
@@ -226,22 +270,33 @@ private final class EluNativeReplayCaptureRun: @unchecked Sendable {
     private let versions: EluVersionContext
     private let wallClock: @Sendable () -> Date
     private let continuousNanoseconds: @Sendable () -> UInt64?
+    private let mayCollect: @Sendable () -> Bool
     private let onCommitted: @Sendable () -> Void
 
     init(queue: EluSQLiteRuntimeQueue, authority: EluNativeReplayAuthority,
          prepared: EluNativeReplayPreparedAuthority, selection: EluNativeReplaySelection,
          versions: EluVersionContext, wallClock: @escaping @Sendable () -> Date,
          continuousNanoseconds: @escaping @Sendable () -> UInt64?,
+         mayCollect: @escaping @Sendable () -> Bool = { true },
          onCommitted: @escaping @Sendable () -> Void = {}) {
         self.queue = queue; self.authority = authority; self.prepared = prepared
         self.selection = selection; self.versions = versions
         self.wallClock = wallClock; self.continuousNanoseconds = continuousNanoseconds
+        self.mayCollect = mayCollect
         self.onCommitted = onCommitted
     }
 
     private func checkLocalIntake() throws {
         guard !Task.isCancelled, fence.isCurrent(), selection.isCurrent() else {
             throw EluNativeReplayCaptureError.withdrawn
+        }
+    }
+
+    private func checkCollection(_ permit: EluNativeReplayPermit? = nil) throws {
+        try check(permit)
+        guard fence.isCollecting(), mayCollect() else {
+            fence.stopGracefully()
+            throw EluNativeReplayCaptureError.locallyStopped
         }
     }
 
@@ -261,6 +316,7 @@ private final class EluNativeReplayCaptureRun: @unchecked Sendable {
             // Source guards may record a durable clock denial. Do not consume
             // one before owning the physical+accounting settlement path.
             try checkLocalIntake()
+            guard fence.isCollecting(), mayCollect() else { throw EluNativeReplayCaptureError.locallyStopped }
             guard let enrolled = try await queue.enrollNativeReplayCapture() else {
                 throw EluNativeReplayCaptureError.occupied
             }
@@ -279,70 +335,95 @@ private final class EluNativeReplayCaptureRun: @unchecked Sendable {
             var sealer = try EluNativeReplaySealer(replayId: permit.replayId, identity: permit.identity,
                 authorization: permit.resolution, privacy: permit.privacy, profile: permit.profile, versions: versions)
             let collector = try await MainActor.run {
-                try self.check(permit)
+                try self.checkCollection(permit)
                 guard permit.isCurrentForCollection(), admission.isCurrent() else {
                     throw EluNativeReplayCaptureError.withdrawn
                 }
                 let collector = try EluUIKitReplayCollector()
-                guard self.fence.installCollector({ collector.withdraw() }) else {
+                guard self.fence.installCollector({ collector.withdraw() }, isCurrent: {
+                    permit.isCurrent() && admission.isCurrent() && self.mayCollect()
+                }) else {
                     throw EluNativeReplayCaptureError.withdrawn
                 }
                 return collector
             }
-            while true {
+            func commit(_ prefix: [EluNativeMaskedSnapshot]) async throws {
                 try check(permit)
-                guard admission.isCurrent(), let ordinal = buffer?.nextFrameOrdinal else {
+                guard admission.isCurrent() else { throw EluNativeReplayCaptureError.withdrawn }
+                let request = try sealer.seal(prefix)
+                pendingRequest = request
+                try check(permit)
+                guard admission.isCurrent() else { throw EluNativeReplayCaptureError.withdrawn }
+                let append = try await queue.appendNativeReplay(request, admission: admission, physicalUse: use)
+                switch append {
+                case .committed:
+                    pendingRequest = nil
+                    onCommitted()
+                case .committedThenWithdrawn:
+                    pendingRequest = nil
+                    onCommitted()
                     throw EluNativeReplayCaptureError.withdrawn
-                }
-                let captured = try await MainActor.run {
-                    try self.check(permit)
-                    guard permit.isCurrentForCollection(), admission.isCurrent(),
-                          let continuous = self.continuousNanoseconds() else {
-                        throw EluNativeReplayCaptureError.withdrawn
-                    }
-                    let timestamp = try EluNativeReplayCaptureClock.milliseconds(self.wallClock())
-                    let frame = try self.selection.consumeRoot { root in
-                        try collector.collect(root: root, ordinal: ordinal, timestamp: timestamp,
-                            hasUnresolvedConfiguredBlockRules: admission.hasUnresolvedBlockRules,
-                            profile: permit.profile,
-                            isCurrent: {
-                                self.fence.isCurrent() && permit.isCurrentForCollection()
-                                    && admission.isCurrent() && self.fence.isCurrent()
-                            })
-                    }
-                    try self.check(permit)
-                    guard admission.isCurrent() else { throw EluNativeReplayCaptureError.withdrawn }
-                    return (frame, continuous)
                 }
                 try check(permit)
                 guard admission.isCurrent() else { throw EluNativeReplayCaptureError.withdrawn }
-                try buffer?.append(captured.0, continuous: captured.1)
-                if buffer?.isReady == true {
-                    guard let prefix = try buffer?.beginSealing() else { throw EluNativeReplayCaptureError.withdrawn }
-                    try check(permit)
-                    guard admission.isCurrent() else { throw EluNativeReplayCaptureError.withdrawn }
-                    let request = try sealer.seal(prefix)
-                    pendingRequest = request
-                    try check(permit)
-                    guard admission.isCurrent() else { throw EluNativeReplayCaptureError.withdrawn }
-                    let append = try await queue.appendNativeReplay(request, admission: admission, physicalUse: use)
-                    switch append {
-                    case .committed:
-                        pendingRequest = nil
-                        onCommitted()
-                    case .committedThenWithdrawn:
-                        pendingRequest = nil
-                        onCommitted()
+                try buffer?.committed()
+            }
+            do {
+                while true {
+                    try checkCollection(permit)
+                    guard admission.isCurrent(), let ordinal = buffer?.nextFrameOrdinal else {
                         throw EluNativeReplayCaptureError.withdrawn
                     }
-                    try check(permit)
+                    let captured: (EluNativeMaskedSnapshot, UInt64)
+                    do {
+                        captured = try await MainActor.run {
+                            try self.checkCollection(permit)
+                            guard permit.isCurrentForCollection(), admission.isCurrent(),
+                                  let continuous = self.continuousNanoseconds() else {
+                                throw EluNativeReplayCaptureError.withdrawn
+                            }
+                            let timestamp = try EluNativeReplayCaptureClock.milliseconds(self.wallClock())
+                            let frame = try self.selection.consumeRoot { root in
+                                try collector.collect(root: root, ordinal: ordinal, timestamp: timestamp,
+                                    hasUnresolvedConfiguredBlockRules: admission.hasUnresolvedBlockRules,
+                                    profile: permit.profile,
+                                    isCurrent: {
+                                        self.fence.isCollecting() && self.mayCollect()
+                                            && permit.isCurrentForCollection() && admission.isCurrent()
+                                            && self.fence.isCollecting()
+                                    })
+                            }
+                            try self.checkCollection(permit)
+                            guard admission.isCurrent() else { throw EluNativeReplayCaptureError.withdrawn }
+                            return (frame, continuous)
+                        }
+                    } catch EluUIKitReplayCollectionError.withdrawn {
+                        // A stopped collector rejects an in-flight frame. Only a
+                        // local stop can preserve an older authorized prefix.
+                        try checkCollection(permit)
+                        throw EluUIKitReplayCollectionError.withdrawn
+                    }
+                    try checkCollection(permit)
                     guard admission.isCurrent() else { throw EluNativeReplayCaptureError.withdrawn }
-                    try buffer?.committed()
+                    try buffer?.append(captured.0, continuous: captured.1)
+                    fence.didCollectFrame()
+                    if buffer?.isReady == true {
+                        guard let prefix = try buffer?.beginSealing() else { throw EluNativeReplayCaptureError.withdrawn }
+                        try await commit(prefix)
+                    }
+                    // No overlap, backfill or timer-only minimum permission.
+                    try await Task.sleep(nanoseconds: 1_000_000_000)
                 }
-                // One serial capture per actual interval; no overlap, missed-frame
-                // backfill, authority renewal, or timer-only minimum permission.
-                try await Task.sleep(nanoseconds: 1_000_000_000)
+            } catch EluNativeReplayCaptureError.locallyStopped {
+                // The collector is frozen, but the original permit, source,
+                // identity, privacy and final SQLite admission must still hold.
+                try check(permit)
+                let stillVisible = await MainActor.run { permit.isCurrentForCollection() }
+                try check(permit)
+                guard stillVisible, admission.isCurrent() else { throw EluNativeReplayCaptureError.withdrawn }
+                if let prefix = try buffer?.beginGracefulSealing() { try await commit(prefix) }
             }
+
         } catch {
             // Withdrawal/failure discards every unsealed value. It never flushes
             // under expired permission or encodes a suffix after unknown commit.

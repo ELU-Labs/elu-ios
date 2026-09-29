@@ -12,10 +12,10 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 PINNED = {
-    "Sources/EluAnalytics/Elu.swift": "df09388150c14cec11d650f075662f790fcc3ff8a2079143a5b62cb8f93ecd81",
-    "Sources/EluAnalytics/EluState.swift": "c18e8225a25cac05b5d510cb15adf333d143f635678544487e45f4af752c8e66",
+    "Sources/EluAnalytics/Elu.swift": "ebb62585eadfa1977ab61ea8b68264d6211aed565e258f86c406988ed4416a1d",
+    "Sources/EluAnalytics/EluState.swift": "a935bd299d1e77abb2dfacbf3b4f4e630396feb8f89cc123df168934d55e9e19",
     "Sources/EluAnalytics/EluConfigClient.swift": "152abfb01a6d0aa81e470d3185ecd4db3aeeef26d8626e67bab8f0a41e20d43d",
-    "Sources/EluAnalytics/Internal/Facade/EluRuntimeBackend.swift": "5c1c294076ba9066a8ecbbd9e7790b4e40cf6657833cb3ada26d24a0ace76059",
+    "Sources/EluAnalytics/Internal/Facade/EluRuntimeBackend.swift": "114b1f41dccfb853eb0dd77d52d674cfe3c8e251ff9a03bbe0e7c1640c11e33e",
     "Package.swift": "86701aa42833ddfff4b928e8ed59608cfe46f54e2765656f8166a75633219398",
     "Conformance/V1/manifest.json": "98152d8725c286f29402ba3e420bda8dd364200fb6fdf1cfe49b2da9b8f63e54",
 }

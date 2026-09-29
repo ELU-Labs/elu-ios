@@ -196,7 +196,9 @@ final class EluNativeReplayAuthorityTests: XCTestCase {
         backend.execute(operation); finish(); await backend.settled()
         XCTAssertFalse(prepared.isCurrent())
         XCTAssertEqual(backend.distinctId(), "native-next-person")
-        XCTAssertNil(backend.replayControl)
+        let replay = try XCTUnwrap(backend.replayControl)
+        replay.startReplay()
+        XCTAssertFalse(replay.replayIsActive(), "Local start cannot substitute capture authority and a root")
         await runtime.close()
     }
 

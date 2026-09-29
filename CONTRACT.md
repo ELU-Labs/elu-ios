@@ -146,6 +146,18 @@ consent changes, and cannot advance on a rolled-back capture. Older stores
 without complete history fail closed for this replay restriction only.
 Absent this field, all devices remain eligible subject to the ordinary gates.
 
+Public `startSessionRecording`, `stopSessionRecording` and
+`sessionRecordingStarted` control only the original runtime's local intake.
+Stop freezes collection synchronously, then settles capture accounting and seals
+only an already captured, still-authorized prefix. It does not bypass the first
+chunk's minimum or discard previously sealed delivery. Privacy/consent/source
+withdrawal still discards unauthorized unsealed values. Start clears local stop
+and reevaluates all existing gates without overriding sampling, audience or
+budget. Status requires the installed current collector, not a desired option.
+Calls before setup are no-ops; local stop is not persisted. Browser URL/event/
+linked-flag override modes are not implemented, and the controls do not add
+native touch/gesture or automatic-screen capture.
+
 The blanket profile masks text. When current policy authorizes ordinary text,
 supported fully visible `UILabel` and `UIButton` text can remain
 readable when its full layout fits, including multiline and wrapped text.

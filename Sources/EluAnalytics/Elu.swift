@@ -195,6 +195,23 @@ public enum Elu {
 
     public static func isOptedOut() -> Bool { EluCore.shared.isOptedOut() }
 
+    // MARK: - Replay controls
+
+    /// Clear this runtime's local replay stop and reevaluate all current
+    /// configuration, consent, privacy, audience, root and budget requirements.
+    /// This cannot force recording or override sampling. Call after setup.
+    public static func startSessionRecording() { EluCore.shared.setSessionRecordingEnabled(true) }
+
+    /// Freeze new replay collection immediately. An already captured authorized
+    /// prefix can finish sealing asynchronously; sealed delivery remains enabled.
+    /// The first chunk still requires its configured minimum observed duration.
+    /// This is a local runtime choice, not persistent consent withdrawal.
+    public static func stopSessionRecording() { EluCore.shared.setSessionRecordingEnabled(false) }
+
+    /// True only while the original UIKit collector is installed and current.
+    /// False during setup, local stop, withdrawal or failed/unavailable capture.
+    public static func sessionRecordingStarted() -> Bool { EluCore.shared.sessionRecordingStarted() }
+
     // MARK: - Delivery
 
     /// Request a delivery attempt for queued events. This does not wait for a

@@ -371,6 +371,32 @@ Restrictions last for the view's lifetime and cannot weaken remote policy.
 Unknown native blocking rules disable replay. Replay remains subject to engine,
 player, privacy, and device qualification before release.
 
+### Local replay controls
+
+After `Elu.setup`, use the same calls from UIKit or SwiftUI application code:
+
+```swift
+Elu.stopSessionRecording()
+Elu.startSessionRecording()
+let isRecording = Elu.sessionRecordingStarted()
+```
+
+Stop synchronously freezes new collection. The original capture then settles
+asynchronously and may seal its already captured prefix only while the original
+source, identity, consent and privacy remain valid. A first chunk below the
+configured minimum observed duration is discarded. Previously sealed chunks
+retain their ordinary delivery/retry permission; this call neither waits for
+server acknowledgement nor acts as opt-out.
+
+Start clears only this runtime's local stop and reevaluates every normal replay
+gate, including configuration, sampling, audience, budget and a supported visible
+UIKit root. It cannot force recording. Status is true only for the installed,
+current collector; it is false during setup, draining, local stop or withdrawal.
+Calls before setup are no-ops. The local choice lasts for this runtime and does
+not persist across launches; use `optOut()` for persistent consent withdrawal.
+There are no URL/event/linked-flag or sampling override arguments. These controls
+do not add SwiftUI-tree replay, touch/gesture recording or automatic screens.
+
 `captureException` records errors explicitly supplied by your app, including
 bounded cause chains. It does not install a synchronous fatal-crash handler.
 Optional delayed numeric OS diagnostics are described below.

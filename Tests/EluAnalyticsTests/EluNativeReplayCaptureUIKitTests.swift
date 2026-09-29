@@ -19,6 +19,96 @@ import zlib
 }
 
 final class EluNativeReplayCaptureUIKitTests: XCTestCase {
+    @MainActor func testLocalStopSealsShortAuthorizedTailAndSettlesBeforeRestart() async throws {
+        let h = try await make(textMasking: "sensitive"), setup = try await selected(h)
+        var settled = false
+        defer { setup.root.removeFromSuperview(); if settled { h.base.remove() } }
+        let label = UILabel(frame: CGRect(x: 4, y: 8, width: 280, height: 30))
+        label.text = "Initial stage"; setup.root.addSubview(label)
+        let owner = try start(h, setup)
+        do {
+            try await wait { try await h.queue.storedReplayChunks().count == 1 }
+            XCTAssertTrue(owner.isRecording())
+            label.text = "Authorized short tail"
+            h.base.testClock.advance(1)
+            let frames = owner.collectedFrameCountForTesting()
+            try await wait { owner.collectedFrameCountForTesting() > frames }
+            owner.requestGracefulStop()
+            XCTAssertFalse(owner.isRecording())
+            guard case .settled = await owner.finishGracefully() else { return XCTFail("local stop did not settle") }
+            let rows = try await h.queue.storedReplayChunks()
+            XCTAssertEqual(rows.count, 2)
+            XCTAssertTrue(try decodedText(rows[1].prepared).contains("Authorized short tail"))
+            let state = try await h.queue.nativeReplaySessionState()
+            XCTAssertNil(state.session?.activeEpoch)
+            let next = try await selected(h)
+            defer { next.root.removeFromSuperview() }
+            let restarted = try start(h, next)
+            try await wait { restarted.isRecording() }
+            guard case .settled = await restarted.stop() else { return XCTFail("restart did not settle") }
+            await h.queue.close(); try await h.reopen()
+            let restored = try await h.queue.storedReplayChunks()
+            XCTAssertTrue(restored.starts(with: rows), "Sealed local-stop bytes survive a later owner")
+            await h.queue.close(); settled = true
+        } catch { _ = await owner.stop(); await h.queue.close(); throw error }
+    }
+
+    @MainActor func testLocalStopBeforeMinimumDoesNotSealOrKeepPhysicalCapture() async throws {
+        let h = try await make(minimum: 30), setup = try await selected(h)
+        var settled = false
+        defer { setup.root.removeFromSuperview(); if settled { h.base.remove() } }
+        let owner = try start(h, setup)
+        do {
+            try await wait { owner.isRecording() && setup.probe.boundsReads > 0 }
+            h.base.testClock.advance(1)
+            owner.requestGracefulStop()
+            XCTAssertFalse(owner.isRecording())
+            guard case .settled = await owner.finished() else { return XCTFail("short local stop did not settle") }
+            let rows = try await h.queue.storedReplayChunks(); XCTAssertTrue(rows.isEmpty)
+            let state = try await h.queue.nativeReplaySessionState(); XCTAssertNil(state.session?.activeEpoch)
+            await h.queue.close(); settled = true
+        } catch { _ = await owner.stop(); await h.queue.close(); throw error }
+    }
+
+    @MainActor func testPrivacyWithdrawalDuringLocalDrainNeverSealsBufferedReadableTail() async throws {
+        let h = try await make(textMasking: "sensitive"), setup = try await selected(h)
+        var settled = false
+        defer { setup.root.removeFromSuperview(); if settled { h.base.remove() } }
+        let label = UILabel(frame: CGRect(x: 4, y: 8, width: 280, height: 30))
+        label.text = "Already sealed"; setup.root.addSubview(label)
+        let owner = try start(h, setup)
+        do {
+            try await wait { try await h.queue.storedReplayChunks().count == 1 }
+            label.text = "UNSEALED_PRIVATE_TAIL"; h.base.testClock.advance(1)
+            let frames = owner.collectedFrameCountForTesting()
+            try await wait { owner.collectedFrameCountForTesting() > frames }
+            // The same MainActor turn cannot admit another collection between
+            // tightening this view's policy and requesting the local drain.
+            Elu.maskView(label)
+            owner.requestGracefulStop()
+            XCTAssertFalse(owner.isRecording())
+            guard case .settled = await owner.finished() else { return XCTFail("privacy stop did not settle") }
+            let rows = try await h.queue.storedReplayChunks()
+            XCTAssertFalse(try rows.contains { try decodedText($0.prepared).contains("UNSEALED_PRIVATE_TAIL") })
+            let state = try await h.queue.nativeReplaySessionState(); XCTAssertNil(state.session?.activeEpoch)
+            await h.queue.close(); settled = true
+        } catch { _ = await owner.stop(); await h.queue.close(); throw error }
+    }
+
+    @MainActor func testLocalStopInsideGetterRejectsInFlightFrameWithoutGrantingMinimum() async throws {
+        let h = try await make(), setup = try await selected(h)
+        var settled = false
+        defer { setup.root.removeFromSuperview(); if settled { h.base.remove() } }
+        var owner: EluNativeReplayCaptureOwner?
+        setup.probe.onBounds = { owner?.requestGracefulStop() }
+        owner = try start(h, setup)
+        guard case .settled = await owner!.finished() else { return XCTFail("getter local stop did not settle") }
+        XCTAssertFalse(owner!.isRecording())
+        let rows = try await h.queue.storedReplayChunks(); XCTAssertTrue(rows.isEmpty)
+        let state = try await h.queue.nativeReplaySessionState(); XCTAssertNil(state.session?.activeEpoch)
+        owner = nil; await h.queue.close(); settled = true
+    }
+
     @MainActor func testSensitiveCaptureStoresReadableTextAndExcludesPrivateContent() async throws {
         let h = try await make(textMasking: "sensitive")
         var setup = try await selected(h)

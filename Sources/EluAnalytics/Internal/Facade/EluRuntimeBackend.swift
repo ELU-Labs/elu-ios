@@ -24,8 +24,8 @@ enum EluFacadeDropReason: String, Equatable, Sendable {
     case rateLimited
 }
 
-/// Visual-replay controls. Only a runtime that renders replay frames offers
-/// them; the ELU-owned runtime records none, so it has none.
+/// Controls the original native collector. Local preference never supplies
+/// replay authority, and status reports physical collection, not desired state.
 protocol EluReplayControl: AnyObject {
     func currentSessionId() -> String?
     func replayIsActive() -> Bool

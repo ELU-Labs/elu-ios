@@ -141,6 +141,31 @@ final class EluNativeReplayCaptureOwnerTests: XCTestCase {
         XCTAssertEqual(original.map(\.ordinal), [0])
     }
 
+    func testGracefulStopCannotCreateFirstMinimumButCanSealAuthorizedLaterTail() throws {
+        var first = try EluNativeReplayFrameBuffer(minimumDurationSeconds: 3)
+        try first.append(frame(0), continuous: 0)
+        try first.append(frame(1), continuous: 2_999_000_000)
+        XCTAssertNil(try first.beginGracefulSealing())
+        try first.append(frame(1), continuous: 3_000_000_000)
+        XCTAssertEqual(try first.beginGracefulSealing()?.map(\.ordinal), [0, 1])
+        try first.committed()
+        try first.append(frame(2), continuous: 3_001_000_000)
+        XCTAssertFalse(first.isReady, "The ten-second periodic flush has not elapsed")
+        XCTAssertEqual(try first.beginGracefulSealing()?.map(\.ordinal), [2])
+        try first.committed()
+        XCTAssertNil(try first.beginGracefulSealing())
+    }
+
+    func testGracefulStopDoesNotReviveWithdrawnOrInFlightBuffer() throws {
+        var buffer = try EluNativeReplayFrameBuffer(minimumDurationSeconds: 0)
+        try buffer.append(frame(0), continuous: 0)
+        _ = try buffer.beginSealing()
+        XCTAssertThrowsError(try buffer.beginGracefulSealing())
+        buffer.withdraw()
+        XCTAssertThrowsError(try buffer.beginGracefulSealing())
+        XCTAssertTrue(buffer.frames.isEmpty)
+    }
+
     private func frame(_ ordinal: Int64, timestamp: Int64 = 100, nodeCount: Int = 0, kind: EluNativeMaskedKind = .rectangle) throws -> EluNativeMaskedSnapshot {
         let rect = try EluNativeRect(x: 0, y: 0, width: 10, height: 10)
         let style = try EluNativeStyle()

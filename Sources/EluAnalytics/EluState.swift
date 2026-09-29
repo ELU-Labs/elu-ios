@@ -207,6 +207,20 @@ final class EluCore {
         return intentBackend?.beginNetworkObservation(request)
     }
 
+    /// Only a bounded local control is synchronized here. Capture settlement,
+    /// UIKit work and delivery remain asynchronous on their original owners.
+    func setSessionRecordingEnabled(_ enabled: Bool) {
+        queue.sync {
+            guard state == .pending || state == .running else { return }
+            if enabled { backend?.replayControl?.startReplay() }
+            else { backend?.replayControl?.stopReplay() }
+        }
+    }
+
+    func sessionRecordingStarted() -> Bool {
+        queue.sync { state == .running && backend?.replayControl?.replayIsActive() == true }
+    }
+
     func flush() {
         queue.async { [self] in
             if state == .running { backend?.flush() }

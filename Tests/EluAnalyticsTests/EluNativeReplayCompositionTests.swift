@@ -3,6 +3,81 @@ import XCTest
 @testable import EluAnalytics
 
 final class EluNativeReplayCompositionTests: XCTestCase {
+    func testLocalControlNeverReportsDesiredStateAsPhysicalRecording() {
+        let control = EluNativeReplayLocalControl(), probe = ReplayLocalProbe()
+        let original = control.token(), id = UUID()
+        XCTAssertFalse(control.isRecording())
+        control.install(id: id, token: original, stop: { probe.stop() }, recording: { probe.isRecording() })
+        XCTAssertFalse(control.isRecording())
+        probe.begin()
+        XCTAssertTrue(control.isRecording())
+        control.setEnabled(false)
+        XCTAssertFalse(control.isRecording())
+        XCTAssertEqual(probe.stops(), 1)
+        control.setEnabled(true)
+        XCTAssertFalse(control.permits(original), "An earlier collector cannot resume after stop/start")
+        XCTAssertFalse(control.isRecording())
+        let next = ReplayLocalProbe(), nextID = UUID()
+        next.begin()
+        control.install(id: nextID, token: control.token(), stop: { next.stop() }, recording: { next.isRecording() })
+        control.remove(id: id)
+        XCTAssertTrue(control.isRecording(), "Old completion cannot clear the new original")
+        control.remove(id: nextID)
+        XCTAssertFalse(control.isRecording())
+    }
+
+    func testStartRacingOriginalStopCallbackCannotReportOldCollectorActive() {
+        let control = EluNativeReplayLocalControl(), probe = ReplayLocalProbe()
+        probe.begin()
+        control.install(id: UUID(), token: control.token(), stop: {
+            // Reentrant start models a newer call before the original stop
+            // callback physically freezes its still-active collector.
+            control.setEnabled(true)
+            XCTAssertTrue(probe.isRecording())
+            XCTAssertFalse(control.isRecording())
+            probe.stop()
+        }, recording: { probe.isRecording() })
+        XCTAssertTrue(control.isRecording())
+        control.setEnabled(false)
+        XCTAssertFalse(control.isRecording())
+    }
+
+    func testLocalStopBeforeCollectorInstallAndDuringStatusCannotEscape() {
+        let control = EluNativeReplayLocalControl(), probe = ReplayLocalProbe()
+        let old = control.token()
+        control.setEnabled(false); control.setEnabled(true)
+        probe.begin()
+        control.install(id: UUID(), token: old, stop: { probe.stop() }, recording: { probe.isRecording() })
+        XCTAssertEqual(probe.stops(), 1)
+        XCTAssertFalse(control.isRecording())
+        control.install(id: UUID(), token: control.token(), stop: {}, recording: {
+            control.setEnabled(false)
+            return true
+        })
+        XCTAssertFalse(control.isRecording(), "Recheck original local generation after the physical observation")
+    }
+
+    func testLocalStopBeforeCompositionKeepsColdSealedDeliveryAndDoesNotGrantCapture() async throws {
+        let h = try await SealedPolicyTestHarness.make(); defer { h.base.remove() }
+        let original = try await h.base.queue.storedReplayChunks()[0].prepared.body
+        let runtime = try await open(h)
+        runtime.setNativeReplayRecordingEnabled(false)
+        XCTAssertFalse(runtime.nativeReplayIsRecording())
+        let sent = expectation(description: "sealed delivery after local stop")
+        let transport = CompositionTransport { sent.fulfill() }
+        let installed = await runtime.installNativeReplayComposition(lifecycle: EluNativeReplayLifecycle(), capabilities: h.proof, transport: transport)
+        let composition = try XCTUnwrap(installed)
+        await fulfillment(of: [sent], timeout: 3)
+        await composition.waitForCurrentDelivery()
+        let body = await transport.firstBody(); XCTAssertEqual(body, original)
+        XCTAssertFalse(runtime.nativeReplayIsRecording())
+        runtime.setNativeReplayRecordingEnabled(true)
+        await composition.reevaluate()
+        XCTAssertFalse(runtime.nativeReplayIsRecording(), "Start cannot supply a current UIKit root")
+        await runtime.close()
+        XCTAssertFalse(runtime.nativeReplayIsRecording())
+    }
+
     func testRuntimeForwardsColdSealedNativeRowWithoutSessionRootOrLedger() async throws {
         let h = try await SealedPolicyTestHarness.make(); defer { h.base.remove() }
         let original = try await h.base.queue.storedReplayChunks()[0].prepared.body
@@ -328,4 +403,14 @@ private final class CompositionDeinitClock: @unchecked Sendable {
         action?()
         return Date(timeIntervalSince1970: 1_785_888_090)
     }
+}
+
+private final class ReplayLocalProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var active = false
+    private var stopCount = 0
+    func begin() { lock.lock(); active = true; lock.unlock() }
+    func stop() { lock.lock(); active = false; stopCount += 1; lock.unlock() }
+    func isRecording() -> Bool { lock.lock(); defer { lock.unlock() }; return active }
+    func stops() -> Int { lock.lock(); defer { lock.unlock() }; return stopCount }
 }

@@ -11,6 +11,27 @@ final class EluRuntimeSelectorTests: XCTestCase {
     // always starts a config request, and no test here wants one to leave.
     private let inertConfigHost = URL(string: "http://127.0.0.1:9")!
 
+    func testCoreReplayControlsApplyDuringPendingWithoutEnteringEventBuffer() throws {
+        let factory = SelectorSpy(), core = EluCore(backendFactory: factory.factory)
+        XCTAssertFalse(core.sessionRecordingStarted())
+        core.setSessionRecordingEnabled(false) // Before setup is a no-op.
+        core.setup(siteKey: uniqueSiteKey(), options: EluSetupOptions(configHost: inertConfigHost))
+        let backend = try XCTUnwrap(core.backendForTesting() as? SelectorBackend)
+        let replay = SelectorReplayControl(); backend.replayControl = replay
+        core.setSessionRecordingEnabled(false)
+        XCTAssertEqual(replay.commands, [false])
+        replay.active = true
+        XCTAssertFalse(core.sessionRecordingStarted(), "Pending is not a running recorder")
+        backend.announceConfigurationReady(); drain(core)
+        XCTAssertTrue(core.sessionRecordingStarted())
+        core.setSessionRecordingEnabled(false)
+        XCTAssertFalse(core.sessionRecordingStarted())
+        core.setSessionRecordingEnabled(true)
+        XCTAssertFalse(core.sessionRecordingStarted(), "Start does not set physical status")
+        XCTAssertEqual(replay.commands, [false, false, true])
+        XCTAssertEqual(backend.recordedCalls(), ["activate"])
+    }
+
     func testSelectorDefaultsToTheOwnedRuntime() {
         XCTAssertEqual(EluSetupOptions().runtimeSelection, .standalone)
         XCTAssertEqual(
@@ -123,9 +144,11 @@ final class EluRuntimeSelectorTests: XCTestCase {
         )
         XCTAssertTrue(backend is EluStandaloneFacadeRuntime)
         XCTAssertEqual(backend.selection, .standalone)
-        // Native capture uses its owned authority/occupancy lane; this legacy
-        // unguarded replay-control seam is never supplied.
-        XCTAssertNil(backend.replayControl)
+        let replay = try XCTUnwrap(backend.replayControl)
+        replay.startReplay()
+        XCTAssertFalse(replay.replayIsActive(), "A local preference cannot grant capture during startup")
+        replay.stopReplay()
+        XCTAssertFalse(replay.replayIsActive())
         backend.shutDown()
     }
 
@@ -457,7 +480,7 @@ final class SelectorSpy: @unchecked Sendable {
 /// A runtime that records what it was asked to do instead of doing it.
 final class SelectorBackend: EluRuntimeBackend, @unchecked Sendable {
     let selection: EluRuntimeSelection
-    let replayControl: (any EluReplayControl)? = nil
+    var replayControl: (any EluReplayControl)? = nil
 
     private let lock = NSLock()
     private let flagsDidLoad: () -> Void
@@ -626,4 +649,13 @@ final class CallOrderRecorder: @unchecked Sendable {
         defer { lock.unlock() }
         return recorded
     }
+}
+
+private final class SelectorReplayControl: EluReplayControl {
+    var active = false
+    var commands: [Bool] = []
+    func currentSessionId() -> String? { nil }
+    func replayIsActive() -> Bool { active }
+    func startReplay() { commands.append(true) }
+    func stopReplay() { commands.append(false); active = false }
 }

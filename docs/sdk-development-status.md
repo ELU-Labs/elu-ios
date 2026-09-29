@@ -1,41 +1,49 @@
 # SDK development status
 
-This document records development evidence separately from published release status.
-Consult the [reviewed releases](https://github.com/ELU-Labs/elu-ios/releases) for customer artifacts.
+Implementation evidence is separate from published release status. Consult the
+[reviewed releases](https://github.com/ELU-Labs/elu-ios/releases) for customer
+artifacts, and the [README](../README.md) for the current public API and limits.
 
-The clean candidate retired the unused preview import path under the dated
-[storage compatibility decision](storage-compatibility.md). Its current source
-at `3f5c2c6` passed all 691 local iOS 18.3.1 simulator tests and all 145 then-current
-release-script tests. The subsequent 0.2.0 archive from `2c7f6ad` passed 643 host
-Swift tests, strict package/API/artifact checks, generic iOS builds, and UIKit
-and SwiftUI consumer compilation. Its application-bundled privacy manifest was
-verified in the Lab UIKit fixture. Those source commits distinguish implementation
-qualification from later metadata/documentation and boundary-guard changes; they
-do not certify physical devices, installation, engine readback, or deployment.
-The startup-consent follow-on changes executable source: the latest pre-setup
-choice is persisted before startup authority, and events retain their original
-consent denial across a later opt-in. The earlier test counts above do not
-qualify that changed artifact; fresh package and Lab checks remain required.
-Immutable baseline definitions and strict scanning policy remain unchanged.
+The current source includes durable analytics and consent, independent device
+identity and person-profile modes, prefixed HTTPS self-hosting, durable flag
+exposures, memory-only analytics persistence with separate explicit consent, and
+a site/API-base capture token bucket. The persistent default and owned-store
+upgrade rules remain in force; the unused 0.1.0 preview import is intentionally
+absent under the [storage compatibility decision](storage-compatibility.md).
 
-Exact distribution installation, supported owned upgrades, Lab engine readback,
-customer-player rendering, physical-device checks, and resource overhead remain
-release gates. The iOS symbol graph preserves all 25 original public symbols
-and includes 28 explicit additions; this source API check is separate from
-runtime and package qualification.
+Replay projects bounded UIKit wireframes with complete visible multiline label
+and button text when privacy policy permits. Standard table/collection cells
+use public visible-cell/content-view traversal and retain actual ancestor
+restrictions. Input values, custom drawing and unknown content remain masked or
+opaque. SwiftUI trees remain opaque: public UIKit bridging cannot prove all
+SwiftUI visibility or `.privacySensitive()` ancestors. Public local replay
+start/stop/status controls preserve full authority gates, first-chunk minimums,
+original capture settlement and sealed delivery. They add no touch/gesture
+protocol, automatic screens or browser trigger overrides.
 
-The owned composition selects the exact implemented native codec, gzip, and
-protocol generation. This is binary support, not release qualification. Current
-server qualification/configuration and local privacy gates must authorize capture.
+Customer request metrics require the explicit `EluURLSession` wrapper; URLs,
+headers and bodies are omitted. Opt-in native performance includes process
+memory, completed main-thread stalls and CADisplayLink callback cadence, not
+Web Vitals or measured rendering completion. Separately opted-in MetricKit
+summaries are delayed numeric OS diagnostics/launch histograms with interval
+continuity checks. They are not synchronous crash reporting, raw crash stacks,
+exact crash-session attribution or guaranteed simulator delivery. Manual
+`captureException` and explicit `screen` remain supported.
 
-Replay currently covers supported UIKit wireframes and complete visible
-single-line native text under authorizing policy. SwiftUI content remains
-opaque. An embedded UIKit text bridge cannot safely infer an ancestor SwiftUI
-`.privacySensitive()` setting through public APIs, so it does not bypass the
-opaque host. Automatic SwiftUI replay and automatic fatal-crash reporting are
-unsupported. Performance samples report process memory and completed native
-main-thread stalls, not browser metrics or full application launch time.
+Historical counts must remain attached to their exact source/artifacts. For
+example, candidate `7703b10` completed 793 hosted simulator cases before later
+prefix, identity, flag, persistence, limiter and replay-control changes. Those
+results cannot certify this source. The `5703d373` CI run executed 842 cases
+with two memory-fixture failures; the corrected successor `a21a6001` then hit a
+separate limiter-test compilation error before native tests. Both failures and
+the isolated test corrections are retained. Current replay-control source and
+its new tests require compilation and native execution; no success is inferred
+from source review or API-ledger additions.
 
-Continue implementation in the dedicated SDK review branch. Build and test the final package from that branch before publishing a release.
-
-Keep generated packages, device data, credentials and test-run evidence out of commits. Continue changes on this branch in its own checkout, with one owner for shared files. Historical test results do not certify changed artifacts.
+Exact distribution installation, owned upgrades, real Lab engine readback,
+customer-player rendering, privacy/fault cohorts and bounded resource checks
+remain release gates. Physical devices are deferred by the owner for this
+release effort; simulator qualification cannot establish real-device resource
+costs or OS diagnostic availability. A source or consumer compile is not final
+artifact or end-to-end qualification. Keep private artifacts, logs, device data,
+credentials and provenance receipts out of public source commits.
