@@ -130,10 +130,15 @@ final class EluNativeReplayLifecycleTests: XCTestCase {
         let window = try activeWindow(), previous = window.rootViewController, first = UIViewController()
         first.view = UIView(frame: window.bounds); window.rootViewController = first
         defer { lifecycle.close(); window.rootViewController = previous }
+        // Unlike explicit-root fixtures, discovery requires the sole key window
+        // and its controller's actual attached view, after public UIKit layout.
+        window.windowLevel = .normal; window.alpha = 1; window.makeKeyAndVisible()
+        try await settleDiscoveredRoot(first, in: window, lifecycle: lifecycle, stage: "initial controller")
         let original = try XCTUnwrap(lifecycle.selectCurrentRoot(reusing: nil)), count = calls.count
         XCTAssertEqual(lifecycle.observeRootReadiness(), .available)
         XCTAssertTrue(original.validateCurrent()); XCTAssertEqual(calls.count, count)
         let next = UIViewController(); next.view = UIView(frame: window.bounds); window.rootViewController = next
+        try await settleDiscoveredRoot(next, in: window, lifecycle: lifecycle, stage: "replacement controller")
         XCTAssertFalse(original.validateCurrent())
         for _ in 0..<3 { XCTAssertEqual(lifecycle.observeRootReadiness(), .available) }
         XCTAssertEqual(calls.count, count, "Observation must not select or revoke an original generation")
@@ -146,6 +151,25 @@ final class EluNativeReplayLifecycleTests: XCTestCase {
         XCTAssertEqual(lifecycle.observeRootReadiness(), .available)
         window.rootViewController = nil; XCTAssertEqual(lifecycle.observeRootReadiness(), .waiting)
         lifecycle.detached(attachment); XCTAssertEqual(lifecycle.observeRootReadiness(), .inactive)
+    }
+
+    @MainActor private func settleDiscoveredRoot(_ controller: UIViewController, in window: UIWindow,
+                                                lifecycle: EluNativeReplayLifecycle, stage: String) async throws {
+        window.setNeedsLayout(); window.layoutIfNeeded(); controller.view.layoutIfNeeded()
+        CATransaction.flush()
+        let start = DispatchTime.now().uptimeNanoseconds
+        while DispatchTime.now().uptimeNanoseconds - start < 6_000_000_000 {
+            if UIApplication.shared.applicationState == .active && window.isKeyWindow && !window.isHidden &&
+                window.alpha == 1 && window.windowLevel == .normal && window.rootViewController === controller &&
+                controller.viewIfLoaded?.window === window && lifecycle.observeRootReadiness() == .available {
+                XCTAssertTrue(window.isKeyWindow); XCTAssertTrue(controller.viewIfLoaded?.window === window)
+                XCTAssertEqual(UIApplication.shared.applicationState, .active)
+                XCTAssertEqual(lifecycle.observeRootReadiness(), .available)
+                return
+            }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        throw NativeLifecycleFixtureFailure(stage: stage)
     }
 
     @MainActor private func activeWindow() throws -> UIWindow {
@@ -163,6 +187,10 @@ private final class NativeLifecycleCalls: @unchecked Sendable {
 }
 
 #if canImport(UIKit)
+private struct NativeLifecycleFixtureFailure: Error, CustomStringConvertible {
+    let stage: String
+    var description: String { "UIKit fixture did not discover its key window and attached root: \(stage)" }
+}
 private final class NativeLifecycleSink: EluRuntimeLifecycleSink, @unchecked Sendable {
     private let lock = NSLock(); private var count = 0
     var backgrounds: Int { lock.lock(); defer { lock.unlock() }; return count }
