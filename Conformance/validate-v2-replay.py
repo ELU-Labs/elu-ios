@@ -794,9 +794,28 @@ V2_GENERATION_SOURCES = frozenset({
 })
 V2_ENDPOINT_SOURCES = frozenset({
     "Sources/EluAnalytics/Internal/Config/EluV1ConfigContract.swift",
-    "Sources/EluAnalytics/Internal/Config/EluV1ConfigManager.swift",
-    "Sources/EluAnalytics/Internal/Replay/EluV2URLSessionReplayTransport.swift",
+    "Sources/EluAnalytics/Internal/Config/EluEndpointPolicy.swift",
 })
+V2_ENDPOINT_PROJECTION = {
+    "Sources/EluAnalytics/Internal/Config/EluEndpointPolicy.swift": (
+        "let declaredAPIOrigin: URL?",
+        "private init(declaredAPIOrigin: URL?)",
+        "guard let origin = EluConfigHostAllowlist.selfHostedOrigin(apiHost) else",
+        'case .replay: path = schemaVersion == 2 ? "/v2/replay" : "/v1/replay"',
+        "parts.host?.lowercased() == host",
+        "parts.percentEncodedPath == path",
+    ),
+    "Sources/EluAnalytics/Internal/Config/EluV1ConfigManager.swift": (
+        "private let endpointPolicy: EluEndpointPolicy",
+        "validated[.replay] = try validateEndpoint(replay, role: .replay, schemaVersion: schemaVersion, endpointPolicy: endpointPolicy)",
+        "guard let url = endpointPolicy.endpoint(value, role: role, schemaVersion: schemaVersion) else",
+    ),
+    "Sources/EluAnalytics/Internal/Replay/EluV2URLSessionReplayTransport.swift": (
+        "private let endpointPolicy: EluEndpointPolicy",
+        "self.endpointPolicy = endpointPolicy",
+        "guard endpointPolicy.endpoint(request.url.absoluteString, role: .replay) != nil,",
+    ),
+}
 PUBLIC_FACADE_SOURCES = frozenset(
     f"Sources/EluAnalytics/{name}" for name in
     ("Elu.swift", "EluState.swift", "EluConfigClient.swift", "EluRemoteConfig.swift")
@@ -818,6 +837,15 @@ def scan_v2_runtime_source(relative: str, source: str) -> list[str]:
     return errors
 
 
+def v2_endpoint_projection_errors(sources: dict[str, str]) -> list[str]:
+    return [
+        f"v2 replay endpoint must retain its local policy and exact role projection: {relative}: {required}"
+        for relative, requirements in V2_ENDPOINT_PROJECTION.items()
+        for required in requirements
+        if required not in sources.get(relative, "")
+    ]
+
+
 def verify_runtime_boundary() -> None:
     # Frozen bytes below remain unchanged. Current source is wired through exact
     # owned boundaries; local codec selection does not certify engine readback.
@@ -825,15 +853,13 @@ def verify_runtime_boundary() -> None:
     # activation, and the exact binary-supported native capability selection.
     boundary = runpy.run_path(str(ROOT / "scripts/verify-feature-flag-boundary.py"))
     errors = boundary["verify"](ROOT)
-    projection_found = False
+    sources: dict[str, str] = {}
     for path in (ROOT / "Sources/EluAnalytics").rglob("*.swift"):
         source = path.read_text(encoding="utf-8")
         relative = path.relative_to(ROOT).as_posix()
+        sources[relative] = source
         errors.extend(scan_v2_runtime_source(relative, source))
-        if relative == "Sources/EluAnalytics/Internal/Config/EluV1ConfigManager.swift":
-            projection_found = '"/v2/replay"' in source
-    if not projection_found:
-        errors.append("the config manager must project the exact v2 replay role")
+    errors.extend(v2_endpoint_projection_errors(sources))
     if errors:
         fail("; ".join(errors))
 
