@@ -114,6 +114,39 @@ class VerifyReleaseTagTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn(fingerprint, result.stdout)
 
+    def replace_tag_object(self, mutate) -> None:
+        original = self.git("cat-file", "tag", "refs/tags/1.2.3")
+        result = subprocess.run(
+            ["git", "hash-object", "-t", "tag", "-w", "--stdin"],
+            input=mutate(original), cwd=self.root, env=self.environment,
+            check=True, capture_output=True, text=True,
+        )
+        self.git("update-ref", "refs/tags/1.2.3", result.stdout.strip())
+
+    def test_rejects_unsigned_review_after_valid_signature(self) -> None:
+        fingerprint = self.signed_tag(message="Release 1.2.3")
+        self.replace_tag_object(lambda raw: raw + "\n\nReviewed-by: SDK Owner <owner@elu.dev>\n")
+        # GPG authenticates the prefix and still accepts this altered tag object.
+        self.git("verify-tag", "refs/tags/1.2.3")
+        result = self.verify("1.2.3", trusted=fingerprint)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unsigned text after", result.stdout + result.stderr)
+
+    def test_rejects_unsigned_suffix_even_with_signed_review(self) -> None:
+        fingerprint = self.signed_tag()
+        self.replace_tag_object(lambda raw: raw + "\n\nReviewed-by: Another Reviewer <other@elu.dev>\n")
+        self.git("verify-tag", "refs/tags/1.2.3")
+        result = self.verify("1.2.3", trusted=fingerprint)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unsigned text after", result.stdout + result.stderr)
+
+    def test_rejects_changed_authenticated_review(self) -> None:
+        fingerprint = self.signed_tag()
+        self.replace_tag_object(lambda raw: raw.replace("SDK Owner", "Another Reviewer"))
+        result = self.verify("1.2.3", trusted=fingerprint)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("valid GPG signature", result.stdout + result.stderr)
+
     def test_rejects_unsigned_annotated_tag(self) -> None:
         self.git(
             "tag",
@@ -191,15 +224,11 @@ class VerifyReleaseTagTests(unittest.TestCase):
         self.assertIn("must contain a Reviewed-by: trailer", result.stdout + result.stderr)
 
     def test_rejects_review_line_outside_the_trailer_block(self) -> None:
-        self.git(
-            "tag",
-            "-a",
-            "1.2.3",
-            "-m",
-            "Reviewed-by: SDK Owner <owner@elu.dev>\n\nRelease narrative, not a trailer.",
+        fingerprint = self.signed_tag(
+            message="Reviewed-by: SDK Owner <owner@elu.dev>\n\nRelease narrative, not a trailer."
         )
 
-        result = self.verify("1.2.3", trusted="0" * 40)
+        result = self.verify("1.2.3", trusted=fingerprint)
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("must contain a Reviewed-by: trailer", result.stdout + result.stderr)

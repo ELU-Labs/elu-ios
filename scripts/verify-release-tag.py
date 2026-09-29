@@ -90,18 +90,28 @@ def verified_signature_fingerprints(ref: str) -> set[str]:
     return fingerprints
 
 
-def tag_has_review_trailer(ref: str) -> bool:
-    message = git(
-        "for-each-ref",
-        "--format=%(contents:subject)%0a%0a%(contents:body)",
-        ref,
-    )
+def signed_message(raw_tag: str) -> str:
+    # Git/GPG may verify the prefix while ignoring text after ASCII armor.
+    # Only one final signature and its authenticated message are admissible.
+    headers, separator, body = raw_tag.partition("\n\n")
+    lines = body.splitlines(keepends=True)
+    starts = [index for index, line in enumerate(lines)
+              if line.rstrip("\r\n") == "-----BEGIN PGP SIGNATURE-----"]
+    ends = [index for index, line in enumerate(lines)
+            if line.rstrip("\r\n") == "-----END PGP SIGNATURE-----"]
+    if not separator or not headers or len(starts) != 1 or len(ends) != 1 or starts[0] >= ends[0]:
+        raise SystemExit("release tag requires exactly one final OpenPGP signature")
+    if "".join(lines[ends[0] + 1:]).strip():
+        raise SystemExit("unsigned text after the release signature is not permitted")
+    return "".join(lines[:starts[0]])
+
+
+def tag_has_review_trailer(message: str) -> bool:
     trailers = git("interpret-trailers", "--parse", input_text=message)
     return any(REVIEW_PATTERN.fullmatch(line) for line in trailers.splitlines())
 
 
-def tag_headers(ref: str) -> dict[str, str]:
-    raw = git("cat-file", "-p", ref)
+def tag_headers(raw: str) -> dict[str, str]:
     headers: dict[str, str] = {}
     for line in raw.splitlines():
         if not line:
@@ -129,26 +139,31 @@ def main() -> None:
 
     ref = f"refs/tags/{tag}"
     try:
-        object_type = git("cat-file", "-t", ref)
+        # Resolve once: all content and cryptographic checks use this immutable
+        # object, even if another process moves the named ref during verification.
+        tag_object = git("rev-parse", "--verify", ref)
+        if re.fullmatch(r"[a-f0-9]{40}(?:[a-f0-9]{24})?", tag_object) is None:
+            raise SystemExit("invalid release tag object identity")
+        object_type = git("cat-file", "-t", tag_object)
     except subprocess.CalledProcessError as error:
         raise SystemExit(f"release tag does not exist: {tag}") from error
     if object_type != "tag":
         raise SystemExit("release tag must be an annotated GPG-signed tag object")
-    headers = tag_headers(ref)
+    raw_tag = git("cat-file", "tag", tag_object)
+    headers = tag_headers(raw_tag)
     if headers.get("tag") != tag:
         raise SystemExit("release tag object's signed name does not match the requested tag")
     if headers.get("type") != "commit" or headers.get("object") != git("rev-parse", "HEAD"):
         raise SystemExit("release tag does not point at the checked-out commit")
-    if not tag_has_review_trailer(ref):
-        raise SystemExit("release tag must contain a Reviewed-by: trailer")
-
     trusted = trusted_fingerprints()
-    observed = verified_signature_fingerprints(ref)
+    observed = verified_signature_fingerprints(tag_object)
     accepted = trusted.intersection(observed)
     if not accepted:
         raise SystemExit(
             "release tag signature is valid but its full signer fingerprint is not trusted"
         )
+    if not tag_has_review_trailer(signed_message(raw_tag)):
+        raise SystemExit("release tag must contain a Reviewed-by: trailer")
     if git("status", "--porcelain=v1", "--untracked-files=all"):
         raise SystemExit("worktree changes, including untracked files, are not publishable")
 
