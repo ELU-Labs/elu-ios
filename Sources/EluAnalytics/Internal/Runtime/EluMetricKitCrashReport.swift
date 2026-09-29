@@ -99,7 +99,7 @@ struct EluMetricKitCrashProjection: Sendable {
     }
     /// The OS adapter reads interval facts first. Neither optional detail closure
     /// nor its first OS getter may run for a historical/future/revoked interval.
-    func project(begin: Date, end: Date, clock: () -> Date, current: () -> Bool,
+    func project(begin: Date, end: Date, clock: @escaping () -> Date, current: @escaping () -> Bool,
                  readCodes: () throws -> (Int64?, Int64?),
                  readDetails: (_ current: () -> Bool) throws -> EluMetricKitCrashReport.Details?) throws -> EluMetricKitCrashReport {
         func permitted() -> Bool { current() && permits(begin: begin, end: end, at: clock()) && current() }

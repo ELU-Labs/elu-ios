@@ -60,7 +60,7 @@ final class EluNativeDiagnosticsMonitor: @unchecked Sendable {
     /// One original slot covers OS projection, the full bounded batch, and its
     /// actor/SQL settlement. Concurrent/reentrant batches do not read details.
     func receiveCrashReports(receiverID: UUID,
-        project: (EluMetricKitCrashProjection, @Sendable () -> Bool) throws -> EluMetricKitCrashBatch) {
+        project: (EluMetricKitCrashProjection, @escaping @Sendable () -> Bool) throws -> EluMetricKitCrashBatch) {
         guard let receiver = currentReceiver(receiverID), receiver.includeCrashReports,
               let projection = receiver.reportProjection, projection.epoch.details == receiver.crashReportDetails else { return }
         lock.lock()
