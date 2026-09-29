@@ -142,6 +142,49 @@ final class EluNativeDiagnosticsRuntimeTests: XCTestCase {
         } catch { /* The original owner remains quarantined after logical close. */ }
     }
 
+    func testCrashReportPathRequiresParentOptionAndExactCurrentExceptionGrant() async throws {
+        for choice in 0...3 {
+            let enabled = choice != 0, selected = choice != 1
+            let h = try await DiagnosticsRuntimeHarness.make(options: .init(enabled: enabled, crashReports: selected))
+            let policy: Any = choice == 2 ? false : ["suppressionRules": []]
+            _ = await h.runtime.applyConfiguration(h.config(exceptionPolicy: policy))
+            _ = await h.runtime.capture("actual-receipt-session")
+            if choice == 3 { try await h.awaitReportEpoch() }
+            else if enabled { try await h.awaitEpoch() }
+            let begin = h.clock.wall(); h.clock.advance(1)
+            let batch = try EluMetricKitCrashBatch([.init(begin: begin, end: h.clock.wall(), machException: 1,
+                signal: 11, detailsPermitted: false)])
+            let before = try await h.runtime.queueSnapshot()
+            await h.runtime.captureMetricKitCrashBatch(batch, isCurrent: { true })
+            let after = try await h.runtime.queueSnapshot()
+            XCTAssertEqual(after.queuedCount, before.queuedCount + (choice == 3 ? 1 : 0))
+            XCTAssertEqual(after.identity.session, before.identity.session)
+            XCTAssertEqual(try h.state().reports?.fingerprints.count, choice == 3 ? 1 : nil)
+            await h.runtime.close(); h.remove()
+        }
+    }
+
+    func testBatchUsesCurrentRemotePermissionAtReceiptNotHistoricalRemoteContinuity() async throws {
+        let h = try await DiagnosticsRuntimeHarness.make(options: .init(enabled: true, crashReports: true))
+        _ = await h.runtime.applyConfiguration(h.config(exceptionPolicy: ["suppressionRules": []]))
+        _ = await h.runtime.capture("actual-session"); try await h.awaitReportEpoch()
+        let begin = h.clock.wall(), original = try XCTUnwrap(h.state().reportEpoch)
+        h.clock.advance(301); await h.runtime.withdrawConfiguration()
+        XCTAssertEqual(try h.state().reportEpoch, original, "Routine expiry is not a local consent withdrawal")
+        let batch = try EluMetricKitCrashBatch([.init(begin: begin, end: h.clock.wall(), machException: 1, signal: 11, detailsPermitted: false)])
+        let before = try await h.runtime.queueSnapshot()
+        await h.runtime.captureMetricKitCrashBatch(batch, isCurrent: { true })
+        let denied = try await h.runtime.queueSnapshot(); XCTAssertEqual(denied.queuedCount, before.queuedCount)
+        _ = await h.runtime.applyConfiguration(h.config(exceptionPolicy: ["suppressionRules": []])); try await h.awaitReportEpoch()
+        XCTAssertEqual(try h.state().reportEpoch, original)
+        await h.runtime.captureMetricKitCrashBatch(batch, isCurrent: { true })
+        let after = try await h.runtime.queueSnapshot(); XCTAssertEqual(after.queuedCount, before.queuedCount + 1)
+        h.clock.advance(0.001)
+        _ = await h.runtime.applyConfiguration(h.config(exceptionPolicy: false)); try await h.awaitEpoch()
+        XCTAssertNil(try h.state().reportEpoch)
+        await h.runtime.close(); h.remove()
+    }
+
     func testInvalidClockAndExplicitShutdownCloseDurableCoverage() async throws {
         for invalidClock in [false, true] {
             let h = try await DiagnosticsRuntimeHarness.make(); defer { h.remove() }
@@ -167,7 +210,7 @@ private final class DiagnosticsRuntimeHarness {
         return .init(root: root, clock: clock, runtime: runtime)
     }
     func remove() { try? FileManager.default.removeItem(at: root) }
-    func config(launch: Bool = true) -> Data {
+    func config(launch: Bool = true, exceptionPolicy: Any? = nil) -> Data {
         let path = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
             .appendingPathComponent("Conformance/V2/fixtures/config-enabled.json")
         var value = try! JSONSerialization.jsonObject(with: Data(contentsOf: path)) as! [String: Any]
@@ -175,6 +218,7 @@ private final class DiagnosticsRuntimeHarness {
         value["expiresAt"] = EluRFC3339.string(from: clock.wall().addingTimeInterval(300))
         value["revision"] = UUID().uuidString
         value["capturePerformance"] = ["memory": false, "long_tasks": launch, "sample_interval_ms": 30_000]
+        if let exceptionPolicy { value["captureExceptions"] = exceptionPolicy }
         return try! JSONSerialization.data(withJSONObject: value)
     }
     func summary(begin: Date, launch: Bool = false) throws -> EluNativeDiagnosticSummary {
@@ -198,6 +242,13 @@ private final class DiagnosticsRuntimeHarness {
         defer { sqlite3_finalize(statement) }
         guard sqlite3_step(statement) == SQLITE_ROW, let bytes = sqlite3_column_blob(statement, 0) else { throw DiagnosticsReadError.failed }
         return try .decode(Data(bytes: bytes, count: Int(sqlite3_column_bytes(statement, 0))))
+    }
+    func awaitReportEpoch() async throws {
+        for _ in 0..<200 {
+            if try state().reportEpoch != nil { return }
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        XCTFail("Expected durable report consent epoch"); throw DiagnosticsReadError.failed
     }
     func awaitEpoch(excluding oldID: String? = nil) async throws {
         for _ in 0..<200 {

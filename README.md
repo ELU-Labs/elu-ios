@@ -540,8 +540,8 @@ hang, and CPU diagnostic counts and duration totals. With `launchSummaries`
 enabled, `$native_launch` contains available launch/resume histogram counts and
 lower/upper duration bounds from iOS 13 onward, plus numeric launch diagnostic
 durations on iOS 16 onward. Launch summaries also require the current server
-responsiveness permission (`capturePerformance.long_tasks`). No stack trees,
-raw OS payloads, exception messages, file paths, or process metadata are read.
+responsiveness permission (`capturePerformance.long_tasks`). Numeric collection
+reads no stack trees, raw OS payloads, exception messages, file paths, or process metadata.
 
 These are delayed, OS-scheduled interval summaries. They do not guarantee every
 crash is reported or describe an individual launch when only histogram bounds
@@ -561,6 +561,63 @@ crash or launch happened in that session. Reports with uncertain ownership,
 unavailable OS data, malformed values, excessive size, or duplicate intervals
 are omitted. Typical use requires the app to receive an OS report after a full
 eligible interval; this collector is not a live crash-stack reporter.
+
+### Individual delayed crash reports
+
+The separate `crashReports` option adds a bounded per-report `$exception` path
+for actual iOS 14+ MetricKit Mach exception/signal values. `enabled` is its parent
+gate. Both report options default to `false`; enabling numeric summaries does
+not grant permission to read report details:
+
+```swift
+options.diagnostics = EluDiagnosticsOptions(
+    enabled: true,
+    crashReports: true,
+    crashReportDetails: false
+)
+```
+
+This path also needs a current server `captureExceptions` grant with exactly an
+empty `suppressionRules` array. Missing/false grants and any nonempty policy deny
+automatic reports. This first native option is an opt-in with no local authority
+override; it does not implement the browser's tri-state override. Native
+control-plane grant emission is not activated by this SDK change. The option
+alone cannot activate reporting under today's default server configuration.
+
+On iOS 17+, setting `crashReportDetails: true` additionally permits the OS's
+Objective-C exception name, class and composed reason, when available. These
+strings can contain application data. Retained strings are limited to 256, 256
+and 1,024 Unicode scalars, respectively, and each detached report to 16 KiB. These
+are output bounds, not guarantees about OS getter allocation or duration. The
+SDK never reads MetricKit JSON/dictionary representations, call-stack trees,
+addresses, process metadata or raw reports. Missing data is marked unavailable;
+there is no global interception of Swift thrown errors, Swift fatal errors or
+native signals, and no promise of every crash or immediate delivery.
+
+Reports require their own continuous local consent/identity epoch covering the
+whole OS interval. Earlier numeric-only consent cannot authorize them. The
+original persisted report epoch is copied under the current identity/source
+fence; the OS interval is validated against it before any optional reason/name
+getter runs. Current general and exception permission is rechecked when
+acquiring and committing a report. This is deliberately receipt-time remote permission: it does **not**
+assert that the same remote grant was valid throughout the historical interval.
+Explicit report/detail withdrawal closes its epoch; routine remote expiry alone
+does not reconstruct or extend local consent. The existing active receipt
+session is used passively, with no new session, idle extension, groups or super
+properties. `occurredAt` is receipt time; the interval properties and
+`$native_crash_exact_time_available: false` explicitly avoid a fabricated crash
+timestamp or historical session.
+
+At most four crash reports in one OS callback are accepted for projection; an
+oversized whole callback is rejected before detail reads. One original intake
+slot remains occupied through projection and the serial SQL writes; shutdown
+joins it. Report content plus occurrence number within the bounded identical
+content group is deduplicated atomically with each event. This is not an OS
+unique crash ID: identical reports in overlapping/subset callbacks may be
+conservatively omitted. Up to 32 receipts at the latest OS interval end are
+retained; older ends and new receipts after saturation are omitted. No event or
+receipt is consumed by known rollback. Unknown commit retains the original lease.
+Actual OS delivery is optional and cannot be forced by simulator fixtures.
 
 ## SDK development
 

@@ -153,6 +153,7 @@ private enum EluSQLiteRuntimeSchema {
     // Schemas 9...16 add installation capture history to owned schemas 1...8.
     // Unpublished import-ledger schemas 17...24 remain unsupported.
     static func baseVersion(_ version: Int64) -> Int64 {
+        if hasCrashReports(version) { return version - 56 }
         if hasRateLimiter(version) { return version - 48 }
         if hasFlagExposures(version) { return version - 40 }
         if hasPersonIdentity(version) { return version - 32 }
@@ -160,13 +161,14 @@ private enum EluSQLiteRuntimeSchema {
         return version > 8 ? version - 8 : version
     }
     static func supports(_ version: Int64) -> Bool { (1...16).contains(version) || hasDiagnostics(version) }
-    static func hasRateLimiter(_ version: Int64) -> Bool { (49...56).contains(version) }
-    static func hasFlagExposures(_ version: Int64) -> Bool { (41...56).contains(version) }
-    static func hasPersonIdentity(_ version: Int64) -> Bool { (33...56).contains(version) }
-    static func hasDiagnostics(_ version: Int64) -> Bool { (25...56).contains(version) }
+    static func hasCrashReports(_ version: Int64) -> Bool { (57...64).contains(version) }
+    static func hasRateLimiter(_ version: Int64) -> Bool { (49...64).contains(version) }
+    static func hasFlagExposures(_ version: Int64) -> Bool { (41...64).contains(version) }
+    static func hasPersonIdentity(_ version: Int64) -> Bool { (33...64).contains(version) }
+    static func hasDiagnostics(_ version: Int64) -> Bool { (25...64).contains(version) }
     static func hasCaptureHistory(_ version: Int64) -> Bool { (9...16).contains(version) || hasDiagnostics(version) }
     static func preservingCaptureHistory(_ base: Int64, from version: Int64) -> Int64 {
-        base + (hasRateLimiter(version) ? 48 : hasFlagExposures(version) ? 40 : hasPersonIdentity(version) ? 32 : hasDiagnostics(version) ? 24 : hasCaptureHistory(version) ? 8 : 0)
+        base + (hasCrashReports(version) ? 56 : hasRateLimiter(version) ? 48 : hasFlagExposures(version) ? 40 : hasPersonIdentity(version) ? 32 : hasDiagnostics(version) ? 24 : hasCaptureHistory(version) ? 8 : 0)
     }
     // Selected capture runtimes add a site/base-scoped token bucket. Raw owned
     // queue fixtures may retain 41...48; all production openers select a limiter.
@@ -2741,11 +2743,20 @@ private enum EluRuntimeDatabase {
             else { throw EluRuntimeQueueError.corruptStorage }
             let data = try connection.requiredData(statement, column: 2, maximumBytes: EluNativeDiagnosticsState.maximumBytes)
             guard sqlite3_step(statement) == SQLITE_DONE else { throw EluRuntimeQueueError.corruptStorage }
-            return try EluNativeDiagnosticsState.decode(data)
+            let diagnostics = try EluNativeDiagnosticsState.decode(data)
+            guard EluSQLiteRuntimeSchema.hasCrashReports(try connection.integerPragma("user_version"))
+                || (diagnostics.reportEpoch == nil && diagnostics.reports == nil) else {
+                throw EluRuntimeQueueError.corruptStorage
+            }
+            return diagnostics
         }
     }
     static func writeDiagnosticsState(_ connection: EluSQLiteConnection, stream: String,
                                       diagnostics: EluNativeDiagnosticsState, inserting: Bool = false) throws {
+        guard EluSQLiteRuntimeSchema.hasCrashReports(try connection.integerPragma("user_version"))
+            || (diagnostics.reportEpoch == nil && diagnostics.reports == nil) else {
+            throw EluRuntimeQueueError.invalidState
+        }
         let sql = inserting ? "INSERT INTO native_diagnostics_state(singleton,stream_id,metadata) VALUES(1,?,?)"
             : "UPDATE native_diagnostics_state SET stream_id=?,metadata=? WHERE singleton=1"
         try connection.withStatement(sql) { statement in
@@ -2880,6 +2891,11 @@ private enum EluRuntimeDatabase {
             throw EluRuntimeQueueError.corruptStorage
         }
         if let epoch = state.diagnostics.epoch {
+            guard epoch.identityRevision == state.identity.revision, !state.identity.optedOut else {
+                throw EluRuntimeQueueError.corruptStorage
+            }
+        }
+        if let epoch = state.diagnostics.reportEpoch {
             guard epoch.identityRevision == state.identity.revision, !state.identity.optedOut else {
                 throw EluRuntimeQueueError.corruptStorage
             }
@@ -3067,6 +3083,7 @@ private enum EluPreparedRecordDraft: Sendable {
     case performanceSample(EluEventDraft)
     case networkObservation(EluEventDraft)
     case nativeDiagnostic(EluEventDraft)
+    case metricKitCrashReport(EluEventDraft)
     case passiveRateLimitWarning(EluEventDraft)
     case mutation(
         change: EluMutationChange,
@@ -3624,6 +3641,7 @@ actor EluSQLiteRuntimeQueue {
     private let configurationGate: EluV2ConfigAuthorityGate?
     private nonisolated let eventDeliveryFence = EluV1FlagOwnerFence()
     private var captureSourceWitness: EluV2ConfigAuthorityWitness?
+    private var crashReportGrantEpoch: UInt64?
     private var flagSourceWitness: EluV2ConfigAuthorityWitness?
     private var flagRequestSource: (token: EluV1FlagBeginToken, witness: EluV2ConfigAuthorityWitness?)?
     private var flagCacheSourceWitness: EluV2ConfigAuthorityWitness?
@@ -7207,7 +7225,13 @@ actor EluSQLiteRuntimeQueue {
         guard consumeSource(sourceWitness, data: configData, apply: {
             captureSourceWitness = sourceWitness
             captureAuthority = .authorized(authority)
+            let document = try? JSONDecoder().decode(EluV1ConfigDocument.self, from: configData)
+            crashReportGrantEpoch = document?.captureExceptions?.allowsMetricKitReports == true ? epoch : nil
         }) else { return sourceUnavailableCaptureResult() }
+        if crashReportGrantEpoch == nil {
+            do { try closeCrashReportContinuity() }
+            catch { return terminateCaptureAuthority(reason: .malformed) }
+        }
         return .activated(authority)
     }
 
@@ -7326,12 +7350,12 @@ actor EluSQLiteRuntimeQueue {
 
     /// Metadata updates do not create a session or consume replay audience.
     @discardableResult
-    func closeDiagnosticsContinuity() throws -> EluRuntimeQueueSnapshot {
+    func closeDiagnosticsContinuity(numericOnly: Bool = false) throws -> EluRuntimeQueueSnapshot {
         // An ambiguous opening can exist on disk while in-memory epoch is nil.
         // A poisoned owner must never report that absence as settled closure.
         let held = try requireResources()
-        guard state.diagnostics.epoch != nil else { return state.snapshot }
-        let next = state.diagnostics.closing(at: clock())
+        guard (numericOnly ? state.diagnostics.epoch != nil : state.diagnostics.hasCoverage) else { return state.snapshot }
+        let next = numericOnly ? state.diagnostics.closingNumeric(at: clock()) : state.diagnostics.closing(at: clock())
         guard next != state.diagnostics else { return state.snapshot }
         diagnosticsDenialPersistenceInProgress = true
         defer { diagnosticsDenialPersistenceInProgress = false }
@@ -7356,8 +7380,12 @@ actor EluSQLiteRuntimeQueue {
     @discardableResult
     func applyDiagnosticsOptions(_ options: EluDiagnosticsOptions) throws -> EluRuntimeQueueSnapshot {
         _ = try requireResources()
-        if !options.enabled || state.diagnostics.epoch.map({ $0.launchSummaries != options.launchSummaries }) == true {
-            return try closeDiagnosticsContinuity()
+        if !options.enabled { return try closeDiagnosticsContinuity() }
+        if state.diagnostics.epoch.map({ $0.launchSummaries != options.launchSummaries }) == true {
+            _ = try closeDiagnosticsContinuity(numericOnly: true)
+        }
+        if !options.crashReports || state.diagnostics.reportEpoch.map({ $0.details != options.crashReportDetails }) == true {
+            try closeCrashReportContinuity()
         }
         return state.snapshot
     }
@@ -7365,19 +7393,73 @@ actor EluSQLiteRuntimeQueue {
     func reconcileDiagnosticsContinuity(options: EluDiagnosticsOptions,
         admissionGuard: @escaping @Sendable () -> Bool) throws -> Bool {
         guard options.enabled, !state.identity.optedOut else {
-            if state.diagnostics.epoch != nil { _ = try closeDiagnosticsContinuity() }
+            if state.diagnostics.hasCoverage { _ = try closeDiagnosticsContinuity() }
             return false
         }
         guard case let .authorized(authority) = captureAuthority,
               sourceIsCurrent(captureSourceWitness), authorityWitnessMatches(authority, diskState: state),
               authorityIsLive(authority, wallNow: clock(), monotonicNow: continuousClock()), admissionGuard()
         else { return false }
-        let next = state.diagnostics.reconciled(at: clock(), identityRevision: state.identity.revision,
+        let reportsAllowed = options.crashReports && crashReportGrantEpoch == authority.ownerEpoch
+        if reportsAllowed { try ensureCrashReportSchema() }
+        var next = state.diagnostics.reconciled(at: clock(), identityRevision: state.identity.revision,
             mayOpen: true, launchSummaries: options.launchSummaries)
+        if reportsAllowed || next.reportEpoch != nil {
+            next = next.reconciledReports(at: clock(), identityRevision: state.identity.revision,
+                allowed: reportsAllowed, details: options.crashReportDetails)
+        }
         if next != state.diagnostics {
             try persistDiagnosticsMetadata(next, admissionGuard: admissionGuard)
         }
         return state.diagnostics.epoch != nil
+    }
+
+    private func ensureCrashReportSchema() throws {
+        guard rateLimiter != nil, EluSQLiteRuntimeSchema.hasRateLimiter(databaseSchemaVersion) else {
+            throw EluRuntimeQueueError.invalidState
+        }
+        guard !EluSQLiteRuntimeSchema.hasCrashReports(databaseSchemaVersion) else { return }
+        let connection = try requireResources().connection
+        let target = EluSQLiteRuntimeSchema.baseVersion(databaseSchemaVersion) + 56
+        diagnosticsMetadataPersistenceInProgress = true
+        defer { diagnosticsMetadataPersistenceInProgress = false }
+        var attemptedCommit = false
+        try connection.execute("BEGIN IMMEDIATE")
+        do {
+            try EluRuntimeDatabase.verifySchema(connection, databaseVersion: databaseSchemaVersion)
+            guard try EluRuntimeDatabase.loadState(connection, validateQueue: false) == state else {
+                throw EluRuntimeQueueError.generationMismatch
+            }
+            // Same closed table; the outer discriminator lets prior openers
+            // refuse before their durability/WAL configuration, not ignore fields.
+            try connection.execute("PRAGMA user_version = \(target)")
+            try EluRuntimeDatabase.verifySchema(connection, databaseVersion: target)
+            try faultInjector?.hit(.beforeDiagnosticsMigrationCommit)
+            attemptedCommit = true
+            try connection.execute("COMMIT")
+            try faultInjector?.hit(.afterCommit)
+            databaseSchemaVersion = target
+        } catch {
+            if attemptedCommit { poisonAndRelease(); throw EluRuntimeQueueError.ambiguousCommit }
+            do { try connection.execute("ROLLBACK") }
+            catch { poisonAndRelease(); throw EluRuntimeQueueError.databaseUnavailable }
+            throw error
+        }
+    }
+
+    private func closeCrashReportContinuity() throws {
+        _ = try requireResources()
+        guard state.diagnostics.reportEpoch != nil else { return }
+        diagnosticsDenialPersistenceInProgress = true
+        defer { diagnosticsDenialPersistenceInProgress = false }
+        let next = state.diagnostics.closingReports(at: clock())
+        for attempt in 0...1 {
+            do { try persistDiagnosticsMetadata(next); return }
+            catch {
+                if attempt == 0, !isPoisoned { continue }
+                poisonAndRelease(); throw error
+            }
+        }
     }
 
     /// Continuity alone is not a customer state mutation. Keep core generation
@@ -7390,6 +7472,13 @@ actor EluSQLiteRuntimeQueue {
         try replayStorageTransaction(validate: {
             guard admissionGuard() else { throw EluRuntimeQueueError.sourceAuthorityUnavailable }
         }) { connection, disk in
+            if let epoch = next.reportEpoch {
+                guard epoch.identityRevision == disk.identity.revision, !disk.identity.optedOut else { throw EluRuntimeQueueError.invalidState }
+                if epoch != disk.diagnostics.reportEpoch {
+                    guard case let .authorized(authority) = self.captureAuthority,
+                          self.crashReportGrantEpoch == authority.ownerEpoch else { throw EluRuntimeQueueError.invalidState }
+                }
+            }
             if let epoch = next.epoch {
                 guard epoch.identityRevision == disk.identity.revision, !disk.identity.optedOut else {
                     throw EluRuntimeQueueError.invalidState
@@ -7418,6 +7507,18 @@ actor EluSQLiteRuntimeQueue {
         return capture(command, performanceSample: false, diagnosticSummary: summary, admissionGuard: admissionGuard)
     }
 
+    func captureMetricKitCrashReport(_ report: EluMetricKitCrashBatch.Item, versions: EluVersionContext,
+        admissionGuard: @escaping @Sendable () -> Bool) -> EluV1CaptureResult {
+        let now = clock()
+        if let observed = state.diagnostics.observedAt.flatMap(EluRFC3339.date(from:)), now < observed {
+            do { _ = try closeDiagnosticsContinuity() } catch { poisonAndRelease() }
+            return .rejected(.invalidEvent, snapshot: state.snapshot)
+        }
+        let command = EluV1CaptureCommand(kind: .exception, name: "$exception", occurredAt: now,
+            properties: report.report.properties, versions: versions)
+        return capture(command, performanceSample: false, crashReport: report, admissionGuard: admissionGuard)
+    }
+
     /// Completion retains its request-start ownership. It never extends an
     /// existing session, but can atomically create the first actual session.
     func captureNetworkObservation(_ command: EluV1CaptureCommand, context: EluNetworkObservationContext,
@@ -7434,7 +7535,7 @@ actor EluSQLiteRuntimeQueue {
         return capture(command, performanceSample: false, networkObservation: true, admissionGuard: admissionGuard)
     }
 
-    private func capture(_ command: EluV1CaptureCommand, performanceSample: Bool, networkObservation: Bool = false, diagnosticSummary: EluNativeDiagnosticSummary? = nil, flagExposure: EluFlagExposureRequest? = nil, rateAttempt: EluCaptureRateAttempt? = nil, bypassRateLimit: Bool = false, passiveWarning: Bool = false, admissionGuard: (@Sendable () -> Bool)?) -> EluV1CaptureResult {
+    private func capture(_ command: EluV1CaptureCommand, performanceSample: Bool, networkObservation: Bool = false, diagnosticSummary: EluNativeDiagnosticSummary? = nil, crashReport: EluMetricKitCrashBatch.Item? = nil, flagExposure: EluFlagExposureRequest? = nil, rateAttempt: EluCaptureRateAttempt? = nil, bypassRateLimit: Bool = false, passiveWarning: Bool = false, admissionGuard: (@Sendable () -> Bool)?) -> EluV1CaptureResult {
         let before = state.snapshot
         let sourceWitness = captureSourceWitness
         guard sourceIsCurrent(sourceWitness), admissionGuard?() ?? true else { return .rejected(.authorityAbsent, snapshot: before) }
@@ -7459,6 +7560,17 @@ actor EluSQLiteRuntimeQueue {
             return .rejected(.authorityExpired, snapshot: before)
         }
 
+        let reportUpdate: EluNativeDiagnosticsState?
+        if let crashReport {
+            guard EluSQLiteRuntimeSchema.hasCrashReports(databaseSchemaVersion),
+                  crashReportGrantEpoch == authority.ownerEpoch,
+                  let update = try? state.diagnostics.acceptingReport(crashReport, at: command.occurredAt,
+                      identityRevision: state.identity.revision) else {
+                return .rejected(.invalidEvent, snapshot: before)
+            }
+            reportUpdate = update
+        } else { reportUpdate = nil }
+
         if let exposure = flagExposure {
             guard exposure.anonymousId.utf8.elementsEqual(state.identity.anonymousId.utf8) else {
                 return .rejected(.authorityWitnessChanged, snapshot: before)
@@ -7482,7 +7594,7 @@ actor EluSQLiteRuntimeQueue {
                             occurredAt: clock(), properties: [EluCaptureRateLimiter.warningProperty: .string(warning)],
                             versions: command.versions)
                         _ = capture(command, performanceSample: false, bypassRateLimit: true,
-                            passiveWarning: performanceSample || diagnosticSummary != nil || networkObservation,
+                            passiveWarning: performanceSample || diagnosticSummary != nil || crashReport != nil || networkObservation,
                             admissionGuard: admissionGuard)
                     }
                     return .rejected(.rateLimited, snapshot: state.snapshot)
@@ -7508,7 +7620,7 @@ actor EluSQLiteRuntimeQueue {
                 return .rejected(.invalidEvent, snapshot: before)
             }
             diagnosticsUpdate = next
-        } else { diagnosticsUpdate = nil }
+        } else { diagnosticsUpdate = reportUpdate }
 
         let prepared: (identity: EluIdentityState, draft: EluEventDraft)
         do {
@@ -7516,8 +7628,8 @@ actor EluSQLiteRuntimeQueue {
                 command: command,
                 occurredAt: occurredAt,
                 authority: authority,
-                performanceSample: passiveWarning || performanceSample || diagnosticSummary != nil || (networkObservation && state.identity.session != nil),
-                includeContext: diagnosticSummary == nil
+                performanceSample: passiveWarning || performanceSample || diagnosticSummary != nil || crashReport != nil || (networkObservation && state.identity.session != nil),
+                includeContext: diagnosticSummary == nil && crashReport == nil
             )
         } catch {
             return .rejected(.invalidEvent, snapshot: before)
@@ -7530,6 +7642,7 @@ actor EluSQLiteRuntimeQueue {
                     identity: prepared.identity,
                     flagContext: state.flagContext,
                     drafts: [passiveWarning ? .passiveRateLimitWarning(prepared.draft)
+                        : crashReport != nil ? .metricKitCrashReport(prepared.draft)
                         : diagnosticSummary != nil ? .nativeDiagnostic(prepared.draft)
                         : performanceSample ? .performanceSample(prepared.draft)
                         : networkObservation ? .networkObservation(prepared.draft) : .event(prepared.draft)],
@@ -7538,7 +7651,8 @@ actor EluSQLiteRuntimeQueue {
                     flagExposure: flagExposure,
                     surfaceProvenNotCommitted: true,
                     prewriteValidation: { diskState in
-                        guard self.sourceIsCurrent(sourceWitness), admissionGuard?() ?? true else { throw EluRuntimeQueueError.sourceAuthorityUnavailable }
+                        guard self.sourceIsCurrent(sourceWitness), admissionGuard?() ?? true,
+                              crashReport == nil || self.crashReportGrantEpoch == authority.ownerEpoch else { throw EluRuntimeQueueError.sourceAuthorityUnavailable }
                         guard self.authorityWitnessMatches(authority, diskState: diskState) else {
                             throw EluRuntimeQueueError.generationMismatch
                         }
@@ -7551,7 +7665,8 @@ actor EluSQLiteRuntimeQueue {
                         }
                     },
                     precommitValidation: {
-                        guard self.sourceIsCurrent(sourceWitness), admissionGuard?() ?? true else { throw EluRuntimeQueueError.sourceAuthorityUnavailable }
+                        guard self.sourceIsCurrent(sourceWitness), admissionGuard?() ?? true,
+                              crashReport == nil || self.crashReportGrantEpoch == authority.ownerEpoch else { throw EluRuntimeQueueError.sourceAuthorityUnavailable }
                     }
                 )
                 guard let record = result.records.first else {
@@ -8654,7 +8769,7 @@ actor EluSQLiteRuntimeQueue {
             reason: reason
         )
         captureAuthority = .terminal(terminal)
-        if reason != .expired, reason != .stale, state.diagnostics.epoch != nil {
+        if reason != .expired, reason != .stale, state.diagnostics.hasCoverage {
             do { _ = try closeDiagnosticsContinuity() }
             catch { poisonAndRelease() }
         }
@@ -9272,10 +9387,12 @@ actor EluSQLiteRuntimeQueue {
             let sequence = firstSequence + Int64(index)
             let rawRecord: EluQueuedRecord
             switch draft {
-            case let .event(eventDraft), let .performanceSample(eventDraft), let .networkObservation(eventDraft), let .nativeDiagnostic(eventDraft), let .passiveRateLimitWarning(eventDraft):
+            case let .event(eventDraft), let .performanceSample(eventDraft), let .networkObservation(eventDraft), let .nativeDiagnostic(eventDraft), let .metricKitCrashReport(eventDraft), let .passiveRateLimitWarning(eventDraft):
                 let isPassive: Bool
                 let passiveName: String?
                 let includeGroups: Bool
+                let passiveException: Bool
+                if case .metricKitCrashReport = draft { passiveException = true } else { passiveException = false }
                 switch draft {
                 case .passiveRateLimitWarning:
                     // Only the internal limited-transition path constructs this
@@ -9283,6 +9400,8 @@ actor EluSQLiteRuntimeQueue {
                     isPassive = true; passiveName = EluCaptureRateLimiter.warningEvent; includeGroups = true
                 case .performanceSample: isPassive = true; passiveName = "$performance_sample"; includeGroups = true
                 case .networkObservation: isPassive = true; passiveName = "$network_request"; includeGroups = true
+                case .metricKitCrashReport:
+                    isPassive = true; passiveName = "$exception"; includeGroups = false
                 case .nativeDiagnostic:
                     guard ["$native_diagnostic", "$native_launch"].contains(eventDraft.name) else { throw EluRuntimeQueueError.invalidRecord }
                     isPassive = true; passiveName = eventDraft.name; includeGroups = false
@@ -9294,7 +9413,7 @@ actor EluSQLiteRuntimeQueue {
                       eventDraft.expectedSessionId == session.id,
                       eventDraft.occurredAt >= session.startedAt,
                       (isPassive
-                        ? eventDraft.kind == .capture && eventDraft.name == passiveName
+                        ? (passiveException ? eventDraft.kind == .exception : eventDraft.kind == .capture) && eventDraft.name == passiveName
                             && eventDraft.occurredAt >= session.lastActivityAt
                             && eventDraft.occurredAt.timeIntervalSince(session.lastActivityAt) < Double(session.timeoutSeconds)
                         : eventDraft.occurredAt <= session.lastActivityAt)
@@ -9488,7 +9607,7 @@ actor EluSQLiteRuntimeQueue {
         // original lease while historical coverage could still be durable,
         // including an ambiguous opening write absent from in-memory state.
         if consentPersistenceInProgress || nativeDenialPersistenceInProgress || diagnosticsDenialPersistenceInProgress ||
-            diagnosticsMetadataPersistenceInProgress || state.diagnostics.epoch != nil {
+            diagnosticsMetadataPersistenceInProgress || state.diagnostics.hasCoverage {
             held?.quarantineNativeClockDenial()
         }
         held?.quarantineReplay()

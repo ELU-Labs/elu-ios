@@ -249,6 +249,53 @@ reuse it. No cross-process persistence guarantee is made for an intent when
 storage rejects every write. See the README for installation, availability, and
 attribution limits.
 
+### Opt-in MetricKit report contract
+
+Individual reports are distinct from numeric diagnostics. The parent
+`diagnostics.enabled`, local `crashReports`, one known report consent/identity
+epoch over the entire OS interval, and current general plus supported exception
+authority are all required. Only absent/false or the exact canonical
+`captureExceptions` object may parse; nonempty recognized suppression rules
+explicitly deny this partial path. Unknown keys/types/operators refuse the
+configuration. The first native path has no local override and does not claim
+browser option/suppression parity or control-plane activation.
+
+Mach exception and signal values are available from iOS 14. iOS 17+ exception
+name/class/reason require the separate `crashReportDetails` opt-in. No raw OS
+representation, stack, address or process metadata getter is called. Four whole
+reports per callback, 16 KiB per detached report, 256/256/1,024 scalar detail
+limits, and one original projection-through-SQL slot bound SDK retention/work
+admission. OS getter time/allocation and OS delivery are not bounded or promised.
+The original persisted report epoch, identity revision and detail selection are
+bound at monitor publication. Canonical OS begin/end and fresh receipt clock
+must pass that original interval projection before optional detail getters;
+identity/consent/source invalidation is rechecked around every getter and handoff.
+SQL retains the final independent check. Close revokes acquisition first and
+joins that original slot. The regular numeric receiver behavior is unchanged.
+
+The event is a passive receipt-time `$exception` with explicit OS interval and
+unavailable exact-crash-time fields. It cannot create/extend a session or inherit
+groups/superproperties. Local interval consent is continuous; remote authority is
+current at import, not asserted historically. Detail/consent/identity withdrawal,
+terminal denial and clock reversal close coverage. Content/identical-occurrence
+receipts are atomic with the event, bounded to 32 at the newest interval end,
+and conservatively omit older or ambiguous duplicate content. Numeric receipts
+and report receipts remain separate and share the original metadata transaction.
+
+Report-capable selection lazily advances selected limiter schemas 49–56 to
+57–64 (same eight flag/replay/delivery/native layouts). Numeric-only selection
+keeps its existing version and canonical metadata bytes; old optional fields
+remain absent. The existing metadata table stays capped at 8 KiB. Production
+openers retain their existing 1–16 and 25–48 forward migrations before selected
+49–56; unpublished 17–24 remain refused. Raw runtimes without the selected limiter
+cannot activate reports. Report-enabled databases do not support downgrade to
+older writable SDKs: their retained schema allowlist ends at 56 and their common
+preflight rejects before original writable/WAL setup. This source fact is not
+historical binary execution evidence. Authored current tests cover all eight
+selected predecessor/successor layouts, unknown-version before-write refusal,
+byte preservation, upgrade rollback/reopen and unknown-commit quarantine. Native
+execution and actual OS report delivery remain separate validation gates.
+
 ## Storage upgrades and release evidence
 
 Supported owned-store schemas preserve identity, consent, queued records, and

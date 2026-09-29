@@ -62,6 +62,7 @@ struct EluV1ConfigDocument: Decodable, Sendable {
     let limits: EluV1Limits?
     let reason: String?
     let capturePerformance: EluCapturePerformancePolicy?
+    let captureExceptions: EluCaptureExceptionsPolicy?
     /// Absent means all devices. This restricts replay only, never events.
     let replayAudience: String?
 
@@ -80,6 +81,7 @@ struct EluV1ConfigDocument: Decodable, Sendable {
         case limits
         case reason
         case capturePerformance
+        case captureExceptions
         case replayAudience
     }
 
@@ -120,6 +122,10 @@ struct EluV1ConfigDocument: Decodable, Sendable {
         limits = try container.eluDecodeIfPresent(EluV1Limits.self, forKey: .limits)
         reason = try container.eluDecodeIfPresent(String.self, forKey: .reason)
         capturePerformance = try container.eluDecodeIfPresent(EluCapturePerformancePolicy.self, forKey: .capturePerformance)
+        captureExceptions = try container.eluDecodeIfPresent(EluCaptureExceptionsPolicy.self, forKey: .captureExceptions)
+        guard captureExceptions == nil || (schemaVersion == Self.v2SchemaVersion && status == .enabled) else {
+            throw EluV1ConfigResolutionError.malformedConfig
+        }
         replayAudience = try container.eluDecodeIfPresent(String.self, forKey: .replayAudience)
         guard replayAudience == nil || (replayAudience == "new-devices"
             && schemaVersion == Self.v2SchemaVersion && status == .enabled) else {
@@ -1430,5 +1436,44 @@ struct EluCapturePerformancePolicy: Decodable, Equatable, Sendable {
         guard (5_000 ... 2_147_483_647).contains(sampleIntervalMilliseconds) else {
             throw EluV1ConfigResolutionError.malformedConfig
         }
+    }
+}
+
+/// Native automatic reports currently implement only an empty suppression list.
+/// Recognized nonempty policies are retained as an explicit denied selection;
+/// they can never become permission by dropping a rule or truncating a value.
+struct EluCaptureExceptionsPolicy: Decodable, Sendable {
+    let allowsMetricKitReports: Bool
+    private enum CodingKeys: String, CodingKey, CaseIterable { case suppressionRules }
+    init(from decoder: Decoder) throws {
+        if let value = try? decoder.singleValueContainer().decode(Bool.self) {
+            guard !value else { throw EluV1ConfigResolutionError.malformedConfig }
+            allowsMetricKitReports = false; return
+        }
+        try EluClosedRecord.requireOnly(CodingKeys.self, from: decoder)
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let rules = try container.decode([EluJSONValue].self, forKey: .suppressionRules)
+        guard rules.count <= 100 else { throw EluV1ConfigResolutionError.malformedConfig }
+        let operators: Set<String> = ["exact", "is_not", "icontains", "not_icontains", "regex", "not_regex", "gt", "lt"]
+        func bounded(_ value: EluJSONValue) -> Bool {
+            guard case let .string(text) = value else { return false }
+            return text.unicodeScalars.prefix(1_001).count <= 1_000
+        }
+        for rule in rules {
+            guard case let .object(fields) = rule, Set(fields.keys) == ["type", "values"],
+                  case let .string(type)? = fields["type"], ["AND", "OR"].contains(type),
+                  case let .array(values)? = fields["values"], values.count <= 50
+            else { throw EluV1ConfigResolutionError.malformedConfig }
+            for value in values {
+                guard case let .object(fields) = value, Set(fields.keys) == ["key", "value", "operator"],
+                      case let .string(key)? = fields["key"], ["$exception_types", "$exception_values"].contains(key),
+                      case let .string(operation)? = fields["operator"], operators.contains(operation),
+                      let match = fields["value"] else { throw EluV1ConfigResolutionError.malformedConfig }
+                if case let .array(parts) = match {
+                    guard parts.count <= 100, parts.allSatisfy(bounded) else { throw EluV1ConfigResolutionError.malformedConfig }
+                } else if !bounded(match) { throw EluV1ConfigResolutionError.malformedConfig }
+            }
+        }
+        allowsMetricKitReports = rules.isEmpty
     }
 }

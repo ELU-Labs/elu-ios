@@ -338,7 +338,7 @@ final class EluCaptureRateQueueTests: XCTestCase {
         XCTAssertEqual(try h.base.schemaVersion(), 41)
         fault.action = nil; try await reopen(h, options: one); await h.queue.close()
         for sql in ["UPDATE capture_rate_limit SET stream_id='foreign'", "DELETE FROM capture_rate_limit",
-                    "UPDATE capture_rate_limit SET metadata=CAST('{}' AS BLOB)", "PRAGMA user_version=57", "PRAGMA user_version=17"] {
+                    "UPDATE capture_rate_limit SET metadata=CAST('{}' AS BLOB)", "PRAGMA user_version=65", "PRAGMA user_version=17"] {
             let invalid = try await make(); defer { invalid.base.remove() }; await invalid.queue.close()
             try invalid.base.sql(sql)
             do { try await reopen(invalid, options: one); XCTFail("Invalid rate store accepted") } catch {}

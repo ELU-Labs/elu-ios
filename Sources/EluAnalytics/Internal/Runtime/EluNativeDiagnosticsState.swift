@@ -88,6 +88,12 @@ struct EluNativeDiagnosticsState: Codable, Equatable, Sendable {
         let begin: String
         let launchSummaries: Bool
     }
+    struct ReportEpoch: Codable, Equatable, Sendable {
+        let id: String
+        let identityRevision: Int64
+        let begin: String
+        let details: Bool
+    }
     struct Receipts: Codable, Equatable, Sendable {
         let end: String
         var fingerprints: [String]
@@ -96,6 +102,9 @@ struct EluNativeDiagnosticsState: Codable, Equatable, Sendable {
     var observedAt: String?
     var diagnostic: Receipts?
     var launch: Receipts?
+    var reportEpoch: ReportEpoch? = nil
+    var reports: Receipts? = nil
+    var hasCoverage: Bool { epoch != nil || reportEpoch != nil }
     static let maximumBytes = 8_192
     static let closed = Self(epoch: nil, observedAt: nil, diagnostic: nil, launch: nil)
 
@@ -109,19 +118,83 @@ struct EluNativeDiagnosticsState: Codable, Equatable, Sendable {
         return result
     }
 
+    func closingNumeric(at date: Date? = nil) -> Self {
+        var result = self
+        result.epoch = nil; result.diagnostic = nil; result.launch = nil
+        if let date, let now = EluNativeDiagnosticSummary.canonical(date),
+           observedAt.flatMap(EluRFC3339.date(from:)).map({ now >= $0 }) ?? true {
+            result.observedAt = EluRFC3339.string(from: now)
+        }
+        return result
+    }
+
     func reconciled(at date: Date, identityRevision: Int64, mayOpen: Bool, launchSummaries: Bool) -> Self {
         guard let now = EluNativeDiagnosticSummary.canonical(date), identityRevision >= 0,
               observedAt.flatMap(EluRFC3339.date(from:)).map({ now >= $0 }) ?? true
         else { return closing() }
         var result = self
-        if let epoch, epoch.identityRevision != identityRevision || epoch.launchSummaries != launchSummaries {
-            result = closing(at: now)
-        }
+        if let epoch, epoch.identityRevision != identityRevision { result = closing(at: now) }
+        else if let epoch, epoch.launchSummaries != launchSummaries { result = closingNumeric(at: now) }
         if result.epoch == nil, mayOpen {
             result.epoch = Epoch(id: UUID().uuidString.lowercased(), identityRevision: identityRevision,
                                  begin: EluRFC3339.string(from: now), launchSummaries: launchSummaries)
         }
         result.observedAt = EluRFC3339.string(from: now)
+        return result
+    }
+
+    func closingReports(at date: Date? = nil) -> Self {
+        var result = self
+        result.reportEpoch = nil; result.reports = nil
+        if let date, let now = EluNativeDiagnosticSummary.canonical(date),
+           observedAt.flatMap(EluRFC3339.date(from:)).map({ now >= $0 }) ?? true {
+            result.observedAt = EluRFC3339.string(from: now)
+        }
+        return result
+    }
+
+    /// Local rich-report consent is independent of the older numeric epoch.
+    /// Remote permission is checked at acquisition/commit, not extrapolated over
+    /// the historical OS interval. Explicit remote withdrawal closes this epoch.
+    func reconciledReports(at date: Date, identityRevision: Int64,
+                           allowed: Bool, details: Bool) -> Self {
+        guard let now = EluNativeDiagnosticSummary.canonical(date), identityRevision >= 0,
+              observedAt.flatMap(EluRFC3339.date(from:)).map({ now >= $0 }) ?? true
+        else { return closing() }
+        guard allowed else { return closingReports(at: now) }
+        var result = self
+        if let epoch = reportEpoch, epoch.identityRevision != identityRevision || epoch.details != details {
+            result = result.closingReports(at: now)
+        }
+        if result.reportEpoch == nil {
+            result.reportEpoch = ReportEpoch(id: UUID().uuidString.lowercased(), identityRevision: identityRevision,
+                begin: EluRFC3339.string(from: now), details: details)
+        }
+        result.observedAt = EluRFC3339.string(from: now)
+        return result
+    }
+
+    func acceptingReport(_ item: EluMetricKitCrashBatch.Item, at date: Date,
+                         identityRevision: Int64) throws -> Self? {
+        let report = item.report
+        guard let now = EluNativeDiagnosticSummary.canonical(date), let epoch = reportEpoch,
+              epoch.identityRevision == identityRevision, epoch.details == report.detailsPermitted,
+              let begin = EluRFC3339.date(from: epoch.begin), report.begin >= begin, report.end <= now,
+              observedAt.flatMap(EluRFC3339.date(from:)).map({ now >= $0 }) == true,
+              (0..<EluMetricKitCrashBatch.maximumReports).contains(item.occurrence),
+              try item.digest == report.contentDigest() else { return nil }
+        let fingerprint = item.receiptFingerprint(epochID: epoch.id)
+        var receipts = reports
+        if let old = receipts, let oldEnd = EluRFC3339.date(from: old.end) {
+            guard report.end >= oldEnd else { return nil }
+            if report.end > oldEnd { receipts = nil }
+        }
+        if receipts == nil { receipts = Receipts(end: EluRFC3339.string(from: report.end), fingerprints: []) }
+        guard var accepted = receipts, accepted.fingerprints.count < 32,
+              !accepted.fingerprints.contains(fingerprint) else { return nil }
+        accepted.fingerprints.append(fingerprint)
+        var result = self
+        result.observedAt = EluRFC3339.string(from: now); result.reports = accepted
         return result
     }
 
@@ -173,6 +246,18 @@ struct EluNativeDiagnosticsState: Codable, Equatable, Sendable {
             guard UUID(uuidString: epoch.id)?.uuidString.lowercased() == epoch.id,
                   epoch.identityRevision >= 0, let observed, try date(epoch.begin) <= observed else { throw EluRuntimeQueueError.corruptStorage }
         } else if diagnostic != nil || launch != nil { throw EluRuntimeQueueError.corruptStorage }
+        if let reportEpoch {
+            guard UUID(uuidString: reportEpoch.id)?.uuidString.lowercased() == reportEpoch.id,
+                  reportEpoch.identityRevision >= 0, let observed, try date(reportEpoch.begin) <= observed
+            else { throw EluRuntimeQueueError.corruptStorage }
+        } else if reports != nil { throw EluRuntimeQueueError.corruptStorage }
+        if let receipt = reports {
+            guard let reportEpoch, let observed, try date(receipt.end) >= date(reportEpoch.begin),
+                  try date(receipt.end) <= observed, (1...32).contains(receipt.fingerprints.count),
+                  Set(receipt.fingerprints).count == receipt.fingerprints.count,
+                  receipt.fingerprints.allSatisfy({ $0.count == 64 && $0.utf8.allSatisfy { (48...57).contains($0) || (97...102).contains($0) } })
+            else { throw EluRuntimeQueueError.corruptStorage }
+        }
         for receipt in [diagnostic, launch].compactMap({ $0 }) {
             guard let epoch, let observed, try date(receipt.end) >= date(epoch.begin),
                   try date(receipt.end) <= observed, (1...32).contains(receipt.fingerprints.count),

@@ -907,9 +907,24 @@ actor EluStandaloneRuntime {
         guard (try? await queue.reconcileDiagnosticsContinuity(options: diagnosticsOptions, admissionGuard: current)) == true,
               phase == .capturing, current() else { diagnosticsMonitor.withdraw(); return }
         let launch = diagnosticsOptions.launchSummaries && document.capturePerformance?.mainThreadStalls == true
-        diagnosticsMonitor.publish(includeLaunch: launch, current: current) { [weak self] summary in
-            Task { await self?.captureNativeDiagnostic(summary, isCurrent: current) }
-        }
+        let reports = diagnosticsOptions.crashReports && document.captureExceptions?.allowsMetricKitReports == true
+        let reportProjection: EluMetricKitCrashProjection?
+        if reports {
+            guard let original = try? await queue.diagnosticsContinuity(), phase == .capturing, current(),
+                  let projection = EluMetricKitCrashProjection(state: original,
+                    identityRevision: lastSnapshot.identity.revision, optedOut: lastSnapshot.identity.optedOut,
+                    details: diagnosticsOptions.crashReportDetails) else { diagnosticsMonitor.withdraw(); return }
+            reportProjection = projection
+        } else { reportProjection = nil }
+        guard phase == .capturing, current() else { diagnosticsMonitor.withdraw(); return }
+        diagnosticsMonitor.publish(includeLaunch: launch, includeCrashReports: reports,
+            crashReportDetails: diagnosticsOptions.crashReportDetails,
+            reportProjection: reportProjection, reportClock: readClock,
+            receiveReports: { [weak self] batch, originalCurrent in
+                await self?.captureMetricKitCrashBatch(batch, isCurrent: originalCurrent)
+            }, current: current) { [weak self] summary in
+                Task { await self?.captureNativeDiagnostic(summary, isCurrent: current) }
+            }
     }
 
     /// A historical OS summary is received now, under a current live session.
@@ -930,6 +945,30 @@ actor EluStandaloneRuntime {
         case let .rejected(_, snapshot):
             if snapshot.queuedCount > lastSnapshot.queuedCount { armFlushTimer() }
             lastSnapshot = snapshot
+        }
+    }
+
+    /// One original subscriber intake remains occupied until this bounded batch
+    /// and every original queue transaction settle. Only receipt-time session
+    /// metadata is used; no crash-time session or continuous remote grant is inferred.
+    func captureMetricKitCrashBatch(_ batch: EluMetricKitCrashBatch,
+        isCurrent: @escaping @Sendable () -> Bool) async {
+        for item in batch.items {
+            guard diagnosticsOptions.enabled, diagnosticsOptions.crashReports,
+                  item.report.detailsPermitted == diagnosticsOptions.crashReportDetails,
+                  phase == .capturing, isCurrent(), diagnosticsGate.token() != nil,
+                  let data = configurationDocument,
+                  let document = try? JSONDecoder().decode(EluV1ConfigDocument.self, from: data),
+                  document.captureExceptions?.allowsMetricKitReports == true else { return }
+            let fence = deliveryFence, decision = fence.token()
+            let result = await queue.captureMetricKitCrashReport(item, versions: versions,
+                admissionGuard: { isCurrent() && fence.isCurrent(decision) })
+            switch result {
+            case let .accepted(_, snapshot): lastSnapshot = snapshot; armFlushTimer()
+            case let .rejected(_, snapshot):
+                if snapshot.queuedCount > lastSnapshot.queuedCount { armFlushTimer() }
+                lastSnapshot = snapshot
+            }
         }
     }
 

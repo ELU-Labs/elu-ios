@@ -4,10 +4,16 @@ import MetricKit
 #endif
 
 /// Registration is lazy and local opt-in only. No access to pastPayloads,
-/// JSON/dictionary representations, metadata or call-stack trees.
+/// JSON/dictionary representations, metadata or call-stack trees. Report detail
+/// getters additionally require their own original local and remote permission.
 final class EluNativeDiagnosticsMonitor: @unchecked Sendable {
     struct Receiver: Sendable {
         let includeLaunch: Bool
+        let includeCrashReports: Bool
+        let crashReportDetails: Bool
+        let reportProjection: EluMetricKitCrashProjection?
+        let reportClock: @Sendable () -> Date
+        let receiveReports: @Sendable (EluMetricKitCrashBatch, @escaping @Sendable () -> Bool) async -> Void
         let current: @Sendable () -> Bool
         let receive: @Sendable (EluNativeDiagnosticSummary) -> Void
     }
@@ -15,18 +21,25 @@ final class EluNativeDiagnosticsMonitor: @unchecked Sendable {
     private let registration = DispatchQueue(label: "dev.elu.diagnostics")
     private var stopped = false
     private var receiver: (id: UUID, value: Receiver)?
+    private var reportIntake: ReportIntake?
     #if canImport(MetricKit) && os(iOS)
     private var subscriber: EluMetricKitSubscriber?
     #endif
-    func publish(includeLaunch: Bool, current: @escaping @Sendable () -> Bool,
-                 receive: @escaping @Sendable (EluNativeDiagnosticSummary) -> Void) {
+    @discardableResult
+    func publish(includeLaunch: Bool, includeCrashReports: Bool = false, crashReportDetails: Bool = false,
+                 reportProjection: EluMetricKitCrashProjection? = nil, reportClock: @escaping @Sendable () -> Date = { Date() },
+                 receiveReports: @escaping @Sendable (EluMetricKitCrashBatch, @escaping @Sendable () -> Bool) async -> Void = { _, _ in },
+                 current: @escaping @Sendable () -> Bool,
+                 receive: @escaping @Sendable (EluNativeDiagnosticSummary) -> Void) -> UUID? {
         withdraw()
         lock.lock()
-        guard !stopped, current() else { lock.unlock(); return }
+        guard !stopped, current() else { lock.unlock(); return nil }
         let id = UUID()
-        receiver = (id, Receiver(includeLaunch: includeLaunch, current: current, receive: receive))
+        receiver = (id, Receiver(includeLaunch: includeLaunch, includeCrashReports: includeCrashReports,
+            crashReportDetails: crashReportDetails, reportProjection: reportProjection, reportClock: reportClock,
+            receiveReports: receiveReports, current: current, receive: receive))
         #if canImport(MetricKit) && os(iOS)
-        let value = EluMetricKitSubscriber { [weak self] in self?.currentReceiver(id) }
+        let value = EluMetricKitSubscriber(owner: self, receiverID: id) { [weak self] in self?.currentReceiver(id) }
         subscriber = value
         #endif
         lock.unlock()
@@ -37,11 +50,52 @@ final class EluNativeDiagnosticsMonitor: @unchecked Sendable {
             if self?.currentReceiver(id) == nil { MXMetricManager.shared.remove(value) }
         }
         #endif
+        return id
     }
     private func currentReceiver(_ id: UUID) -> Receiver? {
         lock.lock(); let value = receiver; let stopped = stopped; lock.unlock()
         guard !stopped, value?.id == id, let receiver = value?.value, receiver.current() else { return nil }
         return receiver
+    }
+    /// One original slot covers OS projection, the full bounded batch, and its
+    /// actor/SQL settlement. Concurrent/reentrant batches do not read details.
+    func receiveCrashReports(receiverID: UUID,
+        project: (EluMetricKitCrashProjection, @Sendable () -> Bool) throws -> EluMetricKitCrashBatch) {
+        guard let receiver = currentReceiver(receiverID), receiver.includeCrashReports,
+              let projection = receiver.reportProjection, projection.epoch.details == receiver.crashReportDetails else { return }
+        lock.lock()
+        guard !stopped, self.receiver?.id == receiverID, reportIntake == nil else { lock.unlock(); return }
+        let intake = ReportIntake()
+        reportIntake = intake
+        lock.unlock()
+        let current: @Sendable () -> Bool = { [weak self] in self?.currentReceiver(receiverID) != nil }
+        do {
+            guard current() else { finish(intake); return }
+            let batch = try project(projection, current)
+            guard current(), batch.items.allSatisfy({ $0.report.detailsPermitted == projection.epoch.details
+                && projection.permits(begin: $0.report.begin, end: $0.report.end, at: receiver.reportClock()) }) else {
+                finish(intake); return
+            }
+            // There is at most one such Task, regardless of callback/report count.
+            Task {
+                await receiver.receiveReports(batch, current)
+                self.finish(intake)
+            }
+        } catch { finish(intake) }
+    }
+    private final class ReportIntake: @unchecked Sendable {
+        let completion = DispatchGroup()
+        init() { completion.enter() }
+    }
+    private func finish(_ original: ReportIntake) {
+        lock.lock()
+        guard reportIntake === original else { lock.unlock(); return }
+        reportIntake = nil
+        original.completion.leave()
+        lock.unlock()
+    }
+    private func currentIntake() -> ReportIntake? {
+        lock.lock(); defer { lock.unlock() }; return reportIntake
     }
     func withdraw() {
         lock.lock(); receiver = nil
@@ -56,7 +110,13 @@ final class EluNativeDiagnosticsMonitor: @unchecked Sendable {
     func stop() { lock.lock(); stopped = true; lock.unlock(); withdraw() }
     func closeAndWait() async {
         stop()
+        let original = currentIntake()
         await withCheckedContinuation { continuation in registration.async { continuation.resume() } }
+        if let original {
+            await withCheckedContinuation { continuation in
+                original.completion.notify(queue: registration) { continuation.resume() }
+            }
+        }
     }
     deinit { stop() }
 }
@@ -64,8 +124,11 @@ final class EluNativeDiagnosticsMonitor: @unchecked Sendable {
 #if canImport(MetricKit) && os(iOS)
 private final class EluMetricKitSubscriber: NSObject, MXMetricManagerSubscriber {
     private let readReceiver: @Sendable () -> EluNativeDiagnosticsMonitor.Receiver?
-    init(readReceiver: @escaping @Sendable () -> EluNativeDiagnosticsMonitor.Receiver?) {
-        self.readReceiver = readReceiver
+    private weak var owner: EluNativeDiagnosticsMonitor?
+    private let receiverID: UUID
+    init(owner: EluNativeDiagnosticsMonitor, receiverID: UUID,
+         readReceiver: @escaping @Sendable () -> EluNativeDiagnosticsMonitor.Receiver?) {
+        self.owner = owner; self.receiverID = receiverID; self.readReceiver = readReceiver
     }
     private func deliver(_ summary: EluNativeDiagnosticSummary, to receiver: EluNativeDiagnosticsMonitor.Receiver) {
         if receiver.current() { receiver.receive(summary) }
@@ -85,6 +148,48 @@ private final class EluMetricKitSubscriber: NSObject, MXMetricManagerSubscriber 
     @available(iOS 14.0, *)
     func didReceive(_ payloads: [MXDiagnosticPayload]) {
         guard let receiver = readReceiver(), payloads.count <= 16 else { return }
+        if receiver.includeCrashReports {
+            owner?.receiveCrashReports(receiverID: receiverID) { projection, current in
+                // Reject the entire oversized input before any report detail read.
+                let counts = payloads.map { $0.crashDiagnostics?.count ?? 0 }
+                guard counts.allSatisfy({ $0 <= EluMetricKitCrashBatch.maximumReports }),
+                      counts.reduce(0, +) <= EluMetricKitCrashBatch.maximumReports else {
+                    throw EluRuntimeQueueError.invalidRecord
+                }
+                var reports: [EluMetricKitCrashReport] = []
+                for payload in payloads {
+                    guard current() else { throw EluRuntimeQueueError.sourceAuthorityUnavailable }
+                    // Original OS interval facts precede every optional detail getter.
+                    let begin = payload.timeStampBegin, end = payload.timeStampEnd
+                    guard projection.permits(begin: begin, end: end, at: receiver.reportClock()), current() else {
+                        throw EluRuntimeQueueError.sourceAuthorityUnavailable
+                    }
+                    for crash in payload.crashDiagnostics ?? [] {
+                        let report = try projection.project(begin: begin, end: end, clock: receiver.reportClock,
+                            current: current, readCodes: {
+                                let mach = try Self.integer(crash.exceptionType)
+                                guard current() else { throw EluRuntimeQueueError.sourceAuthorityUnavailable }
+                                return (mach, try Self.integer(crash.signal))
+                            }, readDetails: { permitted in
+                                guard permitted() else { throw EluRuntimeQueueError.sourceAuthorityUnavailable }
+                                if #available(iOS 17.0, *), let original = crash.exceptionReason {
+                                    // Retained bounds do not bound the original OS getter.
+                                    guard permitted() else { throw EluRuntimeQueueError.sourceAuthorityUnavailable }
+                                    let name = original.exceptionName
+                                    guard permitted() else { throw EluRuntimeQueueError.sourceAuthorityUnavailable }
+                                    let className = original.className
+                                    guard permitted() else { throw EluRuntimeQueueError.sourceAuthorityUnavailable }
+                                    let message = original.composedMessage
+                                    return .init(name: name, className: className, message: message)
+                                }
+                                return nil
+                            })
+                        reports.append(report)
+                    }
+                }
+                return try EluMetricKitCrashBatch(reports)
+            }
+        }
         for payload in payloads {
             guard receiver.current() else { return }
             do {
@@ -116,6 +221,12 @@ private final class EluMetricKitSubscriber: NSObject, MXMetricManagerSubscriber 
                 }
             } catch { continue }
         }
+    }
+    private static func integer(_ value: NSNumber?) throws -> Int64? {
+        guard let value else { return nil }
+        let integer = value.int64Value
+        guard value == NSNumber(value: integer) else { throw EluRuntimeQueueError.invalidRecord }
+        return integer
     }
     private func histogram(_ value: MXHistogram<UnitDuration>, prefix: String) throws -> [String: EluJSONValue] {
         guard value.totalBucketCount <= 128 else { throw EluRuntimeQueueError.invalidRecord }

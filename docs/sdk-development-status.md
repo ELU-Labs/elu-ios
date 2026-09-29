@@ -56,3 +56,14 @@ release effort; simulator qualification cannot establish real-device resource
 costs or OS diagnostic availability. A source or consumer compile is not final
 artifact or end-to-end qualification. Keep private artifacts, logs, device data,
 credentials and provenance receipts out of public source commits.
+
+The per-report MetricKit path is a separately opted-in no-stack implementation:
+iOS 14 Mach/signal fields, optional iOS 17 Objective-C details under another local
+permission, a current empty-suppression exception grant, and independent durable
+local interval consent. Native control-plane grant emission is still unavailable;
+manual exception capture and numeric diagnostic opt-in do not activate it. New
+report/queue/migration/close controls are authored but not yet compiled or run.
+No actual OS delivery, crash-stack mapping, global Swift error interception,
+full browser suppression/override parity or final artifact qualification is
+claimed. See README and CONTRACT for receipt-time attribution and downgrade
+limits. Historical CI totals above predate this source slice.
