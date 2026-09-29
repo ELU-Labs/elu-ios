@@ -25,8 +25,14 @@ final class EluNativeReplayCaptureQueueTests: XCTestCase {
             }
             XCTAssertNil(EluNativeReplayProtocol.matching(codec: tuple.codec, compression: "none", generation: tuple.generation))
         }
-        XCTAssertEqual(EluStandaloneRuntime.readbackProvenReplayCapabilities.transports, [EluNativeReplayProtocol.v1.transport])
-        XCTAssertNil(EluStandaloneRuntime.readbackProvenReplayCapabilities.supportedProtocolGeneration("protocol-generation-v2"))
+        let installed = EluStandaloneRuntime.readbackProvenReplayCapabilities
+        XCTAssertEqual(installed.transports, [EluNativeReplayProtocol.v1.transport, EluNativeReplayProtocol.v2.transport])
+        for tuple in [EluNativeReplayProtocol.v1, .v2] {
+            XCTAssertEqual(installed.supportedProtocolGeneration(tuple.generation), tuple.generation)
+            XCTAssertEqual(installed.transports(for: tuple.generation), [tuple.transport])
+        }
+        XCTAssertNil(installed.supportedProtocolGeneration("protocol-generation-v3"))
+        XCTAssertTrue(installed.transports(for: "protocol-generation-v3").isEmpty)
     }
 
     func testUnusedCancellationIsTerminalAndRequiresNoStartProofBeforeRelease() async throws {

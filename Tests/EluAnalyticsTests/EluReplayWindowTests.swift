@@ -67,10 +67,19 @@ final class EluReplayWindowTests: XCTestCase {
     func testLawfulScrollRetainsContactAndOrdersOldPointsBeforeFreshGeometry() throws {
         let scroll = UIScrollView(frame: root.bounds)
         scroll.showsVerticalScrollIndicator = false; scroll.showsHorizontalScrollIndicator = false
+        // This fixture uses fixed viewport points; host safe-area adjustment is not part of its workload.
+        scroll.contentInsetAdjustmentBehavior = .never
         scroll.contentSize = CGSize(width: 320, height: 900)
         let safe = UIView(frame: CGRect(x: 10, y: 0, width: 100, height: 300))
         scroll.addSubview(safe); root.addSubview(scroll); settle()
+        XCTAssertEqual(scroll.adjustedContentInset, .zero); XCTAssertEqual(scroll.contentOffset, .zero)
         let (initial, firstProjection) = try frame(0)
+        let pointTime = EluNativeInteractionTime(timestamp: 1_100, continuous: 1_100_000_000)
+        let initialPoint = try XCTUnwrap(firstProjection.point(location: CGPoint(x: 50, y: 50),
+            time: pointTime, deadline: 100, now: { 0 }))
+        let initialLeaf = try XCTUnwrap(initial.nodes.first { $0.identity == initialPoint.identity })
+        XCTAssertEqual(initialLeaf.bounds, try EluNativeRect(x: 10, y: 0, width: 100, height: 300))
+        XCTAssertEqual(initialLeaf.clip, initialLeaf.bounds)
         let originalChildren = scroll.subviews.prefix(17).map(ObjectIdentifier.init)
         let originalWitness = try XCTUnwrap(collector.collectedInteractionProjection(for: initial))
         var encoder = try EluNativeWireframeV2Encoder(profile: .sensitiveMask())
@@ -79,10 +88,13 @@ final class EluReplayWindowTests: XCTestCase {
         var deliveries = 0
         wall = 1_100
         value.observeForTesting(fact(.began, finger), originalView: safe) { deliveries += 1 }
+        XCTAssertTrue(value.contactIsActive)
         wall = 1_200
         value.observeForTesting(fact(.moved, finger), originalView: safe) {
             deliveries += 1; scroll.contentOffset.y = 20
         }
+        XCTAssertEqual(firstProjection.point(location: CGPoint(x: 50, y: 50), time: pointTime,
+            deadline: 100, now: { 0 }), initialPoint, "Same lawful identity must remain inside both ordered and current clips")
         let old = try XCTUnwrap(value.drainCurrent(),
             "Old points after original scroll delivery;" + ReplayScrollFixtureDiagnostics.describe(
                 root: root, scroll: scroll, target: safe, originalChildren: originalChildren) +
@@ -109,6 +121,31 @@ final class EluReplayWindowTests: XCTestCase {
         _ = try encoder.encode(suffix.map(EluNativeReplayRecord.interaction))
         XCTAssertEqual(deliveries, 4); XCTAssertFalse(value.contactIsActive)
         value.stop()
+    }
+
+    func testExplicitInsetCannotAdmitNewlyVisiblePointOutsideOriginalClip() throws {
+        let scroll = UIScrollView(frame: root.bounds)
+        scroll.contentInsetAdjustmentBehavior = .never
+        scroll.showsVerticalScrollIndicator = false; scroll.showsHorizontalScrollIndicator = false
+        scroll.contentSize = CGSize(width: 320, height: 900)
+        scroll.contentInset.top = 80
+        let safe = UIView(frame: CGRect(x: 10, y: 0, width: 100, height: 300))
+        scroll.addSubview(safe); root.addSubview(scroll); settle()
+        scroll.contentOffset.y = -80
+        XCTAssertEqual(scroll.adjustedContentInset.top, 80)
+        XCTAssertEqual(scroll.contentOffset.y, -80)
+        let (initial, projection) = try frame(0)
+        let time = EluNativeInteractionTime(timestamp: 1_100, continuous: 1_100_000_000)
+        let original = try XCTUnwrap(projection.point(location: CGPoint(x: 50, y: 100), time: time, deadline: 100, now: { 0 }))
+        let leaf = try XCTUnwrap(initial.nodes.first { $0.identity == original.identity })
+        XCTAssertEqual(leaf.bounds, try EluNativeRect(x: 10, y: 80, width: 100, height: 300))
+        XCTAssertEqual(leaf.clip, leaf.bounds)
+        scroll.contentOffset.y = 20
+        XCTAssertTrue(safe.convert(safe.bounds, to: root).contains(CGPoint(x: 50, y: 50)))
+        XCTAssertNil(projection.point(location: CGPoint(x: 50, y: 50), time: time, deadline: 100, now: { 0 }),
+            "Fresh geometry cannot authorize a point outside this identity's original encoded clip")
+        XCTAssertEqual(projection.point(location: CGPoint(x: 50, y: 100), time: time, deadline: 100, now: { 0 }), original)
+        XCTAssertNotNil(collector.collectedInteractionProjection(for: initial))
     }
 
     func testHandoffCancelsRemovedTargetAtGeometryClockAndSuppressesThroughLift() throws {

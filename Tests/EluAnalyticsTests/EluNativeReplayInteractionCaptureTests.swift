@@ -14,10 +14,13 @@ final class EluNativeReplayInteractionCaptureTests: XCTestCase {
         let h = fixture.h
         let scroll = UIScrollView(frame: fixture.root.bounds)
         scroll.showsHorizontalScrollIndicator = false; scroll.showsVerticalScrollIndicator = false
+        scroll.contentInsetAdjustmentBehavior = .never // Fixed viewport coordinates, independent of the host safe area.
         scroll.contentSize = CGSize(width: scroll.bounds.width, height: 900)
         let safe = UIView(frame: CGRect(x: 10, y: 0, width: 100, height: 300))
         scroll.addSubview(safe); fixture.root.addSubview(scroll)
         fixture.root.layoutIfNeeded(); CATransaction.flush()
+        XCTAssertEqual(scroll.adjustedContentInset, .zero); XCTAssertEqual(scroll.contentOffset, .zero)
+        XCTAssertTrue(safe.convert(safe.bounds, to: fixture.root).contains(CGPoint(x: 50, y: 50)))
         let originalChildren = scroll.subviews.prefix(17).map(ObjectIdentifier.init)
         let owner = try start(fixture)
         let diagnostics = {
@@ -39,10 +42,19 @@ final class EluNativeReplayInteractionCaptureTests: XCTestCase {
             let first = try await h.queue.storedReplayChunks()
             XCTAssertEqual(first.count, 1)
             let original = try XCTUnwrap(observer(fixture.window)), finger = NSObject()
+            // Read the actual committed owner's projection; do not mint a second collector or arm proof.
+            let originalProjection = try XCTUnwrap(projection(original))
+            let pointTime = EluNativeInteractionTime(timestamp: Int64(h.base.now.timeIntervalSince1970 * 1_000),
+                continuous: h.base.testClock.ticks())
+            let initialPoint = try XCTUnwrap(originalProjection.point(location: CGPoint(x: 50, y: 50),
+                time: pointTime, deadline: 100, now: { 0 }), "Original eligible positive clip must contain the fixed emitted point before contact")
             h.base.testClock.advance(0.25)
             original.observeForTesting(fact(.began, finger), originalView: safe) {}
+            XCTAssertTrue(original.contactIsActive)
             h.base.testClock.advance(0.25)
             original.observeForTesting(fact(.moved, finger), originalView: safe) { scroll.contentOffset.y = 20 }
+            XCTAssertEqual(originalProjection.point(location: CGPoint(x: 50, y: 50), time: pointTime,
+                deadline: 100, now: { 0 }), initialPoint, "Current and original positive clips must retain the same identity")
             try await wait("first geometry after original scroll delivery", diagnostics: diagnostics) { owner.collectedFrameCountForTesting() >= 3 }
             XCTAssertTrue(observer(fixture.window) === original)
             h.base.testClock.advance(0.25)
@@ -275,6 +287,10 @@ final class EluNativeReplayInteractionCaptureTests: XCTestCase {
     private func observer(_ window: EluReplayWindow) -> EluUIKitReplayTouchObserver? {
         guard let value = Mirror(reflecting: window).children.first(where: { $0.label == "replayObserver" })?.value else { return nil }
         return Mirror(reflecting: value).children.first?.value as? EluUIKitReplayTouchObserver
+    }
+    private func projection(_ observer: EluUIKitReplayTouchObserver) -> EluUIKitReplayInteractionProjection? {
+        guard let value = Mirror(reflecting: observer).children.first(where: { $0.label == "projection" })?.value else { return nil }
+        return Mirror(reflecting: value).children.first?.value as? EluUIKitReplayInteractionProjection
     }
     private func fact(_ phase: EluUIKitReplayTouchFact.Phase, _ finger: NSObject, y: CGFloat = 50) -> EluUIKitReplayTouchFact {
         .init(phase: phase, identity: ObjectIdentifier(finger), location: CGPoint(x: 50, y: y),
