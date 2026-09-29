@@ -169,7 +169,9 @@ final class EluNativeReplayLifecycleTests: XCTestCase {
             }
             try await Task.sleep(nanoseconds: 20_000_000)
         }
-        throw NativeLifecycleFixtureFailure(stage: stage)
+        throw NativeLifecycleFixtureFailure(stage: stage,
+            diagnostics: EluUIKitTestHost.readinessDiagnostics(window: window, controller: controller) +
+                ";lifecycleReadiness=\(lifecycle.observeRootReadiness())")
     }
 
     @MainActor private func activeWindow() throws -> UIWindow {
@@ -189,7 +191,8 @@ private final class NativeLifecycleCalls: @unchecked Sendable {
 #if canImport(UIKit)
 private struct NativeLifecycleFixtureFailure: Error, CustomStringConvertible {
     let stage: String
-    var description: String { "UIKit fixture did not discover its key window and attached root: \(stage)" }
+    let diagnostics: String
+    var description: String { "UIKit fixture did not discover its key window and attached root: \(stage);\(diagnostics)" }
 }
 private final class NativeLifecycleSink: EluRuntimeLifecycleSink, @unchecked Sendable {
     private let lock = NSLock(); private var count = 0

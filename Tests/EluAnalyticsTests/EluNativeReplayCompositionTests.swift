@@ -476,7 +476,10 @@ final class EluNativeReplayCompositionTests: XCTestCase {
             window.makeKeyAndVisible()
             window.setNeedsLayout(); window.layoutIfNeeded(); controller.view.layoutIfNeeded()
             CATransaction.flush()
-            try await waitUIKit("initial key window and attached controller become discoverable") {
+            try await waitUIKit("initial key window and attached controller become discoverable", diagnostics: {
+                EluUIKitTestHost.readinessDiagnostics(window: window, controller: controller) +
+                    ";lifecycleReadiness=\(lifecycle.observeRootReadiness())"
+            }) {
                 UIApplication.shared.applicationState == .active && window.isKeyWindow && !window.isHidden &&
                     window.alpha == 1 && window.windowLevel == .normal && window.rootViewController === controller &&
                     controller.viewIfLoaded?.window === window && lifecycle.observeRootReadiness() == .available
@@ -489,13 +492,14 @@ final class EluNativeReplayCompositionTests: XCTestCase {
         } catch { _ = await fixture.close(); throw error }
     }
 
-    @MainActor private func waitUIKit(_ stage: String, _ predicate: () async throws -> Bool) async throws {
+    @MainActor private func waitUIKit(_ stage: String, diagnostics: (() -> String)? = nil,
+                                      _ predicate: () async throws -> Bool) async throws {
         let start = DispatchTime.now().uptimeNanoseconds
         while DispatchTime.now().uptimeNanoseconds - start < 6_000_000_000 {
             if try await predicate() { return }
             try await Task.sleep(nanoseconds: 20_000_000)
         }
-        throw CompositionUIKitWaitFailure(stage: stage)
+        throw CompositionUIKitWaitFailure(stage: stage, diagnostics: diagnostics?())
     }
     #endif
 
@@ -594,7 +598,10 @@ private final class ReplayLocalProbe: @unchecked Sendable {
 #if canImport(UIKit)
 private struct CompositionUIKitWaitFailure: Error, CustomStringConvertible {
     let stage: String
-    var description: String { "Timed out waiting for UIKit fixture phase: \(stage)" }
+    let diagnostics: String?
+    var description: String {
+        "Timed out waiting for UIKit fixture phase: \(stage)" + (diagnostics.map { ";" + $0 } ?? "")
+    }
 }
 @MainActor private final class CompositionUIKitFixture {
     let h: SealedPolicyTestHarness
