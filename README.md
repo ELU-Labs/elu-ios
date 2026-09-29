@@ -207,24 +207,26 @@ Elu.setup(siteKey: "YOUR_SITE_KEY",
           options: EluSetupOptions(configHost: URL(string: "https://staging.elu.dev")!))
 ```
 
-ELU Cloud apps use the default host. For a declared self-hosted config origin:
+ELU Cloud apps use the default host. A self-hosted instance can include a path prefix:
 
 ```swift
-let instance = URL(string: "https://analytics.example.com")!
+let instance = URL(string: "https://analytics.example.com/elu")!
 Elu.setup(siteKey: "YOUR_SITE_KEY",
           options: EluSetupOptions(configHost: instance, apiHost: instance))
 ```
 
-Both origins must match exactly and use HTTPS without an explicit port,
-credentials, path beyond `/`, query, fragment or trailing-dot hostname.
-The instance must serve the owned `/sdk/v2/<siteKey>/config`, `/v1/events`,
-`/v1/flags` and `/v2/replay` contracts. Returned endpoints must use the declared
-API origin and each maintained role path; redirects are refused. Declaring an
-origin does not bypass configuration, consent or delivery authorization.
+Both self-hosted base URLs must match exactly and use HTTPS without an explicit
+port, credentials, query, fragment or trailing-dot hostname. One trailing slash
+is removed. Prefixes cannot contain empty or dot segments, encoded separators,
+whitespace or control characters. The instance serves the owned
+`/sdk/v2/<siteKey>/config`, `/v1/events`, `/v1/flags` and `/v2/replay` contracts
+beneath that prefix: the example uses `/elu/v1/events`. Returned endpoints must
+use the declared base and each maintained role path; redirects are refused.
+Declaring a base does not bypass configuration, consent or delivery authorization.
 
-Each canonical self-hosted API origin has separate durable identity, consent,
-feature flags and queued events/replay. Changing servers starts a separate
-installation; returning to the same normalized origin reopens its own store.
+Each canonical self-hosted API base has separate durable identity, consent,
+feature flags and queued events/replay. Changing servers or prefixes starts a
+separate installation; returning to the same normalized base reopens its own store.
 Cloud installations keep their existing storage. SDK config/API requests are
 excluded from the optional customer URLSession metrics, including redirects
 into either configured host. Self-hosted service compatibility still requires

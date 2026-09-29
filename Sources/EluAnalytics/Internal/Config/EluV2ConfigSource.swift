@@ -32,7 +32,12 @@ struct EluV2ConfigRequest: Sendable {
         guard case let .approved(origin) = EluConfigHostAllowlist.resolve(
             configHost: configHost, apiHost: endpointPolicy.declaredAPIOrigin
         ) else { throw EluV2ConfigSourceError.untrustedConfigHost }
-        url = origin.appendingPathComponent("sdk/v2/\(siteKey)/config")
+        guard var components = URLComponents(url: origin, resolvingAgainstBaseURL: false) else {
+            throw EluV2ConfigSourceError.untrustedConfigHost
+        }
+        components.percentEncodedPath += "/sdk/v2/\(siteKey)/config"
+        guard let requestURL = components.url else { throw EluV2ConfigSourceError.untrustedConfigHost }
+        url = requestURL
     }
 }
 

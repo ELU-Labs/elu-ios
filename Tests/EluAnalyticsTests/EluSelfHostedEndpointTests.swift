@@ -9,11 +9,75 @@ final class EluSelfHostedEndpointTests: XCTestCase {
     private var policy: EluEndpointPolicy { try! EluEndpointPolicy(apiHost: host) }
 
     func testExplicitMalformedDeclarationCannotHideBehindApprovedConfigHost() {
-        for raw in ["http://analytics.example.test", "https://analytics.example.test:443", "https://analytics.example.test/path", "https://user@analytics.example.test", "https://analytics.example.test?q=1", "https://analytics.example.test#x", "https://analytics.example.test.", "https://localhost"] {
+        for raw in ["http://analytics.example.test", "https://analytics.example.test:443", "https://analytics.example.test/path//child", "https://user@analytics.example.test", "https://analytics.example.test?q=1", "https://analytics.example.test#x", "https://analytics.example.test.", "https://localhost"] {
             let value = URL(string: raw)!
             XCTAssertThrowsError(try EluEndpointPolicy(apiHost: value), raw)
             guard case .rejected = EluConfigHostAllowlist.resolve(configHost: URL(string: "https://elu.dev")!, apiHost: value) else { return XCTFail(raw) }
         }
+    }
+
+    func testPrefixIsBoundThroughConfigManagersAndEachRole() throws {
+        let base = URL(string: "https://analytics.example.test/elu/tenant-1")!
+        let selected = try EluEndpointPolicy(apiHost: URL(string: base.absoluteString + "/")!)
+        XCTAssertEqual(selected.declaredAPIOrigin, base)
+        XCTAssertEqual(try EluV2ConfigRequest(siteKey: key, configHost: base, endpointPolicy: selected).url.absoluteString,
+                       base.absoluteString + "/sdk/v2/" + key + "/config")
+        let data = try config(base: base), now = Date(timeIntervalSince1970: 1_785_888_090)
+        _ = try EluV1ConfigManager(endpointPolicy: selected).update(configData: data, now: now)
+        _ = try EluV1ConfigManager(exactConstructorSiteKey: key, endpointPolicy: selected).prepareFlagConfig(configData: data, now: now)
+        for (role, path) in [(EluV1EndpointRole.events, "/v1/events"), (.flags, "/v1/flags"), (.replay, "/v2/replay"), (.assets, "/sdk/")] {
+            XCTAssertNotNil(selected.endpoint(base.absoluteString + path, role: role))
+            for other in [host.absoluteString, host.absoluteString + "/elu/tenant-2", base.absoluteString + "/child"] {
+                XCTAssertNil(selected.endpoint(other + path, role: role), other + path)
+            }
+            XCTAssertNil(selected.endpoint(base.absoluteString + "/wrong" + path, role: role))
+        }
+        XCTAssertThrowsError(try EluV1ConfigManager(endpointPolicy: policy).update(configData: data, now: now))
+        XCTAssertThrowsError(try EluV1ConfigManager(endpointPolicy: selected).update(configData: config(), now: now))
+        let other = try EluEndpointPolicy(apiHost: URL(string: host.absoluteString + "/elu/tenant-2")!)
+        XCTAssertThrowsError(try EluV1ConfigManager(endpointPolicy: other).update(configData: data, now: now))
+        // Preserve encoded non-ASCII segment bytes when deriving the config path.
+        let encodedBase = URL(string: host.absoluteString + "/%CE%B1")!
+        let encodedPolicy = try EluEndpointPolicy(apiHost: encodedBase)
+        XCTAssertEqual(try EluV2ConfigRequest(siteKey: key, configHost: encodedBase, endpointPolicy: encodedPolicy).url.absoluteString,
+                       encodedBase.absoluteString + "/sdk/v2/" + key + "/config")
+    }
+
+    func testPhysicalConfigEventAndFlagRequestsKeepExactPrefixAndRefuseRedirects() async throws {
+        let base = URL(string: host.absoluteString + "/elu/tenant-1")!
+        let selected = try EluEndpointPolicy(apiHost: base)
+        let request = try EluV2ConfigRequest(siteKey: key, configHost: base, endpointPolicy: selected)
+        let configTransport = EluV2URLSessionConfigTransport(expectedRequestURL: request.url, protocolClasses: [SelfHostProtocol.self])
+        let events = EluV1URLSessionBatchTransport(endpointPolicy: selected, protocolClasses: [SelfHostProtocol.self])
+        let flags = try EluV1URLSessionFlagTransport(siteKey: key, endpointPolicy: selected, protocolClasses: [SelfHostProtocol.self])
+        let count = SelfHostEmission()
+        SelfHostProtocol.hooks.set { [key] req, client, instance in
+            XCTAssertTrue(req.url!.absoluteString.hasPrefix(base.absoluteString + "/")); count.append()
+            if req.httpMethod == "POST" { XCTAssertEqual(req.value(forHTTPHeaderField: "Authorization"), "Bearer " + key) }
+            SelfHostProtocol.reply(req, client, instance, Data("{}".utf8))
+        }
+        _ = try await configTransport.fetch(request)
+        func event(_ url: URL) -> EluV1BatchHTTPRequest {
+            .init(url: url, headers: ["Authorization": "Bearer " + key], body: Data("{}".utf8), timeoutSeconds: 10, maximumResponseBytes: 1024)
+        }
+        _ = try await events.send(event(base.appendingPathComponent("v1/events")))
+        _ = try await flags.send(endpoint: base.appendingPathComponent("v1/flags"), requestBody: Data("{}".utf8))
+        XCTAssertEqual(count.count, 3)
+        SelfHostProtocol.hooks.set { _, _, _ in XCTFail("Wrong prefix reached physical transport") }
+        for wrong in [host, host.appendingPathComponent("elu/tenant-2")] {
+            do { _ = try await events.send(event(wrong.appendingPathComponent("v1/events"))); XCTFail("Wrong event prefix") } catch {}
+            do { _ = try await flags.send(endpoint: wrong.appendingPathComponent("v1/flags"), requestBody: Data("{}".utf8)); XCTFail("Wrong flag prefix") } catch {}
+        }
+        let redirects = SelfHostEmission()
+        SelfHostProtocol.hooks.set { req, client, instance in
+            redirects.append()
+            client.urlProtocol(instance, wasRedirectedTo: URLRequest(url: self.host.appendingPathComponent("v1/flags")),
+                redirectResponse: HTTPURLResponse(url: req.url!, statusCode: 302, httpVersion: nil, headerFields: nil)!)
+        }
+        do { _ = try await flags.send(endpoint: base.appendingPathComponent("v1/flags"), requestBody: Data("{}".utf8)); XCTFail("Prefix redirect accepted") } catch {}
+        XCTAssertEqual(redirects.count, 1)
+        do { _ = try await configTransport.fetch(request); XCTFail("Config prefix redirect accepted") } catch {}
+        XCTAssertEqual(redirects.count, 2)
     }
 
     func testPublicSetupTransfersOriginalValidatedPolicyBeforeRuntimeConstruction() {
@@ -106,8 +170,14 @@ final class EluSelfHostedEndpointTests: XCTestCase {
     }
 
     func testReplayOriginalOwnerAuthorizesCustomTransportThroughReopen() async throws {
+        try await verifyReplayTransport(base: host)
+        try await verifyReplayTransport(base: URL(string: host.absoluteString + "/elu/tenant-1")!)
+    }
+
+    private func verifyReplayTransport(base host: URL) async throws {
+        let policy = try EluEndpointPolicy(apiHost: host)
         let h = try await DeliveryHarness.make(endpointPolicy: policy); defer { h.remove() }
-        h.config = try config(); try await h.install(); _ = try await h.append()
+        h.config = try config(base: host); try await h.install(); _ = try await h.append()
         await h.queue.close(); h.queue = try await h.reopen(); try await h.activate(support: h.generation)
         try await h.queue.ensureReplayDeliverySchema()
         let authority = try await h.deliveryAuthority()
@@ -125,10 +195,55 @@ final class EluSelfHostedEndpointTests: XCTestCase {
     }
 
     func testStoreIdentityConsentBacklogAndFirstSessionAreIsolatedPerOrigin() async throws {
+        try await verifyStoreIsolation(base: host, otherBase: URL(string: "https://other.example.test")!)
+    }
+
+    func testSameHostDifferentPrefixesHaveIndependentStoresAndNormalizedRestart() async throws {
+        try await verifyStoreIsolation(base: URL(string: host.absoluteString + "/elu/tenant-1")!,
+                                       otherBase: URL(string: host.absoluteString + "/elu/tenant-2")!)
+    }
+
+    func testFlagCacheAndAuthorityDoNotCrossPrefixesOrRootButSurviveNormalizedRestart() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("elu-prefix-flags-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let a = URL(string: host.absoluteString + "/a")!, b = URL(string: host.absoluteString + "/b")!
+        let now = Date(timeIntervalSince1970: 1_785_888_090)
+        let versions = try EluVersionContext(runtime: .init(name: "elu-ios", version: "0.2.0"), facade: .init(name: "Elu", version: "1"))
+        let transport = PrefixFlagTransport()
+        func open(_ base: URL) async throws -> (EluSQLiteRuntimeQueue, EluV1FlagClient) {
+            let queue = try await EluSQLiteRuntimeQueue.openCaptureRuntime(rootDirectoryURL: directory,
+                exactConstructorSiteKey: key, endpointPolicy: EluEndpointPolicy(apiHost: base),
+                limits: EluRuntimeQueueLimits(), clock: { now })
+            let client = try await EluV1FlagClient.make(runtime: queue, transport: transport, versions: versions)
+            return (queue, client)
+        }
+        let (first, client) = try await open(a)
+        guard case .allowed = await client.applyConfig(config(base: a)),
+              case .updated = await client.reload() else { return XCTFail("Prefix A flag evaluation failed") }
+        let selected = await client.read("scope")
+        XCTAssertEqual(selected, .found(value: .string(Array("only-a".utf16)), payload: nil))
+        await first.close()
+        for base in [host, b] {
+            let (queue, other) = try await open(base)
+            // An A authority/cache cannot be adopted merely by selecting the same site key.
+            let before = await other.read("scope"); XCTAssertEqual(before, .missing)
+            guard case .allowed = await other.applyConfig(config(base: base)) else { return XCTFail("Own flags authority rejected") }
+            let after = await other.read("scope"); XCTAssertEqual(after, .missing)
+            await queue.close()
+        }
+        let (reopened, restored) = try await open(URL(string: a.absoluteString + "/")!)
+        guard case .allowed = await restored.applyConfig(config(base: a)) else { return XCTFail("Same prefix failed to reopen") }
+        let cached = await restored.read("scope"); XCTAssertEqual(cached, selected)
+        let calls = await transport.calls; XCTAssertEqual(calls, 1)
+        await reopened.close()
+    }
+
+    private func verifyStoreIsolation(base host: URL, otherBase: URL) async throws {
+        let policy = try EluEndpointPolicy(apiHost: host)
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("elu-origin-" + UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
-        let cloud = EluEndpointPolicy.cloud, other = try EluEndpointPolicy(apiHost: URL(string: "https://other.example.test")!)
-        let normalized = try EluEndpointPolicy(apiHost: URL(string: "HTTPS://ANALYTICS.EXAMPLE.TEST/")!)
+        let cloud = EluEndpointPolicy.cloud, other = try EluEndpointPolicy(apiHost: otherBase)
+        let normalized = try EluEndpointPolicy(apiHost: URL(string: host.absoluteString.replacingOccurrences(of: "https://analytics.example.test", with: "HTTPS://ANALYTICS.EXAMPLE.TEST") + "/")!)
         func open(_ selected: EluEndpointPolicy) async throws -> EluSQLiteRuntimeQueue {
             try await EluSQLiteRuntimeQueue.openCaptureRuntime(rootDirectoryURL: root, exactConstructorSiteKey: key, endpointPolicy: selected, limits: EluRuntimeQueueLimits(), clock: { Date(timeIntervalSince1970: 1_785_888_090) })
         }
@@ -137,7 +252,7 @@ final class EluSelfHostedEndpointTests: XCTestCase {
         XCTAssertNotEqual(first.identity.anonymousId, second.identity.anonymousId)
         XCTAssertNotEqual(first.identity.anonymousId, third.identity.anonymousId)
         _ = try await a.registerStandaloneSuperProperties(["onlyA": .bool(true)])
-        let now = Date(timeIntervalSince1970: 1_785_888_090), data = try config()
+        let now = Date(timeIntervalSince1970: 1_785_888_090), data = try config(base: host)
         let manager = EluV1ConfigManager(endpointPolicy: policy)
         _ = try manager.update(configData: data, now: now)
         let before = try await a.snapshot()
@@ -202,10 +317,43 @@ final class EluSelfHostedEndpointTests: XCTestCase {
         XCTAssertEqual(output.count, 0)
     }
 
-    private func config() throws -> Data {
+    func testPrefixedAPIBaseStillExcludesTheWholeSDKHostFromRequestMetrics() throws {
+        let selected = try EluEndpointPolicy(apiHost: URL(string: host.absoluteString + "/elu/tenant-1")!)
+        let excluded = Set([try XCTUnwrap(selected.declaredAPIOrigin?.host)])
+        let gate = EluNetworkObservationGate(budget: .init(), now: { 1 }), output = SelfHostEmission()
+        gate.setForeground(true)
+        gate.publish(context: .init(identityRevision: 0, contextRevision: 0, sessionID: nil), current: { true }) { _, _, _ in output.append() }
+        for path in ["/v1/events", "/elu/tenant-1/v1/events", "/elu/tenant-2/v1/flags", "/customer"] {
+            XCTAssertNil(gate.begin(URLRequest(url: URL(string: host.absoluteString + path)!), excludedHosts: excluded))
+        }
+        let observation = try XCTUnwrap(gate.begin(URLRequest(url: URL(string: "https://customer.example.test/")!), excludedHosts: excluded))
+        observation.start()
+        observation.finish(response: HTTPURLResponse(url: URL(string: host.absoluteString + "/elu/tenant-2")!, statusCode: 200, httpVersion: nil, headerFields: nil), failed: false)
+        XCTAssertEqual(output.count, 0)
+    }
+
+    private func config(base: URL? = nil) throws -> Data {
+        let host = base ?? self.host
         let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
         let data = try Data(contentsOf: root.appendingPathComponent("Conformance/V2/fixtures/config-enabled.json"))
         return Data(String(decoding: data, as: UTF8.self).replacingOccurrences(of: "https://ingest.elu.dev", with: host.absoluteString).replacingOccurrences(of: "https://assets.elu.dev", with: host.absoluteString).utf8)
+    }
+}
+private actor PrefixFlagTransport: EluV1FlagTransport {
+    private(set) var calls = 0
+    func send(endpoint: URL, requestBody: Data) async throws -> Data {
+        calls += 1
+        XCTAssertEqual(endpoint.path, "/a/v1/flags")
+        let request = try XCTUnwrap(JSONSerialization.jsonObject(with: requestBody) as? [String: Any])
+        let identity = try XCTUnwrap(request["identity"] as? [String: Any])
+        return try JSONSerialization.data(withJSONObject: [
+            "schemaVersion": 1, "requestId": try XCTUnwrap(request["requestId"]),
+            "contextRevision": try XCTUnwrap(request["contextRevision"]),
+            "identityRevision": try XCTUnwrap(identity["revision"]), "flagsRevision": "prefix-test",
+            "evaluatedAt": EluRFC3339.string(from: Date(timeIntervalSince1970: 1_785_888_090)),
+            "expiresAt": EluRFC3339.string(from: Date(timeIntervalSince1970: 1_785_888_120)),
+            "flags": ["scope": "only-a"], "payloads": [:] as [String: Any],
+        ])
     }
 }
 private final class SelfHostEmission: @unchecked Sendable {

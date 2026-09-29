@@ -58,6 +58,10 @@ class V2RuntimeBoundaryTests(unittest.TestCase):
              "endpointPolicy.endpoint(request.url.absoluteString, role: .events)"),
             ("Sources/EluAnalytics/Internal/Config/EluEndpointPolicy.swift",
              'schemaVersion == 2 ? "/v2/replay" : "/v1/replay"', '"/v1/replay"'),
+            ("Sources/EluAnalytics/Internal/Config/EluEndpointPolicy.swift",
+             "parts.percentEncodedPath == prefix + path", "parts.percentEncodedPath == path"),
+            ("Sources/EluAnalytics/Internal/Config/EluEndpointPolicy.swift",
+             "let prefix = declaredAPIOrigin.flatMap", "let prefix = EluEndpointPolicy.cloud.declaredAPIOrigin.flatMap"),
         ]
         for relative, before, after in mutations:
             with self.subTest(source=relative, replacement=after):

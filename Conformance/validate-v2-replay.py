@@ -803,7 +803,9 @@ V2_ENDPOINT_PROJECTION = {
         "guard let origin = EluConfigHostAllowlist.selfHostedOrigin(apiHost) else",
         'case .replay: path = schemaVersion == 2 ? "/v2/replay" : "/v1/replay"',
         "parts.host?.lowercased() == host",
-        "parts.percentEncodedPath == path",
+        "parts.percentEncodedPath == prefix + path",
+        "let prefix = declaredAPIOrigin.flatMap",
+        "URLComponents(url: $0, resolvingAgainstBaseURL: false)?.percentEncodedPath",
     ),
     "Sources/EluAnalytics/Internal/Config/EluV1ConfigManager.swift": (
         "private let endpointPolicy: EluEndpointPolicy",

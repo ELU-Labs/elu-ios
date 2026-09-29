@@ -13,14 +13,16 @@ dependencies. Optional setup parameters include native performance settings and
 an approved development config host; production uses the default `https://elu.dev`.
 
 The public `apiHost` declaration permits an exactly matching self-hosted config
-origin: HTTPS with no explicit port, credentials, path beyond `/`, query, fragment
-or trailing-dot hostname. Undeclared origins are refused before runtime setup.
-This origin declaration does not itself authorize configuration or ingestion;
+base: HTTPS with an optional regular path prefix, without explicit port,
+credentials, query, fragment or trailing-dot hostname. Empty/dot segments,
+encoded separators, whitespace and controls are refused; one trailing slash is
+removed. Undeclared bases are refused before runtime setup.
+This declaration does not itself authorize configuration or ingestion;
 the owned runtime's endpoint and configuration authority checks still apply.
-The declaration fixes the event, flag and replay API origin for this setup;
-remote configuration cannot widen it. Each role retains its maintained path,
+The declaration fixes the event, flag and replay API base for this setup;
+remote configuration cannot widen it. Each role retains its maintained path beneath the prefix,
 and transports refuse redirects. Durable stores are isolated by canonical
-self-hosted API origin and site key; the existing Cloud storage path is unchanged.
+self-hosted API base and site key; the existing Cloud storage path is unchanged.
 
 The runtime obtains configuration from `GET /sdk/v2/<siteKey>/config`. An HTTP
 success alone does not authorize analytics: the document must pass validation

@@ -2,7 +2,7 @@ import CryptoKit
 import Foundation
 
 /// Local setup authority only. Configuration responses may select a maintained
-/// role path on this origin, but cannot add an origin or redirect permission.
+/// role path beneath this base, but cannot add an origin, prefix or redirect permission.
 struct EluEndpointPolicy: Equatable, Sendable {
     static let cloud = EluEndpointPolicy(declaredAPIOrigin: nil)
     let declaredAPIOrigin: URL?
@@ -19,6 +19,9 @@ struct EluEndpointPolicy: Equatable, Sendable {
 
     func endpoint(_ value: String, role: EluV1EndpointRole, schemaVersion: Int = 2) -> URL? {
         let host = declaredAPIOrigin?.host ?? (role == .assets ? "assets.elu.dev" : "ingest.elu.dev")
+        let prefix = declaredAPIOrigin.flatMap {
+            URLComponents(url: $0, resolvingAgainstBaseURL: false)?.percentEncodedPath
+        } ?? ""
         let path: String
         switch role {
         case .events: path = "/v1/events"
@@ -30,7 +33,7 @@ struct EluEndpointPolicy: Equatable, Sendable {
               let parts = URLComponents(string: value), parts.scheme == "https",
               parts.host?.lowercased() == host, parts.port == nil || parts.port == 443,
               parts.user == nil, parts.password == nil, parts.fragment == nil,
-              parts.percentEncodedPath == path,
+              parts.percentEncodedPath == prefix + path,
               parts.queryItems?.contains(where: { $0.name == "site_key" }) != true
         else { return nil }
         return parts.url

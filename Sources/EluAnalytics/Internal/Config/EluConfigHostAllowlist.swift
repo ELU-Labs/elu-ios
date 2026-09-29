@@ -13,7 +13,7 @@ enum EluConfigHostRejection: Equatable, Sendable {
 }
 
 enum EluConfigHostResolution: Equatable, Sendable {
-    /// A normalized `scheme://host[:port]` origin with no path, query, or fragment.
+    /// A normalized origin, with the explicitly declared self-hosted path prefix.
     case approved(URL)
     case rejected(EluConfigHostRejection)
 }
@@ -23,7 +23,7 @@ enum EluConfigHostResolution: Equatable, Sendable {
 /// The option stays source-compatible, but only enumerated ELU HTTPS origins
 /// are accepted, plus exactly the self-hosted ELU instance an app declares as
 /// `EluSetupOptions.apiHost`: both HTTPS on the default port with the same
-/// host, and no credentials, path, query, fragment or trailing dot, so the
+/// host and path prefix, and no credentials, query, fragment or trailing dot, so the
 /// declaration cannot widen the allowlist to any other host. A loopback origin
 /// is accepted only when the binary permits it, which is limited to debug
 /// builds; there is no environment variable, URL scheme, or runtime switch
@@ -89,14 +89,21 @@ enum EluConfigHostAllowlist {
         guard components.user == nil, components.password == nil else {
             return .rejected(.credentialsPresent)
         }
-        guard components.path.isEmpty || components.path == "/" else {
-            return .rejected(.pathPresent)
-        }
         guard components.query == nil else {
             return .rejected(.queryPresent)
         }
         guard components.fragment == nil else {
             return .rejected(.fragmentPresent)
+        }
+
+        // A prefix is authority only when the application declared this exact
+        // canonical base. Cloud and debug-loopback allowlists remain root-only.
+        if let apiHost, let declared = selfHostedOrigin(apiHost),
+           selfHostedOrigin(configHost) == declared {
+            return .approved(declared)
+        }
+        guard components.percentEncodedPath.isEmpty || components.percentEncodedPath == "/" else {
+            return .rejected(.pathPresent)
         }
 
         if isLoopback {
@@ -128,15 +135,15 @@ enum EluConfigHostAllowlist {
         return .approved(url)
     }
 
-    /// `https://host` for an HTTPS origin on the default port with a plain,
-    /// non-loopback host and no credentials, path, query or fragment, else nil.
+    /// Canonical HTTPS base on the default port, with an optional regular path
+    /// prefix. Preserve its encoded bytes; never resolve dot segments or turn an
+    /// encoded separator into a different server-side path.
     static func selfHostedOrigin(_ value: URL) -> URL? {
         guard let components = URLComponents(url: value, resolvingAgainstBaseURL: false),
               components.scheme?.lowercased() == "https",
               let rawHost = components.host, !rawHost.isEmpty,
               components.port == nil,
               components.user == nil, components.password == nil,
-              components.path.isEmpty || components.path == "/",
               components.query == nil, components.fragment == nil
         else {
             return nil
@@ -145,9 +152,21 @@ enum EluConfigHostAllowlist {
         guard !host.hasSuffix("."), !host.hasPrefix("."), !selfHostedExcludedHosts.contains(host) else {
             return nil
         }
+        let path = components.percentEncodedPath
+        let prefix = path.hasSuffix("/") ? String(path.dropLast()) : path
+        guard prefix.isEmpty || prefix.hasPrefix("/") else { return nil }
+        for encoded in prefix.split(separator: "/", omittingEmptySubsequences: false).dropFirst() {
+            guard !encoded.isEmpty, let segment = String(encoded).removingPercentEncoding,
+                  segment != ".", segment != "..",
+                  !segment.unicodeScalars.contains(where: {
+                      $0.value <= 0x20 || $0.value == 0x7f || $0 == "/" || $0 == "\\"
+                  })
+            else { return nil }
+        }
         var origin = URLComponents()
         origin.scheme = "https"
         origin.host = host
+        origin.percentEncodedPath = prefix
         return origin.url
     }
 }

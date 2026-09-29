@@ -87,6 +87,38 @@ final class EluConfigHostAllowlistTests: XCTestCase {
 
     private let cell = URL(string: "https://analytics.example.com")!
 
+    func testDeclaredPathPrefixIsCanonicalAndCannotWidenTheConfigAllowlist() {
+        let base = URL(string: "https://analytics.example.com/elu/tenant-1")!
+        XCTAssertEqual(EluConfigHostAllowlist.resolve(
+            configHost: URL(string: "HTTPS://Analytics.Example.com/elu/tenant-1/")!,
+            apiHost: base, loopbackPermitted: false), .approved(base))
+        for raw in ["https://analytics.example.com", "https://analytics.example.com/elu",
+                    "https://analytics.example.com/elu/tenant-2", "https://analytics.example.com/elu/tenant-1/child"] {
+            guard case .rejected = EluConfigHostAllowlist.resolve(configHost: URL(string: raw)!, apiHost: base) else {
+                return XCTFail("Prefix widened: \(raw)")
+            }
+        }
+        XCTAssertEqual(EluConfigHostAllowlist.resolve(configHost: base), .rejected(.pathPresent))
+        let declaredCloudPath = URL(string: "https://elu.dev/tenant")!
+        XCTAssertEqual(EluConfigHostAllowlist.resolve(configHost: declaredCloudPath, apiHost: declaredCloudPath), .approved(declaredCloudPath))
+        XCTAssertEqual(EluConfigHostAllowlist.resolve(configHost: declaredCloudPath), .rejected(.pathPresent))
+        // Selecting custom ingestion must not change an explicitly selected Cloud config origin.
+        XCTAssertEqual(EluConfigHostAllowlist.resolve(configHost: URL(string: "https://elu.dev")!, apiHost: base),
+                       .approved(URL(string: "https://elu.dev")!))
+    }
+
+    func testIrregularOrAmbiguousPathPrefixesAreRefusedRatherThanRewritten() {
+        for path in ["//elu", "/elu//tenant", "/elu//", "/./elu", "/elu/../tenant",
+                     "/%2e/elu", "/elu/.%2E/tenant", "/elu/%2f/tenant", "/elu%5cprivate",
+                     "/elu%00", "/elu%20private", "/elu%7f"] {
+            let value = URL(string: "https://analytics.example.com" + path)!
+            XCTAssertNil(EluConfigHostAllowlist.selfHostedOrigin(value), path)
+            guard case .rejected = EluConfigHostAllowlist.resolve(configHost: value, apiHost: value) else {
+                return XCTFail("Irregular prefix accepted: \(path)")
+            }
+        }
+    }
+
     func testASelfHostedConfigHostIsApprovedWhenItIsExactlyTheDeclaredApiHost() {
         for loopbackPermitted in [false, true] {
             XCTAssertEqual(
