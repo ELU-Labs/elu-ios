@@ -273,13 +273,13 @@ final class EluReplayAudienceTests: XCTestCase {
             if version >= 3 { try await h.queue.ensureReplaySchema() }
             if version >= 5 { try await h.queue.ensureReplayDeliverySchema() }
             if version >= 7 { try await h.queue.ensureNativeReplayAuthoritySchema() }
-            XCTAssertEqual(try h.base.schemaVersion(), Int64(version + 32))
+            XCTAssertEqual(try h.base.schemaVersion(), Int64(version + 40))
             let before = try await h.queue.snapshot()
             let records = try await h.queue.peek(maximumCount: 10, maximumBytes: 1_000_000)
             await h.queue.close()
             try h.base.sql("DROP TABLE flag_exposure_state; DROP TABLE person_identity_state; DROP TABLE native_diagnostics_state; DROP TABLE capture_session_history; PRAGMA user_version=\(version)")
             try await h.reopen()
-            XCTAssertEqual(try h.base.schemaVersion(), Int64(version + 32))
+            XCTAssertEqual(try h.base.schemaVersion(), Int64(version + 40))
             XCTAssertEqual(try history(h), .unknown)
             let after = try await h.queue.snapshot(); XCTAssertEqual(after, before)
             let reopenedRecords = try await h.queue.peek(maximumCount: 10, maximumBytes: 1_000_000)
