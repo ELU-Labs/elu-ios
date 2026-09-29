@@ -218,7 +218,7 @@ final class EluSelfHostedEndpointTests: XCTestCase {
             return (queue, client)
         }
         let (first, client) = try await open(a)
-        guard case .allowed = await client.applyConfig(config(base: a)),
+        guard case .allowed = await client.applyConfig(try config(base: a)),
               case .updated = await client.reload() else { return XCTFail("Prefix A flag evaluation failed") }
         let selected = await client.read("scope")
         XCTAssertEqual(selected, .found(value: .string(Array("only-a".utf16)), payload: nil))
@@ -227,12 +227,12 @@ final class EluSelfHostedEndpointTests: XCTestCase {
             let (queue, other) = try await open(base)
             // An A authority/cache cannot be adopted merely by selecting the same site key.
             let before = await other.read("scope"); XCTAssertEqual(before, .missing)
-            guard case .allowed = await other.applyConfig(config(base: base)) else { return XCTFail("Own flags authority rejected") }
+            guard case .allowed = await other.applyConfig(try config(base: base)) else { return XCTFail("Own flags authority rejected") }
             let after = await other.read("scope"); XCTAssertEqual(after, .missing)
             await queue.close()
         }
         let (reopened, restored) = try await open(URL(string: a.absoluteString + "/")!)
-        guard case .allowed = await restored.applyConfig(config(base: a)) else { return XCTFail("Same prefix failed to reopen") }
+        guard case .allowed = await restored.applyConfig(try config(base: a)) else { return XCTFail("Same prefix failed to reopen") }
         let cached = await restored.read("scope"); XCTAssertEqual(cached, selected)
         let calls = await transport.calls; XCTAssertEqual(calls, 1)
         await reopened.close()
