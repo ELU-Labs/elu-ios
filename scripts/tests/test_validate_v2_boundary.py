@@ -41,6 +41,19 @@ class V2RuntimeBoundaryTests(unittest.TestCase):
             self.assertTrue(SCAN("Sources/EluAnalytics/Internal/Runtime/" + sibling,
                                  "replayProtocolGeneration"))
 
+    def test_native_capture_owner_reads_original_generation_without_endpoint_authority(self) -> None:
+        relative = "Sources/EluAnalytics/Internal/Replay/EluNativeReplayCaptureOwner.swift"
+        source = (ROOT / relative).read_text()
+        self.assertIn("generation: prepared.resolution.replayProtocolGeneration", source)
+        self.assertIn("generation: permit.resolution.replayProtocolGeneration", source)
+        self.assertEqual([], SCAN(relative, source))
+        self.assertTrue(SCAN(relative, '"/v2/replay"'))
+        self.assertTrue(SCAN(relative, '"elu-http-v2"'))
+        for sibling in ["EluUIKitReplayTouchObserver.swift", "Other.swift"]:
+            self.assertTrue(SCAN("Sources/EluAnalytics/Internal/Replay/" + sibling,
+                                 "replayProtocolGeneration"))
+        self.assertTrue(SCAN("Sources/EluAnalytics/EluNativeReplayCaptureOwner.swift", source))
+
     def test_local_policy_and_both_replay_projections_are_required(self) -> None:
         sources = {relative: (ROOT / relative).read_text()
                    for relative in MODULE["V2_ENDPOINT_PROJECTION"]}
