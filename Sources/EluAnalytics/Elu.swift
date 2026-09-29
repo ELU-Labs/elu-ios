@@ -1,9 +1,11 @@
 import Foundation
 
-/// Options for `Elu.setup(siteKey:options:)`. Production uses the default host.
+/// Options for `Elu.setup(siteKey:options:)`. ELU Cloud uses the default host.
 public struct EluSetupOptions {
     /// ELU config endpoint origin. Default: `https://elu.dev`.
     public var configHost: URL
+    /// Declared self-hosted origin. A custom config origin must match it exactly.
+    public var apiHost: URL?
     /// Native performance collection is disabled unless explicitly enabled.
     public var performance = EluPerformanceOptions()
     /// Delayed numeric OS diagnostics are disabled unless explicitly enabled.
@@ -15,6 +17,10 @@ public struct EluSetupOptions {
 
     public init(configHost: URL = URL(string: "https://elu.dev")!) {
         self.configHost = configHost
+    }
+
+    public init(configHost: URL, apiHost: URL?) {
+        self.configHost = configHost; self.apiHost = apiHost
     }
 
     public init(configHost: URL = URL(string: "https://elu.dev")!, performance: EluPerformanceOptions) {
@@ -39,7 +45,7 @@ public enum Elu {
         setup(siteKey: siteKey, options: EluSetupOptions())
     }
 
-    /// Initialize with explicit options. Alternate config hosts are for development only.
+    /// Initialize with explicit options, including a declared self-hosted config origin.
     public static func setup(siteKey: String, options: EluSetupOptions) {
         EluCore.shared.setup(siteKey: siteKey, options: options)
     }

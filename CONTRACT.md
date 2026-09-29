@@ -12,6 +12,12 @@ ignored. The package supports iOS 13+ and has no external Swift package
 dependencies. Optional setup parameters include native performance settings and
 an approved development config host; production uses the default `https://elu.dev`.
 
+The public `apiHost` declaration permits an exactly matching self-hosted config
+origin: HTTPS with no explicit port, credentials, path beyond `/`, query, fragment
+or trailing-dot hostname. Undeclared origins are refused before runtime setup.
+This origin declaration does not itself authorize configuration or ingestion;
+the owned runtime's endpoint and configuration authority checks still apply.
+
 The runtime obtains configuration from `GET /sdk/v2/<siteKey>/config`. An HTTP
 success alone does not authorize analytics: the document must pass validation
 and its current authority must permit the operation. Configuration has a bounded

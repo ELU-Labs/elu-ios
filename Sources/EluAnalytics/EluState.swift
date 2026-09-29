@@ -53,12 +53,16 @@ final class EluCore {
                 warn("setup() called with an empty siteKey — ignored")
                 return
             }
+            guard case let .approved(approvedConfigHost) = EluConfigHostAllowlist.resolve(options) else {
+                warn("setup() called with an unapproved configHost — ignored")
+                return
+            }
 
             // Marker FIRST: absent-at-setup is the replayNewUsersOnly probe.
             isNewUser = EluDeviceMarkers.recordFirstLaunchIfNeeded()
             self.siteKey = siteKey
             selection = options.runtimeSelection
-            configHost = options.configHost
+            configHost = approvedConfigHost
             performance = options.performance
             diagnostics = options.diagnostics
 
