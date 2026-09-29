@@ -366,7 +366,7 @@ final class EluStandaloneFacadeRuntimeTests: XCTestCase {
         }
     }
 
-    func testExposureIsReportedOncePerKeyAndValueForEachIdentityRevision() async throws {
+    func testExposureIsReportedOncePerVisitorKeyAndTypedValueAcrossIdentifyAndReload() async throws {
         try await withTemporaryDirectory { root in
             let harness = try await makeHarness(root: root, flagTransport: FacadeFlagTransport())
             harness.backend.activate()
@@ -389,6 +389,11 @@ final class EluStandaloneFacadeRuntimeTests: XCTestCase {
             let reported = try XCTUnwrap(exposures.first?["properties"] as? [String: Any])
             XCTAssertEqual(reported["$feature_flag"] as? String, "variant")
             XCTAssertEqual(reported["$feature_flag_response"] as? String, "variant-a")
+            XCTAssertFalse((reported["$feature_flag_request_id"] as? String ?? "").isEmpty)
+            XCTAssertEqual(reported["$feature_flag_evaluated_at"] as? Int64, 1_785_801_661_000)
+            XCTAssertEqual(reported["$used_bootstrap_value"] as? Bool, false)
+            XCTAssertTrue(reported["$feature_flag_bootstrapped_response"] is NSNull)
+            XCTAssertTrue(reported["$feature_flag_bootstrapped_payload"] is NSNull)
             XCTAssertEqual(
                 (reported["$feature_flag_payload"] as? [String: Any])?["color"] as? String,
                 "violet"
@@ -398,7 +403,7 @@ final class EluStandaloneFacadeRuntimeTests: XCTestCase {
             XCTAssertEqual(missing["$feature_flag_error"] as? String, "flag_missing")
             XCTAssertNil(missing["$feature_flag_response"])
 
-            // A new identity is a new ledger: the same value is reported again.
+            // Identifying this visitor preserves the durable ledger.
             harness.backend.execute(.identify(distinctId: "user-1", userProperties: nil))
             await harness.backend.settled()
             _ = harness.backend.featureFlag("variant")
@@ -407,8 +412,57 @@ final class EluStandaloneFacadeRuntimeTests: XCTestCase {
 
             exposures = try await harness.transport.recordedEvents()
                 .filter { $0["name"] as? String == "$feature_flag_called" }
+            XCTAssertEqual(exposures.count, 2)
+            let reloaded = expectation(description: "reload")
+            harness.backend.reloadFeatureFlags { reloaded.fulfill() }
+            await harness.backend.settled(); await fulfillment(of: [reloaded], timeout: 5)
+            _ = harness.backend.featureFlag("variant")
+            await harness.backend.settled(); _ = await harness.runtime.flush()
+            exposures = try await harness.transport.recordedEvents().filter { $0["name"] as? String == "$feature_flag_called" }
+            XCTAssertEqual(exposures.count, 2)
+            harness.backend.execute(.reset)
+            await harness.backend.settled()
+            _ = harness.backend.featureFlag("variant")
+            await harness.backend.settled(); _ = await harness.runtime.flush()
+            exposures = try await harness.transport.recordedEvents().filter { $0["name"] as? String == "$feature_flag_called" }
             XCTAssertEqual(exposures.count, 3)
             await harness.close()
+        }
+    }
+
+    func testReopenedRemoteCacheKeepsVisitorLedgerAndReportsExplicitCacheProvenance() async throws {
+        try await withTemporaryDirectory { root in
+            let first = try await makeHarness(root: root, flagTransport: FacadeFlagTransport())
+            first.backend.activate(); await first.backend.settled()
+            _ = first.backend.featureFlag("variant")
+            await first.backend.settled(); _ = await first.runtime.flush()
+            await first.close()
+            let transport = FacadeFlagTransport(); await transport.setFailing(true)
+            let reopened = try await makeHarness(root: root, flagTransport: transport)
+            reopened.backend.activate(); await reopened.backend.settled()
+            XCTAssertEqual(reopened.backend.featureFlag("variant") as? String, "variant-a")
+            _ = reopened.backend.featureFlag("zero")
+            await reopened.backend.settled(); _ = await reopened.runtime.flush()
+            var exposures = try await reopened.transport.recordedEvents().filter { $0["name"] as? String == "$feature_flag_called" }
+            XCTAssertEqual(exposures.count, 1, "Previously accepted variant is not reported after restart")
+            let cached = try XCTUnwrap(exposures.first?["properties"] as? [String: Any])
+            XCTAssertEqual(cached["$feature_flag"] as? String, "zero")
+            XCTAssertEqual(cached["$used_bootstrap_value"] as? Bool, true)
+            XCTAssertEqual(cached["$feature_flag_evaluated_at"] as? Int64, 1_785_801_661_000)
+            XCTAssertFalse((cached["$feature_flag_request_id"] as? String ?? "").isEmpty)
+            XCTAssertTrue(cached["$feature_flag_bootstrapped_response"] is NSNull)
+            await transport.setFailing(false)
+            let reloaded = expectation(description: "remote response")
+            reopened.backend.reloadFeatureFlags { reloaded.fulfill() }
+            await reopened.backend.settled(); await fulfillment(of: [reloaded], timeout: 5)
+            _ = reopened.backend.featureFlag("enabled")
+            await reopened.backend.settled(); _ = await reopened.runtime.flush()
+            exposures = try await reopened.transport.recordedEvents().filter { $0["name"] as? String == "$feature_flag_called" }
+            XCTAssertEqual(exposures.count, 2)
+            let remote = try XCTUnwrap(exposures.last?["properties"] as? [String: Any])
+            XCTAssertEqual(remote["$feature_flag_response"] as? Bool, false)
+            XCTAssertEqual(remote["$used_bootstrap_value"] as? Bool, false)
+            await reopened.close()
         }
     }
 
@@ -737,9 +791,12 @@ actor FacadeBatchTransport: EluV1BatchHTTPTransport {
 /// Answers every flag request from the identity witness it was sent.
 actor FacadeFlagTransport: EluV1FlagTransport {
     private var calls = 0
+    private var failing = false
+    func setFailing(_ value: Bool) { failing = value }
 
     func send(endpoint: URL, requestBody: Data) async throws -> Data {
         calls += 1
+        if failing { throw URLError(.notConnectedToInternet) }
         guard let request = try JSONSerialization.jsonObject(with: requestBody) as? [String: Any],
               let identity = request["identity"] as? [String: Any]
         else {

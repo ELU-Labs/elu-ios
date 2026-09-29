@@ -73,6 +73,23 @@ final class EluStandaloneStackTests: XCTestCase {
         }
     }
 
+    func testUnchangedSuccessfulConfigResponseReevaluatesFlagsWithoutNewSourceAuthority() async throws {
+        try await withHarness { h in
+            let (_, facade) = try await runningCore(h)
+            let before = await h.stack.flags.readProjection()
+            let previous = try XCTUnwrap(before)
+            await h.stack.lifecycle.refresh()
+            try await eventually { await h.config.count == 2 }
+            await h.config.resolve(try fixture())
+            try await eventually {
+                guard let next = await h.stack.flags.readProjection() else { return false }
+                return next.snapshot.response.requestId != previous.snapshot.response.requestId
+            }
+            XCTAssertTrue(previous.authority.isCurrent() == false, "A replaced evaluation is no longer current")
+            facade.shutDown(); await facade.settled()
+        }
+    }
+
     func testSameIssuanceAfterBackgroundDrainsQueuedEventWithoutAnotherCaptureOrFlush() async throws {
         try await withHarness { h in
             let document = try fixture()

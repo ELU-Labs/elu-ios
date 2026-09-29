@@ -35,6 +35,7 @@ enum EluRuntimeQueueFaultPoint: Equatable, Sendable {
     case afterInspectionCopy
     case beforeCaptureHistoryMigrationCommit
     case beforeDiagnosticsMigrationCommit
+    case beforeExposureMigrationCommit
     case beforePersonIdentityMigrationCommit
     case beforeBegin
     case beforeNativeDenialRead
@@ -87,6 +88,7 @@ struct EluRuntimeQueueSnapshot: Equatable, Sendable {
 
 private struct EluStoredRuntimeState: Equatable, Sendable {
     var personIdentity: EluPersonIdentityState
+    var flagExposures: EluFlagExposureLedger
     var captureSessionHistory: EluCaptureSessionHistory = .unknown
     var diagnostics: EluNativeDiagnosticsState = .closed
     var generation: Int64
@@ -142,17 +144,28 @@ private enum EluSQLiteRuntimeSchema {
     // Schemas 9...16 add installation capture history to owned schemas 1...8.
     // Unpublished import-ledger schemas 17...24 remain unsupported.
     static func baseVersion(_ version: Int64) -> Int64 {
+        if hasFlagExposures(version) { return version - 40 }
         if hasPersonIdentity(version) { return version - 32 }
         if hasDiagnostics(version) { return version - 24 }
         return version > 8 ? version - 8 : version
     }
     static func supports(_ version: Int64) -> Bool { (1...16).contains(version) || hasDiagnostics(version) }
-    static func hasPersonIdentity(_ version: Int64) -> Bool { (33...40).contains(version) }
-    static func hasDiagnostics(_ version: Int64) -> Bool { (25...40).contains(version) }
+    static func hasFlagExposures(_ version: Int64) -> Bool { (41...48).contains(version) }
+    static func hasPersonIdentity(_ version: Int64) -> Bool { (33...48).contains(version) }
+    static func hasDiagnostics(_ version: Int64) -> Bool { (25...48).contains(version) }
     static func hasCaptureHistory(_ version: Int64) -> Bool { (9...16).contains(version) || hasDiagnostics(version) }
     static func preservingCaptureHistory(_ base: Int64, from version: Int64) -> Int64 {
-        base + (hasPersonIdentity(version) ? 32 : hasDiagnostics(version) ? 24 : hasCaptureHistory(version) ? 8 : 0)
+        base + (hasFlagExposures(version) ? 40 : hasPersonIdentity(version) ? 32 : hasDiagnostics(version) ? 24 : hasCaptureHistory(version) ? 8 : 0)
     }
+    // Schemas 41...48 add a bounded visitor exposure ledger to every feature combination.
+    static let createFlagExposureState = """
+    CREATE TABLE flag_exposure_state (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        stream_id TEXT NOT NULL,
+        metadata BLOB NOT NULL CHECK (length(metadata) > 0 AND length(metadata) <= 300000)
+    )
+    """
+    static let flagExposureStateColumns = ["singleton": "INTEGER", "stream_id": "TEXT", "metadata": "BLOB"]
     // Schemas 33...40 retain the prior combinations and add independent device/profile state.
     static let createPersonIdentityState = """
     CREATE TABLE person_identity_state (
@@ -783,8 +796,10 @@ private enum EluRuntimeQueueBootstrap {
                 version: liveInspection.databaseSchemaVersion, state: state, faultInjector: faultInjector)
             let diagnosticsVersion = try migrateDiagnostics(connection: openedConnection,
                 version: historyVersion, state: state, faultInjector: faultInjector)
-            let databaseSchemaVersion = try migratePersonIdentity(connection: openedConnection,
+            let personVersion = try migratePersonIdentity(connection: openedConnection,
                 version: diagnosticsVersion, state: state, faultInjector: faultInjector)
+            let databaseSchemaVersion = try migrateFlagExposures(connection: openedConnection,
+                version: personVersion, state: state, faultInjector: faultInjector)
             state = try normalizeLegacyOptedOutSession(
                 connection: openedConnection,
                 state: state
@@ -882,6 +897,27 @@ private enum EluRuntimeQueueBootstrap {
         } catch { try? connection.execute("ROLLBACK"); throw error }
     }
 
+    private static func migrateFlagExposures(connection: EluSQLiteConnection, version: Int64,
+                                             state: EluStoredRuntimeState,
+                                             faultInjector: (any EluRuntimeQueueFaultInjecting)?) throws -> Int64 {
+        guard !EluSQLiteRuntimeSchema.hasFlagExposures(version) else { return version }
+        let target = EluSQLiteRuntimeSchema.baseVersion(version) + 40
+        try connection.execute("BEGIN IMMEDIATE")
+        do {
+            try EluRuntimeDatabase.verifySchema(connection, databaseVersion: version)
+            // Prior stores have no durable deduplication history. Do not infer it
+            // from a partial queue or cache; start this visitor's ledger empty.
+            try connection.execute(EluSQLiteRuntimeSchema.createFlagExposureState)
+            try EluRuntimeDatabase.writeFlagExposureState(connection, stream: state.streamId,
+                ledger: state.flagExposures, inserting: true)
+            try connection.execute("PRAGMA user_version = \(target)")
+            try EluRuntimeDatabase.verifySchema(connection, databaseVersion: target)
+            try faultInjector?.hit(.beforeExposureMigrationCommit)
+            try connection.execute("COMMIT")
+            return target
+        } catch { try? connection.execute("ROLLBACK"); throw error }
+    }
+
     private static func inspectExisting(
         databaseURL: URL,
         scratchDirectory: URL,
@@ -957,7 +993,10 @@ private enum EluRuntimeQueueBootstrap {
             try connection.execute(EluSQLiteRuntimeSchema.createPersonIdentityState)
             try EluRuntimeDatabase.writePersonIdentityState(connection, stream: state.streamId,
                 person: state.personIdentity, inserting: true)
-            try connection.execute("PRAGMA user_version = 33")
+            try connection.execute(EluSQLiteRuntimeSchema.createFlagExposureState)
+            try EluRuntimeDatabase.writeFlagExposureState(connection, stream: state.streamId,
+                ledger: state.flagExposures, inserting: true)
+            try connection.execute("PRAGMA user_version = 41")
             try connection.execute("COMMIT")
             try connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             try connection.withStatement("PRAGMA journal_mode=DELETE") { statement in
@@ -1155,6 +1194,7 @@ private enum EluRuntimeQueueBootstrap {
             identity.session = nil
             let normalized = EluStoredRuntimeState(
                 personIdentity: diskState.personIdentity,
+                flagExposures: diskState.flagExposures,
                 captureSessionHistory: diskState.captureSessionHistory,
                 diagnostics: diskState.diagnostics,
                 generation: diskState.generation + 1,
@@ -1228,6 +1268,7 @@ private enum EluRuntimeQueueBootstrap {
         }
         return EluStoredRuntimeState(
             personIdentity: EluPersonIdentityState(deviceId: canonicalState.identity.anonymousId),
+            flagExposures: EluFlagExposureLedger(anonymousId: canonicalState.identity.anonymousId),
             generation: 0,
             identity: canonicalState.identity,
             flagContext: canonicalState.flagContext,
@@ -2260,6 +2301,12 @@ private enum EluRuntimeDatabase {
             try verifyCreateSQL(connection, table: "capture_session_history", expected: EluSQLiteRuntimeSchema.createCaptureSessionHistory)
             _ = try loadState(connection, validateQueue: false)
         }
+        if EluSQLiteRuntimeSchema.hasFlagExposures(databaseVersion) {
+            expectedObjects["flag_exposure_state"] = "table"
+            try verifyColumns(connection, table: "flag_exposure_state", expected: EluSQLiteRuntimeSchema.flagExposureStateColumns)
+            try verifyCreateSQL(connection, table: "flag_exposure_state", expected: EluSQLiteRuntimeSchema.createFlagExposureState)
+            _ = try loadState(connection, validateQueue: false)
+        }
         if EluSQLiteRuntimeSchema.hasPersonIdentity(databaseVersion) {
             expectedObjects["person_identity_state"] = "table"
             try verifyColumns(connection, table: "person_identity_state", expected: EluSQLiteRuntimeSchema.personIdentityStateColumns)
@@ -2412,8 +2459,11 @@ private enum EluRuntimeDatabase {
                 ? try readDiagnosticsState(connection, stream: streamId) : .closed
             let person = EluSQLiteRuntimeSchema.hasPersonIdentity(try connection.integerPragma("user_version"))
                 ? try readPersonIdentityState(connection, stream: streamId) : EluPersonIdentityState(deviceId: identity.anonymousId)
+            let exposures = EluSQLiteRuntimeSchema.hasFlagExposures(try connection.integerPragma("user_version"))
+                ? try readFlagExposureState(connection, stream: streamId) : EluFlagExposureLedger(anonymousId: identity.anonymousId)
             let state = EluStoredRuntimeState(
                 personIdentity: person,
+                flagExposures: exposures,
                 captureSessionHistory: history,
                 diagnostics: diagnostics,
                 generation: generation,
@@ -2522,6 +2572,29 @@ private enum EluRuntimeDatabase {
         guard try connection.changes() == 1 else { throw EluRuntimeQueueError.corruptStorage }
     }
 
+    static func readFlagExposureState(_ connection: EluSQLiteConnection, stream: String) throws -> EluFlagExposureLedger {
+        try connection.withStatement("SELECT singleton,stream_id,metadata FROM flag_exposure_state") { statement in
+            try connection.step(statement, expecting: SQLITE_ROW)
+            guard try connection.requiredInteger(statement, column: 0) == 1,
+                  try connection.requiredString(statement, column: 1).utf8.elementsEqual(stream.utf8)
+            else { throw EluRuntimeQueueError.corruptStorage }
+            let data = try connection.requiredData(statement, column: 2, maximumBytes: EluFlagExposureLedger.maximumBytes)
+            guard sqlite3_step(statement) == SQLITE_DONE else { throw EluRuntimeQueueError.corruptStorage }
+            return try EluFlagExposureLedger.decode(data)
+        }
+    }
+    static func writeFlagExposureState(_ connection: EluSQLiteConnection, stream: String,
+                                      ledger: EluFlagExposureLedger, inserting: Bool = false) throws {
+        let sql = inserting ? "INSERT INTO flag_exposure_state(singleton,stream_id,metadata) VALUES(1,?,?)"
+            : "UPDATE flag_exposure_state SET stream_id=?,metadata=? WHERE singleton=1"
+        try connection.withStatement(sql) { statement in
+            try connection.bind(stream, at: 1, to: statement)
+            try connection.bind(ledger.encoded(), at: 2, to: statement)
+            try connection.step(statement)
+        }
+        guard try connection.changes() == 1 else { throw EluRuntimeQueueError.corruptStorage }
+    }
+
     static func readPersonIdentityState(_ connection: EluSQLiteConnection, stream: String) throws -> EluPersonIdentityState {
         try connection.withStatement("SELECT singleton,stream_id,metadata FROM person_identity_state") { statement in
             try connection.step(statement, expecting: SQLITE_ROW)
@@ -2608,6 +2681,9 @@ private enum EluRuntimeDatabase {
         if EluSQLiteRuntimeSchema.hasDiagnostics(try connection.integerPragma("user_version")) {
             try writeDiagnosticsState(connection, stream: state.streamId, diagnostics: state.diagnostics)
         }
+        if EluSQLiteRuntimeSchema.hasFlagExposures(try connection.integerPragma("user_version")) {
+            try writeFlagExposureState(connection, stream: state.streamId, ledger: state.flagExposures)
+        }
         if EluSQLiteRuntimeSchema.hasPersonIdentity(try connection.integerPragma("user_version")) {
             try writePersonIdentityState(connection, stream: state.streamId, person: state.personIdentity)
         }
@@ -2684,6 +2760,10 @@ private enum EluRuntimeDatabase {
 
     private static func validateStateShape(_ state: EluStoredRuntimeState) throws {
         _ = try state.personIdentity.encoded()
+        _ = try state.flagExposures.encoded()
+        guard state.flagExposures.anonymousId.utf8.elementsEqual(state.identity.anonymousId.utf8) else {
+            throw EluRuntimeQueueError.corruptStorage
+        }
         if let epoch = state.diagnostics.epoch {
             guard epoch.identityRevision == state.identity.revision, !state.identity.optedOut else {
                 throw EluRuntimeQueueError.corruptStorage
@@ -2959,9 +3039,15 @@ struct EluV1QueuedEventGuard: Sendable {
 struct EluV1FlagCacheProjection: Sendable {
     let snapshot: EluV1FlagCacheSnapshot
     let authority: EluV1FlagSynchronousGuard
+    private(set) var receivedFromRemote = false
     fileprivate init(snapshot: EluV1FlagCacheSnapshot, authority: EluV1FlagSynchronousGuard) {
         self.snapshot = snapshot
         self.authority = authority
+    }
+    func markingRemoteResponse() -> Self {
+        var copy = self
+        copy.receivedFromRemote = true
+        return copy
     }
     func lookup(_ key: String) -> EluV1FlagLookup {
         authority.isCurrent() ? snapshot.lookup(key) : .missing
@@ -7003,6 +7089,15 @@ actor EluSQLiteRuntimeQueue {
         capture(command, performanceSample: false, admissionGuard: admissionGuard)
     }
 
+    func captureFlagExposure(_ command: EluV1CaptureCommand, exposure: EluFlagExposureRequest,
+                             admissionGuard: @escaping @Sendable () -> Bool) -> EluV1CaptureResult {
+        guard command.kind == .capture, command.name == "$feature_flag_called",
+              EluFlagExposureLedger.validDigest(exposure.digest) else {
+            return .rejected(.invalidEvent, snapshot: state.snapshot)
+        }
+        return capture(command, performanceSample: false, flagExposure: exposure, admissionGuard: admissionGuard)
+    }
+
     /// A passive sample requires an existing live foreground session. It may
     /// neither start/resume a session nor extend its user-activity timeout.
     func capturePerformanceSample(_ command: EluV1CaptureCommand, admissionGuard: @escaping @Sendable () -> Bool) -> EluV1CaptureResult {
@@ -7122,7 +7217,7 @@ actor EluSQLiteRuntimeQueue {
         return capture(command, performanceSample: false, networkObservation: true, admissionGuard: admissionGuard)
     }
 
-    private func capture(_ command: EluV1CaptureCommand, performanceSample: Bool, networkObservation: Bool = false, diagnosticSummary: EluNativeDiagnosticSummary? = nil, admissionGuard: (@Sendable () -> Bool)?) -> EluV1CaptureResult {
+    private func capture(_ command: EluV1CaptureCommand, performanceSample: Bool, networkObservation: Bool = false, diagnosticSummary: EluNativeDiagnosticSummary? = nil, flagExposure: EluFlagExposureRequest? = nil, admissionGuard: (@Sendable () -> Bool)?) -> EluV1CaptureResult {
         let before = state.snapshot
         let sourceWitness = captureSourceWitness
         guard sourceIsCurrent(sourceWitness), admissionGuard?() ?? true else { return .rejected(.authorityAbsent, snapshot: before) }
@@ -7158,6 +7253,17 @@ actor EluSQLiteRuntimeQueue {
             return .rejected(.authorityExpired, snapshot: before)
         }
 
+        if let exposure = flagExposure {
+            guard exposure.anonymousId.utf8.elementsEqual(state.identity.anonymousId.utf8) else {
+                return .rejected(.authorityWitnessChanged, snapshot: before)
+            }
+            if state.flagExposures.digests.contains(exposure.digest) {
+                return .rejected(.exposureAlreadyRecorded, snapshot: before)
+            }
+            if state.flagExposures.digests.count >= EluFlagExposureLedger.maximumEntries {
+                return .rejected(.exposureLedgerFull, snapshot: before)
+            }
+        }
         let diagnosticsUpdate: EluNativeDiagnosticsState?
         if let diagnosticSummary {
             guard let next = try? state.diagnostics.accepting(diagnosticSummary, at: occurredAt,
@@ -7191,6 +7297,7 @@ actor EluSQLiteRuntimeQueue {
                         : networkObservation ? .networkObservation(prepared.draft) : .event(prepared.draft)],
                     maximumQueueBytes: authority.maximumQueueBytes,
                     diagnosticsUpdate: diagnosticsUpdate,
+                    flagExposure: flagExposure,
                     surfaceProvenNotCommitted: true,
                     prewriteValidation: { diskState in
                         guard self.sourceIsCurrent(sourceWitness), admissionGuard?() ?? true else { throw EluRuntimeQueueError.sourceAuthorityUnavailable }
@@ -7706,6 +7813,7 @@ actor EluSQLiteRuntimeQueue {
         maximumQueueBytes: Int? = nil,
         personIdentityUpdate: EluPersonIdentityState? = nil,
         diagnosticsUpdate: EluNativeDiagnosticsState? = nil,
+        flagExposure: EluFlagExposureRequest? = nil,
         surfaceProvenNotCommitted: Bool = false,
         prewriteValidation: ((EluStoredRuntimeState) throws -> Void)? = nil,
         precommitValidation: (() throws -> Void)? = nil
@@ -7763,6 +7871,13 @@ actor EluSQLiteRuntimeQueue {
             }
             try faultInjector?.hit(.afterStateRead)
 
+            var exposures = canonicalIdentity.anonymousId.utf8.elementsEqual(diskState.identity.anonymousId.utf8)
+                ? diskState.flagExposures : EluFlagExposureLedger(anonymousId: canonicalIdentity.anonymousId)
+            if let exposure = flagExposure {
+                guard exposure.anonymousId.utf8.elementsEqual(exposures.anonymousId.utf8),
+                      exposures.digests.count < EluFlagExposureLedger.maximumEntries,
+                      exposures.digests.insert(exposure.digest).inserted else { throw EluRuntimeQueueError.invalidState }
+            }
             var person = personIdentityUpdate ?? diskState.personIdentity
             // Promotion is committed only with the accepted event/identity transaction.
             // A rejected quota or rollback cannot consume this decision.
@@ -7838,6 +7953,7 @@ actor EluSQLiteRuntimeQueue {
             } else { diagnostics = diagnosticsUpdate ?? diskState.diagnostics }
             let nextState = EluStoredRuntimeState(
                 personIdentity: person,
+                flagExposures: exposures,
                 captureSessionHistory: history,
                 diagnostics: diagnostics,
                 generation: diskState.generation + 1,
@@ -8079,6 +8195,7 @@ actor EluSQLiteRuntimeQueue {
             }
             let nextState = EluStoredRuntimeState(
                 personIdentity: diskState.personIdentity,
+                flagExposures: diskState.flagExposures,
                 captureSessionHistory: diskState.captureSessionHistory,
                 diagnostics: diskState.diagnostics,
                 generation: diskState.generation + 1,

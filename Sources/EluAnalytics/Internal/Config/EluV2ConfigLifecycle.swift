@@ -40,6 +40,7 @@ actor EluV2ConfigLifecycle {
     private let clock: EluV2ConfigClock
     private let scheduler: any EluV2ConfigLifecycleScheduler
     private let onChange: @Sendable (EluV2ConfigLifecycleToken) -> Void
+    private let onUnchangedRefresh: @Sendable (EluV2ConfigLifecycleToken) -> Void
     private var started = false
     private var foreground = true
     private var closed = false
@@ -64,13 +65,15 @@ actor EluV2ConfigLifecycle {
         transport: (any EluV2ConfigTransport)? = nil,
         clock: EluV2ConfigClock = .live,
         scheduler: any EluV2ConfigLifecycleScheduler = EluV2TaskConfigScheduler(),
-        onChange: @escaping @Sendable (EluV2ConfigLifecycleToken) -> Void
+        onChange: @escaping @Sendable (EluV2ConfigLifecycleToken) -> Void,
+        onUnchangedRefresh: @escaping @Sendable (EluV2ConfigLifecycleToken) -> Void = { _ in }
     ) throws {
         source = try EluV2ConfigSource(siteKey: siteKey, configHost: configHost, endpointPolicy: endpointPolicy, transport: transport, clock: clock)
         authorityGate = EluV2ConfigAuthorityGate(siteKey: siteKey, clock: clock)
         self.clock = clock
         self.scheduler = scheduler
         self.onChange = onChange
+        self.onUnchangedRefresh = onUnchangedRefresh
     }
 
     func start() {
@@ -168,12 +171,17 @@ actor EluV2ConfigLifecycle {
         if let lease, let remaining = remainingNanoseconds(lease), remaining > 0 {
             failures = 0
             publishedLease = lease
+            let unchanged = state == .document(lease.data)
             publish(.document(lease.data))
+            // A successful endpoint response also renews flag evaluation. Do not
+            // mint a new source token or extend the original lease for equal bytes.
+            if unchanged { onUnchangedRefresh(token) }
             armExpiry(after: remaining)
-            // Avoid an increasingly tight refresh loop near the end of a lease.
+            // Reevaluate within five foreground minutes without extending authority.
+            // Keep the existing short-lease lead and minimum to avoid a tight loop.
             if remaining > Self.second {
                 let lead = min(60 * Self.second, remaining / 5)
-                armRefresh(after: max(Self.second, remaining - lead))
+                armRefresh(after: min(300 * Self.second, max(Self.second, remaining - lead)))
             }
         } else if clockFailed {
             invalidate(.invalidClock, resume: false)

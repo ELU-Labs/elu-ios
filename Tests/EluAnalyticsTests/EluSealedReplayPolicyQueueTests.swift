@@ -7,7 +7,7 @@ final class EluSealedReplayPolicyQueueTests: XCTestCase {
     func testColdNoSessionOrLedgerSendsOriginalNativeBytesThroughExistingClaim() async throws {
         let h = try await SealedPolicyTestHarness.make(); defer { h.base.remove() }
         let noSession = try await h.identity(); XCTAssertNil(noSession.identity.session)
-        XCTAssertEqual(try h.base.schemaVersion(), 37)
+        XCTAssertEqual(try h.base.schemaVersion(), 45)
         let rows = try await h.base.queue.storedReplayChunks(), authority = try await h.authority()
         let permission = try XCTUnwrap(authority)
         guard case let .claimed(claim) = try await h.base.queue.claimNextReplay(permission) else { return XCTFail("original native row") }
@@ -18,7 +18,7 @@ final class EluSealedReplayPolicyQueueTests: XCTestCase {
         XCTAssertEqual(rows[0].prepared.codec, "elu-native-wireframe-v1")
         use.settle(); _ = try await h.base.queue.finishReplayClaim(claim, completion: .response(.accepted))
         let count = try await h.base.count(); XCTAssertEqual(count, 0)
-        XCTAssertEqual(try h.base.schemaVersion(), 37)
+        XCTAssertEqual(try h.base.schemaVersion(), 45)
         await h.base.queue.close()
     }
 

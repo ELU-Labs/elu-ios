@@ -245,9 +245,9 @@ final class EluNativeDiagnosticsQueueTests: XCTestCase {
             if base >= 7 { try await h.queue.ensureNativeReplayAuthoritySchema() }
             let before = try await h.queue.snapshot(), records = try await h.queue.peek(maximumCount: 10, maximumBytes: 1_000_000)
             await h.queue.close()
-            try h.base.sql("DROP TABLE person_identity_state; DROP TABLE native_diagnostics_state; \(version <= 8 ? "DROP TABLE capture_session_history;" : "") PRAGMA user_version=\(version)")
+            try h.base.sql("DROP TABLE flag_exposure_state; DROP TABLE person_identity_state; DROP TABLE native_diagnostics_state; \(version <= 8 ? "DROP TABLE capture_session_history;" : "") PRAGMA user_version=\(version)")
             try await h.reopen()
-            XCTAssertEqual(try h.base.schemaVersion(), Int64(base + 32))
+            XCTAssertEqual(try h.base.schemaVersion(), Int64(base + 40))
             let after = try await h.queue.snapshot(), afterRecords = try await h.queue.peek(maximumCount: 10, maximumBytes: 1_000_000)
             let state = try await h.queue.diagnosticsContinuity()
             XCTAssertEqual(before, after); XCTAssertEqual(records, afterRecords); XCTAssertEqual(state, .closed)
@@ -258,14 +258,14 @@ final class EluNativeDiagnosticsQueueTests: XCTestCase {
     func testDiagnosticsMigrationFailureRollsBackAndReopenRecovers() async throws {
         let fault = DeliveryFault(), h = try await make(fault: fault); defer { h.base.remove() }
         _ = await h.base.capture(); let before = try await h.queue.snapshot()
-        await h.queue.close(); try h.base.sql("DROP TABLE person_identity_state; DROP TABLE native_diagnostics_state; PRAGMA user_version=9")
+        await h.queue.close(); try h.base.sql("DROP TABLE flag_exposure_state; DROP TABLE person_identity_state; DROP TABLE native_diagnostics_state; PRAGMA user_version=9")
         fault.action = { if $0 == .beforeDiagnosticsMigrationCommit { throw EluRuntimeQueueError.faultInjected($0) } }
         do { try await h.reopen(); XCTFail("Migration failure was ignored") } catch {}
         XCTAssertEqual(try h.base.schemaVersion(), 9)
         XCTAssertEqual(try h.integer("SELECT count(*) FROM sqlite_master WHERE name='native_diagnostics_state'"), 0)
         fault.action = nil; try await h.reopen()
         let after = try await h.queue.snapshot(); XCTAssertEqual(before, after)
-        XCTAssertEqual(try h.base.schemaVersion(), 33)
+        XCTAssertEqual(try h.base.schemaVersion(), 41)
         await h.queue.close()
     }
 }

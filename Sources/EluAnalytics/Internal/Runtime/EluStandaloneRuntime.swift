@@ -650,6 +650,12 @@ actor EluStandaloneRuntime {
         )
     }
 
+    func captureFlagExposure(properties: [String: EluJSONValue], exposure: EluFlagExposureRequest,
+                             admissionGuard: @escaping @Sendable () -> Bool) async -> EluV1CaptureResult {
+        await submit(.init(kind: .capture, name: "$feature_flag_called", occurredAt: clock(),
+            properties: properties, versions: versions), flagExposure: exposure, admissionGuard: admissionGuard)
+    }
+
     func screen(
         _ name: String,
         properties: [String: EluJSONValue] = [:],
@@ -1046,12 +1052,12 @@ actor EluStandaloneRuntime {
         await queue.close()
     }
 
-    private func submit(_ command: EluV1CaptureCommand, admissionGuard: (@Sendable () -> Bool)? = nil) async -> EluV1CaptureResult {
+    private func submit(_ command: EluV1CaptureCommand, flagExposure: EluFlagExposureRequest? = nil, admissionGuard: (@Sendable () -> Bool)? = nil) async -> EluV1CaptureResult {
         defer { replayRelay.request() }
         guard phase != .closed else {
             return .rejected(.authorityAbsent, snapshot: lastSnapshot)
         }
-        var result = await record(command, admissionGuard: admissionGuard)
+        var result = await record(command, flagExposure: flagExposure, admissionGuard: admissionGuard)
         // Authority is bound to the identity witness it was derived from. If
         // that witness moved under this call, one renewal decides whether the
         // call proceeds or is discarded with the new reason.
@@ -1062,12 +1068,12 @@ actor EluStandaloneRuntime {
             guard phase != .closed else {
                 return .rejected(.authorityAbsent, snapshot: lastSnapshot)
             }
-            result = await record(command, admissionGuard: admissionGuard)
+            result = await record(command, flagExposure: flagExposure, admissionGuard: admissionGuard)
         }
         return result
     }
 
-    private func record(_ command: EluV1CaptureCommand, performanceSample: Bool = false, networkContext: EluNetworkObservationContext? = nil, admissionGuard: (@Sendable () -> Bool)? = nil) async -> EluV1CaptureResult {
+    private func record(_ command: EluV1CaptureCommand, flagExposure: EluFlagExposureRequest? = nil, performanceSample: Bool = false, networkContext: EluNetworkObservationContext? = nil, admissionGuard: (@Sendable () -> Bool)? = nil) async -> EluV1CaptureResult {
         defer { refreshNetworkObservation() }
         let fence = deliveryFence
         let decision = fence.token()
@@ -1075,7 +1081,9 @@ actor EluStandaloneRuntime {
             fence.isCurrent(decision) && (admissionGuard?() ?? true)
         }
         let result: EluV1CaptureResult
-        if performanceSample { result = await queue.capturePerformanceSample(command, admissionGuard: current) }
+        if let flagExposure {
+            result = await queue.captureFlagExposure(command, exposure: flagExposure, admissionGuard: current)
+        } else if performanceSample { result = await queue.capturePerformanceSample(command, admissionGuard: current) }
         else if let networkContext {
             result = await queue.captureNetworkObservation(command, context: networkContext, admissionGuard: current)
         } else { result = await queue.capture(command, admissionGuard: current) }

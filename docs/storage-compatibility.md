@@ -10,13 +10,22 @@ previous 0.1.0 runtime, and it does not open, rewrite, or delete that runtime's
 files. Applications should call `Elu.identify` after restoring their own login
 state and apply their current consent choice through the public consent APIs.
 
-Supported owned SQLite schemas 1 through 16 and 25 through 32 upgrade to schemas
-33 through 40.
+Supported owned SQLite schemas 1 through 16 and 25 through 40 upgrade to schemas
+41 through 48.
 Schemas 9 through 16 already contain installation capture-session history; the
 25–32 family additionally stores bounded native diagnostics continuity and
 receipt deduplication. Upgrades from older families start diagnostics coverage
 closed and do not import older OS intervals. The 33–40 family adds a bounded,
-stream-bound singleton for independent device identity and profile processing. Reopen, transaction recovery,
+stream-bound singleton for independent device identity and profile processing. The 41–48
+family additionally stores the anonymous visitor's exposure ledger in a separate
+stream-bound singleton (at most 4,096 SHA-256 entries and 300,000 encoded bytes).
+Older stores start with an empty exposure ledger: queue fragments and a retained
+flag cache cannot reconstruct prior accepted reports. This may permit one new
+report for a previously seen value after upgrade. Subsequent event/ledger writes
+and reset/ledger clearing are atomic; ordinary ACK, consent and identify preserve
+history. Saturation suppresses new exposure events until reset, not flag reads.
+These logical metadata bounds are not a bound on allocated SQLite/WAL bytes.
+ Reopen, transaction recovery,
 identity, consent, offline queue, flags, and replay records remain preserved.
 Old SQLite and imported owned JSON stores cannot prove complete first-session
 history. They remain eligible for ordinary analytics and all-device replay,

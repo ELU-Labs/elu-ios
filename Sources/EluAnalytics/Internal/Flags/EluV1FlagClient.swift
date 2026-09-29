@@ -236,14 +236,17 @@ actor EluV1FlagClient {
     }
 
     func reloadProjection() async -> EluV1FlagCacheProjection? {
+        let acceptedGeneration = generation
         let result = await reload()
         let snapshot: EluV1FlagCacheSnapshot
+        let fromRemote: Bool
         switch result {
-        case let .updated(value), let .cached(value): snapshot = value
+        case let .updated(value): snapshot = value; fromRemote = true
+        case let .cached(value): snapshot = value; fromRemote = false
         default: return nil
         }
-        guard let projection = await readProjection(), projection.snapshot == snapshot else { return nil }
-        return projection
+        guard let projection = await readProjection(), generation == acceptedGeneration, projection.snapshot == snapshot else { return nil }
+        return fromRemote ? projection.markingRemoteResponse() : projection
     }
 
     private static func performReload(

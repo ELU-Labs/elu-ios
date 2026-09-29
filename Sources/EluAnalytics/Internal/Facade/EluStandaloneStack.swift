@@ -41,7 +41,7 @@ final class EluStandaloneStack: @unchecked Sendable {
         let relay = EluStandaloneConfigRelay()
         let lifecycle = try EluV2ConfigLifecycle(siteKey: siteKey, configHost: configHost, endpointPolicy: endpointPolicy,
             transport: configTransport, clock: clock, scheduler: scheduler,
-            onChange: { relay.publish($0) })
+            onChange: { relay.publish($0) }, onUnchangedRefresh: { relay.refresh($0) })
         _ = lifecycle.authorityGate.suspend()
         let runtime = try await EluStandaloneRuntime.make(rootDirectoryURL: rootDirectoryURL,
             siteKey: siteKey, endpointPolicy: endpointPolicy, versions: versions,
@@ -143,6 +143,20 @@ final class EluStandaloneStack: @unchecked Sendable {
         ready.release()
     }
 
+    fileprivate func refreshFlags(_ token: EluV2ConfigLifecycleToken) {
+        lock.lock()
+        guard !closed, foreground, let witness = lifecycle.authorityGate.witness(for: token) else {
+            lock.unlock(); return
+        }
+        let decision = latestDecision
+        let notify = onSettled
+        enqueueLocked { [weak self, lifecycle] in
+            guard let self, self.isCurrent(decision), lifecycle.authorityGate.isCurrent(witness) else { return }
+            notify?()
+        }
+        lock.unlock()
+    }
+
     func close() {
         lock.lock()
         guard !closed else { lock.unlock(); return }
@@ -193,6 +207,10 @@ private final class EluStandaloneConfigRelay: @unchecked Sendable {
     func publish(_ token: EluV2ConfigLifecycleToken) {
         lock.lock(); let current = stack; lock.unlock()
         current?.accept(token)
+    }
+    func refresh(_ token: EluV2ConfigLifecycleToken) {
+        lock.lock(); let current = stack; lock.unlock()
+        current?.refreshFlags(token)
     }
 }
 

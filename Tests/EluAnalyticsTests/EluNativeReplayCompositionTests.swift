@@ -9,7 +9,7 @@ final class EluNativeReplayCompositionTests: XCTestCase {
         let runtime = try await open(h)
         let state = try await runtime.queueSnapshot(); XCTAssertNil(state.identity.session)
         let permission = try await runtime.currentSealedReplayDelivery(capabilities: h.proof)
-        XCTAssertNotNil(permission); XCTAssertEqual(try h.base.schemaVersion(), 37)
+        XCTAssertNotNil(permission); XCTAssertEqual(try h.base.schemaVersion(), 45)
         let sent = expectation(description: "original sealed request")
         let transport = CompositionTransport { sent.fulfill() }
         let installed = await runtime.installNativeReplayComposition(lifecycle: EluNativeReplayLifecycle(), capabilities: h.proof, transport: transport)
@@ -20,7 +20,7 @@ final class EluNativeReplayCompositionTests: XCTestCase {
         await runtime.close()
         h.base.queue = try await h.base.reopen()
         let rows = try await h.base.queue.storedReplayChunks(); XCTAssertTrue(rows.isEmpty)
-        XCTAssertEqual(try h.base.schemaVersion(), 37)
+        XCTAssertEqual(try h.base.schemaVersion(), 45)
         await h.base.queue.close()
     }
 
@@ -36,7 +36,7 @@ final class EluNativeReplayCompositionTests: XCTestCase {
         await runtime.close()
         h.base.queue = try await h.base.reopen()
         let retained = try await h.base.queue.storedReplayChunks(); XCTAssertTrue(retained.isEmpty)
-        XCTAssertEqual(try h.base.schemaVersion(), 37)
+        XCTAssertEqual(try h.base.schemaVersion(), 45)
         await h.base.queue.close()
     }
 

@@ -17,6 +17,46 @@ final class EluV2ConfigLifecycleTests: XCTestCase {
         await h.stop()
     }
 
+    func testLongLeaseRefreshesWithinFiveMinutesWithoutExtendingItsExpiry() async throws {
+        let h = try Harness()
+        let data = try fixture {
+            $0["issuedAt"] = "2026-08-05T00:01:00.000Z"
+            $0["expiresAt"] = "2026-08-05T00:11:00.000Z"
+        }
+        try await h.install(data)
+        // This clock begins at00:01:30; original expiry remains570s away.
+        XCTAssertEqual(h.scheduler.delays.sorted(), [300 * second, 570 * second])
+        h.clock.advance(seconds: 300, wall: false)
+        assertTrue(await h.scheduler.fire(delay: 300 * second))
+        try await h.waitForRequests(2)
+        let original = try XCTUnwrap(h.notifications.last)
+        await h.transport.resolve(1, data: data)
+        try await h.waitForTimer(270 * second)
+        XCTAssertEqual(h.unchangedRefreshes.value, [original])
+        XCTAssertEqual(h.notifications.last, original, "Successful same-body refresh is not new authority")
+        h.clock.advance(seconds: 270, wall: false)
+        assertTrue(await h.scheduler.fire(delay: 270 * second))
+        assertEqual(await h.state(), .unavailable(.expired))
+        await h.stop()
+    }
+
+    func testFiveMinuteRefreshStopsInBackgroundAndOnlyOnePhysicalRequestSurvives() async throws {
+        let h = try Harness()
+        let data = try fixture {
+            $0["issuedAt"] = "2026-08-05T00:01:00.000Z"
+            $0["expiresAt"] = "2026-08-05T00:11:00.000Z"
+        }
+        try await h.install(data)
+        await h.driver.setForeground(false)
+        h.clock.advance(seconds: 300)
+        assertTrue(await h.scheduler.fire(delay: 300 * second, includingCancelled: true))
+        assertEqual(await h.transport.count, 1)
+        await h.driver.setForeground(true); try await h.waitForRequests(2)
+        await h.driver.refresh(); await h.driver.refresh()
+        assertEqual(await h.transport.count, 2)
+        await h.stop()
+    }
+
     func testExpiryWithdrawsWhileRenewalIsPendingAndAllowsOnlyFreshLease() async throws {
         let h = try Harness()
         let data = try fixture()
@@ -301,13 +341,15 @@ private struct Harness {
     let clock = LifecycleClock()
     let scheduler = LifecycleScheduler()
     let notifications = LifecycleBox<[EluV2ConfigLifecycleToken]>([])
+    let unchangedRefreshes = LifecycleBox<[EluV2ConfigLifecycleToken]>([])
 
     init() throws {
-        let notifications = notifications
+        let notifications = notifications, unchangedRefreshes = unchangedRefreshes
         driver = try EluV2ConfigLifecycle(
             siteKey: "elu_pk_live_" + String(repeating: "a", count: 22),
             transport: transport, clock: clock.value, scheduler: scheduler,
-            onChange: { token in notifications.mutate { $0.append(token) } }
+            onChange: { token in notifications.mutate { $0.append(token) } },
+            onUnchangedRefresh: { token in unchangedRefreshes.mutate { $0.append(token) } }
         )
     }
     func install(_ data: Data) async throws {

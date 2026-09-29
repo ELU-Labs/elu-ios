@@ -69,6 +69,17 @@ to the current evaluation context; unavailable flags do not imply a successful
 evaluation. `ForFlags` setters and resets change evaluation context only, without
 sending person or group property updates. The README lists the public methods.
 
+Exposure deduplication is durable for the anonymous visitor/key/typed value and
+commits in the same transaction as the accepted exposure event. Identify,
+relaunch and config renewal retain it; reset clears it. A full 4,096-entry ledger
+suppresses only new exposure telemetry, with no eviction or getter restriction.
+Request/evaluation metadata retains the original evaluation provenance. Native
+bootstrap values are unsupported; the compatibility `used` field distinguishes
+retained cache before a remote evaluation, with both bootstrap values null.
+Foreground config refresh is capped at 300 seconds; an unchanged successful
+response also requests flag evaluation without replacing source authority or
+extending its expiry.
+
 Application lifecycle events are automatic when collection is eligible.
 Logical screens require explicit `Elu.screen(...)` calls in both UIKit and
 SwiftUI. Element-interaction autocapture, surveys, and push auto-capture are not

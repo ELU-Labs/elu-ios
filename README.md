@@ -162,6 +162,25 @@ default (the default sentinel is `"None"`). `getFeatureFlagResult` returns one
 current snapshot with `key`, `enabled`, `variant`, and JSON-compatible `payload`;
 nil means the flag is missing or unavailable.
 
+Exposure events (`$feature_flag_called`) are deduplicated durably by anonymous
+visitor, flag key, and typed value. Relaunch, identify, consent changes, and
+configuration renewal retain that history; either reset variant clears it.
+Only an accepted event consumes an entry. After 4,096 distinct entries, new
+exposure telemetry is suppressed until reset; flag evaluation and getters keep
+working. Existing owned stores start with an empty exposure history on upgrade.
+
+Exposure properties include the validated `$feature_flag_request_id` and
+`$feature_flag_evaluated_at` (Unix milliseconds), including when an evaluation
+comes from the retained cache. No customer bootstrap is accepted: compatibility
+fields `$feature_flag_bootstrapped_response` and
+`$feature_flag_bootstrapped_payload` are null. `$used_bootstrap_value` is true
+for a retained evaluation before a remote response has been observed for that
+current logical evaluation; it does not indicate customer-supplied bootstrap.
+Active apps refresh configuration within five minutes, and each successful
+refresh reevaluates flags even if configuration bytes are unchanged. Suspension,
+network failures, and expired authority still suppress unavailable results;
+refresh never extends the signed configuration's original expiry.
+
 The `identify(_:userProperties:userPropertiesOnce:)` and
 `setPersonProperties(_:propertiesOnce:)` overloads can set first-write person
 properties. The `ForFlags` setters and resets change only this device's flag

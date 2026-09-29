@@ -60,7 +60,8 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, @unchecked Sendable {
     private var flagReloadScheduled = false
 
     private var exposures: Set<String> = []
-    private var exposureIdentityRevision: Int64?
+    private var exposureAnonymousId: String?
+    private var flagsFromRemote = false
 
     private var dropped: [EluFacadeDropReason: Int] = [:]
     private var isShutDown = false
@@ -633,10 +634,8 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, @unchecked Sendable {
         }
     }
 
-    /// Reports `$feature_flag_called` once per flag key and reported value for
-    /// the current identity revision. A discarded report is withdrawn from the
-    /// ledger so the next read of that value reports it again, as long as the
-    /// identity revision that recorded it still stands.
+    /// The in-memory set coalesces concurrent getters; the owned queue commits
+    /// durable anonymous-visitor deduplication atomically with the accepted event.
     private func reportExposure(
         _ key: String,
         value: EluV1FlagValue?,
@@ -644,14 +643,15 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, @unchecked Sendable {
         projection: EluV1FlagCacheProjection,
         generation: UUID
     ) {
-        let ledgerKey = EluFacadeJSON.exposureKey(key, value: value)
+        guard let ledgerKey = try? EluFlagExposureLedger.digest(key: key, value: value) else { return }
         lock.lock()
-        guard projectionIsCurrentLocked(projection, generation: generation), !exposures.contains(ledgerKey) else {
+        guard projectionIsCurrentLocked(projection, generation: generation), let anonymousId = identity?.anonymousId,
+              !exposures.contains(ledgerKey), exposures.count < EluFlagExposureLedger.maximumEntries else {
             lock.unlock()
             return
         }
         exposures.insert(ledgerKey)
-        let revision = exposureIdentityRevision
+        let usedCachedValue = !flagsFromRemote
         lock.unlock()
 
         var reported: [String: EluJSONValue] = ["$feature_flag": .string(key)]
@@ -661,21 +661,35 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, @unchecked Sendable {
             reported["$feature_flag_error"] = .string("flag_missing")
         }
         reported["$feature_flag_payload"] = payload?.eluJSONValue ?? .null
+        reported["$feature_flag_request_id"] = .string(projection.snapshot.response.requestId)
+        if let evaluatedAt = try? projection.snapshot.response.evaluatedAt.validated() {
+            reported["$feature_flag_evaluated_at"] = .integer(Int64((evaluatedAt.date.timeIntervalSince1970 * 1_000).rounded(.down)))
+        }
+        // Compatibility fields: this SDK accepts no customer bootstrap values.
+        // "used" denotes a retained cache before this evaluation has a remote response.
+        reported["$feature_flag_bootstrapped_response"] = .null
+        reported["$feature_flag_bootstrapped_payload"] = .null
+        reported["$used_bootstrap_value"] = .bool(usedCachedValue)
         let properties = reported
+        let exposure = EluFlagExposureRequest(anonymousId: anonymousId, digest: ledgerKey)
 
         enqueue { runtime, owner in
-            let result = await runtime.capture("$feature_flag_called", properties: properties,
+            let result = await runtime.captureFlagExposure(properties: properties, exposure: exposure,
                 admissionGuard: { owner.withLock { owner.projectionIsCurrentLocked(projection, generation: generation) } })
-            owner.record(result)
-            if case .rejected = result {
-                owner.withdrawExposure(ledgerKey, recordedAt: revision)
+            switch result {
+            case .rejected(.exposureAlreadyRecorded, _), .rejected(.exposureLedgerFull, _):
+                // Expected durable suppression, not a failed getter or authority error.
+                break
+            default:
+                owner.record(result)
+                if case .rejected = result { owner.withdrawExposure(ledgerKey, anonymousId: anonymousId) }
             }
         }
     }
 
-    private func withdrawExposure(_ ledgerKey: String, recordedAt revision: Int64?) {
+    private func withdrawExposure(_ ledgerKey: String, anonymousId: String) {
         lock.lock()
-        if exposureIdentityRevision == revision {
+        if exposureAnonymousId?.utf8.elementsEqual(anonymousId.utf8) == true {
             exposures.remove(ledgerKey)
         }
         lock.unlock()
@@ -724,6 +738,13 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, @unchecked Sendable {
     private func publish(_ projection: EluV1FlagCacheProjection) {
         lock.lock()
         guard !isShutDown, pendingFlagIntents.isEmpty, projection.authority.isCurrent() else { lock.unlock(); return }
+        if let previous = flagCache?.snapshot.response {
+            let next = projection.snapshot.response
+            if previous.flagsRevision != next.flagsRevision || previous.flags != next.flags || previous.payloads != next.payloads {
+                flagsFromRemote = false
+            }
+        }
+        if projection.receivedFromRemote { flagsFromRemote = true }
         flagCache = projection
         flagsLoadedState = true
         let generation = flagGeneration
@@ -767,7 +788,7 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, @unchecked Sendable {
     private func clearFlagsLocked() {
         flagCache = nil
         flagsLoadedState = false
-        exposures.removeAll(keepingCapacity: false)
+        flagsFromRemote = false
     }
 
     private func currentFlagClient() -> EluV1FlagClient? {
@@ -789,9 +810,9 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, @unchecked Sendable {
     private func syncIdentity(_ next: EluIdentityState) {
         lock.lock()
         identity = next
-        if exposureIdentityRevision != next.revision {
+        if exposureAnonymousId?.utf8.elementsEqual(next.anonymousId.utf8) != true {
             exposures.removeAll(keepingCapacity: false)
-            exposureIdentityRevision = next.revision
+            exposureAnonymousId = next.anonymousId
         }
         lock.unlock()
     }

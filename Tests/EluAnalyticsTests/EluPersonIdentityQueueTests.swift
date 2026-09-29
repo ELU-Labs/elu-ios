@@ -198,14 +198,14 @@ final class EluPersonIdentityQueueTests: XCTestCase {
             if base >= 7 { try await h.queue.ensureNativeReplayAuthoritySchema() }
             let before = try await h.queue.snapshot(), records = try await h.queue.peek(maximumCount: 100, maximumBytes: 1_000_000)
             await h.queue.close()
-            try h.base.sql("DROP TABLE person_identity_state; \(version < 25 ? "DROP TABLE native_diagnostics_state;" : "") \(version <= 8 ? "DROP TABLE capture_session_history;" : "") PRAGMA user_version=\(version)")
+            try h.base.sql("DROP TABLE flag_exposure_state; DROP TABLE person_identity_state; \(version < 25 ? "DROP TABLE native_diagnostics_state;" : "") \(version <= 8 ? "DROP TABLE capture_session_history;" : "") PRAGMA user_version=\(version)")
             try await h.reopen()
-            XCTAssertEqual(try h.base.schemaVersion(), Int64(base + 32))
+            XCTAssertEqual(try h.base.schemaVersion(), Int64(base + 40))
             let after = try await h.queue.snapshot(), restored = try await h.queue.peek(maximumCount: 100, maximumBytes: 1_000_000)
             XCTAssertEqual(after, before); XCTAssertEqual(restored, records)
             XCTAssertEqual(try h.person(), .init(deviceId: before.identity.anonymousId))
             await h.queue.close(); try await h.reopen()
-            XCTAssertEqual(try h.base.schemaVersion(), Int64(base + 32))
+            XCTAssertEqual(try h.base.schemaVersion(), Int64(base + 40))
             await h.queue.close()
         }
     }
@@ -213,14 +213,14 @@ final class EluPersonIdentityQueueTests: XCTestCase {
     func testPersonMigrationRollbackLeavesOldSchemaAndRecordsRecoverable() async throws {
         let fault = DeliveryFault(), h = try await PersonIdentityHarness.make(fault: fault); defer { h.base.remove() }
         _ = try await capture(h); let before = try await h.queue.snapshot()
-        await h.queue.close(); try h.base.sql("DROP TABLE person_identity_state; PRAGMA user_version=25")
+        await h.queue.close(); try h.base.sql("DROP TABLE flag_exposure_state; DROP TABLE person_identity_state; PRAGMA user_version=25")
         fault.action = { if $0 == .beforePersonIdentityMigrationCommit { throw EluRuntimeQueueError.faultInjected($0) } }
         do { try await h.reopen(); XCTFail("Migration fault ignored") } catch {}
         XCTAssertEqual(try h.base.schemaVersion(), 25)
         XCTAssertEqual(try h.native.integer("SELECT count(*) FROM sqlite_master WHERE name='person_identity_state'"), 0)
         fault.action = nil; try await h.reopen()
         let restored = try await h.queue.snapshot(); XCTAssertEqual(restored, before)
-        XCTAssertEqual(try h.base.schemaVersion(), 33)
+        XCTAssertEqual(try h.base.schemaVersion(), 41)
         await h.queue.close()
     }
 
