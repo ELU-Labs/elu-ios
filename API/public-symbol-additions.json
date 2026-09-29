@@ -259,6 +259,18 @@
     {
       "kind": "swift.method",
       "name": "EluReplayWindow.sendEvent(_:)"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluDiagnosticsOptions.crashReportDetails"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluDiagnosticsOptions.crashReports"
+    },
+    {
+      "kind": "swift.init",
+      "name": "EluDiagnosticsOptions.init(enabled:launchSummaries:crashReports:crashReportDetails:)"
     }
   ]
 }
