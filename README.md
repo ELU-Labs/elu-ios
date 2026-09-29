@@ -397,6 +397,17 @@ not persist across launches; use `optOut()` for persistent consent withdrawal.
 There are no URL/event/linked-flag or sampling override arguments. These controls
 do not add SwiftUI-tree replay, touch/gesture recording or automatic screens.
 
+A visible root replacement or a viewport change ends the original capture before
+starting a new replay ID under the same analytics session, sample decision and
+remaining budget. Unsealed boundary frames are discarded. Transient unsupported
+geometry is retried at the existing capture cadence without retaining failed
+frames. A missing or presented root is observed without reading view text; recovery
+stops on local stop, withdrawal or expiry and never renews configuration itself.
+Opaque framework/custom content remains opaque. Scroll and navigation can change
+visual snapshots; they do not produce touch or scroll interaction markers. Ordered
+multi-stream viewport changes and player forward/backward seeking still require
+end-to-end qualification; source recovery alone is not that evidence.
+
 `captureException` records errors explicitly supplied by your app, including
 bounded cause chains. It does not install a synchronous fatal-crash handler.
 Optional delayed numeric OS diagnostics are described below.

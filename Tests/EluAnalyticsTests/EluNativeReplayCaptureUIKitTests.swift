@@ -19,6 +19,78 @@ import zlib
 }
 
 final class EluNativeReplayCaptureUIKitTests: XCTestCase {
+    @MainActor func testTransientUnsupportedGeometryResumesOriginalCaptureWithoutEncodingFailedFrame() async throws {
+        let h = try await make(textMasking: "sensitive"), setup = try await selected(h)
+        var settled = false
+        defer { setup.root.removeFromSuperview(); if settled { h.base.remove() } }
+        let label = UILabel(frame: CGRect(x: 4, y: 8, width: 280, height: 30))
+        label.text = "Before navigation"; setup.root.addSubview(label)
+        let owner = try start(h, setup)
+        do {
+            try await wait { try await h.queue.storedReplayChunks().count == 1 }
+            let initial = try await h.queue.storedReplayChunks()[0].prepared.replayId
+            let frames = owner.collectedFrameCountForTesting(), reads = setup.probe.boundsReads
+            label.text = "TRANSFORMED_UNSUPPORTED"; label.transform = CGAffineTransform(translationX: 20, y: 0)
+            try await wait { setup.probe.boundsReads > reads }
+            XCTAssertEqual(owner.collectedFrameCountForTesting(), frames)
+            XCTAssertTrue(owner.isRecording())
+            label.text = "After navigation"; label.transform = .identity
+            h.base.testClock.advance(10)
+            try await wait { try await h.queue.storedReplayChunks().count == 2 }
+            guard case .settled = await owner.stop() else { return XCTFail("geometry recovery did not settle") }
+            let rows = try await h.queue.storedReplayChunks()
+            XCTAssertEqual(Set(rows.map { $0.prepared.replayId }), Set([initial]))
+            XCTAssertTrue(try decodedText(rows[1].prepared).contains("After navigation"))
+            XCTAssertFalse(try rows.contains { try decodedText($0.prepared).contains("TRANSFORMED_UNSUPPORTED") })
+            XCTAssertFalse(owner.needsRootRecovery())
+            await h.queue.close(); settled = true
+        } catch { _ = await owner.stop(); await h.queue.close(); throw error }
+    }
+
+    @MainActor func testViewportBoundaryDiscardsUnsealedPrefixAndSettlesOriginalAccounting() async throws {
+        let h = try await make(minimum: 30), setup = try await selected(h)
+        var settled = false
+        defer { setup.root.removeFromSuperview(); if settled { h.base.remove() } }
+        let owner = try start(h, setup)
+        do {
+            try await wait { owner.collectedFrameCountForTesting() == 1 }
+            let before = try await h.queue.nativeReplaySessionState()
+            h.base.testClock.advance(1)
+            setup.root.bounds.size = CGSize(width: setup.root.bounds.height, height: setup.root.bounds.width)
+            try await wait { !owner.isRecording() }
+            guard case .settled = await owner.finished() else { return XCTFail("viewport boundary did not settle") }
+            XCTAssertTrue(owner.needsRootRecovery())
+            let rows = try await h.queue.storedReplayChunks(), after = try await h.queue.nativeReplaySessionState()
+            XCTAssertTrue(rows.isEmpty, "Changed viewport cannot grant the initial minimum")
+            XCTAssertEqual(after.session?.firstStartAt, before.session?.firstStartAt)
+            XCTAssertEqual(after.session?.samplingHash, before.session?.samplingHash)
+            XCTAssertNil(after.session?.activeEpoch)
+            XCTAssertGreaterThanOrEqual(after.session?.elapsedFloorMicroseconds ?? 0, 1_000_000)
+            await h.queue.close(); settled = true
+        } catch { _ = await owner.stop(); await h.queue.close(); throw error }
+    }
+
+    @MainActor func testUnsupportedGeometryRetryCannotSurviveSourceWithdrawal() async throws {
+        let h = try await make(), setup = try await selected(h)
+        var settled = false
+        defer { setup.root.removeFromSuperview(); if settled { h.base.remove() } }
+        let owner = try start(h, setup)
+        do {
+            try await wait { try await h.queue.storedReplayChunks().count == 1 }
+            let reads = setup.probe.boundsReads, frames = owner.collectedFrameCountForTesting()
+            let unsupported = UIView(frame: CGRect(x: 4, y: 8, width: 40, height: 40))
+            unsupported.transform = CGAffineTransform(scaleX: 2, y: 2); setup.root.addSubview(unsupported)
+            try await wait { setup.probe.boundsReads > reads }
+            XCTAssertEqual(owner.collectedFrameCountForTesting(), frames)
+            h.base.gate.close()
+            try await wait { !owner.isRecording() }
+            guard case .settled = await owner.finished() else { return XCTFail("expired geometry retry did not settle") }
+            XCTAssertFalse(owner.needsRootRecovery())
+            let rows = try await h.queue.storedReplayChunks(); XCTAssertEqual(rows.count, 1)
+            await h.queue.close(); settled = true
+        } catch { _ = await owner.stop(); await h.queue.close(); throw error }
+    }
+
     @MainActor func testLocalStopSealsShortAuthorizedTailAndSettlesBeforeRestart() async throws {
         let h = try await make(textMasking: "sensitive"), setup = try await selected(h)
         var settled = false

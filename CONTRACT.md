@@ -158,6 +158,18 @@ Calls before setup are no-ops; local stop is not persisted. Browser URL/event/
 linked-flag override modes are not implemented, and the controls do not add
 native touch/gesture or automatic-screen capture.
 
+Safe root replacement and viewport changes recover automatically only after the
+original physical capture and durable accounting settle. Each replacement uses a
+new replay ID, preserving the analytics session's sample and budget history and
+v1's fixed viewport per stream. No unsealed boundary frame is carried forward.
+Only the collector's closed `unsupportedGeometry` error retries the same capture;
+privacy, source, encoding and storage failures are not geometry retries. At most
+one cancellable root-only observer waits for an available foreground root under
+an original, unexpired authorization; it performs no text collection, SQL polling
+or configuration renewal. Local control generations fence late restart. Snapshot
+changes do not represent native touch/scroll events, and engine/player continuity
+across replay IDs requires separate qualification.
+
 The blanket profile masks text. When current policy authorizes ordinary text,
 supported fully visible `UILabel` and `UIButton` text can remain
 readable when its full layout fits, including multiline and wrapped text.

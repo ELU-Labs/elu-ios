@@ -6,6 +6,7 @@ import UIKit
 enum EluNativeReplayCaptureError: Error, Equatable {
     case withdrawn
     case locallyStopped
+    case rootChanged
     case occupied
     case invalidClock
     case frameOrder
@@ -179,6 +180,7 @@ private final class EluNativeReplayCaptureFence: @unchecked Sendable {
     private let lock = NSLock()
     private var active = true
     private var draining = false
+    private var rootRecovery = false
     private var collectedFrames = 0
     private var currentCollector: (@Sendable () -> Bool)?
     private var stopCollector: (@Sendable () -> Void)?
@@ -188,6 +190,13 @@ private final class EluNativeReplayCaptureFence: @unchecked Sendable {
     }
     func isCollecting() -> Bool {
         lock.lock(); defer { lock.unlock() }; return active && !draining
+    }
+    func requestRootRecovery() {
+        lock.lock(); defer { lock.unlock() }
+        if active && !draining { rootRecovery = true }
+    }
+    func needsRootRecovery() -> Bool {
+        lock.lock(); defer { lock.unlock() }; return rootRecovery
     }
     func didCollectFrame() { lock.lock(); collectedFrames += 1; lock.unlock() }
     func frameCount() -> Int { lock.lock(); defer { lock.unlock() }; return collectedFrames }
@@ -245,6 +254,7 @@ final class EluNativeReplayCaptureOwner: @unchecked Sendable {
 
     /// Read-only causal observation; never supplies capture or commit permission.
     func collectedFrameCountForTesting() -> Int { fence.frameCount() }
+    func needsRootRecovery() -> Bool { fence.needsRootRecovery() }
     func requestGracefulStop() { fence.stopGracefully() }
     func isDraining() -> Bool { fence.isDraining() }
     func isRecording() -> Bool { fence.isRecording() }
@@ -287,9 +297,14 @@ private final class EluNativeReplayCaptureRun: @unchecked Sendable {
     }
 
     private func checkLocalIntake() throws {
-        guard !Task.isCancelled, fence.isCurrent(), selection.isCurrent() else {
+        guard !Task.isCancelled, fence.isCurrent() else {
             throw EluNativeReplayCaptureError.withdrawn
         }
+        guard selection.isCurrent() else { throw EluNativeReplayCaptureError.rootChanged }
+    }
+
+    @MainActor private func checkSelectedRoot() throws {
+        guard selection.validateCurrent() else { throw EluNativeReplayCaptureError.rootChanged }
     }
 
     private func checkCollection(_ permit: EluNativeReplayPermit? = nil) throws {
@@ -336,6 +351,7 @@ private final class EluNativeReplayCaptureRun: @unchecked Sendable {
                 authorization: permit.resolution, privacy: permit.privacy, profile: permit.profile, versions: versions)
             let collector = try await MainActor.run {
                 try self.checkCollection(permit)
+                try self.checkSelectedRoot()
                 guard permit.isCurrentForCollection(), admission.isCurrent() else {
                     throw EluNativeReplayCaptureError.withdrawn
                 }
@@ -368,6 +384,7 @@ private final class EluNativeReplayCaptureRun: @unchecked Sendable {
                 guard admission.isCurrent() else { throw EluNativeReplayCaptureError.withdrawn }
                 try buffer?.committed()
             }
+            var viewport: EluNativeViewport?
             do {
                 while true {
                     try checkCollection(permit)
@@ -378,6 +395,7 @@ private final class EluNativeReplayCaptureRun: @unchecked Sendable {
                     do {
                         captured = try await MainActor.run {
                             try self.checkCollection(permit)
+                            try self.checkSelectedRoot()
                             guard permit.isCurrentForCollection(), admission.isCurrent(),
                                   let continuous = self.continuousNanoseconds() else {
                                 throw EluNativeReplayCaptureError.withdrawn
@@ -397,14 +415,35 @@ private final class EluNativeReplayCaptureRun: @unchecked Sendable {
                             guard admission.isCurrent() else { throw EluNativeReplayCaptureError.withdrawn }
                             return (frame, continuous)
                         }
+                    } catch EluUIKitReplayCollectionError.unsupportedGeometry {
+                        // Animation/zoom/layout may be transient. Retain no
+                        // failed frame or ordinal and retry only this closed
+                        // geometry error under the original current authority.
+                        try checkCollection(permit)
+                        guard admission.isCurrent() else { throw EluNativeReplayCaptureError.withdrawn }
+                        try await Task.sleep(nanoseconds: 1_000_000_000)
+                        continue
+                    } catch EluNativeReplayAuthorityError.stale {
+                        // A root can detach during its synchronous getter.
+                        // Only that observed boundary is recoverable; stale
+                        // source/privacy/storage authority remains terminal.
+                        try await MainActor.run { try self.checkSelectedRoot() }
+                        throw EluNativeReplayAuthorityError.stale
                     } catch EluUIKitReplayCollectionError.withdrawn {
                         // A stopped collector rejects an in-flight frame. Only a
                         // local stop can preserve an older authorized prefix.
                         try checkCollection(permit)
+                        try await MainActor.run { try self.checkSelectedRoot() }
                         throw EluUIKitReplayCollectionError.withdrawn
                     }
                     try checkCollection(permit)
                     guard admission.isCurrent() else { throw EluNativeReplayCaptureError.withdrawn }
+                    if let viewport, viewport != captured.0.viewport {
+                        // v1 fixes a viewport for one replayId. Never append a
+                        // changed viewport or emit a second Meta in that stream.
+                        throw EluNativeReplayCaptureError.rootChanged
+                    }
+                    viewport = captured.0.viewport
                     try buffer?.append(captured.0, continuous: captured.1)
                     fence.didCollectFrame()
                     if buffer?.isReady == true {
@@ -424,6 +463,14 @@ private final class EluNativeReplayCaptureRun: @unchecked Sendable {
                 if let prefix = try buffer?.beginGracefulSealing() { try await commit(prefix) }
             }
 
+        } catch EluNativeReplayCaptureError.rootChanged {
+            // Remember intent before stop invalidates the original projection.
+            // Completion is still terminal unless physical AND durable capture
+            // accounting settle below. This grants no replacement authority.
+            if !Task.isCancelled, fence.isCollecting(), mayCollect(), prepared.isCurrent() {
+                fence.requestRootRecovery()
+            }
+            fence.withdraw(); buffer?.withdraw()
         } catch {
             // Withdrawal/failure discards every unsealed value. It never flushes
             // under expired permission or encodes a suffix after unknown commit.

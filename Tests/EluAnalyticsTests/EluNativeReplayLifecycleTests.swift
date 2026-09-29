@@ -124,6 +124,30 @@ final class EluNativeReplayLifecycleTests: XCTestCase {
         XCTAssertNil(weakRoot); XCTAssertFalse(retained?.isCurrent() == true)
     }
 
+    @MainActor func testRootReadinessIsReadOnlyAcrossReplacementHiddenAndPresentedRoots() async throws {
+        let lifecycle = EluNativeReplayLifecycle(), attachment = UUID(), calls = NativeLifecycleCalls()
+        lifecycle.attached(attachment); lifecycle.observeWithdrawal { calls.increment() }
+        let window = try activeWindow(), previous = window.rootViewController, first = UIViewController()
+        first.view = UIView(frame: window.bounds); window.rootViewController = first
+        defer { lifecycle.close(); window.rootViewController = previous }
+        let original = try XCTUnwrap(lifecycle.selectCurrentRoot(reusing: nil)), count = calls.count
+        XCTAssertEqual(lifecycle.observeRootReadiness(), .available)
+        XCTAssertTrue(original.validateCurrent()); XCTAssertEqual(calls.count, count)
+        let next = UIViewController(); next.view = UIView(frame: window.bounds); window.rootViewController = next
+        XCTAssertFalse(original.validateCurrent())
+        for _ in 0..<3 { XCTAssertEqual(lifecycle.observeRootReadiness(), .available) }
+        XCTAssertEqual(calls.count, count, "Observation must not select or revoke an original generation")
+        next.view.isHidden = true; XCTAssertEqual(lifecycle.observeRootReadiness(), .waiting)
+        next.view.isHidden = false
+        let modal = UIViewController(); modal.view = UIView(frame: window.bounds)
+        await withCheckedContinuation { continuation in next.present(modal, animated: false) { continuation.resume() } }
+        XCTAssertEqual(lifecycle.observeRootReadiness(), .waiting)
+        await withCheckedContinuation { continuation in next.dismiss(animated: false) { continuation.resume() } }
+        XCTAssertEqual(lifecycle.observeRootReadiness(), .available)
+        window.rootViewController = nil; XCTAssertEqual(lifecycle.observeRootReadiness(), .waiting)
+        lifecycle.detached(attachment); XCTAssertEqual(lifecycle.observeRootReadiness(), .inactive)
+    }
+
     @MainActor private func activeWindow() throws -> UIWindow {
         try EluUIKitTestHost.window()
     }

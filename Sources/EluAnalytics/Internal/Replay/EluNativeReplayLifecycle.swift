@@ -130,6 +130,19 @@ final class EluNativeReplayLifecycle: @unchecked Sendable {
         return !closed && attachment != nil && selectedScene != nil && generation == token
     }
     #if canImport(UIKit)
+    enum RootReadiness: Equatable, Sendable { case inactive, waiting, available }
+
+    /// Recovery observes only public root/window state. It never selects a root,
+    /// advances a lifecycle generation, traverses descendants or reads text.
+    @MainActor func observeRootReadiness() -> RootReadiness {
+        lock.lock(); let attached = !closed && attachment != nil; lock.unlock()
+        guard attached, UIApplication.shared.applicationState == .active else { return .inactive }
+        guard let (root, _) = discoveredRoot(), !root.isHidden, root.alpha == 1 else { return .waiting }
+        let bounds = root.bounds
+        guard (try? EluNativeViewport(width: Double(bounds.width), height: Double(bounds.height))) != nil else { return .waiting }
+        return .available
+    }
+
     /// Main-only discovery never loads a view or chooses the first ambiguous window.
     @MainActor fileprivate func discoveredRoot() -> (UIView, UIWindow)? {
         let application = UIApplication.shared

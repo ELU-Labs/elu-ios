@@ -107,6 +107,9 @@ actor EluNativeReplayComposition {
     private var capture: EluNativeReplayCaptureOwner?
     private var capturePrepared: EluNativeReplayPreparedAuthority?
     private var captureID: UUID?
+    private var rootRecoveryRequested = false
+    private var rootObservationTask: Task<Bool, Never>?
+    private var rootObservationID: UUID?
     #endif
 
     init(runtime: EluStandaloneRuntime, lifecycle: EluNativeReplayLifecycle,
@@ -193,6 +196,8 @@ actor EluNativeReplayComposition {
 
     #if canImport(UIKit)
     private func evaluateCapture(_ runtime: EluStandaloneRuntime, token: UUID) async {
+        // No replacement selection/capture may overlap a prior root observer.
+        await cancelRootObservation()
         guard !captureQuarantined, !capabilities.transports.isEmpty,
               !capabilities.readbackProvenProtocolGenerations.isEmpty else { return }
         let localToken = localControl.token()
@@ -215,6 +220,12 @@ actor EluNativeReplayComposition {
             needsEvaluation = true
             return
         }
+        if capture != nil, discovered == nil, !closed, fence.current(token),
+           localControl.permits(localToken), capturePrepared?.isCurrent() == true {
+            // A commit-triggered observation may see the missing root before
+            // the collector's next sample does. Preserve only lawful intent.
+            rootRecoveryRequested = true
+        }
         if let capture, let prepared = capturePrepared, let selection,
            prepared.isCurrent(), selection.isCurrent() {
             if !closed, fence.current(token), localControl.permits(localToken),
@@ -230,8 +241,11 @@ actor EluNativeReplayComposition {
         }
         guard !closed, fence.current(token), !capabilities.transports.isEmpty,
               !capabilities.readbackProvenProtocolGenerations.isEmpty else { return }
-        guard !closed, fence.current(token), localControl.permits(localToken),
-              let selected = discovered, selected.isCurrent() else { return }
+        guard !closed, fence.current(token), localControl.permits(localToken) else { return }
+        guard let selected = discovered, selected.isCurrent() else {
+            if rootRecoveryRequested { await observeRootWhenAvailable(runtime, token: token, localToken: localToken) }
+            return
+        }
         selection = selected
         guard let prepared = try? await runtime.prepareNativeReplay(capabilities: capabilities),
               !closed, fence.current(token), localControl.permits(localToken),
@@ -241,6 +255,7 @@ actor EluNativeReplayComposition {
             mayCollect: { localControl.permits(localToken) },
             onCommitted: { [weak self] in self?.requestReevaluation() })
         guard let original else { return }
+        rootRecoveryRequested = false
         capture = original; capturePrepared = prepared
         let id = UUID(); captureID = id
         localControl.install(id: id, token: localToken,
@@ -256,13 +271,69 @@ actor EluNativeReplayComposition {
     private func captureFinished(_ id: UUID, outcome: EluNativeReplayCaptureOutcome) {
         guard captureID == id else { return }
         let wasDraining = capture?.isDraining() == true
+        let recoverRoot = capture?.needsRootRecovery() == true
         localControl.remove(id: id)
         capture = nil; capturePrepared = nil; captureID = nil
         fence.installCapture(nil)
         if case .quarantined = outcome { captureQuarantined = true }
+        if recoverRoot, !captureQuarantined { rootRecoveryRequested = true }
         // A start accepted while the previous original drained cannot overlap it.
-        if wasDraining, !closed, !captureQuarantined { requestReevaluation() }
+        if wasDraining || recoverRoot, !closed, !captureQuarantined { requestReevaluation() }
     }
+
+    private func cancelRootObservation() async {
+        guard let original = rootObservationTask else { return }
+        rootObservationTask = nil; rootObservationID = nil
+        fence.installCapture(nil)
+        original.cancel()
+        _ = await original.value
+    }
+
+    private func observeRootWhenAvailable(_ runtime: EluStandaloneRuntime, token: UUID, localToken: UUID) async {
+        guard capture == nil, !captureQuarantined, !closed, rootObservationTask == nil,
+              fence.current(token), localControl.permits(localToken),
+              let prepared = try? await runtime.prepareNativeReplay(capabilities: capabilities),
+              !closed, fence.current(token), localControl.permits(localToken), prepared.isCurrent(),
+              case .authorized = prepared.resolution.replayAuthorization else { return }
+        // One preparation, then root/window + original memory/clock checks only.
+        // The observer never renews source authority, polls SQLite, gathers text,
+        // selects a root or retains a UIKit object across the MainActor hop.
+        let id = UUID(), lifecycle = self.lifecycle, fence = self.fence, local = localControl
+        rootObservationID = id
+        let task = Task { () -> Bool in
+            var available = false
+            while !Task.isCancelled, fence.current(token), local.permits(localToken), prepared.isCurrent() {
+                let readiness = await lifecycle.observeRootReadiness()
+                guard !Task.isCancelled, fence.current(token), local.permits(localToken), prepared.isCurrent() else { break }
+                switch readiness {
+                case .available: available = true
+                case .inactive: break
+                case .waiting:
+                    do { try await Task.sleep(nanoseconds: 1_000_000_000); continue }
+                    catch { break }
+                }
+                break
+            }
+            return available
+        }
+        rootObservationTask = task
+        fence.installCapture { task.cancel() }
+        Task { [weak self] in
+            let available = await task.value
+            await self?.rootObservationFinished(id, available: available, token: token, localToken: localToken)
+        }
+    }
+    private func rootObservationFinished(_ id: UUID, available: Bool, token: UUID, localToken: UUID) {
+        guard rootObservationID == id else { return }
+        rootObservationTask = nil; rootObservationID = nil; fence.installCapture(nil)
+        guard available, !closed, !captureQuarantined, fence.current(token), localControl.permits(localToken) else { return }
+        // The observer supplied no root/proof. Selection and full current gates
+        // are resolved anew through the ordinary serialized evaluation path.
+        requestReevaluation()
+    }
+
+    /// Causal observation of the retained original task, never capture authority.
+    func isObservingRootForTesting() -> Bool { rootObservationTask != nil }
     #endif
 
     /// Joins the retained current trigger and any timer-origin pass it encountered.
@@ -288,6 +359,7 @@ actor EluNativeReplayComposition {
     private func finishClose() async -> CloseOutcome {
         if evaluating { await withCheckedContinuation { evaluationWaiters.append($0) } }
         #if canImport(UIKit)
+        await cancelRootObservation()
         if let capture, case .quarantined = await capture.stop() { captureQuarantined = true }
         if let id = captureID { localControl.remove(id: id) }
         self.capture = nil; capturePrepared = nil; captureID = nil
