@@ -210,7 +210,9 @@ final class EluMemoryPersistenceTests: XCTestCase {
     func testConsentFaultsDenyAndRetainOriginalLeaseRatherThanReleaseAnUnsettledGrant() async throws {
         for point in [EluRuntimeQueueFaultPoint.beforeConsentIntentWrite, .afterConsentIntentWrite,
                       .beforeCommit, .afterCommit, .beforeConsentSettlementWrite, .afterConsentSettlementWrite] {
-            let root = try directory(); defer { try? FileManager.default.removeItem(at: root) }
+            // This test deliberately quarantines the original connection/lease until
+            // process exit. Retain its namespace; unlinking it is not resource cleanup.
+            let root = try directory()
             let fault = DeliveryFault(), queue = try await open(root, fault: fault)
             _ = try await queue.setOptedOut(true, expectedGeneration: queue.snapshot().generation)
             let generation = try await queue.snapshot().generation
@@ -280,7 +282,9 @@ final class EluMemoryPersistenceTests: XCTestCase {
     }
 
     func testProductionMemorySQLKeepsReplayFlagsAndExposureOnlyForCurrentOwner() async throws {
-        let root = try directory(); defer { try? FileManager.default.removeItem(at: root) }
+        let root = try directory()
+        var settled = false
+        defer { if settled { try? FileManager.default.removeItem(at: root) } }
         let clock = DeliveryClock(), key = siteKey
         let gate = EluV2ConfigAuthorityGate(siteKey: key, clock: .init(wallNow: { clock.read() }, continuousNow: { clock.ticks() }, floorTicks: { $0 }, floorNanoseconds: { $0 }))
         let queue = try await EluSQLiteRuntimeQueue.openCaptureRuntime(rootDirectoryURL: root, exactConstructorSiteKey: key,
@@ -303,12 +307,22 @@ final class EluMemoryPersistenceTests: XCTestCase {
         let replay = try await fresh.replayInventory(); XCTAssertEqual(replay.replayCount, 0)
         let diagnostics = try await fresh.diagnosticsContinuity(); XCTAssertNil(diagnostics.epoch)
         await fresh.close()
+        settled = true
     }
 
     private func populateFlagsAndExposure(_ h: DeliveryHarness) async throws {
-        _ = await h.queue.submitFlagConfig(h.config, sourceWitness: h.witness)
+        // DeliveryHarness activates replay only. Use the flag client's actual lazy
+        // schema activation before attempting a durable flag request/cache write.
+        try await h.queue.ensureFlagSchema()
+        let authorization = await h.queue.submitFlagConfig(h.config, sourceWitness: h.witness)
+        guard case .allowed = authorization else {
+            XCTFail("Expected current flag authority, got \(authorization)")
+            throw EluRuntimeQueueError.invalidState
+        }
         let version = try versions()
-        guard case let .begun(request) = await h.queue.beginFlagReload(requestId: "memory-flags", versions: version) else {
+        let begun = await h.queue.beginFlagReload(requestId: "memory-flags", versions: version)
+        guard case let .begun(request) = begun else {
+            XCTFail("Expected durable flag request, got \(begun)")
             throw EluRuntimeQueueError.invalidState
         }
         let requestJSON = try XCTUnwrap(JSONSerialization.jsonObject(with: request.request.canonicalData) as? [String: Any])
@@ -333,7 +347,10 @@ final class EluMemoryPersistenceTests: XCTestCase {
     }
 
     func testMemoryConsentRoundTripRetiresDormantPrivacyStateEvenWhenFinalBitMatches() async throws {
-        let h = try await DeliveryHarness.make(); defer { h.remove() }
+        let h = try await DeliveryHarness.make()
+        // An unexpected throw must preserve the still-owned database and evidence.
+        var settled = false
+        defer { if settled { h.remove() } }
         try await h.install(); _ = try await h.append()
         try await populateFlagsAndExposure(h)
         let opened = try await h.queue.reconcileDiagnosticsContinuity(options: .init(enabled: true), admissionGuard: { true })
@@ -380,12 +397,14 @@ final class EluMemoryPersistenceTests: XCTestCase {
         await h.queue.close(); h.queue = try await h.reopen()
         let again = try await h.queue.snapshot(); XCTAssertEqual(again, after) // Barrier settles once.
         await h.queue.close()
+        settled = true
     }
 
     func testPersistentPrivacyBarrierFailureNeverMarksConsentReconciledOrReleasesLease() async throws {
         for point in [EluRuntimeQueueFaultPoint.beforeCommit, .afterCommit] {
             let fault = DeliveryFault(), h = try await DeliveryHarness.make(fault: fault)
-            defer { h.remove() }
+            // Failed privacy settlement deliberately retains the original SQLite
+            // connection and lease until process exit; do not unlink their files.
             try await h.install(); _ = try await h.append()
             await h.queue.close()
             let namespace = try EluV1SiteNamespace.directoryComponent(exactConstructorSiteKey: siteKey)
