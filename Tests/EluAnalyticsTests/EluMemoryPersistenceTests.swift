@@ -156,6 +156,57 @@ final class EluMemoryPersistenceTests: XCTestCase {
         await persistent.close()
     }
 
+    func testReconciledGrantCannotReviveLaterPersistentDatabaseDenial() async throws {
+        let root = try directory(); defer { try? FileManager.default.removeItem(at: root) }
+        var queue = try await open(root, mode: .persistent)
+        _ = try await queue.applyMutation(.setPersonProperties(set: ["retained": .bool(true)], setOnce: [:], unset: []),
+            versions: versions(), expectedGeneration: queue.snapshot().generation)
+        _ = try await queue.setOptedOut(false, expectedGeneration: queue.snapshot().generation)
+        let sidecar = root.appendingPathComponent(EluExplicitConsentStore.filename)
+        let previousGrant = try Data(contentsOf: sidecar)
+        _ = try await queue.setOptedOut(true, expectedGeneration: queue.snapshot().generation)
+        let denied = try await queue.snapshot()
+        let backlog = try await queue.peek(maximumCount: 100, maximumBytes: 1_000_000)
+        await queue.close()
+        // The real denial transaction above supplies the prior owned DB shape.
+        // Restore only the stale sidecar, as a version unaware of that file
+        // would leave it. This does not claim execution of that old binary.
+        try previousGrant.write(to: sidecar)
+        queue = try await open(root, mode: .persistent)
+        let reopened = try await queue.snapshot()
+        XCTAssertTrue(reopened.identity.optedOut)
+        XCTAssertEqual(reopened.identity.anonymousId, denied.identity.anonymousId)
+        let retained = try await queue.peek(maximumCount: 100, maximumBytes: 1_000_000)
+        XCTAssertEqual(retained, backlog)
+        XCTAssertEqual(try EluExplicitConsentStore(directoryURL: root).load(),
+            .init(optedOut: true, settled: false, persistentReconciled: true))
+        await queue.close()
+        queue = try await open(root, mode: .persistent)
+        let again = try await queue.snapshot(); XCTAssertEqual(again, reopened)
+        await queue.close()
+    }
+
+    func testUnreconciledExplicitMemoryGrantStillReplacesPersistentDenialThroughBarrier() async throws {
+        let root = try directory(); defer { try? FileManager.default.removeItem(at: root) }
+        var queue = try await open(root, mode: .persistent)
+        _ = try await queue.setOptedOut(true, expectedGeneration: queue.snapshot().generation)
+        let denied = try await queue.snapshot(); await queue.close()
+        let oldAnalytics = try analyticsFiles(root)
+        queue = try await open(root, mode: .memory)
+        _ = try await queue.setOptedOut(false, expectedGeneration: queue.snapshot().generation)
+        await queue.close(); XCTAssertEqual(try analyticsFiles(root), oldAnalytics)
+        XCTAssertEqual(try EluExplicitConsentStore(directoryURL: root).load(),
+            .init(optedOut: false, settled: true, persistentReconciled: false))
+        queue = try await open(root, mode: .persistent)
+        let granted = try await queue.snapshot()
+        XCTAssertFalse(granted.identity.optedOut)
+        XCTAssertEqual(granted.identity.anonymousId, denied.identity.anonymousId)
+        XCTAssertEqual(granted.identity.contextRevision, denied.identity.contextRevision + 1)
+        XCTAssertEqual(try EluExplicitConsentStore(directoryURL: root).load(),
+            .init(optedOut: false, settled: true, persistentReconciled: true))
+        await queue.close()
+    }
+
     func testConsentFaultsDenyAndRetainOriginalLeaseRatherThanReleaseAnUnsettledGrant() async throws {
         for point in [EluRuntimeQueueFaultPoint.beforeConsentIntentWrite, .afterConsentIntentWrite,
                       .beforeCommit, .afterCommit, .beforeConsentSettlementWrite, .afterConsentSettlementWrite] {

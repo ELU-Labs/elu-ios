@@ -7855,6 +7855,15 @@ actor EluSQLiteRuntimeQueue {
         defer { consentPersistenceInProgress = false }
         do {
             if var choice = try original.consentStore.load() {
+                if original.persistence == .persistent, choice.persistentReconciled,
+                   state.identity.optedOut, !choice.effectiveOptedOut {
+                    // A previously reconciled grant cannot override a later DB
+                    // denial (including one written by a prior owned runtime
+                    // that did not know this sidecar). Preserve restrictive
+                    // intent, then run the normal durable privacy barrier.
+                    choice = .init(optedOut: true, settled: false)
+                    try original.consentStore.save(choice)
+                }
                 let barrier = original.persistence == .persistent && !choice.persistentReconciled
                 if state.identity.optedOut != choice.effectiveOptedOut || barrier {
                     _ = try applyOptedOut(choice.effectiveOptedOut, expectedGeneration: state.generation, privacyBarrier: barrier)
