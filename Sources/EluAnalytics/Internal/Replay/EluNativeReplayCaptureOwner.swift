@@ -561,7 +561,7 @@ private final class EluNativeReplayCaptureRun: @unchecked Sendable {
             }
         } catch EluNativeReplayCaptureError.locallyStopped {
             try check(permit)
-            let tail = try await MainActor.run {
+            let tail: [EluNativeInteraction] = try await MainActor.run {
                 try self.check(permit); try self.checkSelectedRoot()
                 guard admission.isCurrent(), permit.isCurrentForCollection() else { throw EluNativeReplayCaptureError.withdrawn }
                 return try attachment.map { original in
