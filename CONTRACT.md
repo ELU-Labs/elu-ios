@@ -100,8 +100,12 @@ persist it. Event, screen, and exception calls made during denial are discarded
 even if consent is later granted. Opt-out removes queued replay; previously
 admitted analytics events remain paused subject to later eligible delivery.
 
-Admitted records use a site-scoped owned SQLite store and survive ordinary
-process termination. Event and replay admission share record and logical-byte
+With the default `.persistent` option, admitted records use a site-scoped owned
+SQLite store and survive ordinary process termination. `.memory` uses the same
+SQL schema and transactions entirely in memory, including flags, replay,
+independent device identity, diagnostics and exposure history. These analytics
+states do not survive owner closure or process exit; no temporary analytics
+database or old-store import participates. Event and replay admission share record and logical-byte
 limits; current remote `queueBytes` also limits admission without requiring
 replay initialization. A lower limit preserves existing backlog but rejects
 new records that exceed it. Logical queue limits are not a physical SQLite,
@@ -113,6 +117,21 @@ guarantee delivery before termination. Unacknowledged durable events may retry
 on a later eligible launch; lost acknowledgments do not justify treating a
 request as delivered. Offline storage does not bypass current configuration,
 consent, or privacy authority.
+
+Explicit consent has a separate bounded pending/settled record under the same
+canonical site/API-base lease in both modes. Only a settled explicit choice can
+establish a grant across modes; pending choices deny. Existing denied persistent
+state can establish denial, but its false bit does not prove explicit opt-in.
+Memory startup with an older analytics store and no explicit choice is denied
+until a public consent call settles. Old analytics bytes remain untouched while
+memory mode runs. Returning to persistent mode transactionally retires dormant
+session/replay/diagnostic coverage and invalidates flag context before admitting
+work, even if the final consent Boolean matches. Existing analytics backlog,
+device/person identity and exposure history follow ordinary opt-out retention.
+The consent-only reconciliation bit advances only after that SQL barrier settles.
+Storage/ambiguous consent failure denies this owner and retains its original
+lease. Durable intent through process death cannot be guaranteed when storage
+rejects all restrictive writes. Reset never erases this consent record.
 
 ## Replay and privacy
 

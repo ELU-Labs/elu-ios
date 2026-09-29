@@ -36,7 +36,8 @@ final class EluStandaloneStack: @unchecked Sendable {
         timeZoneIdentifier: @escaping @Sendable () -> String? = { TimeZone.current.identifier },
         performance: EluPerformanceOptions = .init(),
         diagnostics: EluDiagnosticsOptions = .init(),
-        personProfiles: EluPersonProfilesMode = .identifiedOnly
+        personProfiles: EluPersonProfilesMode = .identifiedOnly,
+        persistence: EluPersistenceMode = .persistent
     ) async throws -> EluStandaloneStack {
         let relay = EluStandaloneConfigRelay()
         let lifecycle = try EluV2ConfigLifecycle(siteKey: siteKey, configHost: configHost, endpointPolicy: endpointPolicy,
@@ -52,7 +53,7 @@ final class EluStandaloneStack: @unchecked Sendable {
             time: EluV1BatchTimeSource(wallNow: clock.wallNow,
                 monotonicNow: { clock.floorNanoseconds(clock.continuousNow()) ?? UInt64.max },
                 sleep: { try await Task.sleep(nanoseconds: $0) }),
-            timeZoneIdentifier: timeZoneIdentifier, performance: performance, diagnostics: diagnostics, personProfiles: personProfiles)
+            timeZoneIdentifier: timeZoneIdentifier, performance: performance, diagnostics: diagnostics, personProfiles: personProfiles, persistence: persistence)
         do {
             let selectedFlags = try flagTransport ?? EluV1URLSessionFlagTransport(siteKey: siteKey, endpointPolicy: endpointPolicy)
             let flags = try await runtime.flagClient(transport: selectedFlags)

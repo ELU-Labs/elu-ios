@@ -27,6 +27,7 @@ final class EluCore {
     private var performance = EluPerformanceOptions()
     private var diagnostics = EluDiagnosticsOptions()
     private var personProfiles: EluPersonProfilesMode = .identifiedOnly
+    private var persistence: EluPersistenceMode = .persistent
     private var configHost = URL(string: "https://elu.dev")!
     private var endpointPolicy = EluEndpointPolicy.cloud
     private var buffer = EluEventBuffer()
@@ -62,7 +63,7 @@ final class EluCore {
             }
 
             // Marker FIRST: absent-at-setup is the replayNewUsersOnly probe.
-            isNewUser = EluDeviceMarkers.recordFirstLaunchIfNeeded()
+            isNewUser = options.persistence == .persistent ? EluDeviceMarkers.recordFirstLaunchIfNeeded() : true
             self.siteKey = siteKey
             selection = options.runtimeSelection
             configHost = approvedConfigHost
@@ -70,6 +71,7 @@ final class EluCore {
             performance = options.performance
             diagnostics = options.diagnostics
             personProfiles = options.personProfiles
+            persistence = options.persistence
 
             // The owned source, including independent flags/privacy, decides
             // readiness. No legacy cache or v1 request participates.
@@ -101,7 +103,7 @@ final class EluCore {
         EluRuntimeBackendContext(siteKey: siteKey, config: config, configDocument: document,
             isNewUser: isNewUser, flagsDidLoad: { [weak self] in
                 self?.dispatchFlagNotification(ifCurrent: { true })
-            }, configHost: configHost, endpointPolicy: endpointPolicy, performance: performance, diagnostics: diagnostics, personProfiles: personProfiles, initialConsent: initialConsent, guardedFlagsDidLoad: { [weak self] predicate in
+            }, configHost: configHost, endpointPolicy: endpointPolicy, performance: performance, diagnostics: diagnostics, personProfiles: personProfiles, persistence: persistence, initialConsent: initialConsent, guardedFlagsDidLoad: { [weak self] predicate in
                 self?.dispatchFlagNotification(ifCurrent: predicate)
             }, initialConfigurationReady: { [weak self] predicate in
                 guard let self else { return }

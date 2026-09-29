@@ -158,7 +158,7 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, @unchecked Sendable {
                     rootDirectoryURL: rootDirectoryURL,
                     siteKey: siteKey,
                     configHost: context.configHost, endpointPolicy: context.endpointPolicy,
-                    performance: context.performance, diagnostics: context.diagnostics, personProfiles: context.personProfiles
+                    performance: context.performance, diagnostics: context.diagnostics, personProfiles: context.personProfiles, persistence: context.persistence
                 )
             },
             guardedFlagsDidLoad: context.guardedFlagsDidLoad

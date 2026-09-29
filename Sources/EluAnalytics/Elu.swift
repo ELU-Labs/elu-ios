@@ -13,6 +13,8 @@ public struct EluSetupOptions {
     public var diagnostics = EluDiagnosticsOptions()
     /// New anonymous events do not create a person profile by default.
     public var personProfiles: EluPersonProfilesMode = .identifiedOnly
+    /// Analytics storage lifetime. Explicit consent is retained separately in both modes.
+    public var persistence: EluPersistenceMode = .persistent
 
     /// Internal construction marker for the owned runtime. Customer code
     /// cannot select or construct another backend.

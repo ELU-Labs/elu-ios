@@ -12,10 +12,10 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 PINNED = {
-    "Sources/EluAnalytics/Elu.swift": "6ba9bac1334402effebc83832a7df21ccdc14dbbbd7dc47a68b5d5d483420d72",
-    "Sources/EluAnalytics/EluState.swift": "7ba720a5653e6096bbf11de7fcbb9984620ce9754e8d040080612d3efbc0b8ae",
+    "Sources/EluAnalytics/Elu.swift": "2b022bf1290cb03e0912c4164e4a37de968a2dd90780a942b77f102b84a5e2f0",
+    "Sources/EluAnalytics/EluState.swift": "625c463a7d316a5248a0833528a3d39a537b2e0ee61d09901d2f68ebf1fd50cd",
     "Sources/EluAnalytics/EluConfigClient.swift": "152abfb01a6d0aa81e470d3185ecd4db3aeeef26d8626e67bab8f0a41e20d43d",
-    "Sources/EluAnalytics/Internal/Facade/EluRuntimeBackend.swift": "42f7a10c44697a59e421076de693dc95113c1fe8415a9f3d3807442f3a916c17",
+    "Sources/EluAnalytics/Internal/Facade/EluRuntimeBackend.swift": "b65fa950cbfbac3ffc03f023d7b46e4965467cd27d8594cec393f7ccf29aa3da",
     "Package.swift": "86701aa42833ddfff4b928e8ed59608cfe46f54e2765656f8166a75633219398",
     "Conformance/V1/manifest.json": "98152d8725c286f29402ba3e420bda8dd364200fb6fdf1cfe49b2da9b8f63e54",
 }
@@ -234,7 +234,7 @@ def scan_outside_source(path: pathlib.Path, text: str) -> list[str]:
         owned_factory = (
             "openStack: { try await EluStandaloneStack.make( "
             "rootDirectoryURL: rootDirectoryURL, siteKey: siteKey, "
-            "configHost: context.configHost, endpointPolicy: context.endpointPolicy, performance: context.performance, diagnostics: context.diagnostics, personProfiles: context.personProfiles ) }, "
+            "configHost: context.configHost, endpointPolicy: context.endpointPolicy, performance: context.performance, diagnostics: context.diagnostics, personProfiles: context.personProfiles, persistence: context.persistence ) }, "
             "guardedFlagsDidLoad: context.guardedFlagsDidLoad"
         )
         if normalized.count(owned_factory) != 1:

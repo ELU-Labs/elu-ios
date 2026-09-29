@@ -54,6 +54,43 @@ versions and malformed stores likewise never authorize destructive recovery.
 Reset is an analytics identity operation, not permission to erase an
 unsupported database.
 
+`.persistent` remains the default. `.memory` starts a fresh `:memory:` SQLite
+database using the same schema 41–48 and ordinary queue transactions, with
+memory-only journals and SQLite temporary storage. It never opens or imports
+an existing analytics database or its sidecars. Closing that owner or ending
+the process drops its analytics identity, queues, cache, first-session history,
+exposure ledger and diagnostic continuity. Historical OS intervals consequently
+cannot be attributed across memory-mode restarts. Switching back to persistent
+mode keeps the old database and its admitted analytics backlog, subject to the
+consent barrier below.
+
+Both modes hold one canonical installation lease. The only additional durable
+state in memory mode is an explicit consent-only record; it contains no IDs,
+timestamps or analytics payloads. Its atomic pending/settled protocol brackets
+the ordinary queue consent transaction. Pending or partial records deny on
+startup, and failed/ambiguous writes quarantine the original live lease.
+A consent-only `persistentReconciled` bit is cleared by memory entry/choices.
+On return to persistent mode, the existing opt-out privacy transaction also runs
+when the final consent Boolean matches: clear session, purge queued replay,
+close diagnostic continuity, and invalidate cached flag/request context. Existing
+event backlog, device/person metadata, first-session history and exposure ledger
+remain exactly as ordinary opt-out specifies. Only a settled SQL barrier marks
+this bit reconciled; a failed or ambiguous application remains denied. This
+prevents memory opt-out followed by opt-in from reviving dormant replay/OS
+coverage without modifying the old analytics files during memory use.
+Unsupported or malformed consent records fail closed. An explicit choice made
+before setup is still only in process memory until the runtime opens.
+
+Older stores lack an explicit-choice bit. A saved denial may be retained as
+denial, but `optedOut == false` cannot be promoted into explicit consent. Thus
+memory mode with any prior owned analytics store and no explicit record starts
+denied without reading the old database and saves that pending denial for either
+mode; a public consent call is needed.
+New installations retain their existing default behavior. Pending-file cleanup
+only handles the bounded consent file under the original lease. Failure to
+persist every attempted restrictive write cannot provide a process-death
+durability guarantee; the current owner nevertheless remains denied.
+
 The original public source API baseline, release tag/archive digests, and
 historical evidence definitions are retained for provenance. They do not make
 the retired preview continuity runner a current release gate. Current gates

@@ -256,6 +256,7 @@ actor EluStandaloneRuntime {
         performance: EluPerformanceOptions = .init(),
         diagnostics: EluDiagnosticsOptions = .init(),
         personProfiles: EluPersonProfilesMode = .identifiedOnly,
+        persistence: EluPersistenceMode = .persistent,
         faultInjector: (any EluRuntimeQueueFaultInjecting)? = nil
     ) async throws -> EluStandaloneRuntime {
         guard isHeaderSafeSiteKey(siteKey) else {
@@ -283,6 +284,7 @@ actor EluStandaloneRuntime {
             exactConstructorSiteKey: siteKey,
             endpointPolicy: endpointPolicy,
             personProfiles: personProfiles,
+            persistence: persistence,
             limits: resolvedLimits,
             clock: clock,
             continuousClock: continuousClock,

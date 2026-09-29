@@ -195,6 +195,26 @@
     {
       "kind": "swift.func.op",
       "name": "EluPersonProfilesMode.!=(_:_:)"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluSetupOptions.persistence"
+    },
+    {
+      "kind": "swift.enum",
+      "name": "EluPersistenceMode"
+    },
+    {
+      "kind": "swift.enum.case",
+      "name": "EluPersistenceMode.persistent"
+    },
+    {
+      "kind": "swift.enum.case",
+      "name": "EluPersistenceMode.memory"
+    },
+    {
+      "kind": "swift.func.op",
+      "name": "EluPersistenceMode.!=(_:_:)"
     }
   ]
 }

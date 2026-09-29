@@ -32,6 +32,10 @@ enum EluRuntimeQueueFaultPoint: Equatable, Sendable {
     case open
     case beforeInitialInstall
     case afterInitialInstall
+    case beforeConsentIntentWrite
+    case afterConsentIntentWrite
+    case beforeConsentSettlementWrite
+    case afterConsentSettlementWrite
     case afterInspectionCopy
     case beforeCaptureHistoryMigrationCommit
     case beforeDiagnosticsMigrationCommit
@@ -396,6 +400,8 @@ private enum EluReplayResourceQuarantine {
 private final class EluRuntimeResources: @unchecked Sendable {
     let canonicalDirectory: String
     let connection: EluSQLiteConnection
+    let persistence: EluPersistenceMode
+    let consentStore: EluExplicitConsentStore
 
     private let lock = NSLock()
     private var lockDescriptor: Int32
@@ -464,11 +470,14 @@ private final class EluRuntimeResources: @unchecked Sendable {
     init(
         canonicalDirectory: String,
         lockDescriptor: Int32,
-        connection: EluSQLiteConnection
+        connection: EluSQLiteConnection,
+        persistence: EluPersistenceMode = .persistent
     ) {
         self.canonicalDirectory = canonicalDirectory
         self.lockDescriptor = lockDescriptor
         self.connection = connection
+        self.persistence = persistence
+        consentStore = EluExplicitConsentStore(directoryURL: URL(fileURLWithPath: canonicalDirectory, isDirectory: true))
     }
 
     func close() {
@@ -695,6 +704,7 @@ private struct EluRuntimeInspection: Sendable {
 private enum EluRuntimeQueueBootstrap {
     static func open(
         directoryURL: URL,
+        persistence: EluPersistenceMode,
         clock: @Sendable () -> Date,
         anonymousIdGenerator: @Sendable () -> String,
         streamIdGenerator: @Sendable () -> String,
@@ -752,6 +762,39 @@ private enum EluRuntimeQueueBootstrap {
                 throw EluRuntimeQueueError.databaseUnavailable
             }
             _ = Darwin.fchmod(lockDescriptor, mode_t(0o600))
+
+            let consentStore = EluExplicitConsentStore(directoryURL: canonicalURL)
+            let choice = try consentStore.load()
+            if persistence == .memory {
+                // Do not inspect, import, checkpoint or remove old analytics. Presence
+                // without an explicit choice cannot prove permission for a new mode.
+                let denied: Bool
+                if var choice {
+                    denied = choice.effectiveOptedOut
+                    // Returning to persistent storage must retire the dormant
+                    // owner's session/replay/diagnostic coverage, even if the
+                    // final explicit choice happens to equal its old Boolean.
+                    if choice.persistentReconciled {
+                        choice.persistentReconciled = false
+                        try consentStore.save(choice)
+                    }
+                } else {
+                    denied = try consentStore.hasPriorAnalyticsStore()
+                    if denied {
+                        try consentStore.save(.init(optedOut: true, settled: false))
+                    }
+                }
+                let state = try freshState(now: clock(), anonymousId: anonymousIdGenerator(),
+                    streamId: streamIdGenerator(), forceOptOut: denied)
+                let openedConnection = try EluSQLiteConnection(path: ":memory:", create: true)
+                connection = openedConnection
+                try configureMemory(openedConnection)
+                try initializeDatabase(openedConnection, state: state)
+                let resources = EluRuntimeResources(canonicalDirectory: canonicalDirectory,
+                    lockDescriptor: lockDescriptor, connection: openedConnection, persistence: .memory)
+                connection = nil; lockDescriptor = -1
+                return EluRuntimeBootstrapResult(resources: resources, state: state, databaseSchemaVersion: 41)
+            }
 
             // Scratch belongs to this exact store lease. Reuse one reserved
             // directory so abrupt process death cannot accumulate UUID copies.
@@ -980,24 +1023,7 @@ private enum EluRuntimeQueueBootstrap {
         let connection = try EluSQLiteConnection(path: stagedURL.path, create: true)
         do {
             try configureDurability(connection, initializing: true)
-            try connection.execute("BEGIN IMMEDIATE")
-            try connection.execute(EluSQLiteRuntimeSchema.createRuntimeState)
-            try connection.execute(EluSQLiteRuntimeSchema.createQueueRecords)
-            try connection.execute(EluSQLiteRuntimeSchema.createCaptureSessionHistory)
-            try EluRuntimeDatabase.insertInitialState(connection, state: state)
-            try EluRuntimeDatabase.writeCaptureSessionHistory(connection, stream: state.streamId,
-                history: state.captureSessionHistory, inserting: true)
-            try connection.execute(EluSQLiteRuntimeSchema.createDiagnosticsState)
-            try EluRuntimeDatabase.writeDiagnosticsState(connection, stream: state.streamId,
-                diagnostics: state.diagnostics, inserting: true)
-            try connection.execute(EluSQLiteRuntimeSchema.createPersonIdentityState)
-            try EluRuntimeDatabase.writePersonIdentityState(connection, stream: state.streamId,
-                person: state.personIdentity, inserting: true)
-            try connection.execute(EluSQLiteRuntimeSchema.createFlagExposureState)
-            try EluRuntimeDatabase.writeFlagExposureState(connection, stream: state.streamId,
-                ledger: state.flagExposures, inserting: true)
-            try connection.execute("PRAGMA user_version = 41")
-            try connection.execute("COMMIT")
+            try initializeDatabase(connection, state: state)
             try connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             try connection.withStatement("PRAGMA journal_mode=DELETE") { statement in
                 try connection.step(statement, expecting: SQLITE_ROW)
@@ -1020,6 +1046,47 @@ private enum EluRuntimeQueueBootstrap {
             directoryURL: databaseURL.deletingLastPathComponent()
         )
         try faultInjector?.hit(.afterInitialInstall)
+    }
+
+    private static func initializeDatabase(_ connection: EluSQLiteConnection, state: EluStoredRuntimeState) throws {
+        do {
+            try connection.execute("BEGIN IMMEDIATE")
+            try connection.execute(EluSQLiteRuntimeSchema.createRuntimeState)
+            try connection.execute(EluSQLiteRuntimeSchema.createQueueRecords)
+            try connection.execute(EluSQLiteRuntimeSchema.createCaptureSessionHistory)
+            try EluRuntimeDatabase.insertInitialState(connection, state: state)
+            try EluRuntimeDatabase.writeCaptureSessionHistory(connection, stream: state.streamId,
+                history: state.captureSessionHistory, inserting: true)
+            try connection.execute(EluSQLiteRuntimeSchema.createDiagnosticsState)
+            try EluRuntimeDatabase.writeDiagnosticsState(connection, stream: state.streamId,
+                diagnostics: state.diagnostics, inserting: true)
+            try connection.execute(EluSQLiteRuntimeSchema.createPersonIdentityState)
+            try EluRuntimeDatabase.writePersonIdentityState(connection, stream: state.streamId,
+                person: state.personIdentity, inserting: true)
+            try connection.execute(EluSQLiteRuntimeSchema.createFlagExposureState)
+            try EluRuntimeDatabase.writeFlagExposureState(connection, stream: state.streamId,
+                ledger: state.flagExposures, inserting: true)
+            try connection.execute("PRAGMA user_version = 41")
+            try connection.execute("COMMIT")
+        } catch {
+            try? connection.execute("ROLLBACK")
+            throw error
+        }
+    }
+
+    private static func configureMemory(_ connection: EluSQLiteConnection) throws {
+        try connection.withStatement("PRAGMA journal_mode=MEMORY") { statement in
+            try connection.step(statement, expecting: SQLITE_ROW)
+            guard try connection.requiredString(statement, column: 0).lowercased() == "memory",
+                  sqlite3_step(statement) == SQLITE_DONE else {
+                throw EluSQLiteFailure.result(SQLITE_CANTOPEN, "Memory journal unavailable")
+            }
+        }
+        try connection.execute("PRAGMA temp_store=MEMORY")
+        guard try connection.integerPragma("temp_store") == 2 else {
+            throw EluSQLiteFailure.result(SQLITE_CANTOPEN, "Memory temporary storage unavailable")
+        }
+        try connection.execute("PRAGMA foreign_keys=ON")
     }
 
     private static func synchronizeFile(_ url: URL) throws {
@@ -3503,6 +3570,7 @@ actor EluSQLiteRuntimeQueue {
     private var nativeDenialPersistenceInProgress = false
     private var diagnosticsDenialPersistenceInProgress = false
     private var diagnosticsMetadataPersistenceInProgress = false
+    private var consentPersistenceInProgress = false
     private var pinnedConfigSiteId: String?
     private let configurationGate: EluV2ConfigAuthorityGate?
     private nonisolated let eventDeliveryFence = EluV1FlagOwnerFence()
@@ -3550,6 +3618,7 @@ actor EluSQLiteRuntimeQueue {
     static func open(
         directoryURL: URL,
         personProfiles: EluPersonProfilesMode = .identifiedOnly,
+        persistence: EluPersistenceMode = .persistent,
         limits: EluRuntimeQueueLimits,
         clock: @escaping @Sendable () -> Date = { Date() },
         anonymousIdGenerator: @escaping @Sendable () -> String = {
@@ -3566,13 +3635,14 @@ actor EluSQLiteRuntimeQueue {
         let opened = try await Task.detached(priority: .utility) {
             try EluRuntimeQueueBootstrap.open(
                 directoryURL: directoryURL,
+                persistence: persistence,
                 clock: clock,
                 anonymousIdGenerator: anonymousIdGenerator,
                 streamIdGenerator: streamIdGenerator,
                 faultInjector: faultInjector
             )
         }.value
-        return EluSQLiteRuntimeQueue(
+        let queue = EluSQLiteRuntimeQueue(
             resources: opened.resources,
             state: opened.state,
             limits: limits,
@@ -3587,6 +3657,8 @@ actor EluSQLiteRuntimeQueue {
             continuousClock: EluMachContinuousClock.now,
             continuousBudgetConverter: EluMachContinuousClock.floorTicks
         )
+        try await queue.reconcileStoredConsent()
+        return queue
     }
 
     /// Opens the internal standalone runtime in a constructor-site-key scoped
@@ -3597,6 +3669,7 @@ actor EluSQLiteRuntimeQueue {
         exactConstructorSiteKey: String,
         endpointPolicy: EluEndpointPolicy = .cloud,
         personProfiles: EluPersonProfilesMode = .identifiedOnly,
+        persistence: EluPersistenceMode = .persistent,
         limits: EluRuntimeQueueLimits,
         clock: @escaping @Sendable () -> Date = { Date() },
         continuousClock: @escaping @Sendable () -> UInt64 = EluMachContinuousClock.now,
@@ -3631,6 +3704,7 @@ actor EluSQLiteRuntimeQueue {
         let opened = try await Task.detached(priority: .utility) {
             try EluRuntimeQueueBootstrap.open(
                 directoryURL: directoryURL,
+                persistence: persistence,
                 clock: clock,
                 anonymousIdGenerator: anonymousIdGenerator,
                 streamIdGenerator: streamIdGenerator,
@@ -3643,7 +3717,7 @@ actor EluSQLiteRuntimeQueue {
                 guard native.matches(namespace: namespaceHash, stream: opened.state.streamId) else { throw EluRuntimeQueueError.corruptStorage }
             } catch { opened.resources.close(); throw error }
         }
-        return EluSQLiteRuntimeQueue(
+        let queue = EluSQLiteRuntimeQueue(
             resources: opened.resources,
             state: opened.state,
             limits: limits,
@@ -3662,12 +3736,15 @@ actor EluSQLiteRuntimeQueue {
             flagStoreEpochGenerator: flagStoreEpochGenerator,
             configurationGate: configurationGate
         )
+        try await queue.reconcileStoredConsent()
+        return queue
     }
 
     static func openCaptureRuntime(
         rootDirectoryURL: URL,
         exactConstructorSiteKey: String,
         personProfiles: EluPersonProfilesMode = .identifiedOnly,
+        persistence: EluPersistenceMode = .persistent,
         clock: @escaping @Sendable () -> Date = { Date() },
         continuousClock: @escaping @Sendable () -> UInt64 = EluMachContinuousClock.now,
         continuousBudgetConverter: @escaping @Sendable (UInt64) -> UInt64? =
@@ -3692,6 +3769,7 @@ actor EluSQLiteRuntimeQueue {
             rootDirectoryURL: rootDirectoryURL,
             exactConstructorSiteKey: exactConstructorSiteKey,
             personProfiles: personProfiles,
+            persistence: persistence,
             limits: EluRuntimeQueueLimits(),
             clock: clock,
             continuousClock: continuousClock,
@@ -3709,6 +3787,7 @@ actor EluSQLiteRuntimeQueue {
     static func open(
         directoryURL: URL,
         personProfiles: EluPersonProfilesMode = .identifiedOnly,
+        persistence: EluPersistenceMode = .persistent,
         clock: @escaping @Sendable () -> Date = { Date() },
         anonymousIdGenerator: @escaping @Sendable () -> String = {
             "anon_\(EluRuntimeIdentifier.compactUUID())"
@@ -3724,6 +3803,7 @@ actor EluSQLiteRuntimeQueue {
         try await open(
             directoryURL: directoryURL,
             personProfiles: personProfiles,
+            persistence: persistence,
             limits: EluRuntimeQueueLimits(),
             clock: clock,
             anonymousIdGenerator: anonymousIdGenerator,
@@ -7737,10 +7817,74 @@ actor EluSQLiteRuntimeQueue {
         admissionGuard: @escaping @Sendable () -> Bool = { true }
     ) throws -> EluRuntimeQueueSnapshot {
         guard admissionGuard() else { throw EluRuntimeQueueError.sourceAuthorityUnavailable }
+        guard expectedGeneration == state.generation else { throw EluRuntimeQueueError.generationMismatch }
+        let original = try requireResources()
+        consentPersistenceInProgress = true
+        defer { consentPersistenceInProgress = false }
+        do {
+            try faultInjector?.hit(.beforeConsentIntentWrite)
+            // A pending grant is a denial on restart. Never leave a reusable
+            // grant behind while its analytics-state application is unsettled.
+            try original.consentStore.save(.init(optedOut: optedOut, settled: false), ifCurrent: admissionGuard)
+            try faultInjector?.hit(.afterConsentIntentWrite)
+            let snapshot = try applyOptedOut(optedOut, expectedGeneration: expectedGeneration, admissionGuard: admissionGuard)
+            guard admissionGuard() else { throw EluRuntimeQueueError.sourceAuthorityUnavailable }
+            try faultInjector?.hit(.beforeConsentSettlementWrite)
+            try original.consentStore.save(.init(optedOut: optedOut, settled: true,
+                persistentReconciled: original.persistence == .persistent), ifCurrent: admissionGuard)
+            try faultInjector?.hit(.afterConsentSettlementWrite)
+            return snapshot
+        } catch {
+            // A known superseded intent leaves pending denial for its successor;
+            // it is not a storage fault. Every other failure closes this owner.
+            if (error as? EluRuntimeQueueError) != .sourceAuthorityUnavailable {
+                // Best effort only: storage may reject every restrictive write.
+                // Such a failure cannot promise durable intent across process death.
+                try? original.consentStore.save(.init(optedOut: true, settled: false))
+                poisonAndRelease()
+            }
+            throw mapOperationError(error)
+        }
+    }
+
+    /// Runs before this queue is returned to a runtime or configuration source.
+    /// Existing opted-out state may establish denial, never an inferred grant.
+    private func reconcileStoredConsent() throws {
+        let original = try requireResources()
+        consentPersistenceInProgress = true
+        defer { consentPersistenceInProgress = false }
+        do {
+            if var choice = try original.consentStore.load() {
+                let barrier = original.persistence == .persistent && !choice.persistentReconciled
+                if state.identity.optedOut != choice.effectiveOptedOut || barrier {
+                    _ = try applyOptedOut(choice.effectiveOptedOut, expectedGeneration: state.generation, privacyBarrier: barrier)
+                }
+                if barrier {
+                    // Only after the real queue privacy transaction settles.
+                    // Never turn an unfinished intent into a settled grant.
+                    choice.persistentReconciled = true
+                    try original.consentStore.save(choice)
+                }
+            } else if original.persistence == .persistent && state.identity.optedOut {
+                try original.consentStore.save(.init(optedOut: true, settled: true, persistentReconciled: true))
+            }
+        } catch {
+            poisonAndRelease()
+            throw mapOperationError(error)
+        }
+    }
+
+    private func applyOptedOut(
+        _ optedOut: Bool,
+        expectedGeneration: Int64,
+        privacyBarrier: Bool = false,
+        admissionGuard: @escaping @Sendable () -> Bool = { true }
+    ) throws -> EluRuntimeQueueSnapshot {
+        guard admissionGuard() else { throw EluRuntimeQueueError.sourceAuthorityUnavailable }
         guard expectedGeneration == state.generation else {
             throw EluRuntimeQueueError.generationMismatch
         }
-        if state.identity.optedOut == optedOut {
+        if state.identity.optedOut == optedOut && !privacyBarrier {
             return try closeDiagnosticsContinuity()
         }
         guard state.identity.contextRevision < Int64.max else {
@@ -7748,7 +7892,7 @@ actor EluSQLiteRuntimeQueue {
         }
         var identity = state.identity
         identity.optedOut = optedOut
-        if optedOut {
+        if optedOut || privacyBarrier {
             identity.session = nil
         }
         identity.contextRevision += 1
@@ -7761,6 +7905,7 @@ actor EluSQLiteRuntimeQueue {
             identity: identity,
             flagContext: state.flagContext,
             drafts: [],
+            consentPrivacyBarrier: privacyBarrier,
             prewriteValidation: { _ in
                 guard admissionGuard() else { throw EluRuntimeQueueError.sourceAuthorityUnavailable }
             },
@@ -7814,6 +7959,7 @@ actor EluSQLiteRuntimeQueue {
         personIdentityUpdate: EluPersonIdentityState? = nil,
         diagnosticsUpdate: EluNativeDiagnosticsState? = nil,
         flagExposure: EluFlagExposureRequest? = nil,
+        consentPrivacyBarrier: Bool = false,
         surfaceProvenNotCommitted: Bool = false,
         prewriteValidation: ((EluStoredRuntimeState) throws -> Void)? = nil,
         precommitValidation: (() throws -> Void)? = nil
@@ -7833,7 +7979,7 @@ actor EluSQLiteRuntimeQueue {
             identity.groups != state.identity.groups || identity.optedOut != state.identity.optedOut || flagContext != state.flagContext {
             flagScopeFence.invalidate()
         }
-        if identity.optedOut != state.identity.optedOut { eventDeliveryFence.invalidate() }
+        if consentPrivacyBarrier || identity.optedOut != state.identity.optedOut { eventDeliveryFence.invalidate() }
         let resources = try requireResources()
         let canonicalIdentity: EluIdentityState
         let canonicalFlagContext: EluPersistedFlagContext
@@ -7895,7 +8041,7 @@ actor EluSQLiteRuntimeQueue {
             guard Int64(storedRecords.count) <= Int64.max - diskState.liveCount else {
                 throw EluRuntimeQueueError.counterExhausted
             }
-            if canonicalIdentity.optedOut, EluSQLiteRuntimeSchema.hasReplay(databaseSchemaVersion) {
+            if canonicalIdentity.optedOut || consentPrivacyBarrier, EluSQLiteRuntimeSchema.hasReplay(databaseSchemaVersion) {
                 try connection.execute("DELETE FROM replay_chunks")
                 if EluSQLiteRuntimeSchema.hasReplayDelivery(databaseSchemaVersion) {
                     try connection.execute("DELETE FROM replay_delivery WHERE ordinal >= 0")
@@ -7948,7 +8094,7 @@ actor EluSQLiteRuntimeQueue {
                 history = history.observing(session)
             }
             let diagnostics: EluNativeDiagnosticsState
-            if canonicalIdentity.revision != diskState.identity.revision || canonicalIdentity.optedOut != diskState.identity.optedOut {
+            if consentPrivacyBarrier || canonicalIdentity.revision != diskState.identity.revision || canonicalIdentity.optedOut != diskState.identity.optedOut {
                 diagnostics = diskState.diagnostics.closing(at: canonicalIdentity.updatedAt)
             } else { diagnostics = diagnosticsUpdate ?? diskState.diagnostics }
             let nextState = EluStoredRuntimeState(
@@ -9130,7 +9276,8 @@ actor EluSQLiteRuntimeQueue {
     }
 
     private func runMaintenance(checkpoint: Bool, vacuum: Bool) {
-        guard let connection = resources?.connection else { return }
+        guard let resources, resources.persistence == .persistent else { return }
+        let connection = resources.connection
         if checkpoint {
             do {
                 try faultInjector?.hit(.checkpoint)
@@ -9169,7 +9316,7 @@ actor EluSQLiteRuntimeQueue {
         // Any poisoned owner may later receive explicit shutdown. Preserve its
         // original lease while historical coverage could still be durable,
         // including an ambiguous opening write absent from in-memory state.
-        if nativeDenialPersistenceInProgress || diagnosticsDenialPersistenceInProgress ||
+        if consentPersistenceInProgress || nativeDenialPersistenceInProgress || diagnosticsDenialPersistenceInProgress ||
             diagnosticsMetadataPersistenceInProgress || state.diagnostics.epoch != nil {
             held?.quarantineNativeClockDenial()
         }

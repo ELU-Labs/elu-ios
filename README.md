@@ -204,6 +204,41 @@ out are discarded, and queued replay is removed.
 guarantee a send before termination. Unacknowledged durable events remain for a
 later eligible launch.
 
+Choose analytics storage before setup:
+
+```swift
+var options = EluSetupOptions()
+options.persistence = .memory // Default is .persistent.
+Elu.setup(siteKey: "YOUR_SITE_KEY", options: options)
+```
+
+Memory mode uses in-memory SQLite for identity, device/session IDs, properties,
+events, flags, replay, and diagnostic/exposure metadata. It writes no analytics
+database or temporary analytics cache. That state is lost when this SDK owner
+closes or the application process ends, so queued events cannot retry on a later
+launch and flags must be fetched again. A new owner starts a new anonymous
+visitor and first-capture history. This is a native process lifetime, not browser
+tab/session storage.
+
+Explicit consent is retained separately in a small consent-only file in both
+modes; reset does not remove it. Both modes use the same exclusive installation
+lease and site/API-base namespace. Switching to memory leaves an existing
+analytics store untouched and does not import or delete it. On return to
+persistent mode, a consent reconciliation transaction retires its old session,
+queued replay and diagnostic continuity, even if a memory opt-out/opt-in cycle
+ends with the same consent Boolean. Flags require a current evaluation context.
+As with ordinary opt-out, previously admitted analytics events, device/person
+identity and exposure history remain; eligible analytics backlog may resume.
+An older store without an explicit consent record cannot prove an opt-in from
+`optedOut == false`: memory startup records denial without reading that store.
+That denial applies in either mode until your application explicitly calls
+`optIn()` or `optOut()`. A fresh installation keeps the existing default consent
+behavior.
+
+A pending consent write is treated as denial on restart. Storage or queue
+failure stops the current owner and retains its lease; if storage rejects every
+restrictive write, the SDK cannot promise that intent survives process death.
+
 The facade accepts calls before setup, while config is loading, and when
 analytics is disabled without throwing errors into application code.
 When analytics is disabled or a device is EU-blocked, `Elu.*` event calls are
