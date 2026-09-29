@@ -61,10 +61,13 @@ jobs:
           echo "ELU_SIMULATOR_UDID=$simulator_udid" >> "$GITHUB_ENV"
       - name: Swift unit and concurrency tests
         run: |
+          python3 scripts/verify-hosted-test-project.py
           xcodebuild test \
-            -scheme EluAnalytics \
+            -project Fixtures/Simulator/HostedTests/EluHostedTests.xcodeproj \
+            -scheme EluHostedTests \
             -destination "id=$ELU_SIMULATOR_UDID" \
             -derivedDataPath "$PWD/.build/test-derived-data" \
+            -parallel-testing-enabled NO \
             -skipMacroValidation \
             CODE_SIGNING_ALLOWED=NO
       - name: Build public interface and symbol graph
