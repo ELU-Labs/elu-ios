@@ -62,56 +62,8 @@ struct EluNativeWireframeEncoder: Sendable {
         var next = state
         var output = Data([0x5b]), eventCount = 0, representations = 0
         for frame in snapshots {
-            try validate(frame, previous: next)
-            let previous = Dictionary(uniqueKeysWithValues: next.live.map { ($0.value.identity, $0) })
-            let identities = Set(frame.nodes.map(\.identity))
-            next.retired.formUnion(next.live.lazy.filter { !identities.contains($0.value.identity) }.map { $0.value.identity })
-            var current: [LiveNode] = []
-            current.reserveCapacity(frame.nodes.count)
-            for node in frame.nodes {
-                if let old = previous[node.identity] { current.append(LiveNode(id: old.id, value: node)) }
-                else {
-                    guard !next.retired.contains(node.identity) else { throw EluNativeEncodingError.retiredIdentity }
-                    guard next.allocatedIDs < limits.lifetimeIDs else { throw EluNativeEncodingError.nodeLimit }
-                    guard let id = next.nextNodeID else { throw EluNativeEncodingError.counterExhausted }
-                    next.nextNodeID = id == Self.maximumSafeInteger ? nil : id + 1
-                    next.allocatedIDs += 1
-                    current.append(LiveNode(id: id, value: node))
-                }
-            }
-            let survivors = next.live.filter { identities.contains($0.value.identity) }
-            let added = current.filter { previous[$0.value.identity] == nil }
-            // The inherited renderer appends replacements. A full snapshot is
-            // required for changes/reordering so earlier leaves cannot jump above
-            // later ones. Only removals and suffix additions use mutations.
-            let currentByIdentity = Dictionary(uniqueKeysWithValues: current.map { ($0.value.identity, $0) })
-            let unchangedSurvivors = survivors.allSatisfy { old in
-                currentByIdentity[old.value.identity] == old
-            }
-            let suffixOrder = current.map(\.id) == survivors.map(\.id) + added.map(\.id)
-            let noChange = current == next.live
-            let first = next.viewport == nil
-            let mutationCost = added.reduce(0) { $0 + generatedNodeCost($1.value.kind) }
-            let full = first || !unchangedSurvivors || !suffixOrder || noChange
-                || next.rendererBudget + mutationCost > 1_000_000
-            let count = full ? current.count + 1 : added.count
-            guard count <= limits.representations - representations else { throw EluNativeEncodingError.representationLimit }
-            representations += count
-            if first {
-                try appendEvent(meta(frame), to: &output, count: &eventCount)
-            }
-            if full {
-                try appendFull(frame, nodes: current, to: &output, count: &eventCount)
-                // Actual converter: two CSS nodes per full snapshot, one child
-                // for text/labelled placeholder, zero for our other leaf forms.
-                next.rendererBudget = 2 + current.reduce(0) { $0 + generatedNodeCost($1.value.kind) }
-            } else {
-                let removed = next.live.filter { !identities.contains($0.value.identity) }
-                try appendMutation(frame, added: added, removed: removed, to: &output, count: &eventCount)
-                next.rendererBudget += mutationCost
-            }
-            next.live = current; next.viewport = frame.viewport
-            next.lastTimestamp = frame.timestamp; next.nextFrameOrdinal += 1
+            try appendGeometry(frame, state: &next, output: &output,
+                               eventCount: &eventCount, representations: &representations)
         }
         guard output.count < limits.decodedBytes else { throw EluNativeEncodingError.byteLimit }
         output.append(0x5d)
@@ -121,6 +73,64 @@ struct EluNativeWireframeEncoder: Sendable {
         next.nextSequence += 1
         state = next
         return chunk
+    }
+
+    /// Internal geometry-only seam. Callers keep this state/output local until
+    /// the complete chunk succeeds. V1 supplies no discriminator; v2 owns its
+    /// independent gesture/sequence state and supplies its exact Meta codec.
+    func appendGeometry(_ frame: EluNativeMaskedSnapshot, state next: inout State,
+                        output: inout Data, eventCount: inout Int,
+                        representations: inout Int, v2: Bool = false) throws {
+        try validate(frame, previous: next)
+        let previous = Dictionary(uniqueKeysWithValues: next.live.map { ($0.value.identity, $0) })
+        let identities = Set(frame.nodes.map(\.identity))
+        next.retired.formUnion(next.live.lazy.filter { !identities.contains($0.value.identity) }.map { $0.value.identity })
+        var current: [LiveNode] = []
+        current.reserveCapacity(frame.nodes.count)
+        for node in frame.nodes {
+            if let old = previous[node.identity] { current.append(LiveNode(id: old.id, value: node)) }
+            else {
+                guard !next.retired.contains(node.identity) else { throw EluNativeEncodingError.retiredIdentity }
+                guard next.allocatedIDs < limits.lifetimeIDs else { throw EluNativeEncodingError.nodeLimit }
+                guard let id = next.nextNodeID else { throw EluNativeEncodingError.counterExhausted }
+                next.nextNodeID = id == Self.maximumSafeInteger ? nil : id + 1
+                next.allocatedIDs += 1
+                current.append(LiveNode(id: id, value: node))
+            }
+        }
+        let survivors = next.live.filter { identities.contains($0.value.identity) }
+        let added = current.filter { previous[$0.value.identity] == nil }
+        // The inherited renderer appends replacements. A full snapshot is
+        // required for changes/reordering so earlier leaves cannot jump above
+        // later ones. Only removals and suffix additions use mutations.
+        let currentByIdentity = Dictionary(uniqueKeysWithValues: current.map { ($0.value.identity, $0) })
+        let unchangedSurvivors = survivors.allSatisfy { old in
+            currentByIdentity[old.value.identity] == old
+        }
+        let suffixOrder = current.map(\.id) == survivors.map(\.id) + added.map(\.id)
+        let noChange = current == next.live
+        let first = next.viewport == nil
+        let mutationCost = added.reduce(0) { $0 + generatedNodeCost($1.value.kind) }
+        let full = first || !unchangedSurvivors || !suffixOrder || noChange
+            || next.rendererBudget + mutationCost > 1_000_000
+        let count = full ? current.count + 1 : added.count
+        guard count <= limits.representations - representations else { throw EluNativeEncodingError.representationLimit }
+        representations += count
+        if first {
+            try appendEvent(meta(frame, v2: v2), to: &output, count: &eventCount)
+        }
+        if full {
+            try appendFull(frame, nodes: current, to: &output, count: &eventCount)
+            // Actual converter: two CSS nodes per full snapshot, one child
+            // for text/labelled placeholder, zero for our other leaf forms.
+            next.rendererBudget = 2 + current.reduce(0) { $0 + generatedNodeCost($1.value.kind) }
+        } else {
+            let removed = next.live.filter { !identities.contains($0.value.identity) }
+            try appendMutation(frame, added: added, removed: removed, to: &output, count: &eventCount)
+            next.rendererBudget += mutationCost
+        }
+        next.live = current; next.viewport = frame.viewport
+        next.lastTimestamp = frame.timestamp; next.nextFrameOrdinal += 1
     }
 
     private func generatedNodeCost(_ kind: EluNativeMaskedKind) -> Int {
@@ -182,10 +192,12 @@ struct EluNativeWireframeEncoder: Sendable {
         if !style.isEmpty { fields.append(member("style", .object(style))) }
         return .object(fields)
     }
-    private func meta(_ frame: EluNativeMaskedSnapshot) throws -> Data {
-        try EluV1StrictCanonicalJSON.canonicalData(for: .object([
+    private func meta(_ frame: EluNativeMaskedSnapshot, v2: Bool) throws -> Data {
+        var fields = [member("width", integer(Int64(frame.viewport.width))), member("height", integer(Int64(frame.viewport.height)))]
+        if v2 { fields.append(member("codec", string("elu-native-wireframe-v2"))) }
+        return try EluV1StrictCanonicalJSON.canonicalData(for: .object([
             member("type", integer(4)), member("timestamp", integer(frame.timestamp)),
-            member("data", .object([member("width", integer(Int64(frame.viewport.width))), member("height", integer(Int64(frame.viewport.height)))]))]))
+            member("data", .object(fields))]))
     }
     private func append(_ bytes: Data, to output: inout Data) throws {
         // Reserve the final array terminator at every append. This checks bytes

@@ -8,6 +8,17 @@ final class EluNativeWireframeEncoderTests: XCTestCase {
     private let third = UUID(uuidString: "00000000-0000-4000-8000-000000000003")!
     private let time: Int64 = 1_788_883_200_000
 
+    func testEmptyGeometryCanonicalBytesRemainFrozenAcrossExtractedStep() throws {
+        var encoder = try EluNativeWireframeEncoder()
+        let initial = try encoder.encode([frame(0)])
+        let expected = #"[{"data":{"height":844,"width":390},"timestamp":1788883200000,"type":4},{"data":{"initialOffset":{"left":0,"top":0},"wireframes":[{"childWireframes":[],"height":844,"id":10000000,"type":"div","width":390,"x":0,"y":0}]},"timestamp":1788883200000,"type":2}]"#
+        XCTAssertEqual(initial.data, Data(expected.utf8))
+        let next = try encoder.encode([frame(1)])
+        let nextExpected = #"[{"data":{"initialOffset":{"left":0,"top":0},"wireframes":[{"childWireframes":[],"height":844,"id":10000000,"type":"div","width":390,"x":0,"y":0}]},"timestamp":1788883200000,"type":2}]"#
+        XCTAssertEqual(next.data, Data(nextExpected.utf8)); XCTAssertEqual(next.sequence, 1)
+        XCTAssertEqual(initial.firstTimestamp, time); XCTAssertEqual(next.lastTimestamp, time)
+    }
+
     func testOrdinaryTextSurvivesInitialChangedAndInsertedFrames() throws {
         var encoder = try EluNativeWireframeEncoder()
         let initial = try encoder.encode([frame(0, nodes: [node(first, .ordinaryText("Welcome to ELU"))])])
