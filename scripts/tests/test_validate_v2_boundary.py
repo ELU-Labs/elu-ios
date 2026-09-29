@@ -32,6 +32,15 @@ class V2RuntimeBoundaryTests(unittest.TestCase):
             for token in ["EluV1ConfigManager", "EluV1ConfigDocument"]:
                 self.assertTrue(SCAN(relative, token))
 
+    def test_native_privacy_projector_reads_generation_without_endpoint_authority(self) -> None:
+        relative = "Sources/EluAnalytics/Internal/Runtime/EluPrivacyStateProjector.swift"
+        self.assertEqual([], SCAN(relative, (ROOT / relative).read_text()))
+        self.assertTrue(SCAN(relative, '"/v2/replay"'))
+        self.assertTrue(SCAN(relative, '"elu-http-v2"'))
+        for sibling in ["EluStandaloneRuntime.swift", "Other.swift"]:
+            self.assertTrue(SCAN("Sources/EluAnalytics/Internal/Runtime/" + sibling,
+                                 "replayProtocolGeneration"))
+
     def test_local_policy_and_both_replay_projections_are_required(self) -> None:
         sources = {relative: (ROOT / relative).read_text()
                    for relative in MODULE["V2_ENDPOINT_PROJECTION"]}

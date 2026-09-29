@@ -790,6 +790,7 @@ V2_GENERATION_SOURCES = frozenset({
     "Sources/EluAnalytics/Internal/Config/EluV1ConfigManager.swift",
     "Sources/EluAnalytics/Internal/Replay/EluNativeReplayAuthority.swift",
     "Sources/EluAnalytics/Internal/Replay/EluNativeReplaySealer.swift",
+    "Sources/EluAnalytics/Internal/Runtime/EluPrivacyStateProjector.swift",
     "Sources/EluAnalytics/Internal/Runtime/EluSQLiteRuntimeQueue.swift",
 })
 V2_ENDPOINT_SOURCES = frozenset({
