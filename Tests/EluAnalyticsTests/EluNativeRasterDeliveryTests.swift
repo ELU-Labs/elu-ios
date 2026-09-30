@@ -140,6 +140,7 @@ final class EluNativeRasterDeliveryTests: XCTestCase {
         do { _ = try await h.append(rejected); XCTFail("refused prefix accepted suffix") }
         catch { XCTAssertEqual(error as? EluRuntimeQueueError, .nativeRasterEpochBlocked(replayId: rejected.replayId, reason: "credential-401")) }
         await h.stop(); try await h.publish(branch: true, advance: true); try await h.start()
+        h.native.base.testClock.advance(1)
         let fresh = try h.request(); XCTAssertNotEqual(fresh.replayId, rejected.replayId); _ = try await h.append(fresh)
         let renewedValue = try await h.permission(), renewed = try XCTUnwrap(renewedValue)
         let recovered = await coordinator.trigger(renewed); XCTAssertEqual(recovered.accepted, 1); XCTAssertEqual(recovered.attempted, 1)
@@ -474,7 +475,11 @@ final class EluNativeRasterDeliveryTests: XCTestCase {
         }
         func request() throws -> EluNativeRasterPreparedRequest {
             var value = try XCTUnwrap(sealerValue)
-            let request = try value.seal(registry.capture(deadline: 1, clock: { 0 }, draw: { _, _, context in
+            // Use the original manually advanced monotonic clock for cadence.
+            // Whole seconds avoid fractional floating-point edges in this fixture;
+            // time remains fixed within one deterministic draw, not between frames.
+            let captureTime = TimeInterval(native.base.testClock.ticks() / 1_000_000_000)
+            let request = try value.seal(registry.capture(deadline: captureTime + 1, clock: { captureTime }, draw: { _, _, context in
                 context.setFillColor(UIColor.green.cgColor); context.fill(CGRect(x: 0, y: 0, width: 32, height: 32)); return true
             }), timestamp: timestamp)
             sealerValue = value
