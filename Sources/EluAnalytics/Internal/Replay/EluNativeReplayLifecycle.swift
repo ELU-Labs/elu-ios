@@ -33,6 +33,10 @@ struct EluNativeReplaySelection: Sendable {
         owner.isCurrent(token) && weakSelection.root != nil && weakSelection.window != nil
             && (!weakSelection.hadScene || weakSelection.scene != nil)
     }
+    func sameRoot(as other: Self) -> Bool {
+        weakSelection.root != nil && weakSelection.root === other.weakSelection.root
+            && weakSelection.window != nil && weakSelection.window === other.weakSelection.window
+    }
     #if canImport(UIKit)
     /// Borrows the original weak selection for one synchronous main-actor use.
     /// It never discovers a replacement root, window or scene.

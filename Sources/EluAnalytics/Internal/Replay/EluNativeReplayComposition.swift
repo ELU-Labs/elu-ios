@@ -88,6 +88,7 @@ actor EluNativeReplayComposition {
     private weak var runtime: EluStandaloneRuntime?
     private let lifecycle: EluNativeReplayLifecycle
     private let capabilities: EluNativeReplayCapabilities
+    private let declaredRegionReplaySupported: Bool
     private let delivery: EluV2ReplayDeliveryCoordinator
     private nonisolated let fence = EluNativeReplayCompositionFence()
     private nonisolated let localControl: EluNativeReplayLocalControl
@@ -105,7 +106,25 @@ actor EluNativeReplayComposition {
     #if canImport(UIKit)
     private var selection: EluNativeReplaySelection?
     private var capture: EluNativeReplayCaptureOwner?
-    private var capturePrepared: EluNativeReplayPreparedAuthority?
+    private enum CapturePreparation {
+        case wireframe(EluNativeReplayPreparedAuthority)
+        #if canImport(SwiftUI)
+        case raster(EluNativeRasterPreparedAuthority)
+        #endif
+        func isCurrent() -> Bool {
+            switch self {
+            case let .wireframe(value): return value.isCurrent()
+            #if canImport(SwiftUI)
+            case let .raster(value): return value.isCurrent()
+            #endif
+            }
+        }
+    }
+    private var capturePrepared: CapturePreparation?
+    #if canImport(SwiftUI)
+    private var declaredSelection: EluNativeReplaySelection?
+    private var blockedRaster: EluNativeRasterPreparedAuthority?
+    #endif
     private var captureID: UUID?
     private var rootRecoveryRequested = false
     private var rootObservationTask: Task<Bool, Never>?
@@ -115,8 +134,10 @@ actor EluNativeReplayComposition {
     init(runtime: EluStandaloneRuntime, lifecycle: EluNativeReplayLifecycle,
          capabilities: EluNativeReplayCapabilities, delivery: EluV2ReplayDeliveryCoordinator,
          initiallyActive: Bool = true,
+         declaredRegionReplaySupported: Bool = false,
          localControl: EluNativeReplayLocalControl = EluNativeReplayLocalControl()) {
         active = initiallyActive
+        self.declaredRegionReplaySupported = declaredRegionReplaySupported
         self.localControl = localControl
         self.runtime = runtime; self.lifecycle = lifecycle
         self.capabilities = capabilities; self.delivery = delivery
@@ -195,16 +216,20 @@ actor EluNativeReplayComposition {
     }
 
     #if canImport(UIKit)
+    private var supportsCapture: Bool {
+        declaredRegionReplaySupported || (!capabilities.transports.isEmpty
+            && !capabilities.readbackProvenProtocolGenerations.isEmpty)
+    }
     private func evaluateCapture(_ runtime: EluStandaloneRuntime, token: UUID) async {
         // No replacement selection/capture may overlap a prior root observer.
         await cancelRootObservation()
-        guard !captureQuarantined, !capabilities.transports.isEmpty,
-              !capabilities.readbackProvenProtocolGenerations.isEmpty else { return }
+        guard !captureQuarantined, supportsCapture else { return }
         let localToken = localControl.token()
         // Local stop leaves the sealed-delivery lane above fully operational.
         if !localControl.permits(localToken) || capture?.isDraining() == true {
             if let original = capture, let id = captureID {
                 let outcome = await original.finishGracefully()
+                retainEpochRefusal(outcome)
                 if captureID == id {
                     capture = nil; capturePrepared = nil; captureID = nil
                     fence.installCapture(nil); localControl.remove(id: id)
@@ -234,26 +259,71 @@ actor EluNativeReplayComposition {
         }
         if let original = capture {
             let outcome = await original.stop()
+            retainEpochRefusal(outcome)
             if let id = captureID { localControl.remove(id: id) }
             capture = nil; capturePrepared = nil; captureID = nil
             fence.installCapture(nil)
             if case .quarantined = outcome { captureQuarantined = true; return }
         }
-        guard !closed, fence.current(token), !capabilities.transports.isEmpty,
-              !capabilities.readbackProvenProtocolGenerations.isEmpty else { return }
+        guard !closed, fence.current(token), supportsCapture else { return }
         guard !closed, fence.current(token), localControl.permits(localToken) else { return }
         guard let selected = discovered, selected.isCurrent() else {
             if rootRecoveryRequested { await observeRootWhenAvailable(runtime, token: token, localToken: localToken) }
             return
         }
         selection = selected
-        guard let prepared = try? await runtime.prepareNativeReplay(capabilities: capabilities),
-              !closed, fence.current(token), localControl.permits(localToken),
-              prepared.isCurrent(), selected.isCurrent() else { return }
         let localControl = self.localControl
-        let original = await runtime.makeNativeReplayCapture(prepared: prepared, selection: selected,
+        let prepared: CapturePreparation
+        let original: EluNativeReplayCaptureOwner?
+        #if canImport(SwiftUI)
+        if declaredRegionReplaySupported {
+            let discovery = await EluSwiftUIReplayRegistry.discover(in: selected)
+            guard !closed, fence.current(token), localControl.permits(localToken), selected.isCurrent() else { return }
+            switch discovery {
+            case let .bound(binding):
+                declaredSelection = selected
+                guard let value = try? await runtime.prepareNativeRaster(sourceIdentity: binding.sourceIdentity),
+                      !closed, fence.current(token), localControl.permits(localToken),
+                      value.isCurrent(), selected.isCurrent(), binding.isCurrent() else { return }
+                if let blockedRaster, blockedRaster.sameCaptureContext(as: value) { return }
+                blockedRaster = nil
+                prepared = .raster(value)
+                original = await runtime.makeNativeRasterCapture(prepared: value, selection: selected, binding: binding,
+                    mayCollect: { localControl.permits(localToken) },
+                    onCommitted: { [weak self] in self?.requestReevaluation() })
+            case .unavailable:
+                declaredSelection = selected
+                return
+            case .absent:
+                // Removing a declared scope cannot silently convert that same
+                // mounted root to the automatic wireframe privacy contract.
+                if let declaredSelection, declaredSelection.sameRoot(as: selected) { return }
+                guard let value = try? await runtime.prepareNativeReplay(capabilities: capabilities),
+                      !closed, fence.current(token), localControl.permits(localToken),
+                      value.isCurrent(), selected.isCurrent() else { return }
+                prepared = .wireframe(value)
+                original = await runtime.makeNativeReplayCapture(prepared: value, selection: selected,
+                    mayCollect: { localControl.permits(localToken) },
+                    onCommitted: { [weak self] in self?.requestReevaluation() })
+            }
+        } else {
+            guard let value = try? await runtime.prepareNativeReplay(capabilities: capabilities),
+                  !closed, fence.current(token), localControl.permits(localToken),
+                  value.isCurrent(), selected.isCurrent() else { return }
+            prepared = .wireframe(value)
+            original = await runtime.makeNativeReplayCapture(prepared: value, selection: selected,
+                mayCollect: { localControl.permits(localToken) },
+                onCommitted: { [weak self] in self?.requestReevaluation() })
+        }
+        #else
+        guard let value = try? await runtime.prepareNativeReplay(capabilities: capabilities),
+              !closed, fence.current(token), localControl.permits(localToken),
+              value.isCurrent(), selected.isCurrent() else { return }
+        prepared = .wireframe(value)
+        original = await runtime.makeNativeReplayCapture(prepared: value, selection: selected,
             mayCollect: { localControl.permits(localToken) },
             onCommitted: { [weak self] in self?.requestReevaluation() })
+        #endif
         guard let original else { return }
         rootRecoveryRequested = false
         capture = original; capturePrepared = prepared
@@ -268,8 +338,17 @@ actor EluNativeReplayComposition {
             await self?.captureFinished(id, outcome: outcome)
         }
     }
+    private func retainEpochRefusal(_ outcome: EluNativeReplayCaptureOutcome) {
+        #if canImport(SwiftUI)
+        if case .epochBlocked = outcome, case let .raster(prepared)? = capturePrepared {
+            blockedRaster = prepared
+        }
+        #endif
+    }
+
     private func captureFinished(_ id: UUID, outcome: EluNativeReplayCaptureOutcome) {
         guard captureID == id else { return }
+        retainEpochRefusal(outcome)
         let wasDraining = capture?.isDraining() == true
         let recoverRoot = capture?.needsRootRecovery() == true
         localControl.remove(id: id)

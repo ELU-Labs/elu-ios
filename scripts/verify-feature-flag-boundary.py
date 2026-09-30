@@ -74,6 +74,7 @@ NATIVE_RASTER_STORAGE_SOURCE = "Sources/EluAnalytics/Internal/Replay/EluStoredRe
 NATIVE_RASTER_QUEUE_SOURCE = "Sources/EluAnalytics/Internal/Runtime/EluSQLiteRuntimeQueue.swift"
 NATIVE_CAPTURE_SOURCE = "Sources/EluAnalytics/Internal/Replay/EluNativeReplayCaptureOwner.swift"
 NATIVE_WINDOW_SOURCE = "Sources/EluAnalytics/EluReplayWindow.swift"
+SWIFTUI_COLLECTOR_SOURCE = "Sources/EluAnalytics/Internal/Replay/EluSwiftUIReplayCollector.swift"
 NATIVE_COLLECTOR_SOURCE = "Sources/EluAnalytics/Internal/Replay/EluUIKitReplayCollector.swift"
 NATIVE_INTERACTION_PROJECTION_SOURCE = "Sources/EluAnalytics/Internal/Replay/EluUIKitReplayInteractionProjection.swift"
 NATIVE_TOUCH_OBSERVER_SOURCE = "Sources/EluAnalytics/Internal/Replay/EluUIKitReplayTouchObserver.swift"
@@ -115,7 +116,8 @@ def scan_replay_storage_source(path: pathlib.Path, text: str) -> list[str]:
     if exact in tuple_guards and ("import Foundation" in text):
         if any(token not in text for token in tuple_guards[exact]):
             errors.append(f"{path} weakens original-generation native tuple selection or admission")
-    if re.search(r"\bEluNativeReplayCapture\w*\b", text) and exact not in NATIVE_CAPTURE_CALLERS:
+    capture_references = re.sub(r"\bEluNativeReplayCaptureError\b", "", text) if exact == SWIFTUI_COLLECTOR_SOURCE else text
+    if re.search(r"\bEluNativeReplayCapture\w*\b", capture_references) and exact not in NATIVE_CAPTURE_CALLERS:
         errors.append(f"{path} references native capture ownership outside its exact internal files")
     physical = set(re.findall(r"\bEluNativeReplayCapture(?:Owner|Run|Fence)\b", text))
     if physical and exact != NATIVE_CAPTURE_SOURCE and not (
@@ -134,6 +136,28 @@ def scan_replay_storage_source(path: pathlib.Path, text: str) -> list[str]:
     if exact == NATIVE_COMPOSITION_SOURCE and "actor EluNativeReplayComposition" in text:
         if "!capabilities.transports.isEmpty" not in text or "!capabilities.readbackProvenProtocolGenerations.isEmpty" not in text or re.search(r"\bEluNativeReplayCaptureOwner\s*\(", text):
             errors.append(f"{path} bypasses the supported runtime capture construction")
+    if exact == NATIVE_COMPOSITION_SOURCE and "actor EluNativeReplayComposition" in text:
+        for token in ["declaredRegionReplaySupported: Bool = false", "if declaredRegionReplaySupported",
+                      "EluSwiftUIReplayRegistry.discover(in: selected)",
+                      "declaredSelection.sameRoot(as: selected)", "blockedRaster.sameCaptureContext(as: value)",
+                      "retainEpochRefusal(outcome)", "await original.stop()"]:
+            if token not in text: errors.append(f"{path} loses original declared-root selection or epoch refusal")
+    if exact == STACK_SOURCE and "static func make(" in text:
+        for token in ["configurationFormat: EluV2ConfigRequest.Format = .v2",
+                      "declaredRegionReplaySupported: Bool = false", "format: configurationFormat",
+                      "declaredRegionReplaySupported: declaredRegionReplaySupported"]:
+            if token not in text: errors.append(f"{path} changes the explicit dormant original source selection")
+    if re.search(r"\bEluSwiftUIReplay(?:Registry|Binding|Registration)\b", text) and exact not in {
+            SWIFTUI_COLLECTOR_SOURCE, "Sources/EluAnalytics/EluSwiftUIReplayScope.swift",
+            NATIVE_COMPOSITION_SOURCE, NATIVE_RUNTIME_SOURCE, NATIVE_CAPTURE_SOURCE}:
+        errors.append(f"{path} escapes original declared-root registration ownership")
+    if exact == SWIFTUI_COLLECTOR_SOURCE and "final class EluSwiftUIReplayRegistry" in text:
+        for token in ["weak var host: UIView?", "weak var window: UIWindow?",
+                      "Self.installed.count < 64", "Self.discoveryClosed = true",
+                      "$0.value == nil && ($0.host == nil || $0.window == nil)",
+                      "matches.allSatisfy({ $0.value != nil })",
+                      "originalSource?.revoke()", "bindingFence.withdraw()"]:
+            if token not in text: errors.append(f"{path} loses bounded persistent declared-root intent or source revocation")
     if re.search(r"\bEluNativeReplayComposition\w*\b", text) and exact not in {NATIVE_COMPOSITION_SOURCE, NATIVE_RUNTIME_SOURCE}:
         errors.append(f"{path} references native composition outside its exact runtime")
     if "requiringCurrent" in text and exact not in {NATIVE_RUNTIME_SOURCE, "Sources/EluAnalytics/Internal/Runtime/EluSQLiteRuntimeQueue.swift"}:
@@ -246,6 +270,28 @@ def scan_replay_storage_source(path: pathlib.Path, text: str) -> list[str]:
             or re.search(r"\bTask(?:\.detached)?\s*[{(]", text))
         if not storage_only_raster:
             errors.append(f"{path} adds live authority, capture or delivery to restored raster values")
+    raster_runtime_owner = exact in {NATIVE_RUNTIME_SOURCE, NATIVE_COMPOSITION_SOURCE}
+    raster_physical_owner = exact == NATIVE_CAPTURE_SOURCE
+    if raster_runtime_owner:
+        forbidden = ("EluNativeRasterPermit", "EluNativeRasterCaptureAdmission", "EluNativeRasterPreparedRequest",
+            "EluNativeRasterSealer", "EluSwiftUIReplayFrame", "appendNativeRaster",
+            "EluNativeRasterStoredRequest", "EluStoredReplayRecord", "EluNativeRasterSourceLedger")
+        if any(re.search(rf"\b{token}\b", text) for token in forbidden):
+            errors.append(f"{path} bypasses original raster physical capture or durable ownership")
+    if raster_physical_owner and re.search(r"\b(?:EluStoredReplayRecord|EluNativeRasterStored\w*|EluNativeRasterSourceLedger)\b", text):
+        errors.append(f"{path} restores raster storage outside the original queue")
+    if raster_physical_owner and "private final class EluNativeRasterCaptureRun" in text:
+        required = ["queue.enrollNativeReplayCapture()", "original.takePhysicalUse()",
+            "authority.startRaster(prepared, selection: selection, physicalUse: physical)",
+            "authority.captureAdmission(for: permit, physicalUse: physical)",
+            "sourceIdentity: binding.sourceIdentity", "sourceIsCurrent:", "try await validate(permit)",
+            "queue.appendNativeRaster(request, admission: admission, physicalUse: physical)",
+            "UInt64(prepared.minimumDurationSeconds) * 1_000_000_000",
+            "captured.2 - beginning >= minimum", "try await commit(retained)",
+            "case .committedThenWithdrawn", "EluRuntimeQueueError.nativeRasterEpochBlocked",
+            "first = nil; fence.withdraw()", "use.settle()", "queue.finishNativeReplayCapture(enrollment)"]
+        if any(token not in text for token in required):
+            errors.append(f"{path} loses original raster duration, admission, source or physical settlement")
     raster_durable_owner = exact in {NATIVE_RASTER_QUEUE_SOURCE, NATIVE_AUTHORITY_SOURCE}
     if raster_durable_owner:
         forbidden = ("EluNativeRasterSealer", "EluNativeRasterResponse",
@@ -256,7 +302,7 @@ def scan_replay_storage_source(path: pathlib.Path, text: str) -> list[str]:
             r"\bEluNativeRasterPreparedRequest\s*(?:\.\s*init)?\s*\(", text):
             errors.append(f"{path} adds a raster recorder, request constructor or response dispatch to durable admission")
     if re.search(r"\b(?:EluStoredReplayRecord|EluNativeRaster(?:Stored\w*|SourceLedger|Permit|PreparedAuthority|Capture\w*|AppendResult))\b", text) and not (
-        raster_durable_owner or exact == NATIVE_RASTER_STORAGE_SOURCE or (
+        raster_durable_owner or raster_runtime_owner or raster_physical_owner or exact == NATIVE_RASTER_STORAGE_SOURCE or (
             exact == NATIVE_RASTER_RESPONSE_SOURCE and not re.search(
                 r"\b(?:EluStoredReplayRecord|EluNativeRaster(?:Stored\w*|SourceLedger|Permit|PreparedAuthority|Capture\w*|AppendResult))\b",
                 re.sub(r"\brequest\s*:\s*EluNativeRasterStoredRequest\b", "", text)))):
@@ -288,11 +334,15 @@ def scan_replay_storage_source(path: pathlib.Path, text: str) -> list[str]:
         if re.search(r"\bEluNativeRasterResponse\b|\bEluNativeRaster(?:Sealer|PreparedRequest|StoredRequest|PolicyBinding)\b", remaining):
             errors.append(f"{path} constructs raster values or bypasses the exact response classifier")
     delivery_selection_owners = {NATIVE_RASTER_QUEUE_SOURCE, NATIVE_RASTER_DELIVERY_STATE, REPLAY_TRANSPORT_SOURCE}
-    if re.search(r"\bEluReplayDelivery(?:Format|Support)\b|\.includingRaster\b", text) and exact not in delivery_selection_owners:
+    delivery_selection_text = text
+    if exact == NATIVE_RUNTIME_SOURCE:
+        delivery_selection_text = delivery_selection_text.replace(
+            "support: declaredRegionReplaySupported ? .includingRaster : .wireframeOnly", "")
+    if re.search(r"\bEluReplayDelivery(?:Format|Support)\b|\.includingRaster\b", delivery_selection_text) and exact not in delivery_selection_owners:
         errors.append(f"{path} activates raster delivery outside its original explicit internal selection")
     if exact == NATIVE_RASTER_QUEUE_SOURCE and "support: EluReplayDeliverySupport = .wireframeOnly" not in text:
         errors.append(f"{path} changes the dormant raster delivery default")
-    if re.search(r"\bEluNativeRaster(?:Sealer|PreparedRequest|PolicyBinding|SealingError)\b", text) and exact != NATIVE_RASTER_SEALER_SOURCE and not response_only_raster and not raster_durable_owner:
+    if re.search(r"\bEluNativeRaster(?:Sealer|PreparedRequest|PolicyBinding|SealingError)\b", text) and exact != NATIVE_RASTER_SEALER_SOURCE and not response_only_raster and not raster_durable_owner and not raster_physical_owner:
         errors.append(f"{path} installs the unintegrated raster sealer outside its exact value file")
     if re.search(r"\bEluNativeReplaySealer\b", text) and exact not in {NATIVE_SEALER_SOURCE, NATIVE_CAPTURE_SOURCE} and not helper_only_raster:
         errors.append(f"{path} references the native sealer outside its exact physical owner")
@@ -318,10 +368,16 @@ def scan_replay_storage_source(path: pathlib.Path, text: str) -> list[str]:
         )
         if normalized.count(exact_capability) != 1 or text.count("static let readbackProvenReplayCapabilities") != 1:
             errors.append(f"{path} changed the exact binary-supported native capabilities")
-        required = ["capabilities: EluNativeReplayCapabilities = EluNativeReplayCapabilities()",
+        required = ["declaredRegionReplaySupported: Bool = false",
+                    "support: declaredRegionReplaySupported ? .includingRaster : .wireframeOnly",
+                    "guard declaredRegionReplaySupported, phase != .closed",
+                    "prepared.sourceIdentity === binding.sourceIdentity",
+                    "authority?.withdraw(); relay.withdrawCapture(); relay.request()",
+                    "EluSwiftUIReplayRegistration.shared.remove(declaredRegionObserver)",
+                    "capabilities: EluNativeReplayCapabilities = EluNativeReplayCapabilities()",
                     "nativeAuthority.ownsPrepared(prepared)", "prepared.supportedProtocolGeneration != nil",
                     "value?.requiringCurrent", "configurationWitness == source", "readZone() == zone"]
-        if any(token not in text for token in required) or len(re.findall(rf"\b{REPLAY_TRANSPORT_NAME}\s*\(", text)) != 1 or len(re.findall(r"\bEluNativeReplayCaptureOwner\s*\(", text)) != 1:
+        if any(token not in text for token in required) or len(re.findall(rf"\b{REPLAY_TRANSPORT_NAME}\s*\(", text)) != 1 or len(re.findall(r"\bEluNativeReplayCaptureOwner\s*\(", text)) != 2:
             errors.append(f"{path} weakens the empty proof/original source native composition gate")
     for match in re.finditer(r"\b(class|struct|actor|enum|extension)\s+(\w+)(?:(?!\{).)*?:([^\{]+)\{", text, re.DOTALL):
         kind, name, bases = match.groups()

@@ -173,6 +173,7 @@ struct EluNativeReplayFrameBuffer: Sendable {
 enum EluNativeReplayCaptureOutcome: Sendable {
     case settled
     case quarantined
+    case epochBlocked(replayId: String, reason: String)
 }
 
 /// One coalesced signal and reusable timer for the existing capture task.
@@ -291,6 +292,22 @@ final class EluNativeReplayCaptureOwner: @unchecked Sendable {
         // deliberately captures run, never self, so deinit can withdraw intake.
         task = Task { await run.execute() }
     }
+
+    #if canImport(SwiftUI)
+    init(queue: EluSQLiteRuntimeQueue, authority: EluNativeReplayAuthority,
+         raster: EluNativeRasterPreparedAuthority, selection: EluNativeReplaySelection,
+         binding: EluSwiftUIReplayBinding, versions: EluVersionContext,
+         wallClock: @escaping @Sendable () -> Date,
+         continuousNanoseconds: @escaping @Sendable () -> UInt64?,
+         mayCollect: @escaping @Sendable () -> Bool = { true },
+         onCommitted: @escaping @Sendable () -> Void = {}) {
+        let run = EluNativeRasterCaptureRun(queue: queue, authority: authority, prepared: raster,
+            selection: selection, binding: binding, versions: versions, wallClock: wallClock,
+            continuousNanoseconds: continuousNanoseconds, mayCollect: mayCollect, onCommitted: onCommitted)
+        fence = run.fence
+        task = Task { await run.execute() }
+    }
+    #endif
 
     /// Read-only causal observation; never supplies capture or commit permission.
     func collectedFrameCountForTesting() -> Int { fence.frameCount() }
@@ -800,4 +817,163 @@ private final class EluNativeReplayCaptureRun: @unchecked Sendable {
         }
     }
 }
+#if canImport(SwiftUI)
+/// Alternative body of the same original physical owner. It allocates no queue,
+/// grant, transport or additional capture task and cannot run beside wireframe.
+private final class EluNativeRasterCaptureRun: @unchecked Sendable {
+    let fence = EluNativeReplayCaptureFence()
+    private let queue: EluSQLiteRuntimeQueue
+    private let authority: EluNativeReplayAuthority
+    private let prepared: EluNativeRasterPreparedAuthority
+    private let selection: EluNativeReplaySelection
+    private let binding: EluSwiftUIReplayBinding
+    private let versions: EluVersionContext
+    private let wallClock: @Sendable () -> Date
+    private let continuousNanoseconds: @Sendable () -> UInt64?
+    private let mayCollect: @Sendable () -> Bool
+    private let onCommitted: @Sendable () -> Void
+
+    init(queue: EluSQLiteRuntimeQueue, authority: EluNativeReplayAuthority,
+         prepared: EluNativeRasterPreparedAuthority, selection: EluNativeReplaySelection,
+         binding: EluSwiftUIReplayBinding, versions: EluVersionContext,
+         wallClock: @escaping @Sendable () -> Date,
+         continuousNanoseconds: @escaping @Sendable () -> UInt64?,
+         mayCollect: @escaping @Sendable () -> Bool, onCommitted: @escaping @Sendable () -> Void) {
+        self.queue = queue; self.authority = authority; self.prepared = prepared
+        self.selection = selection; self.binding = binding; self.versions = versions
+        self.wallClock = wallClock; self.continuousNanoseconds = continuousNanoseconds
+        self.mayCollect = mayCollect; self.onCommitted = onCommitted
+    }
+    private func check(_ permit: EluNativeRasterPermit? = nil) throws {
+        guard !Task.isCancelled, fence.isCurrent(), prepared.isCurrent(),
+              permit?.isCurrent() ?? true else { throw EluNativeReplayCaptureError.withdrawn }
+        guard selection.isCurrent(), binding.isCurrent() else { throw EluNativeReplayCaptureError.rootChanged }
+        guard fence.isCollecting(), mayCollect() else { throw EluNativeReplayCaptureError.locallyStopped }
+    }
+    @MainActor private func validate(_ permit: EluNativeRasterPermit? = nil) throws {
+        try check(permit); try binding.validate()
+        guard selection.validateCurrent() else { throw EluNativeReplayCaptureError.rootChanged }
+        try check(permit)
+    }
+
+    func execute() async -> EluNativeReplayCaptureOutcome {
+        var enrollment: EluNativeReplayCaptureEnrollment?
+        var use: EluNativeReplayCapturePhysicalUse?
+        var first: EluNativeRasterPreparedRequest?
+        var outcome: EluNativeReplayCaptureOutcome = .settled
+        do {
+            try check()
+            guard let original = try await queue.enrollNativeReplayCapture() else { throw EluNativeReplayCaptureError.occupied }
+            enrollment = original
+            guard let physical = original.takePhysicalUse() else { throw EluNativeReplayCaptureError.occupied }
+            use = physical
+            try await validate()
+            guard let permit = try await authority.startRaster(prepared, selection: selection, physicalUse: physical) else {
+                throw EluNativeReplayCaptureError.withdrawn
+            }
+            try check(permit)
+            let admission = try await authority.captureAdmission(for: permit, physicalUse: physical)
+            try await validate(permit)
+            guard admission.isCurrent(), fence.installCollector({}, isCurrent: { [self] in
+                binding.isCurrent() && permit.isCurrent() && admission.isCurrent() && mayCollect()
+            }) else { throw EluNativeReplayCaptureError.withdrawn }
+            var sealer = try EluNativeRasterSealer(replayId: permit.replayId, identity: permit.identity,
+                policy: permit.sealingPolicy(), versions: versions,
+                sourceIdentity: binding.sourceIdentity, sourceIsCurrent: { [self] in
+                    fence.isCollecting() && mayCollect() && binding.isCurrent() && permit.isCurrent() && admission.isCurrent()
+                })
+            let minimum = UInt64(prepared.minimumDurationSeconds) * 1_000_000_000
+            var firstContinuous: UInt64?
+            var lastContinuous: UInt64?
+            var minimumProved = false
+            func commit(_ request: EluNativeRasterPreparedRequest) async throws {
+                try await validate(permit)
+                guard admission.isCurrent() else { throw EluNativeReplayCaptureError.withdrawn }
+                let result = try await queue.appendNativeRaster(request, admission: admission, physicalUse: physical)
+                switch result {
+                case .committed: onCommitted()
+                case .committedThenWithdrawn:
+                    onCommitted(); throw EluNativeReplayCaptureError.withdrawn
+                }
+                try check(permit)
+            }
+            while true {
+                try check(permit)
+                guard admission.isCurrent() else { throw EluNativeReplayCaptureError.withdrawn }
+                let captured = try await MainActor.run { () throws -> (EluSwiftUIReplayFrame, Int64, UInt64) in
+                    try self.validate(permit)
+                    guard admission.isCurrent(), let ticks = self.continuousNanoseconds() else {
+                        throw EluNativeReplayCaptureError.invalidClock
+                    }
+                    let timestamp = try EluNativeReplayCaptureClock.milliseconds(self.wallClock())
+                    let start = Double(ticks) / 1_000_000_000
+                    let frame = try self.binding.capture(deadline: start + 0.050, clock: {
+                        self.continuousNanoseconds().map { Double($0) / 1_000_000_000 } ?? .nan
+                    })
+                    do {
+                        try self.validate(permit)
+                        guard admission.isCurrent() else { throw EluNativeReplayCaptureError.withdrawn }
+                        return (frame, timestamp, ticks)
+                    } catch { frame.close(); throw error }
+                }
+                let frame = captured.0
+                defer { frame.close() }
+                try check(permit)
+                if let lastContinuous {
+                    guard captured.2 >= lastContinuous, captured.2 - lastContinuous >= 1_000_000_000 else {
+                        throw EluNativeReplayCaptureError.invalidClock
+                    }
+                }
+                lastContinuous = captured.2
+                if firstContinuous == nil {
+                    firstContinuous = captured.2
+                    first = try sealer.seal(frame, timestamp: captured.1)
+                    if minimum == 0 {
+                        try await commit(first!); first = nil; minimumProved = true
+                    }
+                } else if !minimumProved {
+                    guard let beginning = firstContinuous, captured.2 >= beginning else { throw EluNativeReplayCaptureError.invalidClock }
+                    if captured.2 - beginning >= minimum {
+                        // Two lawful original samples prove elapsed time. The
+                        // first request stays exact; discarded middle samples
+                        // never advance the sealer or manufacture a prefix gap.
+                        guard let retained = first else { throw EluNativeReplayCaptureError.frameOrder }
+                        try await commit(retained); first = nil; minimumProved = true
+                        try check(permit)
+                        let current = try sealer.seal(frame, timestamp: captured.1)
+                        try await commit(current)
+                    }
+                } else {
+                    let current = try sealer.seal(frame, timestamp: captured.1)
+                    try await commit(current)
+                }
+                fence.didCollectFrame()
+                // Explicitly close the original frame before suspending.
+                frame.close()
+                try await Task.sleep(nanoseconds: 1_000_000_000)
+            }
+        } catch let EluRuntimeQueueError.nativeRasterEpochBlocked(replayId, reason) {
+            outcome = .epochBlocked(replayId: replayId, reason: reason)
+        } catch EluNativeReplayCaptureError.rootChanged {
+            if !Task.isCancelled, fence.isCollecting(), mayCollect(), prepared.isCurrent() { fence.requestRootRecovery() }
+        } catch {
+            // No raw pixels or prefix are flushed on withdrawal, privacy change,
+            // invalid clock, incomplete rendering, local stop or unknown commit.
+        }
+        first = nil; fence.withdraw()
+        // Every borrowed MainActor draw has returned before this point. No
+        // queued draw, callback or independent encoder task remains to abandon.
+        guard let enrollment else { return outcome }
+        if let use { use.settle() } else { enrollment.cancelUnused() }
+        do {
+            if use != nil, try await authority.stop() != .settled { enrollment.quarantine(); return .quarantined }
+            guard try await queue.finishNativeReplayCapture(enrollment) == .settled else {
+                enrollment.quarantine(); return .quarantined
+            }
+        } catch { enrollment.quarantine(); return .quarantined }
+        return outcome
+    }
+}
+#endif
+
 #endif

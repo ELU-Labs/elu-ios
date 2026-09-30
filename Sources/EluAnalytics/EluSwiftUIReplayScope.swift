@@ -5,8 +5,9 @@ import UIKit
 /// Explicit privacy declarations for one original mounted SwiftUI root.
 ///
 /// This surface does not enable recording. The declared-region capture policy
-/// and transport are not installed in the runtime yet. Every input and private
-/// or unsupported painted region must be declared and wrapped before display.
+/// and transport require separate original runtime selection and a current
+/// declared-region grant. The public bootstrap does not select them. Every input
+/// and private or unsupported painted region must be declared and wrapped before display.
 /// Native `privacySensitive()` and arbitrary inputs are not discovered.
 ///
 /// Keep one scope for the lifetime of the root. Its required identifiers cannot

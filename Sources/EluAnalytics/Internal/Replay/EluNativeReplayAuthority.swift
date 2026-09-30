@@ -162,7 +162,18 @@ struct EluNativeRasterPreparedAuthority: Sendable {
     fileprivate let owner: UUID
     fileprivate let invocation: UUID
     fileprivate let projection: EluNativeReplayProjectionInput
-    func isCurrent() -> Bool { projection.isCurrent() }
+    var minimumDurationSeconds: Int { projection.context.policy.replay.minimumDurationSeconds }
+    func isCurrent() -> Bool { sourceIdentity.isCurrent() && projection.isCurrent() }
+    /// A terminal epoch stays stopped after its physical owner invalidates the
+    /// projection. Only a genuinely different original source/root/identity
+    /// context can attempt a new epoch; this comparison grants no permission.
+    func sameCaptureContext(as other: Self) -> Bool {
+        sourceIdentity === other.sourceIdentity && projection.source == other.projection.source
+            && identity.streamId == other.identity.streamId
+            && identity.identity.revision == other.identity.identity.revision
+            && identity.identity.contextRevision == other.identity.identity.contextRevision
+            && projection.accounting.key == other.projection.accounting.key
+    }
 }
 
 struct EluNativeRasterPermit: Sendable {
@@ -174,7 +185,7 @@ struct EluNativeRasterPermit: Sendable {
     fileprivate let receipt: EluNativeReplayStartReceipt
     fileprivate let authority: EluNativeReplaySynchronousGuard
     fileprivate let invocation: UUID
-    func isCurrent() -> Bool { authority.isCurrent() && selection.isCurrent() }
+    func isCurrent() -> Bool { sourceIdentity.isCurrent() && authority.isCurrent() && selection.isCurrent() }
     func sealingPolicy() throws -> EluNativeRasterPolicyBinding {
         try EluNativeRasterPolicyBinding(policyRevision: policy.revision,
             effectivePolicyHash: policy.effectivePolicyHash,
@@ -216,6 +227,12 @@ actor EluNativeReplayAuthority {
     nonisolated func ownsPrepared(_ value: EluNativeReplayPreparedAuthority) -> Bool {
         value.owner == id && fence.current(value.invocation)
     }
+
+    #if canImport(SwiftUI) && canImport(UIKit)
+    nonisolated func ownsPrepared(_ value: EluNativeRasterPreparedAuthority) -> Bool {
+        value.owner == id && fence.current(value.invocation)
+    }
+    #endif
 
     nonisolated func withdraw() {
         fence.invalidate()

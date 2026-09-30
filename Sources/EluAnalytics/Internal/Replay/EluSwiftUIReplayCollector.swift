@@ -8,15 +8,28 @@ enum EluSwiftUIReplayFailure: Error, Equatable {
     case busy, cadence, deadline, incompleteDraw, invalidPixels, pngLimit, pngEncoding
 }
 
-/// Local observation only. This registry grants no capture authority and is not
-/// installed in the runtime. The future original capture owner must supply its
-/// existing authority/physical-admission boundaries around collection and sealing.
+/// Geometry registration only; capture and delivery remain owned by the original
+/// runtime's separately selected and remotely authorized composition.
 @MainActor
 final class EluSwiftUIReplayRegistry {
     private final class WeakMarker {
         weak var value: EluSwiftUIReplayMarkerView?
         init(_ value: EluSwiftUIReplayMarkerView) { self.value = value }
     }
+    private final class WeakRegistry {
+        weak var value: EluSwiftUIReplayRegistry?
+        weak var host: UIView?
+        weak var window: UIWindow?
+        init(_ value: EluSwiftUIReplayRegistry, host: UIView? = nil, window: UIWindow? = nil) {
+            self.value = value; self.host = host; self.window = window
+        }
+    }
+    private static var installed: [WeakRegistry] = []
+    private static var discoveryClosed = false
+    private let bindingFence = EluSwiftUIReplayBindingFence()
+    // The bounded inventory retains weak host tombstones independently of a
+    // registry's lifetime. Releasing/reparenting a scope cannot erase its prior
+    // declaration while the original host/window still exist.
     let requiredRegions: Set<String>
     private var validDeclaration: Bool
     private var markers: [WeakMarker] = []
@@ -34,31 +47,88 @@ final class EluSwiftUIReplayRegistry {
         self.requiredRegions = valid ? requiredRegions : []
         validDeclaration = valid
     }
-    deinit { activeLease?.revoke() }
+    deinit { activeLease?.revoke(); originalSource?.revoke(); bindingFence.withdraw() }
+
+    enum Discovery { case absent, unavailable, bound(EluSwiftUIReplayBinding) }
+    static func discover(in selection: EluNativeReplaySelection) -> Discovery {
+        guard !discoveryClosed else { return .unavailable }
+        pruneInstalled()
+        do {
+            return try selection.consumeRoot { root in
+                guard let window = root.window else { return .unavailable }
+                let matches = installed.filter { entry in
+                    (entry.host === root && entry.window === window)
+                        || entry.value?.markers.compactMap(\.value).contains { marker in
+                            marker.region == nil && marker.window === window && marker.isDescendant(of: root)
+                        } == true
+                }
+                guard !matches.isEmpty else { return .absent }
+                guard matches.allSatisfy({ $0.value != nil }), let registry = matches.first?.value,
+                      matches.allSatisfy({ $0.value === registry }) else { return .unavailable }
+                let plan = try registry.plan()
+                guard plan.window === window, let marker = plan.witnesses.first?.marker,
+                      marker.isDescendant(of: root) else { return .unavailable }
+                return .bound(EluSwiftUIReplayBinding(registry: registry, selection: selection,
+                    viewport: plan.viewport, sourceIdentity: try registry.sourceIdentity(for: plan),
+                    fence: registry.bindingFence, token: registry.bindingFence.token()))
+            }
+        } catch { return .unavailable }
+    }
+
+    private func registrationChanged() {
+        originalSource?.revoke(); originalSource = nil; sourceRoot = nil; sourceWindow = nil
+        bindingFence.withdraw()
+        EluSwiftUIReplayRegistration.shared.changed()
+    }
 
     func geometryChanged() {
         activeLease?.revoke()
-        if revision == .max { validDeclaration = false } else { revision += 1 }
+        if revision == .max { validDeclaration = false; registrationChanged() } else { revision += 1 }
+    }
+    private static func pruneInstalled() {
+        installed.removeAll { $0.value == nil && ($0.host == nil || $0.window == nil) }
+    }
+    private func rememberInstallation(host: UIView? = nil, window: UIWindow? = nil) {
+        Self.pruneInstalled()
+        guard !Self.installed.contains(where: { $0.value === self && $0.host === host && $0.window === window }) else { return }
+        guard Self.installed.count < 64 else {
+            Self.discoveryClosed = true; registrationChanged(); return
+        }
+        Self.installed.append(WeakRegistry(self, host: host, window: window))
+    }
+    private func noteDeclaredHost(_ marker: EluSwiftUIReplayMarkerView) {
+        guard marker.region == nil, let window = marker.window,
+              let root = window.rootViewController?.viewIfLoaded, marker.isDescendant(of: root) else { return }
+        rememberInstallation(host: root, window: window)
     }
     func rootBindingChanged(_ marker: EluSwiftUIReplayMarkerView) {
-        if marker === sourceRoot {
-            originalSource = nil; sourceRoot = nil; sourceWindow = nil
-        }
+        noteDeclaredHost(marker)
+        // Any required marker reparenting changes the original declaration,
+        // even when UIKit later restores an identical rectangle.
+        registrationChanged()
+    }
+    func markerGeometryChanged(_ marker: EluSwiftUIReplayMarkerView) {
+        geometryChanged()
+        if marker.region == nil { registrationChanged() }
     }
     func add(_ marker: EluSwiftUIReplayMarkerView) {
+        noteDeclaredHost(marker)
         markers.removeAll { $0.value == nil }
         guard !markers.contains(where: { $0.value === marker }) else { return }
         // A duplicate/unknown registration is never silently omitted. Overflow
         // permanently closes this scope instead of retaining an unbounded list.
         guard markers.count < 130, marker.region.map({ !$0.isEmpty && $0.utf8.prefix(129).count <= 128 }) ?? true else {
-            validDeclaration = false; geometryChanged(); return
+            validDeclaration = false; geometryChanged(); registrationChanged(); return
         }
-        markers.append(WeakMarker(marker)); geometryChanged()
+        markers.append(WeakMarker(marker)); geometryChanged(); registrationChanged()
+        if marker.region == nil {
+            if !Self.installed.contains(where: { $0.value === self }) { rememberInstallation() }
+        }
     }
     func remove(_ marker: EluSwiftUIReplayMarkerView) {
         rootBindingChanged(marker)
         markers.removeAll { $0.value == nil || $0.value === marker }
-        geometryChanged()
+        geometryChanged(); registrationChanged()
     }
 
     struct Ancestor {
@@ -184,6 +254,7 @@ final class EluSwiftUIReplayRegistry {
             throw EluSwiftUIReplayFailure.staleGeometry
         }
         if let originalSource, sourceRoot === root, sourceWindow === window { return originalSource }
+        originalSource?.revoke()
         let identity = EluSwiftUIReplaySourceIdentity()
         sourceRoot = root; sourceWindow = window; originalSource = identity
         return identity
@@ -288,6 +359,67 @@ final class EluSwiftUIReplayRegistry {
     }
 }
 
+/// A bounded original registration observation, never remote authorization.
+/// It carries no mutable UIKit object across an actor boundary.
+@MainActor
+final class EluSwiftUIReplayBinding {
+    private weak var registry: EluSwiftUIReplayRegistry?
+    private let selection: EluNativeReplaySelection
+    private let viewport: CGRect
+    nonisolated let sourceIdentity: EluSwiftUIReplaySourceIdentity
+    private nonisolated let fence: EluSwiftUIReplayBindingFence
+    private nonisolated let token: UUID
+    fileprivate init(registry: EluSwiftUIReplayRegistry, selection: EluNativeReplaySelection,
+        viewport: CGRect, sourceIdentity: EluSwiftUIReplaySourceIdentity,
+        fence: EluSwiftUIReplayBindingFence, token: UUID) {
+        self.registry = registry; self.selection = selection; self.viewport = viewport
+        self.sourceIdentity = sourceIdentity; self.fence = fence; self.token = token
+    }
+    nonisolated func isCurrent() -> Bool { fence.current(token) && sourceIdentity.isCurrent() }
+    func validate() throws {
+        guard isCurrent(), selection.validateCurrent(), let registry else { throw EluNativeReplayCaptureError.rootChanged }
+        let plan = try registry.plan()
+        guard plan.viewport == viewport, try registry.sourceIdentity() === sourceIdentity else {
+            throw EluNativeReplayCaptureError.rootChanged
+        }
+        try selection.consumeRoot { root in
+            guard plan.window === root.window, let marker = plan.witnesses.first?.marker,
+                  marker.isDescendant(of: root) else { throw EluNativeReplayCaptureError.rootChanged }
+        }
+        guard isCurrent() else { throw EluNativeReplayCaptureError.rootChanged }
+    }
+    func capture(deadline: TimeInterval, clock: () -> TimeInterval) throws -> EluSwiftUIReplayFrame {
+        try validate()
+        guard let registry else { throw EluNativeReplayCaptureError.rootChanged }
+        let frame = try registry.capture(deadline: deadline, clock: clock)
+        do { try validate(); return frame } catch { frame.close(); throw error }
+    }
+}
+
+fileprivate final class EluSwiftUIReplayBindingFence: @unchecked Sendable {
+    private let lock = NSLock()
+    private var generation = UUID()
+    func token() -> UUID { lock.lock(); defer { lock.unlock() }; return generation }
+    func current(_ value: UUID) -> Bool { lock.lock(); defer { lock.unlock() }; return generation == value }
+    func withdraw() { lock.lock(); generation = UUID(); lock.unlock() }
+}
+
+/// Weak UIKit registration changes wake the existing composition. Observers own
+/// neither a root nor a source; removal is part of the original composition close.
+final class EluSwiftUIReplayRegistration: @unchecked Sendable {
+    static let shared = EluSwiftUIReplayRegistration()
+    private let lock = NSLock()
+    private var observers: [UUID: @Sendable () -> Void] = [:]
+    func observe(_ callback: @escaping @Sendable () -> Void) -> UUID {
+        lock.lock(); defer { lock.unlock() }; let id = UUID(); observers[id] = callback; return id
+    }
+    func remove(_ id: UUID) { lock.lock(); observers.removeValue(forKey: id); lock.unlock() }
+    fileprivate func changed() {
+        lock.lock(); let callbacks = Array(observers.values); lock.unlock()
+        for callback in callbacks { callback() }
+    }
+}
+
 @MainActor
 final class EluSwiftUIReplayMarkerView: UIView {
     private(set) var region: String?
@@ -306,12 +438,12 @@ final class EluSwiftUIReplayMarkerView: UIView {
         if window != nil { registry.add(self) }
     }
     func unbind() { registry?.remove(self); registry = nil }
-    override var frame: CGRect { didSet { if oldValue != frame { registry?.geometryChanged() } } }
-    override var bounds: CGRect { didSet { if oldValue != bounds { registry?.geometryChanged() } } }
-    override var center: CGPoint { didSet { if oldValue != center { registry?.geometryChanged() } } }
-    override var transform: CGAffineTransform { didSet { if oldValue != transform { registry?.geometryChanged() } } }
-    override var alpha: CGFloat { didSet { if oldValue != alpha { registry?.geometryChanged() } } }
-    override var isHidden: Bool { didSet { if oldValue != isHidden { registry?.geometryChanged() } } }
+    override var frame: CGRect { didSet { if oldValue != frame { registry?.markerGeometryChanged(self) } } }
+    override var bounds: CGRect { didSet { if oldValue != bounds { registry?.markerGeometryChanged(self) } } }
+    override var center: CGPoint { didSet { if oldValue != center { registry?.markerGeometryChanged(self) } } }
+    override var transform: CGAffineTransform { didSet { if oldValue != transform { registry?.markerGeometryChanged(self) } } }
+    override var alpha: CGFloat { didSet { if oldValue != alpha { registry?.markerGeometryChanged(self) } } }
+    override var isHidden: Bool { didSet { if oldValue != isHidden { registry?.markerGeometryChanged(self) } } }
     override func didMoveToSuperview() {
         super.didMoveToSuperview(); registry?.rootBindingChanged(self); registry?.geometryChanged()
     }
@@ -324,8 +456,12 @@ final class EluSwiftUIReplayMarkerView: UIView {
 
 /// Opaque collector-owned identity, with no UIKit references or caller minting.
 /// Object identity deliberately distinguishes otherwise identical live roots.
-final class EluSwiftUIReplaySourceIdentity: Sendable {
+final class EluSwiftUIReplaySourceIdentity: @unchecked Sendable {
+    private let lock = NSLock()
+    private var current = true
     fileprivate init() {}
+    func isCurrent() -> Bool { lock.lock(); defer { lock.unlock() }; return current }
+    fileprivate func revoke() { lock.lock(); current = false; lock.unlock() }
 }
 
 /// Detached revocation/slot state only; no UIKit reference crosses MainActor.

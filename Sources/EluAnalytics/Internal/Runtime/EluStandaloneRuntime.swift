@@ -148,10 +148,14 @@ actor EluStandaloneRuntime {
     private nonisolated let replayRelay = EluNativeReplayCompositionRelay()
     private var replayComposition: EluNativeReplayComposition?
     private var viewPrivacyObserver: UUID?
+    #if canImport(SwiftUI) && canImport(UIKit)
+    private var declaredRegionObserver: UUID?
+    #endif
     private var closeTask: Task<Void, Never>?
     private(set) var diagnosticsCloseSettlement: EluNativeDiagnosticsCloseSettlement?
     private(set) var nativeReplayCompositionSettlement: EluNativeReplayComposition.CloseOutcome?
     private let nativeContinuousNow: @Sendable () -> UInt64?
+    private let declaredRegionReplaySupported: Bool
     private nonisolated let deliveryFence = EluStandaloneDeliveryFence()
     private nonisolated let performanceMonitor = EluNativePerformanceMonitor()
     private nonisolated let networkGate = EluNetworkObservationGate()
@@ -201,8 +205,10 @@ actor EluStandaloneRuntime {
         configurationGate: EluV2ConfigAuthorityGate?,
         nativeContinuousNow: @escaping @Sendable () -> UInt64?,
         performance: EluPerformanceOptions,
-        diagnostics: EluDiagnosticsOptions
+        diagnostics: EluDiagnosticsOptions,
+        declaredRegionReplaySupported: Bool
     ) {
+        self.declaredRegionReplaySupported = declaredRegionReplaySupported
         self.performanceOptions = performance
         self.diagnosticsOptions = diagnostics
         self.nativeContinuousNow = nativeContinuousNow
@@ -256,6 +262,7 @@ actor EluStandaloneRuntime {
         },
         performance: EluPerformanceOptions = .init(),
         diagnostics: EluDiagnosticsOptions = .init(),
+        declaredRegionReplaySupported: Bool = false,
         personProfiles: EluPersonProfilesMode = .identifiedOnly,
         persistence: EluPersistenceMode = .persistent,
         rateLimiting: EluRateLimitingOptions = .init(),
@@ -324,7 +331,8 @@ actor EluStandaloneRuntime {
             flushDelayNanoseconds: flushDelayNanoseconds,
             configurationGate: configurationGate,
             nativeContinuousNow: { nativeContinuousNanoseconds(continuousClock()) },
-            performance: performance, diagnostics: diagnostics
+            performance: performance, diagnostics: diagnostics,
+            declaredRegionReplaySupported: declaredRegionReplaySupported
         )
     }
 
@@ -336,6 +344,9 @@ actor EluStandaloneRuntime {
         performanceMonitor.invalidate()
         networkGate.invalidate()
         if let viewPrivacyObserver { EluNativeViewPrivacy.shared.removeObserver(viewPrivacyObserver) }
+        #if canImport(SwiftUI) && canImport(UIKit)
+        if let declaredRegionObserver { EluSwiftUIReplayRegistration.shared.remove(declaredRegionObserver) }
+        #endif
         nativeAuthority.invalidateForOwnerDestruction()
         replayRelay.withdraw()
     }
@@ -461,7 +472,8 @@ actor EluStandaloneRuntime {
         let zone = timeZoneIdentifier()
         guard deliveryFence.isCurrent(decision), configurationGate?.isCurrent(source) == true else { return nil }
         let value = try await queue.currentSealedReplayDelivery(source: source,
-            capabilities: capabilities, timeZoneIdentifier: zone)
+            capabilities: capabilities, timeZoneIdentifier: zone,
+            support: declaredRegionReplaySupported ? .includingRaster : .wireframeOnly)
         guard phase != .closed, deliveryFence.isCurrent(decision),
               configurationWitness == source, configurationDocument == source.data,
               configurationGate?.isCurrent(source) == true, value?.isCurrent() == true else { return nil }
@@ -499,9 +511,20 @@ actor EluStandaloneRuntime {
             wallNow: clock, sleep: time.sleep)
         let composition = EluNativeReplayComposition(runtime: self, lifecycle: lifecycle,
             capabilities: capabilities, delivery: delivery, initiallyActive: !deferredUntilActivation,
+            declaredRegionReplaySupported: declaredRegionReplaySupported,
             localControl: replayRelay.localControl)
         replayComposition = composition
         replayRelay.attach(composition)
+        #if canImport(SwiftUI) && canImport(UIKit)
+        if declaredRegionReplaySupported {
+            let authority = nativeAuthority, relay = replayRelay
+            declaredRegionObserver = EluSwiftUIReplayRegistration.shared.observe { [weak authority] in
+                // Original queue projection is synchronously revoked before an
+                // already-enqueued append can validate its final SQL admission.
+                authority?.withdraw(); relay.withdrawCapture(); relay.request()
+            }
+        }
+        #endif
         lifecycle.observeReevaluation { [weak composition] in composition?.requestReevaluation() }
         lifecycle.observePrivacyChange { [weak self] in self?.nativePrivacyContextChanged() }
         composition.requestReevaluation()
@@ -521,6 +544,35 @@ actor EluStandaloneRuntime {
         return EluNativeReplayCaptureOwner(queue: queue, authority: nativeAuthority,
             prepared: prepared, selection: selection, versions: versions, wallClock: clock,
             continuousNanoseconds: nativeContinuousNow, mayCollect: mayCollect, onCommitted: onCommitted)
+    }
+    #endif
+
+    #if canImport(SwiftUI) && canImport(UIKit)
+    func prepareNativeRaster(sourceIdentity: EluSwiftUIReplaySourceIdentity) async throws -> EluNativeRasterPreparedAuthority {
+        guard declaredRegionReplaySupported, phase != .closed, let source = configurationWitness,
+              configurationDocument == source.data, configurationGate?.isCurrent(source) == true else {
+            throw EluNativeReplayAuthorityError.unavailable
+        }
+        let value = try await nativeAuthority.prepareRaster(source: source, sourceIdentity: sourceIdentity,
+            timeZoneIdentifier: timeZoneIdentifier())
+        guard phase != .closed, configurationWitness == source, configurationDocument == source.data,
+              configurationGate?.isCurrent(source) == true, value.isCurrent() else {
+            nativeAuthority.withdraw(); throw EluNativeReplayAuthorityError.stale
+        }
+        return value
+    }
+
+    func makeNativeRasterCapture(prepared: EluNativeRasterPreparedAuthority,
+        selection: EluNativeReplaySelection, binding: EluSwiftUIReplayBinding,
+        mayCollect: @escaping @Sendable () -> Bool = { true },
+        onCommitted: @escaping @Sendable () -> Void) -> EluNativeReplayCaptureOwner? {
+        guard declaredRegionReplaySupported, phase != .closed, nativeAuthority.ownsPrepared(prepared),
+              prepared.isCurrent(), selection.isCurrent(), binding.isCurrent(),
+              prepared.sourceIdentity === binding.sourceIdentity else { return nil }
+        return EluNativeReplayCaptureOwner(queue: queue, authority: nativeAuthority,
+            raster: prepared, selection: selection, binding: binding, versions: versions,
+            wallClock: clock, continuousNanoseconds: nativeContinuousNow,
+            mayCollect: mayCollect, onCommitted: onCommitted)
     }
     #endif
 
@@ -1087,6 +1139,12 @@ actor EluStandaloneRuntime {
         nativeAuthority.withdraw()
         replayRelay.withdraw()
         phase = .closed
+        #if canImport(SwiftUI) && canImport(UIKit)
+        if let declaredRegionObserver {
+            EluSwiftUIReplayRegistration.shared.remove(declaredRegionObserver)
+            self.declaredRegionObserver = nil
+        }
+        #endif
         diagnosticsGate.close(); diagnosticsMonitor.stop()
         networkGate.invalidate()
         performanceMonitor.invalidate()

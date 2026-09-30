@@ -19,6 +19,41 @@ SPEC.loader.exec_module(MODULE)
 
 
 class FeatureFlagBoundaryScannerTests(unittest.TestCase):
+    def test_raster_original_runtime_selection_and_physical_joins_remain_closed(self) -> None:
+        checks = {
+            MODULE.STACK_SOURCE: ["configurationFormat: EluV2ConfigRequest.Format = .v2",
+                "declaredRegionReplaySupported: Bool = false", "format: configurationFormat"],
+            MODULE.NATIVE_RUNTIME_SOURCE: ["declaredRegionReplaySupported: Bool = false",
+                "support: declaredRegionReplaySupported ? .includingRaster : .wireframeOnly",
+                "prepared.sourceIdentity === binding.sourceIdentity",
+                "authority?.withdraw(); relay.withdrawCapture(); relay.request()"],
+            MODULE.NATIVE_COMPOSITION_SOURCE: ["declaredSelection.sameRoot(as: selected)",
+                "blockedRaster.sameCaptureContext(as: value)", "retainEpochRefusal(outcome)",
+                "EluSwiftUIReplayRegistry.discover(in: selected)"],
+            MODULE.SWIFTUI_COLLECTOR_SOURCE: ["weak var host: UIView?", "weak var window: UIWindow?",
+                "Self.installed.count < 64", "Self.discoveryClosed = true",
+                "$0.value == nil && ($0.host == nil || $0.window == nil)",
+                "matches.allSatisfy({ $0.value != nil })", "originalSource?.revoke()", "bindingFence.withdraw()"],
+            MODULE.NATIVE_CAPTURE_SOURCE: ["authority.startRaster(prepared, selection: selection, physicalUse: physical)",
+                "sourceIdentity: binding.sourceIdentity", "sourceIsCurrent:",
+                "captured.2 - beginning >= minimum", "try await commit(retained)",
+                "queue.appendNativeRaster(request, admission: admission, physicalUse: physical)",
+                "EluRuntimeQueueError.nativeRasterEpochBlocked", "first = nil; fence.withdraw()"],
+        }
+        for relative, tokens in checks.items():
+            path = pathlib.Path(relative); source = (ROOT / path).read_text()
+            self.assertEqual([], MODULE.scan_replay_storage_source(path, source), relative)
+            for token in tokens:
+                self.assertIn(token, source)
+                self.assertTrue(MODULE.scan_replay_storage_source(path, source.replace(token, "removed_original_join")), token)
+        for relative in [MODULE.NATIVE_RUNTIME_SOURCE, MODULE.NATIVE_COMPOSITION_SOURCE]:
+            for extra in ["EluSwiftUIReplayFrame", "EluNativeRasterPermit", "EluNativeRasterSealer()",
+                          "appendNativeRaster()", "EluNativeRasterStoredRequest"]:
+                self.assertTrue(MODULE.scan_replay_storage_source(pathlib.Path(relative), extra), (relative, extra))
+        for relative in [MODULE.STACK_SOURCE, "Sources/EluAnalytics/Elu.swift", "Sources/EluAnalytics/Internal/Replay/Other.swift"]:
+            for extra in ["EluSwiftUIReplayRegistry", "EluSwiftUIReplayBinding", "EluSwiftUIReplayRegistration"]:
+                self.assertTrue(MODULE.scan_replay_storage_source(pathlib.Path(relative), extra), (relative, extra))
+
     def test_source_denial_is_original_bounded_and_durably_settled(self) -> None:
         checks = {
             MODULE.NATIVE_V3_SOURCE_PATH: ["fileprivate init(issuedAt:", "latest.map({ $0.issuedAt < issuedAt }) ?? true",
@@ -366,7 +401,10 @@ class FeatureFlagBoundaryScannerTests(unittest.TestCase):
                      "Sources/EluAnalytics/Elu.swift", "Sources/EluAnalytics/Internal/Replay/Other.swift"]:
             for token in ["EluStoredReplayRecord", "EluNativeRasterStoredRequest", "EluNativeRasterSourceLedger",
                           "EluNativeRasterPermit", "EluNativeRasterCaptureAdmission"]:
-                self.assertTrue(MODULE.scan_replay_storage_source(pathlib.Path(path), token), (path, token))
+                if path == MODULE.NATIVE_CAPTURE_SOURCE and token in {"EluNativeRasterPermit", "EluNativeRasterCaptureAdmission"}:
+                    self.assertEqual([], MODULE.scan_replay_storage_source(pathlib.Path(path), token))
+                else:
+                    self.assertTrue(MODULE.scan_replay_storage_source(pathlib.Path(path), token), (path, token))
             self.assertTrue(MODULE.scan_native_v3_source(pathlib.Path(path), "source.nativeV3"))
 
     def test_raster_delivery_only_extends_original_dispatch_and_keeps_default_dormant(self) -> None:

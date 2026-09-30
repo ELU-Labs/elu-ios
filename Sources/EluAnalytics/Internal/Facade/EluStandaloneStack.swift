@@ -28,6 +28,8 @@ final class EluStandaloneStack: @unchecked Sendable {
         configHost: URL,
         endpointPolicy: EluEndpointPolicy = .cloud,
         configTransport: (any EluV2ConfigTransport)? = nil,
+        configurationFormat: EluV2ConfigRequest.Format = .v2,
+        declaredRegionReplaySupported: Bool = false,
         eventTransport: (any EluV1AuthorizedBatchTransport)? = nil,
         flagTransport: (any EluV1AuthorizedFlagTransport)? = nil,
         clock: EluV2ConfigClock = .live,
@@ -42,7 +44,7 @@ final class EluStandaloneStack: @unchecked Sendable {
     ) async throws -> EluStandaloneStack {
         let relay = EluStandaloneConfigRelay()
         let lifecycle = try EluV2ConfigLifecycle(siteKey: siteKey, configHost: configHost, endpointPolicy: endpointPolicy,
-            transport: configTransport, clock: clock, scheduler: scheduler,
+            format: configurationFormat, transport: configTransport, clock: clock, scheduler: scheduler,
             onChange: { relay.publish($0) }, onUnchangedRefresh: { relay.refresh($0) })
         _ = lifecycle.authorityGate.suspend()
         let runtime = try await EluStandaloneRuntime.make(rootDirectoryURL: rootDirectoryURL,
@@ -54,7 +56,8 @@ final class EluStandaloneStack: @unchecked Sendable {
             time: EluV1BatchTimeSource(wallNow: clock.wallNow,
                 monotonicNow: { clock.floorNanoseconds(clock.continuousNow()) ?? UInt64.max },
                 sleep: { try await Task.sleep(nanoseconds: $0) }),
-            timeZoneIdentifier: timeZoneIdentifier, performance: performance, diagnostics: diagnostics, personProfiles: personProfiles, persistence: persistence, rateLimiting: rateLimiting)
+            timeZoneIdentifier: timeZoneIdentifier, performance: performance, diagnostics: diagnostics,
+            declaredRegionReplaySupported: declaredRegionReplaySupported, personProfiles: personProfiles, persistence: persistence, rateLimiting: rateLimiting)
         do {
             let selectedFlags = try flagTransport ?? EluV1URLSessionFlagTransport(siteKey: siteKey, endpointPolicy: endpointPolicy)
             let flags = try await runtime.flagClient(transport: selectedFlags)
