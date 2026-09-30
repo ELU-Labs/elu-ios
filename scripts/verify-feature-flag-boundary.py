@@ -390,6 +390,61 @@ def scan_outside_source(path: pathlib.Path, text: str) -> list[str]:
     return errors
 
 
+NATIVE_V3_SOURCE_PATH = "Sources/EluAnalytics/Internal/Config/EluV2ConfigSource.swift"
+NATIVE_V3_GATE_PATH = "Sources/EluAnalytics/Internal/Config/EluV2ConfigAuthorityGate.swift"
+NATIVE_V3_LIFECYCLE_PATH = "Sources/EluAnalytics/Internal/Config/EluV2ConfigLifecycle.swift"
+NATIVE_V3_PARSER_PATH = "Sources/EluAnalytics/Internal/Config/EluNativeV3ConfigParser.swift"
+
+
+def scan_native_v3_source(path: pathlib.Path, text: str) -> list[str]:
+    exact = path.as_posix()
+    owners = {NATIVE_V3_SOURCE_PATH, NATIVE_V3_GATE_PATH, NATIVE_V3_LIFECYCLE_PATH}
+    errors: list[str] = []
+    if "EluNativeV3ConfigParser" in text and exact not in owners | {NATIVE_V3_PARSER_PATH}:
+        errors.append(f"{path} references native v3 outside its original configuration owner")
+    if re.search(r"\.nativeV3\b", text) and exact not in owners:
+        errors.append(f"{path} activates or consumes dormant native v3 outside its original owner")
+    required = {
+        NATIVE_V3_SOURCE_PATH: [
+            "enum Format: Equatable, Sendable { case v2, nativeV3 }", "format: Format = .v2",
+            "format: EluV2ConfigRequest.Format = .v2", 'format == .v2 ? "v2" : "v3"',
+            "let task = Task { try await transport.fetch(request) }",
+            "EluNativeV3ConfigParser.parse(data, endpointPolicy: endpointPolicy)",
+            "nativeV3 = parsed; baseData = parsed.configV2Data; document = parsed.base",
+            "previous.canonicalData == nativeV3.canonicalData", "!previous.conflicted",
+            "previous.conflicted = true; envelopeBoundary = previous",
+            "document.issuedAt < previous.issuedAt", "document.issuedAt == previous.issuedAt",
+            "manager.update(configData: baseData, now: sample.wall)",
+            "continuousDeadline: boundedDeadline, nativeV3: nativeV3)", "return .document(baseData)",
+        ],
+        NATIVE_V3_GATE_PATH: [
+            "$0.configV2Data == lease.data && $0.base.expiresAt == lease.expiresAt",
+            "retainedLease.receiptData == lease.receiptData", "nativeV3: lease.nativeV3",
+            "nativeV3: pinned.nativeV3", "lhs.nativeV3?.data == rhs.nativeV3?.data",
+        ],
+        NATIVE_V3_LIFECYCLE_PATH: [
+            "format: EluV2ConfigRequest.Format = .v2", "format: format, transport: transport",
+            "state == .document(lease.data) && publishedLease?.receiptData == lease.receiptData",
+            "publish(.document(lease.data), receiptChanged: !unchanged)", "next != state || receiptChanged",
+        ],
+    }
+    if exact in required and any(token not in text for token in required[exact]):
+        errors.append(f"{path} lost original native-v3 bytes, conflict, lease or default-selection binding")
+    if exact == NATIVE_V3_SOURCE_PATH:
+        if text.count("transport.fetch(request)") != 1 or text.count("manager = EluV1ConfigManager(") != 1:
+            errors.append(f"{path} adds a native-v3 fallback fetch or independent manager")
+        if "envelopeBoundary = nil" in text:
+            errors.append(f"{path} discards the native-v3 conflict/ordering boundary")
+    if exact == NATIVE_V3_LIFECYCLE_PATH:
+        comparison = text.find("let unchanged = state == .document(lease.data)")
+        if not (0 <= comparison < text.find("publishedLease = lease", comparison)):
+            errors.append(f"{path} replaces the original receipt before comparing publication identity")
+    if exact in owners and re.search(r"\b(?:EluSQLiteRuntimeQueue|EluNativeRasterSealer|EluNativeReplayAuthority|"
+                                     r"URLSession|URLRequest)\b", text):
+        errors.append(f"{path} adds queue, channel authority, raster capture or platform networking")
+    return errors
+
+
 def verify(root: pathlib.Path = ROOT) -> list[str]:
     errors: list[str] = []
     for relative, expected in PINNED.items():
@@ -415,6 +470,7 @@ def verify(root: pathlib.Path = ROOT) -> list[str]:
         if any(re.search(rf"\b{symbol}\b", text) for symbol in RETIRED_STARTUP_SYMBOLS):
             errors.append(f"{path.relative_to(root)} restores a retired preview import surface")
         errors.extend(scan_replay_storage_source(path.relative_to(root), text))
+        errors.extend(scan_native_v3_source(path.relative_to(root), text))
     replay_activation = {
         path.relative_to(root).as_posix(): path.read_text(encoding="utf-8").count("ensureReplaySchema")
         for path in source_root.rglob("*.swift") if "ensureReplaySchema" in path.read_text(encoding="utf-8")

@@ -3,6 +3,57 @@ import XCTest
 @testable import EluAnalytics
 
 final class EluV2ConfigAuthorityGateTests: XCTestCase {
+    func testNativeV3ReceiptIsBoundToOriginalGateExactBaseAndOriginalLease() throws {
+        let clock = GateClock(), parsed = try nativeReceipt()
+        let first = EluV2ConfigAuthorityGate(siteKey: "site", clock: clock.source)
+        let other = EluV2ConfigAuthorityGate(siteKey: "site", clock: clock.source)
+        let token = EluV2ConfigLifecycleToken()
+        let lease = EluV2ConfigLease(data: parsed.configV2Data, expiresAt: parsed.base.expiresAt,
+                                   continuousDeadline: 10, nativeV3: parsed)
+        first.publish(token: token, lease: lease); other.publish(token: token, lease: lease)
+        let original = try XCTUnwrap(first.witness(for: token))
+        XCTAssertEqual(original.nativeV3?.data, parsed.data)
+        XCTAssertTrue(first.isCurrent(original, data: parsed.configV2Data))
+        XCTAssertFalse(first.isCurrent(original, data: parsed.data))
+        XCTAssertFalse(other.isCurrent(original, data: parsed.configV2Data))
+        first.publish(token: EluV2ConfigLifecycleToken(), lease: nil)
+        let nextToken = EluV2ConfigLifecycleToken()
+        first.publish(token: nextToken, lease: EluV2ConfigLease(data: parsed.configV2Data,
+            expiresAt: parsed.base.expiresAt, continuousDeadline: 100, nativeV3: parsed))
+        let next = try XCTUnwrap(first.witness(for: nextToken))
+        XCTAssertEqual(next.continuousDeadline, 10)
+        XCTAssertFalse(first.isCurrent(original))
+        clock.set(continuous: 10); XCTAssertFalse(first.isCurrent(next))
+    }
+
+    func testNativeV3ReceiptCannotBePairedWithForeignBaseOrExpiry() throws {
+        let clock = GateClock(), parsed = try nativeReceipt()
+        let gate = EluV2ConfigAuthorityGate(siteKey: "site", clock: clock.source)
+        for (data, expiry) in [(Data("other".utf8), parsed.base.expiresAt),
+                              (parsed.configV2Data, try EluV1Timestamp("2026-08-05T00:06:00Z"))] {
+            let token = EluV2ConfigLifecycleToken()
+            gate.publish(token: token, lease: EluV2ConfigLease(data: data, expiresAt: expiry,
+                continuousDeadline: 100, nativeV3: parsed))
+            XCTAssertNil(gate.witness(for: token))
+        }
+        let token = EluV2ConfigLifecycleToken()
+        let lease = EluV2ConfigLease(data: parsed.configV2Data, expiresAt: parsed.base.expiresAt,
+            continuousDeadline: 100, nativeV3: parsed)
+        gate.publish(token: token, lease: lease)
+        let original = try XCTUnwrap(gate.witness(for: token))
+        _ = gate.suspend(); XCTAssertFalse(gate.isCurrent(original))
+        gate.close(); gate.publish(token: token, lease: lease)
+        XCTAssertNil(gate.witness(for: token))
+    }
+
+    private func nativeReceipt() throws -> EluNativeV3ConfigParser.Parsed {
+        let data = Data("""
+        {"schemaVersion":2,"revision":"closed","issuedAt":"2026-08-05T00:00:00Z",\
+        "expiresAt":"2026-08-05T00:05:00Z","status":"disabled","reason":"fixture"}
+        """.utf8)
+        return try EluNativeV3ConfigParser.parse(nativeV3SourceEnvelope(data))
+    }
+
     func testWitnessBindsOriginatingGateTokenAndExactDocument() throws {
         let clock = GateClock()
         let first = EluV2ConfigAuthorityGate(siteKey: "site-a", clock: clock.source)

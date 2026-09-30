@@ -18,11 +18,15 @@ enum EluV2ConfigSourceError: Error, Equatable {
 }
 
 struct EluV2ConfigRequest: Sendable {
+    /// Immutable selection on the original fetch owner. There is no version fallback.
+    enum Format: Equatable, Sendable { case v2, nativeV3 }
     let url: URL
+    let format: Format
     static let maximumResponseBytes = 65_536
     static let timeoutSeconds: TimeInterval = 10
 
-    init(siteKey: String, configHost: URL, endpointPolicy: EluEndpointPolicy = .cloud) throws {
+    init(siteKey: String, configHost: URL, endpointPolicy: EluEndpointPolicy = .cloud,
+         format: Format = .v2) throws {
         // Matches the public config service boundary. Do not trim or rewrite a
         // credential, and never permit it to become URL syntax.
         guard siteKey.range(
@@ -35,9 +39,11 @@ struct EluV2ConfigRequest: Sendable {
         guard var components = URLComponents(url: origin, resolvingAgainstBaseURL: false) else {
             throw EluV2ConfigSourceError.untrustedConfigHost
         }
-        components.percentEncodedPath += "/sdk/v2/\(siteKey)/config"
+        let version = format == .v2 ? "v2" : "v3"
+        components.percentEncodedPath += "/sdk/\(version)/\(siteKey)/config"
         guard let requestURL = components.url else { throw EluV2ConfigSourceError.untrustedConfigHost }
         url = requestURL
+        self.format = format
     }
 }
 
@@ -47,9 +53,24 @@ protocol EluV2ConfigTransport: Sendable {
 }
 
 struct EluV2ConfigLease: Equatable, Sendable {
+    /// Existing channel owners still receive the exact original embedded v2 value.
     let data: Data
     let expiresAt: EluV1Timestamp
     let continuousDeadline: UInt64
+    /// The same original receipt and lease, not a second authority or renewed grant.
+    let nativeV3: EluNativeV3ConfigParser.Parsed?
+    var receiptData: Data { nativeV3?.data ?? data }
+
+    init(data: Data, expiresAt: EluV1Timestamp, continuousDeadline: UInt64,
+         nativeV3: EluNativeV3ConfigParser.Parsed? = nil) {
+        self.data = data; self.expiresAt = expiresAt
+        self.continuousDeadline = continuousDeadline; self.nativeV3 = nativeV3
+    }
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.data == rhs.data && lhs.receiptData == rhs.receiptData
+            && lhs.expiresAt == rhs.expiresAt && lhs.continuousDeadline == rhs.continuousDeadline
+    }
 }
 
 struct EluV2ConfigClock: Sendable {
@@ -102,6 +123,13 @@ actor EluV2ConfigSource {
     private let transport: any EluV2ConfigTransport
     private let clock: EluV2ConfigClock
     private let manager: EluV1ConfigManager
+    private let endpointPolicy: EluEndpointPolicy
+    private struct EnvelopeBoundary {
+        let issuedAt: EluV1Timestamp
+        let canonicalData: Data
+        var conflicted = false
+    }
+    private var envelopeBoundary: EnvelopeBoundary?
     private var lease: EluV2ConfigLease?
     private var acceptedIssuedAt: EluV1Timestamp?
     private var acceptedDeadline: UInt64?
@@ -116,13 +144,15 @@ actor EluV2ConfigSource {
         siteKey: String,
         configHost: URL = URL(string: "https://elu.dev")!,
         endpointPolicy: EluEndpointPolicy = .cloud,
+        format: EluV2ConfigRequest.Format = .v2,
         transport: (any EluV2ConfigTransport)? = nil,
         clock: EluV2ConfigClock = .live
     ) throws {
-        request = try EluV2ConfigRequest(siteKey: siteKey, configHost: configHost, endpointPolicy: endpointPolicy)
+        request = try EluV2ConfigRequest(siteKey: siteKey, configHost: configHost, endpointPolicy: endpointPolicy, format: format)
         manager = EluV1ConfigManager(endpointPolicy: endpointPolicy, readbackProvenReplayTransports: EluStandaloneRuntime.readbackProvenReplayCapabilities.transports)
         self.transport = transport ?? EluV2URLSessionConfigTransport(expectedRequestURL: request.url)
         self.clock = clock
+        self.endpointPolicy = endpointPolicy
     }
 
     func currentDocument() -> Data? {
@@ -170,17 +200,43 @@ actor EluV2ConfigSource {
             guard data.count <= EluV2ConfigRequest.maximumResponseBytes else {
                 throw EluV2ConfigSourceError.responseTooLarge
             }
-            let strict = try EluV1StrictCanonicalJSON.parse(data)
-            let document = try JSONDecoder().decode(
-                EluV1ConfigDocument.self, from: strict.canonicalData
-            )
+            let nativeV3: EluNativeV3ConfigParser.Parsed?
+            let baseData: Data
+            let document: EluV1ConfigDocument
+            switch request.format {
+            case .v2:
+                nativeV3 = nil; baseData = data
+                let strict = try EluV1StrictCanonicalJSON.parse(data)
+                document = try JSONDecoder().decode(EluV1ConfigDocument.self, from: strict.canonicalData)
+            case .nativeV3:
+                let parsed = try EluNativeV3ConfigParser.parse(data, endpointPolicy: endpointPolicy)
+                nativeV3 = parsed; baseData = parsed.configV2Data; document = parsed.base
+            }
             guard document.schemaVersion == EluV1ConfigDocument.v2SchemaVersion,
                   Self.validWindow(document, now: sample.wall)
             else { throw EluV2ConfigSourceError.invalidLease }
 
+            // The base manager alone cannot see a changed optional raster branch.
+            // Retain that complete-wrapper boundary in this same source, including
+            // across withdrawal/failure, and never restore a conflicted issuance.
+            if let nativeV3 {
+                if let previous = envelopeBoundary, document.issuedAt < previous.issuedAt {
+                    return currentDocument().map(EluV2ConfigRefreshResult.document) ?? .unavailable
+                }
+                if var previous = envelopeBoundary, document.issuedAt == previous.issuedAt {
+                    guard !previous.conflicted, previous.canonicalData == nativeV3.canonicalData else {
+                        previous.conflicted = true; envelopeBoundary = previous
+                        throw EluV2ConfigSourceError.invalidLease
+                    }
+                } else {
+                    envelopeBoundary = EnvelopeBoundary(issuedAt: document.issuedAt,
+                                                        canonicalData: nativeV3.canonicalData)
+                }
+            }
+
             // Update before testing remaining life: a validated expired/revoked
             // document still establishes a boundary against older responses.
-            let update = try manager.update(configData: data, now: sample.wall)
+            let update = try manager.update(configData: baseData, now: sample.wall)
             if case .stale = update {
                 return currentDocument().map(EluV2ConfigRefreshResult.document) ?? .unavailable
             }
@@ -208,8 +264,9 @@ actor EluV2ConfigSource {
             guard sample.continuous < boundedDeadline else {
                 throw EluV2ConfigSourceError.invalidLease
             }
-            lease = EluV2ConfigLease(data: data, expiresAt: document.expiresAt, continuousDeadline: boundedDeadline)
-            return .document(data)
+            lease = EluV2ConfigLease(data: baseData, expiresAt: document.expiresAt,
+                                    continuousDeadline: boundedDeadline, nativeV3: nativeV3)
+            return .document(baseData)
         } catch {
             guard !closed, attempt == token else { return .superseded }
             pending = nil

@@ -317,6 +317,78 @@ final class EluV2ConfigLifecycleTests: XCTestCase {
         await transport.finishAll()
     }
 
+    func testNativeV3EquivalentOuterBytesRepublishOriginalGateWithoutExtendingLease() async throws {
+        let h = try Harness(format: .nativeV3)
+        let base = try fixture(), first = nativeV3SourceEnvelope(base)
+        try await h.install(first, expectedBase: base)
+        let token = try XCTUnwrap(h.notifications.last)
+        let witness = try XCTUnwrap(h.driver.authorityGate.witness(for: token))
+        XCTAssertEqual(witness.data, base); XCTAssertEqual(witness.nativeV3?.data, first)
+        let second = Data(" \n".utf8) + first
+        let count = h.notifications.value.count
+        h.clock.advance(seconds: 10, wall: false)
+        await h.driver.refresh(); try await h.waitForRequests(2)
+        await h.transport.resolve(1, data: second)
+        try await h.waitForNotifications(count + 1)
+        let currentToken = try XCTUnwrap(h.notifications.last)
+        let current = try XCTUnwrap(h.driver.authorityGate.witness(for: currentToken))
+        XCTAssertNotEqual(currentToken, token)
+        XCTAssertFalse(h.driver.authorityGate.isCurrent(witness))
+        XCTAssertEqual(current.nativeV3?.data, second)
+        XCTAssertEqual(current.data, base)
+        XCTAssertEqual(current.continuousDeadline, witness.continuousDeadline)
+        XCTAssertEqual(h.unchangedRefreshes.value, [])
+        await h.driver.refresh(); try await h.waitForRequests(3)
+        await h.transport.resolve(2, data: second)
+        try await h.waitForUnchangedRefreshes(1)
+        XCTAssertEqual(h.notifications.last, currentToken)
+        XCTAssertEqual(h.unchangedRefreshes.value, [currentToken])
+        await h.stop()
+    }
+
+    func testNativeV3NewerBranchRemovalWithdrawsOnlyItsPresenceOnSameOriginalGate() async throws {
+        let h = try Harness(format: .nativeV3)
+        let positive = try nativeV3SourceRasterFixture(base: fixture())
+        let parsed = try EluNativeV3ConfigParser.parse(positive)
+        try await h.install(positive, expectedBase: parsed.configV2Data)
+        let old = try XCTUnwrap(h.driver.authorityGate.witness(for: XCTUnwrap(h.notifications.last)))
+        XCTAssertNotNil(old.nativeV3?.raster)
+        let base = try fixture { $0["issuedAt"] = "2026-08-05T00:01:00.000Z" }
+        let removed = nativeV3SourceEnvelope(base)
+        await h.driver.refresh(); try await h.waitForRequests(2)
+        await h.transport.resolve(1, data: removed)
+        try await h.waitForState(.document(base))
+        let current = try XCTUnwrap(h.driver.authorityGate.witness(for: XCTUnwrap(h.notifications.last)))
+        XCTAssertNil(current.nativeV3?.raster)
+        XCTAssertEqual(current.nativeV3?.data, removed)
+        XCTAssertTrue(h.driver.authorityGate.isCurrent(current, data: base))
+        XCTAssertFalse(h.driver.authorityGate.isCurrent(current, data: removed))
+        XCTAssertFalse(h.driver.authorityGate.isCurrent(old))
+        await h.driver.setForeground(false)
+        XCTAssertFalse(h.driver.authorityGate.isCurrent(current))
+        await h.stop()
+    }
+
+    func testNativeV3OriginalPhysicalFetchMustFinishBeforeForegroundReplacement() async throws {
+        let h = try Harness(format: .nativeV3)
+        let base = try fixture(), envelope = nativeV3SourceEnvelope(base)
+        try await h.install(envelope, expectedBase: base)
+        let original = try XCTUnwrap(h.driver.authorityGate.witness(for: XCTUnwrap(h.notifications.last)))
+        await h.driver.refresh(); try await h.waitForRequests(2)
+        await h.driver.setForeground(false)
+        await h.driver.setForeground(true)
+        assertEqual(await h.transport.count, 2)
+        XCTAssertFalse(h.driver.authorityGate.isCurrent(original))
+        await h.transport.resolve(1, data: envelope)
+        try await h.waitForRequests(3)
+        assertEqual(await h.state(), .unavailable(.loading))
+        await h.driver.close()
+        await h.transport.resolve(2, data: envelope)
+        assertEqual(await h.state(), .unavailable(.closed))
+        XCTAssertNil(h.driver.authorityGate.witness(for: try XCTUnwrap(h.notifications.last)))
+        await h.stop()
+    }
+
     private func fixture(_ edit: (inout [String: Any]) -> Void = { _ in }) throws -> Data {
         let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
             .deletingLastPathComponent().deletingLastPathComponent()
@@ -343,20 +415,20 @@ private struct Harness {
     let notifications = LifecycleBox<[EluV2ConfigLifecycleToken]>([])
     let unchangedRefreshes = LifecycleBox<[EluV2ConfigLifecycleToken]>([])
 
-    init() throws {
+    init(format: EluV2ConfigRequest.Format = .v2) throws {
         let notifications = notifications, unchangedRefreshes = unchangedRefreshes
         driver = try EluV2ConfigLifecycle(
             siteKey: "elu_pk_live_" + String(repeating: "a", count: 22),
-            transport: transport, clock: clock.value, scheduler: scheduler,
+            format: format, transport: transport, clock: clock.value, scheduler: scheduler,
             onChange: { token in notifications.mutate { $0.append(token) } },
             onUnchangedRefresh: { token in unchangedRefreshes.mutate { $0.append(token) } }
         )
     }
-    func install(_ data: Data) async throws {
+    func install(_ data: Data, expectedBase: Data? = nil) async throws {
         await driver.start()
         try await waitForRequests(1)
         await transport.resolve(0, data: data)
-        try await waitForState(.document(data))
+        try await waitForState(.document(expectedBase ?? data))
     }
     func state() async -> EluV2ConfigLifecycleState? {
         for _ in 0 ..< 3 {
@@ -376,6 +448,12 @@ private struct Harness {
     }
     func waitForTimer(_ delay: UInt64) async throws {
         try await eventually { scheduler.delays.contains(delay) }
+    }
+    func waitForNotifications(_ count: Int) async throws {
+        try await eventually { notifications.value.count >= count }
+    }
+    func waitForUnchangedRefreshes(_ count: Int) async throws {
+        try await eventually { unchangedRefreshes.value.count >= count }
     }
     func stop() async {
         await driver.close()

@@ -62,13 +62,14 @@ actor EluV2ConfigLifecycle {
         siteKey: String,
         configHost: URL = URL(string: "https://elu.dev")!,
         endpointPolicy: EluEndpointPolicy = .cloud,
+        format: EluV2ConfigRequest.Format = .v2,
         transport: (any EluV2ConfigTransport)? = nil,
         clock: EluV2ConfigClock = .live,
         scheduler: any EluV2ConfigLifecycleScheduler = EluV2TaskConfigScheduler(),
         onChange: @escaping @Sendable (EluV2ConfigLifecycleToken) -> Void,
         onUnchangedRefresh: @escaping @Sendable (EluV2ConfigLifecycleToken) -> Void = { _ in }
     ) throws {
-        source = try EluV2ConfigSource(siteKey: siteKey, configHost: configHost, endpointPolicy: endpointPolicy, transport: transport, clock: clock)
+        source = try EluV2ConfigSource(siteKey: siteKey, configHost: configHost, endpointPolicy: endpointPolicy, format: format, transport: transport, clock: clock)
         authorityGate = EluV2ConfigAuthorityGate(siteKey: siteKey, clock: clock)
         self.clock = clock
         self.scheduler = scheduler
@@ -170,9 +171,9 @@ actor EluV2ConfigLifecycle {
         activeFetch = nil
         if let lease, let remaining = remainingNanoseconds(lease), remaining > 0 {
             failures = 0
+            let unchanged = state == .document(lease.data) && publishedLease?.receiptData == lease.receiptData
             publishedLease = lease
-            let unchanged = state == .document(lease.data)
-            publish(.document(lease.data))
+            publish(.document(lease.data), receiptChanged: !unchanged)
             // A successful endpoint response also renews flag evaluation. Do not
             // mint a new source token or extend the original lease for equal bytes.
             if unchanged { onUnchangedRefresh(token) }
@@ -292,8 +293,8 @@ actor EluV2ConfigLifecycle {
     private func cancelExpiryTimer() { expiryTimer?.1.cancel(); expiryTimer = nil }
     private func cancelRefreshTimer() { refreshTimer?.1.cancel(); refreshTimer = nil }
 
-    private func publish(_ next: EluV2ConfigLifecycleState) {
-        guard next != state else { return }
+    private func publish(_ next: EluV2ConfigLifecycleState, receiptChanged: Bool = false) {
+        guard next != state || receiptChanged else { return }
         state = next
         token = EluV2ConfigLifecycleToken()
         authorityGate.publish(token: token, lease: publishedLease)

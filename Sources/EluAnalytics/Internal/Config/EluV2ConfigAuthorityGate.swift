@@ -8,6 +8,13 @@ struct EluV2ConfigAuthorityWitness: Equatable, Sendable {
     let data: Data
     let expiresAt: EluV1Timestamp
     let continuousDeadline: UInt64
+    let nativeV3: EluNativeV3ConfigParser.Parsed?
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.gateID == rhs.gateID && lhs.token == rhs.token && lhs.data == rhs.data
+            && lhs.expiresAt == rhs.expiresAt && lhs.continuousDeadline == rhs.continuousDeadline
+            && lhs.nativeV3?.data == rhs.nativeV3?.data
+    }
 }
 
 /// Synchronous source fence shared by the lifecycle actor and final channel owners.
@@ -38,16 +45,22 @@ final class EluV2ConfigAuthorityGate: @unchecked Sendable {
         defer { lock.unlock() }
         guard !closed, !clockFailed, suspension == nil else { witness = nil; return }
         if let lease {
+            // A v3 witness must carry the original parser-owned receipt for this
+            // exact embedded base, never a policy paired with unrelated bytes.
+            guard lease.nativeV3.map({ $0.configV2Data == lease.data && $0.base.expiresAt == lease.expiresAt }) ?? true else {
+                witness = nil; return
+            }
             let pinned: EluV2ConfigLease
-            if let retainedLease, retainedLease.data == lease.data {
+            if let retainedLease, retainedLease.receiptData == lease.receiptData {
                 pinned = EluV2ConfigLease(data: lease.data, expiresAt: retainedLease.expiresAt,
-                    continuousDeadline: min(retainedLease.continuousDeadline, lease.continuousDeadline))
+                    continuousDeadline: min(retainedLease.continuousDeadline, lease.continuousDeadline),
+                    nativeV3: lease.nativeV3)
             } else {
                 pinned = lease
             }
             retainedLease = pinned
             witness = EluV2ConfigAuthorityWitness(gateID: id, token: token, data: pinned.data,
-                expiresAt: pinned.expiresAt, continuousDeadline: pinned.continuousDeadline)
+                expiresAt: pinned.expiresAt, continuousDeadline: pinned.continuousDeadline, nativeV3: pinned.nativeV3)
         } else {
             witness = nil
         }

@@ -19,6 +19,43 @@ SPEC.loader.exec_module(MODULE)
 
 
 class FeatureFlagBoundaryScannerTests(unittest.TestCase):
+    def test_native_v3_original_owner_preserves_whole_receipt_and_base_bytes(self) -> None:
+        source_path = pathlib.Path(MODULE.NATIVE_V3_SOURCE_PATH)
+        source = (ROOT / source_path).read_text()
+        self.assertEqual([], MODULE.scan_native_v3_source(source_path, source))
+        for old, new in [
+            ("format: Format = .v2", "format: Format = .nativeV3"),
+            ("format: EluV2ConfigRequest.Format = .v2", "format: EluV2ConfigRequest.Format = .nativeV3"),
+            ("baseData = parsed.configV2Data", "baseData = parsed.canonicalData"),
+            ("previous.canonicalData == nativeV3.canonicalData", "true"),
+            ("!previous.conflicted", "true"),
+            ("previous.conflicted = true; envelopeBoundary = previous", "lease = nil"),
+            ("manager.update(configData: baseData, now: sample.wall)", "manager.update(configData: data, now: sample.wall)"),
+            ("continuousDeadline: boundedDeadline, nativeV3: nativeV3)", "continuousDeadline: boundedDeadline)"),
+        ]:
+            self.assertIn(old, source)
+            self.assertTrue(MODULE.scan_native_v3_source(source_path, source.replace(old, new)), old)
+        for extra in ["transport.fetch(request)", "manager = EluV1ConfigManager(", "envelopeBoundary = nil",
+                      "EluSQLiteRuntimeQueue", "EluNativeRasterSealer", "URLSession"]:
+            self.assertTrue(MODULE.scan_native_v3_source(source_path, source + "\n" + extra), extra)
+
+    def test_native_v3_original_gate_lifecycle_and_dormant_scope_cannot_be_bypassed(self) -> None:
+        for relative, tokens in [
+            (MODULE.NATIVE_V3_GATE_PATH, ["$0.configV2Data == lease.data && $0.base.expiresAt == lease.expiresAt",
+                "retainedLease.receiptData == lease.receiptData", "nativeV3: pinned.nativeV3"]),
+            (MODULE.NATIVE_V3_LIFECYCLE_PATH, ["format: EluV2ConfigRequest.Format = .v2",
+                "publishedLease?.receiptData == lease.receiptData", "next != state || receiptChanged"]),
+        ]:
+            path = pathlib.Path(relative); source = (ROOT / path).read_text()
+            self.assertEqual([], MODULE.scan_native_v3_source(path, source))
+            for token in tokens:
+                self.assertIn(token, source)
+                self.assertTrue(MODULE.scan_native_v3_source(path, source.replace(token, "removed")), token)
+        for path in [MODULE.STACK_SOURCE, MODULE.NATIVE_RUNTIME_SOURCE, "Sources/EluAnalytics/Elu.swift",
+                     "Sources/EluAnalytics/Internal/Config/Other.swift", "Other/EluV2ConfigSource.swift"]:
+            for source in ["format: .nativeV3", "witness.nativeV3", "EluNativeV3ConfigParser.parse(data)"]:
+                self.assertTrue(MODULE.scan_native_v3_source(pathlib.Path(path), source), (path, source))
+
     def test_explicit_window_and_original_commit_owner_are_closed(self) -> None:
         path = pathlib.Path(MODULE.NATIVE_WINDOW_SOURCE)
         source = (ROOT / path).read_text()
