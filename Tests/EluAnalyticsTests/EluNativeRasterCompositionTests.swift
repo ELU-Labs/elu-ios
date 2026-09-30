@@ -1,5 +1,6 @@
 #if canImport(SwiftUI) && canImport(UIKit)
 import Foundation
+import SQLite3
 import UIKit
 import XCTest
 @testable import EluAnalytics
@@ -35,11 +36,17 @@ final class EluNativeRasterCompositionTests: XCTestCase {
         do {
             let composition = try await h.install()
             try await h.wait { await h.transport.bodies.count == 1 }
+            // The transport observation precedes the durable loss receipt. Join
+            // that receipt before local-stop reevaluation invalidates dispatch.
+            await composition.waitForCurrentDelivery()
             h.runtime.setNativeReplayRecordingEnabled(false)
             await composition.reevaluate(); await composition.waitForCurrentDelivery()
             let rows = try await h.queue.storedReplayRecords()
             XCTAssertEqual(rows.count, 1); original = try XCTUnwrap(rows.first?.body)
             let sent = await h.transport.bodies; XCTAssertEqual(sent, [original])
+            let retry = try h.deliveryMetadata(ordinal: XCTUnwrap(rows.first?.ordinal))
+            XCTAssertEqual(retry.attemptCount, 1)
+            XCTAssertEqual(retry.retry?.delayMillis, 1_000)
             await h.close()
         } catch { await h.close(); throw error }
         let reopened = try await Rig.make(directory: h.directory)
@@ -368,6 +375,24 @@ final class EluNativeRasterCompositionTests: XCTestCase {
             _ = await directOwner?.stop(); directOwner = nil
             lifecycle.close(); stack.close(); await stack.settled()
             marker.unbind(); privateMarker.unbind(); window.rootViewController = previous
+        }
+        func deliveryMetadata(ordinal: Int64) throws -> EluV2ReplayDeliveryState {
+            let namespace = try EluV1SiteNamespace.directoryComponent(exactConstructorSiteKey: "elu_pk_test_aaaaaaaaaaaaaaaaaaaaaa")
+            let path = directory.appendingPathComponent(namespace).appendingPathComponent("runtime-state-v1.sqlite3").path
+            var database: OpaquePointer?
+            let opened = sqlite3_open_v2(path, &database, SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX, nil)
+            defer { sqlite3_close(database) }
+            guard opened == SQLITE_OK else { throw EluRuntimeQueueError.invalidState }
+            var statement: OpaquePointer?
+            defer { sqlite3_finalize(statement) }
+            guard sqlite3_prepare_v2(database, "SELECT metadata FROM replay_delivery WHERE ordinal=?", -1, &statement, nil) == SQLITE_OK,
+                  sqlite3_bind_int64(statement, 1, ordinal) == SQLITE_OK,
+                  sqlite3_step(statement) == SQLITE_ROW,
+                  (1...16_384).contains(Int(sqlite3_column_bytes(statement, 0))),
+                  let bytes = sqlite3_column_blob(statement, 0) else { throw EluRuntimeQueueError.invalidState }
+            let data = Data(bytes: bytes, count: Int(sqlite3_column_bytes(statement, 0)))
+            guard sqlite3_step(statement) == SQLITE_DONE else { throw EluRuntimeQueueError.invalidState }
+            return try EluV2ReplayDeliveryState.decode(data)
         }
         func remove() { try? FileManager.default.removeItem(at: directory) }
     }
