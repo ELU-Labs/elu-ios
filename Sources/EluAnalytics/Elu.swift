@@ -119,6 +119,12 @@ public enum Elu {
         EluCore.shared.dispatch(.capture(event: event, properties: properties))
     }
 
+    /// Record an explicit event time. Times before persisted activity, or
+    /// outside the supported date range, are discarded with the event.
+    public static func capture(_ event: String, properties: [String: Any]? = nil, timestamp: Date) {
+        EluCore.shared.dispatch(.capture(event: event, properties: properties, timestamp: timestamp))
+    }
+
     /// Record a logical screen view. Call explicitly from UIKit and SwiftUI
     /// when the application presents a screen — see README.
     public static func screen(_ name: String, properties: [String: Any]? = nil) {

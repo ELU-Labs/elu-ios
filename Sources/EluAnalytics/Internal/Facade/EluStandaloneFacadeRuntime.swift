@@ -348,13 +348,13 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
 
     func execute(_ op: EluBufferedOp) {
         switch op {
-        case let .capture(event, properties):
+        case let .capture(event, properties, timestamp):
             // Canonical rejection happens after rate admission in the queue.
             // Bound and detach customer values here before the actor handoff.
             let name = event
             let projected = project(properties)
             enqueue { runtime, owner in
-                owner.record(await runtime.capture(name, properties: projected))
+                owner.record(await runtime.capture(name, properties: projected, occurredAt: timestamp))
             }
 
         case let .screen(name, properties):

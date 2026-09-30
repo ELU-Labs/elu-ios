@@ -6,6 +6,10 @@
   "symbols": [
     {
       "kind": "swift.type.method",
+      "name": "Elu.capture(_:properties:timestamp:)"
+    },
+    {
+      "kind": "swift.type.method",
       "name": "Elu.blockView(_:)"
     },
     {

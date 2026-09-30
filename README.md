@@ -164,6 +164,13 @@ default (the default sentinel is `"None"`). `getFeatureFlagResult` returns one
 current snapshot with `key`, `enabled`, `variant`, and JSON-compatible `payload`;
 nil means the flag is missing or unavailable.
 
+To supply an event time, use
+`Elu.capture("Checkout completed", properties: ["amount": 42], timestamp: completedAt)`
+with a Foundation `Date`. The timestamp must not precede persisted identity or
+session activity; invalid or older times discard the entire event. Events keep
+call order, so backdating an event after newer activity does not reorder it.
+The overload without `timestamp` uses the runtime clock when it processes the call.
+
 Pass `EluFeatureFlagOptions` to control one read:
 
 ```swift

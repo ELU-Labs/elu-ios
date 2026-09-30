@@ -794,6 +794,63 @@ final class EluStandaloneFacadeRuntimeTests: XCTestCase {
 
     // MARK: - Harness
 
+    func testExplicitCaptureTimeIsPersistedAndDeliveredAfterReopen() async throws {
+        try await withTemporaryDirectory { root in
+            let timestamp = baseDate.addingTimeInterval(1.125)
+            let harness = try await makeHarness(root: root)
+            harness.backend.execute(.capture(event: "explicit-time", properties: ["amount": 42], timestamp: timestamp))
+            await harness.backend.settled()
+            let saved = try await harness.runtime.queueSnapshot()
+            XCTAssertEqual(saved.queuedCount, 1)
+            XCTAssertEqual(saved.identity.updatedAt, timestamp)
+            XCTAssertEqual(saved.identity.session?.lastActivityAt, timestamp)
+            let beforeSend = try await harness.transport.recordedEvents()
+            XCTAssertTrue(beforeSend.isEmpty)
+            await harness.close()
+
+            let reopened = try await makeHarness(root: root)
+            let restored = try await reopened.runtime.queueSnapshot()
+            XCTAssertEqual(restored.queuedCount, 1)
+            XCTAssertEqual(restored.identity, saved.identity)
+            _ = await reopened.runtime.flush()
+            let events = try await reopened.transport.recordedEvents()
+            XCTAssertEqual(events.count, 1)
+            let event = try XCTUnwrap(events.first)
+            XCTAssertEqual(event["name"] as? String, "explicit-time")
+            XCTAssertEqual(event["occurredAt"] as? String, EluRFC3339.string(from: timestamp))
+            XCTAssertEqual((event["properties"] as? [String: Any])?["amount"] as? Int, 42)
+            await reopened.close()
+        }
+    }
+
+    func testExplicitCaptureTimeRejectsInvalidAndOlderActivityWithoutReordering() async throws {
+        try await withTemporaryDirectory { root in
+            let harness = try await makeHarness(root: root)
+            for timestamp in [Date(timeIntervalSince1970: .nan),
+                              Date(timeIntervalSince1970: .infinity), baseDate.addingTimeInterval(-1)] {
+                harness.backend.execute(.capture(event: "invalid-time", properties: nil, timestamp: timestamp))
+            }
+            await harness.backend.settled()
+            let before = try await harness.runtime.queueSnapshot()
+            XCTAssertEqual(before.queuedCount, 0)
+            XCTAssertNil(before.identity.session)
+
+            harness.backend.execute(.capture(event: "ordinary-time", properties: nil))
+            harness.backend.execute(.capture(event: "later-time", properties: nil, timestamp: baseDate.addingTimeInterval(2)))
+            harness.backend.execute(.capture(event: "out-of-order", properties: nil, timestamp: baseDate.addingTimeInterval(1)))
+            await harness.backend.settled()
+            let saved = try await harness.runtime.queueSnapshot()
+            XCTAssertEqual(saved.queuedCount, 2)
+            XCTAssertEqual(saved.identity.updatedAt, baseDate.addingTimeInterval(2))
+            _ = await harness.runtime.flush()
+            let events = try await harness.transport.recordedEvents()
+            XCTAssertEqual(events.compactMap { $0["name"] as? String }, ["ordinary-time", "later-time"])
+            XCTAssertEqual(events.compactMap { $0["occurredAt"] as? String },
+                           [EluRFC3339.string(from: baseDate), EluRFC3339.string(from: baseDate.addingTimeInterval(2))])
+            await harness.close()
+        }
+    }
+
     private struct Harness {
         let runtime: EluStandaloneRuntime
         let backend: EluStandaloneFacadeRuntime

@@ -32,10 +32,25 @@ final class EluEventBufferTests: XCTestCase {
         XCTAssertTrue(buffer.drain().isEmpty)
     }
 
+    func testExplicitCaptureTimestampSurvivesPendingBuffer() {
+        let timestamp = Date(timeIntervalSince1970: 1_785_801_661.125)
+        var buffer = EluEventBuffer()
+        buffer.push(.capture(event: "delayed", properties: ["amount": 42], timestamp: timestamp))
+        guard let operation = buffer.drain().first,
+              case let .capture(event, properties, observed) = operation else {
+            return XCTFail("Expected the pending capture")
+        }
+        XCTAssertEqual(event, "delayed")
+        XCTAssertEqual(properties?["amount"] as? Int, 42)
+        XCTAssertEqual(observed, timestamp)
+        let publicCapture: (String, [String: Any]?, Date) -> Void = Elu.capture(_:properties:timestamp:)
+        _ = publicCapture
+    }
+
     private func labels(_ operations: [EluBufferedOp]) -> [String] {
         operations.map { operation in
             switch operation {
-            case let .capture(event, _): "capture:\(event)"
+            case let .capture(event, _, _): "capture:\(event)"
             case .reset: "reset"
             case .resetDeviceIdentity: "resetDeviceIdentity"
             case .resetGroups: "resetGroups"
