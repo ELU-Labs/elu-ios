@@ -47,6 +47,11 @@ final class EluNativeRasterCompositionTests: XCTestCase {
             reopened.runtime.setNativeReplayRecordingEnabled(false)
             reopened.clock.advance(2)
             let composition = try await reopened.install()
+            await composition.waitForCurrentDelivery()
+            let beforeRetry = await reopened.transport.bodies
+            XCTAssertTrue(beforeRetry.isEmpty, "Reopen must first retain the original retry delay")
+            reopened.clock.advance(1)
+            await composition.reevaluate()
             try await reopened.wait { await reopened.transport.bodies.count == 1 }
             await composition.waitForCurrentDelivery()
             let sent = await reopened.transport.bodies; XCTAssertEqual(sent, [original])
@@ -413,7 +418,9 @@ final class EluNativeRasterCompositionTests: XCTestCase {
             guard await use.revalidate(), use.beginOnce() else { throw EluV1BoundTransportError.staleAuthority }
             let request = try EluNativeRasterStoredRequest(restoring: use.request.body)
             bodies.append(use.request.body); urls.append(use.request.url)
-            if lostAck { throw CancellationError() }
+            // A missing network response uses retry/backoff. Cancellation only
+            // releases a claim and permits a later lawful trigger immediately.
+            if lostAck { throw URLError(.networkConnectionLost) }
             if refusal {
                 return .init(status: 413, headers: [:], body: try JSONSerialization.data(withJSONObject: [
                     "schemaVersion": 1, "requestId": request.requestId, "status": 413,

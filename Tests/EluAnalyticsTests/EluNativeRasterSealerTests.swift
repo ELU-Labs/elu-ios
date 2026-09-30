@@ -117,11 +117,23 @@ final class EluNativeRasterSealerTests: XCTestCase {
     func testChangedViewportRequiresNewEpochInsteadOfSilentlyStretchingOrResetting() throws {
         let fixture = try Fixture(); defer { fixture.close() }
         var sealer = try makeSealer(fixture)
-        _ = try sealer.seal(fixture.capture(), timestamp: instant)
+        let originalSource = try fixture.registry.sourceIdentity()
+        let first = try sealer.seal(fixture.capture(), timestamp: instant)
         fixture.root.frame.size.width = 63
-        assertFailure(.changedViewport) { _ = try sealer.seal(fixture.capture(at: 1), timestamp: instant + 1_000) }
+        let resizedSource = try fixture.registry.sourceIdentity()
+        XCTAssertFalse(originalSource.isCurrent()); XCTAssertFalse(originalSource === resizedSource)
+        // Root-marker geometry now retires the original source before sealing;
+        // that stronger fence precedes the sealer's unchanged viewport guard.
+        assertFailure(.sourceMismatch) { _ = try sealer.seal(fixture.capture(at: 1), timestamp: instant + 1_000) }
         fixture.root.frame.size.width = 64
-        XCTAssertEqual(try sealer.seal(fixture.capture(at: 2), timestamp: instant + 1_000).sequence, 1)
+        let restoredSource = try fixture.registry.sourceIdentity()
+        XCTAssertFalse(resizedSource.isCurrent()); XCTAssertFalse(originalSource === restoredSource)
+        XCTAssertFalse(resizedSource === restoredSource)
+        assertFailure(.sourceMismatch) { _ = try sealer.seal(fixture.capture(at: 2), timestamp: instant + 1_000) }
+        var replacement = try makeSealer(fixture, replayId: "raster-next-epoch")
+        let next = try replacement.seal(fixture.capture(at: 3), timestamp: instant + 1_000)
+        XCTAssertEqual(next.sequence, 0); XCTAssertNotEqual(next.replayId, first.replayId)
+        XCTAssertEqual(next.width, first.width); XCTAssertEqual(next.height, first.height)
     }
 
     func testSourceWithdrawalAtEveryHandoffLeavesHistoryAndConsumesFrame() throws {
@@ -257,8 +269,9 @@ final class EluNativeRasterSealerTests: XCTestCase {
 
     private func makeSealer(_ fixture: Fixture, identity original: EluIdentitySnapshot? = nil,
                             maximumBytes: Int = EluNativeRasterPreparedRequest.maximumBytes,
+                            replayId: String = "raster-epoch",
                             source: Source = Source()) throws -> EluNativeRasterSealer {
-        try EluNativeRasterSealer(replayId: "raster-epoch", identity: original ?? identity(),
+        try EluNativeRasterSealer(replayId: replayId, identity: original ?? identity(),
             policy: .init(policyRevision: "policy-1", effectivePolicyHash: policyHash, contextRevision: 7, maximumRequestBytes: maximumBytes),
             versions: .init(runtime: .init(name: "elu-ios", version: "1.0.0"),
                 facade: .init(name: "EluAnalytics", version: "1.0.0"), build: "raster-test"),
