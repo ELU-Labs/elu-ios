@@ -15,8 +15,8 @@ Replay projects bounded UIKit wireframes with complete visible multiline label
 and button text when privacy policy permits. Standard table/collection cells
 use public visible-cell/content-view traversal and retain actual ancestor
 restrictions. Input values, custom drawing and unknown content remain masked or
-opaque. SwiftUI trees remain opaque: public UIKit bridging cannot prove all
-SwiftUI visibility or `.privacySensitive()` ancestors. Public local replay
+opaque. The default automatic wireframe mode keeps SwiftUI trees opaque: public
+UIKit bridging cannot prove all SwiftUI inputs or `.privacySensitive()` ancestors. Public local replay
 start/stop/status controls preserve full authority gates, first-chunk minimums,
 original capture settlement and sealed delivery. They add no automatic screens
 or browser trigger overrides. A separate candidate v2 path now joins the original
@@ -26,6 +26,24 @@ stream and lawful geometry handoffs. The local runtime supports exact v1 and v2
 tuples under the original server configuration; the engine's default policy is
 unchanged. Actual dispatch, useful-scroll, resource and player qualification
 remain separate gates, including a fresh artifact built from this source.
+
+The separate annotated SwiftUI candidate now has a default-false setup option,
+`declaredRegionReplayEnabled`. The original setup copies it once and selects
+native-v3 configuration plus implementation support together; it neither grants
+permission nor starts a second source/queue. A stable `EluSwiftUIReplayScope` and
+explicit mask/block wrappers are required for every input/private region.
+Declared intent survives marker removal; ambiguous or stale geometry rejects
+the frame before retention. This mode preserves original rendered state and
+scroll, but does not discover inputs or native `.privacySensitive()` markings,
+and adds no SwiftUI interaction markers. General self-hosted raster endpoints
+are unsupported. See the README for the exact customer obligations.
+
+The new bootstrap/consumer tests are authored, not yet compiled or executed.
+The latest runtime candidate's hosted run executed 1,126 tests with three
+assertion failures in two fixtures: lost-ACK retry semantics and root-source
+revocation on resize. Their separate corrections preserve production behavior
+and await fresh execution. No current all-green or package qualification is
+inferred from earlier collector/parser tests or source review.
 
 Customer request metrics require the explicit `EluURLSession` wrapper; URLs,
 headers and bodies are omitted. Opt-in native performance includes process
@@ -46,8 +64,8 @@ the isolated test corrections are retained. Later `35afe9c` CI executed 954 case
 and two opaque-counter fixture failures; baseline and owned-upgrade gates passed.
 The actual hosted-target/counter successor `1f8e705` then passed all three CI jobs,
 including hosted tests, consumers/API/artifact checks and owned upgrades. That
-result predates the new capture/window integration, which is uncompiled and
-unrun; no success is inferred from source review or API-ledger additions.
+result predates later capture/window, raster and bootstrap changes; no current
+success is inferred from that historical run or API-ledger additions.
 
 Exact distribution installation, owned upgrades, real Lab engine readback,
 customer-player rendering, privacy/fault cohorts and bounded resource checks

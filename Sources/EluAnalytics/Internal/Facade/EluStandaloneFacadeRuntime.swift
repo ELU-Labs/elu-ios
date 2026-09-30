@@ -176,18 +176,27 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
     /// production transports.
     static func make(context: EluRuntimeBackendContext) -> EluStandaloneFacadeRuntime? {
         guard let rootDirectoryURL = runtimeDirectoryURL() else { return nil }
-        let siteKey = context.siteKey
         return EluStandaloneFacadeRuntime(
             context: context,
             openStack: {
-                try await EluStandaloneStack.make(
-                    rootDirectoryURL: rootDirectoryURL,
-                    siteKey: siteKey,
-                    configHost: context.configHost, endpointPolicy: context.endpointPolicy,
-                    performance: context.performance, diagnostics: context.diagnostics, personProfiles: context.personProfiles, persistence: context.persistence, rateLimiting: context.rateLimiting
-                )
+                try await makeStack(context: context, rootDirectoryURL: rootDirectoryURL)
             },
             guardedFlagsDidLoad: context.guardedFlagsDidLoad
+        )
+    }
+
+    /// The original factory, with its existing store/transport dependencies
+    /// injectable internally so tests can also join the exact stack's close.
+    static func makeStack(context: EluRuntimeBackendContext, rootDirectoryURL: URL,
+                          configTransport: (any EluV2ConfigTransport)? = nil) async throws -> EluStandaloneStack {
+        try await EluStandaloneStack.make(
+            rootDirectoryURL: rootDirectoryURL, siteKey: context.siteKey,
+            configHost: context.configHost, endpointPolicy: context.endpointPolicy,
+            configTransport: configTransport,
+            configurationFormat: context.declaredRegionReplayEnabled ? .nativeV3 : .v2,
+            declaredRegionReplaySupported: context.declaredRegionReplayEnabled,
+            performance: context.performance, diagnostics: context.diagnostics, personProfiles: context.personProfiles,
+            persistence: context.persistence, rateLimiting: context.rateLimiting
         )
     }
 

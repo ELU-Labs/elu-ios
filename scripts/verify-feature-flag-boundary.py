@@ -12,10 +12,10 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 PINNED = {
-    "Sources/EluAnalytics/Elu.swift": "ebb62585eadfa1977ab61ea8b68264d6211aed565e258f86c406988ed4416a1d",
-    "Sources/EluAnalytics/EluState.swift": "a935bd299d1e77abb2dfacbf3b4f4e630396feb8f89cc123df168934d55e9e19",
+    "Sources/EluAnalytics/Elu.swift": "c8810cd3404ff27a99f59aca3f17f3276050fca80a46bb82154224dd970784b9",
+    "Sources/EluAnalytics/EluState.swift": "d47c8a32015ad65c197c7f2902acde3df7b9fc51192bf500150b8e432f14158e",
     "Sources/EluAnalytics/EluConfigClient.swift": "152abfb01a6d0aa81e470d3185ecd4db3aeeef26d8626e67bab8f0a41e20d43d",
-    "Sources/EluAnalytics/Internal/Facade/EluRuntimeBackend.swift": "114b1f41dccfb853eb0dd77d52d674cfe3c8e251ff9a03bbe0e7c1640c11e33e",
+    "Sources/EluAnalytics/Internal/Facade/EluRuntimeBackend.swift": "739317b7590626f04052dc15866e83b55de517152e8878b3f8a6f72928795d14",
     "Package.swift": "86701aa42833ddfff4b928e8ed59608cfe46f54e2765656f8166a75633219398",
     "Conformance/V1/manifest.json": "98152d8725c286f29402ba3e420bda8dd364200fb6fdf1cfe49b2da9b8f63e54",
 }
@@ -43,6 +43,7 @@ FLAG_CLIENT_CALLERS = frozenset(
 FLAG_TRANSPORT_SOURCE = "Sources/EluAnalytics/Internal/Flags/EluV1URLSessionFlagTransport.swift"
 STACK_SOURCE = "Sources/EluAnalytics/Internal/Facade/EluStandaloneStack.swift"
 STANDALONE_FACADE_SOURCE = "Sources/EluAnalytics/Internal/Facade/EluStandaloneFacadeRuntime.swift"
+DECLARED_BOOTSTRAP_SELECTION = "configurationFormat: context.declaredRegionReplayEnabled ? .nativeV3 : .v2"
 BOUND_AUTHORITY_SOURCE = "Sources/EluAnalytics/Internal/Runtime/EluV1TransportAuthority.swift"
 FLAG_TRANSPORT_NAME = "EluV1URLSessionFlagTransport"
 FLAG_TRANSPORT_PROTOCOLS = ("EluV1FlagTransport", "EluV1AuthorizedFlagTransport")
@@ -435,6 +436,17 @@ def scan_outside_source(path: pathlib.Path, text: str) -> list[str]:
     stack = exact_path == STACK_SOURCE
     allowed_caller = exact_path in FLAG_CLIENT_CALLERS or stack
     bound_authority = exact_path == BOUND_AUTHORITY_SOURCE
+    bootstrap_requirements = {
+        "Sources/EluAnalytics/Elu.swift": ["public var declaredRegionReplayEnabled = false"],
+        "Sources/EluAnalytics/EluState.swift": ["private var declaredRegionReplayEnabled = false",
+            "declaredRegionReplayEnabled = options.declaredRegionReplayEnabled",
+            "declaredRegionReplayEnabled: declaredRegionReplayEnabled"],
+        "Sources/EluAnalytics/Internal/Facade/EluRuntimeBackend.swift": ["let declaredRegionReplayEnabled: Bool",
+            "declaredRegionReplayEnabled: Bool = false",
+            "self.declaredRegionReplayEnabled = declaredRegionReplayEnabled"],
+    }
+    if exact_path in bootstrap_requirements and any(text.count(token) != 1 for token in bootstrap_requirements[exact_path]):
+        errors.append(f"{path} changes default-off copied declared-region setup selection")
     if "EluV1FlagClient" in text and not allowed_caller:
         errors.append(f"{path} references the flag client outside the wired callers")
     if any(re.search(rf"\b{protocol}\b", text) for protocol in FLAG_TRANSPORT_PROTOCOLS) and not (allowed_caller or bound_authority):
@@ -470,13 +482,22 @@ def scan_outside_source(path: pathlib.Path, text: str) -> list[str]:
                 "guard accepted, await persistStartupConsent(to: runtime) else" not in normalized):
             errors.append(f"{path} removed durable consent gating from startup")
         owned_factory = (
-            "openStack: { try await EluStandaloneStack.make( "
-            "rootDirectoryURL: rootDirectoryURL, siteKey: siteKey, "
-            "configHost: context.configHost, endpointPolicy: context.endpointPolicy, performance: context.performance, diagnostics: context.diagnostics, personProfiles: context.personProfiles, persistence: context.persistence, rateLimiting: context.rateLimiting ) }, "
+            "openStack: { try await makeStack(context: context, rootDirectoryURL: rootDirectoryURL) }, "
             "guardedFlagsDidLoad: context.guardedFlagsDidLoad"
         )
         if normalized.count(owned_factory) != 1:
             errors.append(f"{path} changed the exact owned bootstrap host/callback binding")
+        owned_stack = (
+            "static func makeStack(context: EluRuntimeBackendContext, rootDirectoryURL: URL, "
+            "configTransport: (any EluV2ConfigTransport)? = nil) async throws -> EluStandaloneStack { "
+            "try await EluStandaloneStack.make( rootDirectoryURL: rootDirectoryURL, siteKey: context.siteKey, "
+            "configHost: context.configHost, endpointPolicy: context.endpointPolicy, configTransport: configTransport, "
+            + DECLARED_BOOTSTRAP_SELECTION + ", declaredRegionReplaySupported: context.declaredRegionReplayEnabled, "
+            "performance: context.performance, diagnostics: context.diagnostics, personProfiles: context.personProfiles, "
+            "persistence: context.persistence, rateLimiting: context.rateLimiting ) }"
+        )
+        if normalized.count(owned_stack) != 1 or len(re.findall(r"\bEluStandaloneStack\.make\s*\(", text)) != 1:
+            errors.append(f"{path} changed the exact owned bootstrap host/callback or atomic declared-region option binding")
     errors.extend(scan_transport_conformers(text))
     if bound_authority:
         # This seam may define protocols and delegate to an injected transport,
@@ -500,7 +521,10 @@ def scan_native_v3_source(path: pathlib.Path, text: str) -> list[str]:
     durable_owners = {NATIVE_RASTER_QUEUE_SOURCE, NATIVE_AUTHORITY_SOURCE}
     if "EluNativeV3ConfigParser" in text and exact not in owners | durable_owners | {NATIVE_V3_PARSER_PATH}:
         errors.append(f"{path} references native v3 outside its original configuration owner")
-    if re.search(r"\.nativeV3\b", text) and exact not in owners | durable_owners:
+    selection_text = text
+    if exact == STANDALONE_FACADE_SOURCE:
+        selection_text = selection_text.replace(DECLARED_BOOTSTRAP_SELECTION, "", 1)
+    if re.search(r"\.nativeV3\b", selection_text) and exact not in owners | durable_owners:
         errors.append(f"{path} activates or consumes dormant native v3 outside its original owner")
     required = {
         NATIVE_V3_SOURCE_PATH: [

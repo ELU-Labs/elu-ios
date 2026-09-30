@@ -93,6 +93,8 @@ struct EluRuntimeBackendContext {
     let endpointPolicy: EluEndpointPolicy
     let performance: EluPerformanceOptions
     let diagnostics: EluDiagnosticsOptions
+    /// Local implementation selection only; the original source still owns permission.
+    let declaredRegionReplayEnabled: Bool
     let personProfiles: EluPersonProfilesMode
     let persistence: EluPersistenceMode
     let rateLimiting: EluRateLimitingOptions
@@ -108,6 +110,7 @@ struct EluRuntimeBackendContext {
          endpointPolicy: EluEndpointPolicy = .cloud,
          performance: EluPerformanceOptions = .init(),
          diagnostics: EluDiagnosticsOptions = .init(),
+         declaredRegionReplayEnabled: Bool = false,
          personProfiles: EluPersonProfilesMode = .identifiedOnly,
          persistence: EluPersistenceMode = .persistent,
          rateLimiting: EluRateLimitingOptions = .init(),
@@ -123,6 +126,7 @@ struct EluRuntimeBackendContext {
         self.endpointPolicy = endpointPolicy
         self.performance = performance
         self.diagnostics = diagnostics
+        self.declaredRegionReplayEnabled = declaredRegionReplayEnabled
         self.personProfiles = personProfiles
         self.persistence = persistence
         self.rateLimiting = rateLimiting.normalized

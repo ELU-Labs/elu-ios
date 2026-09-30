@@ -19,6 +19,40 @@ SPEC.loader.exec_module(MODULE)
 
 
 class FeatureFlagBoundaryScannerTests(unittest.TestCase):
+    def test_declared_bootstrap_uses_one_copied_default_off_option_and_original_stack(self) -> None:
+        checks = {
+            "Sources/EluAnalytics/Elu.swift": ["public var declaredRegionReplayEnabled = false"],
+            "Sources/EluAnalytics/EluState.swift": ["private var declaredRegionReplayEnabled = false",
+                "declaredRegionReplayEnabled = options.declaredRegionReplayEnabled",
+                "declaredRegionReplayEnabled: declaredRegionReplayEnabled"],
+            "Sources/EluAnalytics/Internal/Facade/EluRuntimeBackend.swift": ["declaredRegionReplayEnabled: Bool = false",
+                "self.declaredRegionReplayEnabled = declaredRegionReplayEnabled"],
+            MODULE.STANDALONE_FACADE_SOURCE: [MODULE.DECLARED_BOOTSTRAP_SELECTION,
+                "declaredRegionReplaySupported: context.declaredRegionReplayEnabled",
+                "makeStack(context: context, rootDirectoryURL: rootDirectoryURL)",
+                "configTransport: configTransport"],
+        }
+        for relative, tokens in checks.items():
+            path = pathlib.Path(relative); source = (ROOT / path).read_text()
+            self.assertEqual([], MODULE.scan_outside_source(path, source), relative)
+            for token in tokens:
+                self.assertEqual(source.count(token), 1, token)
+                self.assertTrue(MODULE.scan_outside_source(path, source.replace(token, "removed_original_binding")), token)
+        path = pathlib.Path(MODULE.STANDALONE_FACADE_SOURCE); source = (ROOT / path).read_text()
+        for changed in [source.replace("? .nativeV3 : .v2", "? .v2 : .nativeV3"),
+                        source.replace("declaredRegionReplaySupported: context.declaredRegionReplayEnabled", "declaredRegionReplaySupported: true"),
+                        source + "\nEluStandaloneStack.make()"]:
+            self.assertTrue(MODULE.scan_outside_source(path, changed))
+
+    def test_declared_bootstrap_allows_only_exact_original_format_selection(self) -> None:
+        path = pathlib.Path(MODULE.STANDALONE_FACADE_SOURCE); source = (ROOT / path).read_text()
+        self.assertEqual([], MODULE.scan_native_v3_source(path, source))
+        for token in [".nativeV3", "EluNativeV3ConfigParser.parse(data)", "EluV2ConfigSourceDenial()"]:
+            self.assertTrue(MODULE.scan_native_v3_source(path, source + "\n" + token), token)
+        for relative in ["Sources/EluAnalytics/Elu.swift", MODULE.STACK_SOURCE,
+                         "Sources/EluAnalytics/Internal/Facade/Other.swift"]:
+            self.assertTrue(MODULE.scan_native_v3_source(pathlib.Path(relative), MODULE.DECLARED_BOOTSTRAP_SELECTION), relative)
+
     def test_raster_original_runtime_selection_and_physical_joins_remain_closed(self) -> None:
         checks = {
             MODULE.STACK_SOURCE: ["configurationFormat: EluV2ConfigRequest.Format = .v2",

@@ -26,6 +26,7 @@ final class EluCore {
     private var acceptedConsent: EluConsentOperation? // guarded by backendIntentLock
     private var performance = EluPerformanceOptions()
     private var diagnostics = EluDiagnosticsOptions()
+    private var declaredRegionReplayEnabled = false
     private var personProfiles: EluPersonProfilesMode = .identifiedOnly
     private var persistence: EluPersistenceMode = .persistent
     private var rateLimiting = EluRateLimitingOptions()
@@ -71,6 +72,7 @@ final class EluCore {
             endpointPolicy = selectedEndpoints
             performance = options.performance
             diagnostics = options.diagnostics
+            declaredRegionReplayEnabled = options.declaredRegionReplayEnabled
             personProfiles = options.personProfiles
             persistence = options.persistence
             rateLimiting = options.rateLimiting.normalized
@@ -105,7 +107,7 @@ final class EluCore {
         EluRuntimeBackendContext(siteKey: siteKey, config: config, configDocument: document,
             isNewUser: isNewUser, flagsDidLoad: { [weak self] in
                 self?.dispatchFlagNotification(ifCurrent: { true })
-            }, configHost: configHost, endpointPolicy: endpointPolicy, performance: performance, diagnostics: diagnostics, personProfiles: personProfiles, persistence: persistence, rateLimiting: rateLimiting, initialConsent: initialConsent, guardedFlagsDidLoad: { [weak self] predicate in
+            }, configHost: configHost, endpointPolicy: endpointPolicy, performance: performance, diagnostics: diagnostics, declaredRegionReplayEnabled: declaredRegionReplayEnabled, personProfiles: personProfiles, persistence: persistence, rateLimiting: rateLimiting, initialConsent: initialConsent, guardedFlagsDidLoad: { [weak self] predicate in
                 self?.dispatchFlagNotification(ifCurrent: predicate)
             }, initialConfigurationReady: { [weak self] predicate in
                 guard let self else { return }

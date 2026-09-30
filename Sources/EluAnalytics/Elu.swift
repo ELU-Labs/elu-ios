@@ -11,6 +11,15 @@ public struct EluSetupOptions {
     public var performance = EluPerformanceOptions()
     /// Delayed numeric OS diagnostics are disabled unless explicitly enabled.
     public var diagnostics = EluDiagnosticsOptions()
+    /// Opt in to annotated SwiftUI replay through the original native-v3 config.
+    /// Default false. Requires a current compatible declared-region grant and
+    /// a stable `EluSwiftUIReplayScope` with every input/private area wrapped.
+    /// This does not discover inputs or `privacySensitive()` automatically,
+    /// grant capture permission, or enable SwiftUI touch/gesture recording.
+    /// Select before the first setup call; unsupported config has no v2 fallback.
+    /// This candidate requires the supported ELU issuer/replay endpoint pair;
+    /// arbitrary self-hosted raster endpoints are not supported.
+    public var declaredRegionReplayEnabled = false
     /// New anonymous events do not create a person profile by default.
     public var personProfiles: EluPersonProfilesMode = .identifiedOnly
     /// Analytics storage lifetime. Explicit consent is retained separately in both modes.

@@ -13,6 +13,63 @@ final class EluStandaloneFacadeRuntimeTests: XCTestCase {
         var errorDescription: String? { "checkout failed" }
     }
 
+    func testOriginalFacadeFactoryDefaultsToOneV2Request() async throws {
+        try await assertBootstrapRequest(optIn: false, body: Data("{}".utf8), expected: .v2)
+    }
+
+    func testOriginalFacadeFactoryOptsIntoV3WithoutFallbackOnInvalidResponse() async throws {
+        try await assertBootstrapRequest(optIn: true, body: Data("{}".utf8), expected: .nativeV3)
+    }
+
+    func testOriginalFacadeFactoryBaseOnlyV3DoesNotGrantRaster() async throws {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let now = Date()
+        let base: [String: Any] = ["schemaVersion": 2, "revision": "bootstrap-closed",
+            "status": "disabled", "reason": "policy",
+            "issuedAt": formatter.string(from: now.addingTimeInterval(-1)),
+            "expiresAt": formatter.string(from: now.addingTimeInterval(300))]
+        let body = try JSONSerialization.data(withJSONObject: ["schemaVersion": 3, "configV2": base], options: [.sortedKeys])
+        XCTAssertNil(try EluNativeV3ConfigParser.parse(body).raster)
+        try await assertBootstrapRequest(optIn: true, body: body, expected: .nativeV3)
+    }
+
+    private func assertBootstrapRequest(optIn: Bool, body: Data, expected: EluV2ConfigRequest.Format) async throws {
+        try await withTemporaryDirectory { root in
+            let siteKey = "elu_pk_test_" + String(repeating: "b", count: 22)
+            let context = EluRuntimeBackendContext(siteKey: siteKey, isNewUser: true,
+                flagsDidLoad: {}, declaredRegionReplayEnabled: optIn)
+            let transport = BootstrapConfigTransport(body: body)
+            let stack = try await EluStandaloneFacadeRuntime.makeStack(context: context,
+                rootDirectoryURL: root, configTransport: transport)
+            do {
+                stack.start(); stack.setForeground(true)
+                for _ in 0..<250 {
+                    if await transport.requests.count == 1 { break }
+                    try await Task.sleep(nanoseconds: 20_000_000)
+                }
+                let requests = await transport.requests
+                XCTAssertEqual(requests.count, 1)
+                let request = try XCTUnwrap(requests.first)
+                XCTAssertEqual(request.format, expected)
+                XCTAssertEqual(request.url.absoluteString,
+                    "https://elu.dev/sdk/\(expected == .v2 ? "v2" : "v3")/\(siteKey)/config")
+                XCTAssertFalse(stack.runtime.nativeReplayIsRecording())
+                let capture = await stack.runtime.capture("without-permission")
+                guard case .rejected = capture else {
+                    XCTFail("The implementation option granted capture permission")
+                    stack.close(); await stack.settled(); return
+                }
+                stack.close(); await stack.settled()
+                let finalRequests = await transport.requests
+                XCTAssertEqual(finalRequests.count, 1, "No second configuration owner or fallback request")
+                XCTAssertEqual(finalRequests.map(\.format), [expected])
+            } catch {
+                stack.close(); await stack.settled(); throw error
+            }
+        }
+    }
+
     func testNeverModeRejectsPersonIntentBeforeOptimisticGettersAndKeepsForFlagsLocal() async throws {
         try await withTemporaryDirectory { root in
             let harness = try await makeHarness(root: root, personProfiles: .never)
@@ -762,6 +819,16 @@ final class EluStandaloneFacadeRuntimeTests: XCTestCase {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
         defer { try? FileManager.default.removeItem(at: directory) }
         try await body(directory)
+    }
+}
+
+private actor BootstrapConfigTransport: EluV2ConfigTransport {
+    private let body: Data
+    private(set) var requests: [EluV2ConfigRequest] = []
+    init(body: Data) { self.body = body }
+    func fetch(_ request: EluV2ConfigRequest) async throws -> Data {
+        requests.append(request)
+        return body
     }
 }
 

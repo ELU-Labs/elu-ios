@@ -5,14 +5,16 @@ import UIKit
 /// Explicit privacy declarations for one original mounted SwiftUI root.
 ///
 /// This surface does not enable recording. The declared-region capture policy
-/// and transport require separate original runtime selection and a current
-/// declared-region grant. The public bootstrap does not select them. Every input
+/// and transport require `EluSetupOptions.declaredRegionReplayEnabled` before
+/// the first setup call and a current compatible declared-region grant. Every input
 /// and private or unsupported painted region must be declared and wrapped before display.
 /// Native `privacySensitive()` and arbitrary inputs are not discovered.
 ///
 /// Keep one scope for the lifetime of the root. Its required identifiers cannot
 /// be retired by removing a view. Missing, duplicate or stale bindings reject
 /// the complete frame. Invalid declarations also leave capture unavailable.
+/// Keep required wrappers mounted around conditional content. Releasing a
+/// scope while its declared host remains alive does not erase that intent.
 @MainActor
 public final class EluSwiftUIReplayScope: ObservableObject {
     let registry: EluSwiftUIReplayRegistry

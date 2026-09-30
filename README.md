@@ -1,8 +1,9 @@
 # EluAnalytics for iOS
 
-ELU product intelligence for native iOS apps. One site key, no other
-configuration — behavior (privacy controls, kill switches, session replay)
-is managed from your ELU dashboard and delivered as remote config.
+ELU product intelligence for native iOS apps. Initialize with one site key;
+behavior (privacy controls, kill switches, session replay) is managed from your
+ELU dashboard and delivered as remote config. Optional native integrations,
+including annotated SwiftUI replay, require the explicit setup below.
 
 This package uses the ELU-owned analytics runtime and has no external Swift
 package dependencies. Customer installation and support apply to the exact
@@ -359,7 +360,8 @@ cells through their public `contentView`; offscreen cells are excluded and actua
 ancestor mask, block, visibility and clipping restrictions still apply. Transparent or truncated text, attachments, links, unsupported attributed content,
 and custom subclasses remain masked or opaque. All input values, including `UITextField` and `UITextView`, remain hidden. Images, web
 views, custom drawing, and SwiftUI content are represented by content-free
-placeholders. SwiftUI replay is not supported.
+placeholders in this automatic wireframe mode. Annotated SwiftUI capture is a
+separate opt-in candidate described below.
 
 Apply additional restrictions on the main thread before content is presented:
 
@@ -371,6 +373,72 @@ Elu.blockView(paymentContainer) // Excludes content and descendants.
 Restrictions last for the view's lifetime and cannot weaken remote policy.
 Unknown native blocking rules disable replay. Replay remains subject to engine,
 player, privacy, and device qualification before release.
+
+### Annotated SwiftUI replay (unreleased candidate)
+
+The candidate can capture the original displayed SwiftUI root, including its
+current state and scroll position, using explicit privacy declarations. It is
+not automatic input discovery. Select it before the first setup call:
+
+```swift
+var options = EluSetupOptions()
+options.declaredRegionReplayEnabled = true // default: false
+Elu.setup(siteKey: "YOUR_SITE_KEY", options: options)
+```
+
+Keep one scope for the original root's entire lifetime. This iOS 14+ example
+uses `StateObject`; an iOS 13 host must retain the same scope itself.
+
+```swift
+@MainActor
+struct RecordedRoot: View {
+    @StateObject private var replay = EluSwiftUIReplayScope(
+        requiredRegions: ["inputs", "private-card"])
+    @State private var name = ""
+    @State private var password = ""
+    @State private var notes = ""
+
+    var body: some View {
+        VStack {
+            Text("Public content")
+            VStack {
+                TextField("Name", text: $name)
+                SecureField("Password", text: $password)
+                TextEditor(text: $notes).frame(height: 80)
+            }
+            .eluMask(replay, region: "inputs")
+            Text("Private card")
+                .eluBlock(replay, region: "private-card")
+        }
+        .eluReplayRoot(replay)
+    }
+}
+```
+
+Declare and wrap every input, private image/content and unsupported drawing
+before display, including overlays and effects inside each wrapper's clip.
+Both wrappers erase their entire region in retained output. Standard SwiftUI
+inputs and `.privacySensitive()` are not discovered automatically; unannotated
+content may be visible. Keep required wrappers mounted around conditional
+content. Removing a view or releasing its scope does not erase the original
+host's required intent. Missing, duplicate, stale or ambiguous bindings reject
+the whole frame. Geometry/source changes revoke the old capture. Rejected owned
+buffers are cleared; candidates that fail validation are never persisted or uploaded.
+
+The option selects one original `/sdk/v3/<siteKey>/config` source and its same
+runtime/queue. It creates no grant and makes no fallback v2 fetch. The embedded
+v2 configuration still governs ordinary analytics and automatic UIKit replay;
+raster additionally requires an explicit compatible declared-region policy,
+current consent, identity, sampling and budget. The candidate is limited to the
+supported ELU issuer/replay endpoint pair; arbitrary self-hosted raster origins
+or prefixes are not supported. Leaving the option false preserves v2 setup.
+
+Capture uses one eligible original window/root, at most one frame per second,
+with bounded image dimensions and request size. It adds no SwiftUI interaction
+markers or automatic screen tracking; continue explicit `Elu.screen` calls.
+The API remains an unreleased candidate pending exact package, engine, privacy
+and customer-player qualification. The compiled consumer example and isolated
+rendering checks are not release approval.
 
 ### Local replay controls
 
@@ -391,12 +459,13 @@ server acknowledgement nor acts as opt-out.
 
 Start clears only this runtime's local stop and reevaluates every normal replay
 gate, including configuration, sampling, audience, budget and a supported visible
-UIKit root. It cannot force recording. Status is true only for the installed,
+root under the selected replay mode. It cannot force recording. Status is true only for the installed,
 current collector; it is false during setup, draining, local stop or withdrawal.
 Calls before setup are no-ops. The local choice lasts for this runtime and does
 not persist across launches; use `optOut()` for persistent consent withdrawal.
 There are no URL/event/linked-flag or sampling override arguments. These controls
-do not add SwiftUI-tree replay, touch/gesture recording or automatic screens.
+do not opt into annotated SwiftUI replay, add touch/gesture recording or track
+screens automatically.
 
 A visible root replacement or a viewport change ends the original capture before
 starting a new replay ID under the same analytics session, sample decision and
@@ -404,7 +473,7 @@ remaining budget. Unsealed boundary frames are discarded. Transient unsupported
 geometry is retried at the existing capture cadence without retaining failed
 frames. A missing or presented root is observed without reading view text; recovery
 stops on local stop, withdrawal or expiry and never renews configuration itself.
-Opaque framework/custom content remains opaque. Scroll and navigation can change
+In automatic wireframe mode, opaque framework/custom content remains opaque. Scroll and navigation can change
 visual snapshots; they do not produce touch or scroll interaction markers. Ordered
 multi-stream viewport changes and player forward/backward seeking still require
 end-to-end qualification; source recovery alone is not that evidence.
