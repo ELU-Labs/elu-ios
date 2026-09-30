@@ -67,6 +67,7 @@ NATIVE_PROTOCOL_SOURCE = "Sources/EluAnalytics/Internal/Replay/EluNativeReplayPr
 NATIVE_AUTHORITY_SOURCE = "Sources/EluAnalytics/Internal/Replay/EluNativeReplayAuthority.swift"
 NATIVE_SEALER_SOURCE = "Sources/EluAnalytics/Internal/Replay/EluNativeReplaySealer.swift"
 NATIVE_RASTER_SEALER_SOURCE = "Sources/EluAnalytics/Internal/Replay/EluNativeRasterSealer.swift"
+NATIVE_RASTER_RESPONSE_SOURCE = "Sources/EluAnalytics/Internal/Replay/EluNativeRasterResponse.swift"
 NATIVE_CAPTURE_SOURCE = "Sources/EluAnalytics/Internal/Replay/EluNativeReplayCaptureOwner.swift"
 NATIVE_WINDOW_SOURCE = "Sources/EluAnalytics/EluReplayWindow.swift"
 NATIVE_COLLECTOR_SOURCE = "Sources/EluAnalytics/Internal/Replay/EluUIKitReplayCollector.swift"
@@ -229,11 +230,32 @@ def scan_replay_storage_source(path: pathlib.Path, text: str) -> list[str]:
             token in text for token in (*NETWORK_TOKENS, "import UIKit")
         ) or re.search(r"\bTask(?:\.detached)?\s*[{(]", text):
             errors.append(f"{path} widens the pure raster sealer beyond static byte helpers and retained values")
-    if re.search(r"\bEluNativeRaster(?:Sealer|PreparedRequest|PolicyBinding|SealingError)\b", text) and exact != NATIVE_RASTER_SEALER_SOURCE:
+    response_only_raster = False
+    if exact == NATIVE_RASTER_RESPONSE_SOURCE:
+        remaining = re.sub(r"\brequest\s*:\s*EluNativeRasterPreparedRequest\b", "", text)
+        remaining = re.sub(r"\bEluV2ReplayText\.equal\s*\(", "(", remaining)
+        remaining = re.sub(r"\bEluV1BatchDeliveryCoordinator\.parseRetryAfter\s*\(", "(", remaining)
+        forbidden = ("EluSQLiteRuntimeQueue", "EluStandaloneRuntime", "EluNativeReplayAuthority",
+            "EluNativeReplayCapabilities", "EluNativeReplayScope", "EluNativeReplayPermit",
+            "EluSwiftUIReplayRegistry", "EluSwiftUIReplayFrame", "EluNativeReplaySealer",
+            "appendNativeReplay", "appendReplay", "reconcileReplay", "ensureReplaySchema",
+            "ensureReplayDeliverySchema", "ensureNativeReplayAuthoritySchema")
+        response_only_raster = not (
+            re.search(r"\bEluNativeRaster(?:Sealer|PreparedRequest|PolicyBinding|SealingError)\b", remaining)
+            or re.search(r"\bEluV2(?:Replay|SealedReplay)\w*\b|\bEluV1BatchDeliveryCoordinator\b", remaining)
+            or any(re.search(rf"\b{token}\b", text) for token in forbidden)
+            or any(token in text for token in (*NETWORK_TOKENS, "import UIKit"))
+            or re.search(r"\bTask(?:\.detached)?\s*[{(]", text)
+        )
+        if not response_only_raster:
+            errors.append(f"{path} widens the pure raster response classifier beyond original request reads and static helpers")
+    if re.search(r"\bEluNativeRaster(?:Response\w*|ConflictScope)\b", text) and exact != NATIVE_RASTER_RESPONSE_SOURCE:
+        errors.append(f"{path} installs the unintegrated raster response classifier outside its exact value file")
+    if re.search(r"\bEluNativeRaster(?:Sealer|PreparedRequest|PolicyBinding|SealingError)\b", text) and exact != NATIVE_RASTER_SEALER_SOURCE and not response_only_raster:
         errors.append(f"{path} installs the unintegrated raster sealer outside its exact value file")
     if re.search(r"\bEluNativeReplaySealer\b", text) and exact not in {NATIVE_SEALER_SOURCE, NATIVE_CAPTURE_SOURCE} and not helper_only_raster:
         errors.append(f"{path} references the native sealer outside its exact physical owner")
-    if (re.search(r"\bEluV2(?:Replay|SealedReplay)\w*\b", text) or "ensureReplaySchema" in text or "ensureReplayDeliverySchema" in text) and exact not in allowed:
+    if (re.search(r"\bEluV2(?:Replay|SealedReplay)\w*\b", text) or "ensureReplaySchema" in text or "ensureReplayDeliverySchema" in text) and exact not in allowed and not response_only_raster:
         errors.append(f"{path} references owned replay storage outside its exact files")
     if exact in allowed and "/Replay/" in exact:
         permitted = {"URLSession", "URLRequest"} if exact == REPLAY_TRANSPORT_SOURCE else ({"import UIKit"} if exact == NATIVE_CAPTURE_SOURCE else set())
