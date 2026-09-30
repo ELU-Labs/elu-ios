@@ -484,6 +484,58 @@ def scan_native_v3_source(path: pathlib.Path, text: str) -> list[str]:
     if exact in owners and re.search(r"\b(?:EluSQLiteRuntimeQueue|EluNativeRasterSealer|EluNativeReplayAuthority|"
                                      r"URLSession|URLRequest)\b", text):
         errors.append(f"{path} adds queue, channel authority, raster capture or platform networking")
+    denial_owners = owners | {NATIVE_RASTER_QUEUE_SOURCE}
+    if re.search(r"\bEluV2ConfigSourceDenials?\b", text) and exact not in denial_owners:
+        errors.append(f"{path} gains an original-source denial receipt outside its owner")
+    if exact != NATIVE_V3_SOURCE_PATH and re.search(r"\bEluV2ConfigSourceDenials?\s*\(", text):
+        errors.append(f"{path} fabricates a source denial")
+    denial_required = {
+        NATIVE_V3_SOURCE_PATH: [
+            "fileprivate init(issuedAt:", "fileprivate init(siteKey:",
+            "latest.map({ $0.issuedAt < issuedAt }) ?? true", "latest === candidate",
+            "denials.record(issuedAt: previous.issuedAt, original: previous.canonicalData,",
+            "conflicting: nativeV3.canonicalData)",
+        ],
+        NATIVE_V3_GATE_PATH: [
+            "sourceDenials?.belongs(to: siteKey) == true", "sourceDenials?.contains(candidate) == true",
+            "if sourceDenials?.pending() != nil { witness = nil; return false }",
+        ],
+        NATIVE_V3_LIFECYCLE_PATH: [
+            "sourceDenials: source.denials", "await source.close()",
+            "denial !== publishedDenial", "publishedDenial = denial",
+        ],
+        NATIVE_RASTER_QUEUE_SOURCE: [
+            "let denial = gate.pendingDenial()", "exactConstructorSiteKey == gate.siteKey",
+            "guard gate.retainsDenial(denial)", "ledger.rasterSource.map({ $0.issuedAt > denial.issuedAt })",
+            "ledger.witness.map({ $0.issuedAt > denial.issuedAt })", "rejected.conflicted = true",
+            "ledger.admissionEnabled = false", "gate.acknowledgeDenial(denial)",
+            "configurationGate?.pendingDenial() != nil { held?.quarantineNativeClockDenial() }",
+        ],
+        STACK_SOURCE: ["runtime.settleConfigurationDenial()", "await lifecycle.configurationDenialSettled()"],
+        NATIVE_RUNTIME_SOURCE: ["return try await queue.persistConfigurationDenial()"],
+    }
+    if exact in denial_required and any(token not in text for token in denial_required[exact]):
+        errors.append(f"{path} lost original denial provenance, settlement, lifetime or ordering")
+    if exact == STACK_SOURCE:
+        start = text.find("fileprivate func accept(")
+        end = text.find("fileprivate func refreshFlags(", start)
+        section = text[start:end]
+        if not (0 <= section.find("runtime.settleConfigurationDenial()") < section.find("guard let self, self.isCurrent(decision)")):
+            errors.append(f"{path} filters restrictive denial behind the latest-only notification")
+    if exact == NATIVE_RASTER_QUEUE_SOURCE:
+        start = text.find("func persistConfigurationDenial()")
+        end = text.find("func reconcileNativeRasterSource(", start)
+        section = text[start:end]
+        if not (0 <= section.find("try replayStorageTransaction(validate: validate)") < section.find("gate.acknowledgeDenial(denial)")):
+            errors.append(f"{path} acknowledges source denial before original SQL settlement")
+        migrations = ("try ensureReplaySchema()", "try ensureReplayDeliverySchema()",
+                      "try ensureNativeReplayAuthoritySchema()", "try migrateNativeRasterSchema(validate: validate)")
+        if any(section.count(call) != 1 for call in migrations) or not (
+            0 <= section.find("guard gate.retainsDenial(denial)")
+            < section.find("if !EluSQLiteRuntimeSchema.hasRaster(databaseSchemaVersion)")
+            < section.find(migrations[0]) < section.find(migrations[1])
+            < section.find(migrations[2]) < section.find(migrations[3])):
+            errors.append(f"{path} widens denial-only lazy storage migration")
     return errors
 
 
@@ -517,13 +569,13 @@ def verify(root: pathlib.Path = ROOT) -> list[str]:
         path.relative_to(root).as_posix(): path.read_text(encoding="utf-8").count("ensureReplaySchema")
         for path in source_root.rglob("*.swift") if "ensureReplaySchema" in path.read_text(encoding="utf-8")
     }
-    if replay_activation != {"Sources/EluAnalytics/Internal/Runtime/EluSQLiteRuntimeQueue.swift": 1, NATIVE_AUTHORITY_SOURCE: 1}:
+    if replay_activation != {"Sources/EluAnalytics/Internal/Runtime/EluSQLiteRuntimeQueue.swift": 2, NATIVE_AUTHORITY_SOURCE: 1}:
         errors.append("replay schema activation escaped its owned storage definition")
     delivery_activation = {
         path.relative_to(root).as_posix(): path.read_text(encoding="utf-8").count("ensureReplayDeliverySchema")
         for path in source_root.rglob("*.swift") if "ensureReplayDeliverySchema" in path.read_text(encoding="utf-8")
     }
-    if delivery_activation != {"Sources/EluAnalytics/Internal/Runtime/EluSQLiteRuntimeQueue.swift": 1, NATIVE_AUTHORITY_SOURCE: 1}:
+    if delivery_activation != {"Sources/EluAnalytics/Internal/Runtime/EluSQLiteRuntimeQueue.swift": 2, NATIVE_AUTHORITY_SOURCE: 1}:
         errors.append("replay delivery schema activation escaped its owned definition")
     flag_root = source_root / "Internal/Flags"
     for path in flag_root.rglob("*.swift"):

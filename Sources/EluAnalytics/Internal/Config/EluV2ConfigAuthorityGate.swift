@@ -24,6 +24,7 @@ final class EluV2ConfigAuthorityGate: @unchecked Sendable {
     let siteKey: String
     private let id = UUID()
     private let clock: EluV2ConfigClock
+    private let sourceDenials: EluV2ConfigSourceDenials?
     private let lock = NSLock()
     private var witness: EluV2ConfigAuthorityWitness?
     private var retainedLease: EluV2ConfigLease?
@@ -33,9 +34,29 @@ final class EluV2ConfigAuthorityGate: @unchecked Sendable {
     private var lastWall: Date?
     private var lastContinuous: UInt64?
 
-    init(siteKey: String, clock: EluV2ConfigClock = .live) {
+    init(siteKey: String, clock: EluV2ConfigClock = .live,
+         sourceDenials: EluV2ConfigSourceDenials? = nil) {
         self.siteKey = siteKey
         self.clock = clock
+        self.sourceDenials = sourceDenials?.belongs(to: siteKey) == true ? sourceDenials : nil
+    }
+
+    // Denial access deliberately survives source expiry, suspension and close.
+    // No gate lock is held while the original queue performs durable work.
+    func pendingDenial() -> EluV2ConfigSourceDenial? {
+        lock.lock(); defer { lock.unlock() }
+        let pending = sourceDenials?.pending()
+        if pending != nil { witness = nil }
+        return pending
+    }
+    func retainsDenial(_ candidate: EluV2ConfigSourceDenial) -> Bool {
+        sourceDenials?.contains(candidate) == true
+    }
+    func acknowledgeDenial(_ candidate: EluV2ConfigSourceDenial) {
+        lock.lock(); defer { lock.unlock() }
+        guard sourceDenials?.contains(candidate) == true else { return }
+        witness = nil
+        sourceDenials?.acknowledge(candidate)
     }
 
     /// Lifecycle-only publication, before notifying queued consumers. A nil lease
@@ -120,6 +141,7 @@ final class EluV2ConfigAuthorityGate: @unchecked Sendable {
     }
 
     private func isLiveLocked() -> Bool {
+        if sourceDenials?.pending() != nil { witness = nil; return false }
         guard !closed, !clockFailed, suspension == nil, let candidate = witness else { return false }
         let wall = clock.wallNow()
         let continuous = clock.continuousNow()

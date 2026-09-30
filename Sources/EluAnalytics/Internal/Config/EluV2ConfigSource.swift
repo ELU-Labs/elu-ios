@@ -73,6 +73,56 @@ struct EluV2ConfigLease: Equatable, Sendable {
     }
 }
 
+/// A restrictive fact produced only by the original validated source. This is
+/// neither a lease nor permission. It contains no response body or credentials.
+final class EluV2ConfigSourceDenial: Sendable {
+    let issuedAt: EluV1Timestamp
+    let semanticHash: String
+    let conflictingSemanticHash: String
+
+    fileprivate init(issuedAt: EluV1Timestamp, semanticHash: String, conflictingSemanticHash: String) {
+        self.issuedAt = issuedAt
+        self.semanticHash = semanticHash
+        self.conflictingSemanticHash = conflictingSemanticHash
+    }
+}
+
+/// One original-source slot. A newer conflict dominates an older one; ordinary
+/// withdrawal/close cannot erase an unsettled restrictive fact. The source alone
+/// creates receipts and only the exact original gate acknowledges SQL settlement.
+final class EluV2ConfigSourceDenials: @unchecked Sendable {
+    private let siteKey: String
+    private let lock = NSLock()
+    private var latest: EluV2ConfigSourceDenial?
+    private var settled = false
+    fileprivate init(siteKey: String) { self.siteKey = siteKey }
+    func belongs(to key: String) -> Bool { siteKey == key }
+
+    fileprivate func record(issuedAt: EluV1Timestamp, original: Data, conflicting: Data) {
+        lock.lock(); defer { lock.unlock() }
+        guard original != conflicting, latest.map({ $0.issuedAt < issuedAt }) ?? true else { return }
+        latest = EluV2ConfigSourceDenial(issuedAt: issuedAt,
+            semanticHash: EluV1StrictCanonicalJSON.hash(original),
+            conflictingSemanticHash: EluV1StrictCanonicalJSON.hash(conflicting))
+        settled = false
+    }
+
+    func pending() -> EluV2ConfigSourceDenial? {
+        lock.lock(); defer { lock.unlock() }
+        return settled ? nil : latest
+    }
+
+    func contains(_ candidate: EluV2ConfigSourceDenial) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return !settled && latest === candidate
+    }
+
+    func acknowledge(_ candidate: EluV2ConfigSourceDenial) {
+        lock.lock(); defer { lock.unlock() }
+        if latest === candidate { settled = true }
+    }
+}
+
 struct EluV2ConfigClock: Sendable {
     let wallNow: @Sendable () -> Date
     let continuousNow: @Sendable () -> UInt64
@@ -119,6 +169,7 @@ struct EluV2ConfigClock: Sendable {
 /// No cached/provider fallback is used, and failed fetches retain the manager's
 /// anti-rollback boundary while withdrawing the published document.
 actor EluV2ConfigSource {
+    nonisolated let denials: EluV2ConfigSourceDenials
     private let request: EluV2ConfigRequest
     private let transport: any EluV2ConfigTransport
     private let clock: EluV2ConfigClock
@@ -149,6 +200,7 @@ actor EluV2ConfigSource {
         clock: EluV2ConfigClock = .live
     ) throws {
         request = try EluV2ConfigRequest(siteKey: siteKey, configHost: configHost, endpointPolicy: endpointPolicy, format: format)
+        denials = EluV2ConfigSourceDenials(siteKey: siteKey)
         manager = EluV1ConfigManager(endpointPolicy: endpointPolicy, readbackProvenReplayTransports: EluStandaloneRuntime.readbackProvenReplayCapabilities.transports)
         self.transport = transport ?? EluV2URLSessionConfigTransport(expectedRequestURL: request.url)
         self.clock = clock
@@ -225,6 +277,8 @@ actor EluV2ConfigSource {
                 }
                 if var previous = envelopeBoundary, document.issuedAt == previous.issuedAt {
                     guard !previous.conflicted, previous.canonicalData == nativeV3.canonicalData else {
+                        denials.record(issuedAt: previous.issuedAt, original: previous.canonicalData,
+                                       conflicting: nativeV3.canonicalData)
                         previous.conflicted = true; envelopeBoundary = previous
                         throw EluV2ConfigSourceError.invalidLease
                     }

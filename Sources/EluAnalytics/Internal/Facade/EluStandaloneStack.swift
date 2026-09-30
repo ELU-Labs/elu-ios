@@ -119,9 +119,14 @@ final class EluStandaloneStack: @unchecked Sendable {
         let intent = runtime.beginFlagProjectionIntent()
         let notify = onIntent
         let ready = EluStandaloneNotificationSignal()
-        enqueueLocked { [weak self, runtime, flags] in
+        enqueueLocked { [weak self, runtime, flags, lifecycle] in
             await ready.wait()
             defer { runtime.finishFlagProjectionIntent(intent) }
+            do {
+                if try await runtime.settleConfigurationDenial() {
+                    await lifecycle.configurationDenialSettled()
+                }
+            } catch { return }
             guard let self, self.isCurrent(decision) else { return }
             if let witness {
                 _ = await runtime.applyConfiguration(witness.data, sourceWitness: witness)

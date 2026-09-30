@@ -542,6 +542,20 @@ actor EluStandaloneRuntime {
     }
     func stopNativeReplay() async throws { try await nativeAuthority.stop() }
 
+    /// Called on the original stack tail even for a superseded notification.
+    /// An unsettled denial is restrictive and must never use a latest-only filter.
+    func settleConfigurationDenial() async throws -> Bool {
+        do { return try await queue.persistConfigurationDenial() }
+        catch {
+            invalidateAuthority()
+            configurationDocument = nil
+            configurationWitness = nil
+            if phase != .closed { phase = .awaitingConfiguration }
+            await retireDelivery()
+            throw error
+        }
+    }
+
     func applyConfiguration(_ configData: Data, sourceWitness: EluV2ConfigAuthorityWitness? = nil) async -> EluStandaloneConfigurationOutcome {
         networkGate.invalidate()
         performanceMonitor.invalidate()

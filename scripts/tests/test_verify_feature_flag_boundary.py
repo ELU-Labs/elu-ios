@@ -19,6 +19,42 @@ SPEC.loader.exec_module(MODULE)
 
 
 class FeatureFlagBoundaryScannerTests(unittest.TestCase):
+    def test_source_denial_is_original_bounded_and_durably_settled(self) -> None:
+        checks = {
+            MODULE.NATIVE_V3_SOURCE_PATH: ["fileprivate init(issuedAt:", "latest.map({ $0.issuedAt < issuedAt }) ?? true",
+                "denials.record(issuedAt: previous.issuedAt, original: previous.canonicalData,"],
+            MODULE.NATIVE_V3_GATE_PATH: ["sourceDenials?.belongs(to: siteKey) == true",
+                "if sourceDenials?.pending() != nil { witness = nil; return false }"],
+            MODULE.NATIVE_V3_LIFECYCLE_PATH: ["sourceDenials: source.denials", "await source.close()", "denial !== publishedDenial"],
+            MODULE.NATIVE_RASTER_QUEUE_SOURCE: ["guard gate.retainsDenial(denial)",
+                "ledger.rasterSource.map({ $0.issuedAt > denial.issuedAt })",
+                "ledger.witness.map({ $0.issuedAt > denial.issuedAt })", "gate.acknowledgeDenial(denial)"],
+            MODULE.STACK_SOURCE: ["runtime.settleConfigurationDenial()"],
+            MODULE.NATIVE_RUNTIME_SOURCE: ["return try await queue.persistConfigurationDenial()"],
+        }
+        for relative, tokens in checks.items():
+            path = pathlib.Path(relative); source = (ROOT / path).read_text()
+            self.assertEqual([], MODULE.scan_native_v3_source(path, source), relative)
+            for token in tokens:
+                self.assertIn(token, source)
+                self.assertTrue(MODULE.scan_native_v3_source(path, source.replace(token, "removed_denial_join")), token)
+        for relative in [MODULE.STACK_SOURCE, MODULE.NATIVE_RUNTIME_SOURCE, "Sources/EluAnalytics/Elu.swift",
+                         "Sources/EluAnalytics/Internal/Config/Other.swift"]:
+            self.assertTrue(MODULE.scan_native_v3_source(pathlib.Path(relative), "EluV2ConfigSourceDenial(issuedAt: value)"))
+        stack = (ROOT / MODULE.STACK_SOURCE).read_text()
+        moved = stack.replace("await ready.wait()", "await ready.wait(); guard let self, self.isCurrent(decision) else { return }")
+        self.assertTrue(MODULE.scan_native_v3_source(pathlib.Path(MODULE.STACK_SOURCE), moved))
+        queue = (ROOT / MODULE.NATIVE_RASTER_QUEUE_SOURCE).read_text()
+        marker = "try replayStorageTransaction(validate: validate) { connection, _ in"
+        start = queue.index("func persistConfigurationDenial()")
+        self.assertIn(marker, queue[start:])
+        moved = queue[:start] + queue[start:].replace(marker, "gate.acknowledgeDenial(denial); " + marker, 1)
+        self.assertTrue(MODULE.scan_native_v3_source(pathlib.Path(MODULE.NATIVE_RASTER_QUEUE_SOURCE), moved))
+        for migration in ["try ensureReplaySchema()", "try ensureReplayDeliverySchema()",
+                          "try ensureNativeReplayAuthoritySchema()", "try migrateNativeRasterSchema(validate: validate)"]:
+            moved = queue[:start] + queue[start:].replace(migration, "removed_original_migration", 1) + "\n" + migration
+            self.assertTrue(MODULE.scan_native_v3_source(pathlib.Path(MODULE.NATIVE_RASTER_QUEUE_SOURCE), moved))
+
     def test_native_v3_original_owner_preserves_whole_receipt_and_base_bytes(self) -> None:
         source_path = pathlib.Path(MODULE.NATIVE_V3_SOURCE_PATH)
         source = (ROOT / source_path).read_text()

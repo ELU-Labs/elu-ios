@@ -369,6 +369,67 @@ final class EluV2ConfigLifecycleTests: XCTestCase {
         await h.stop()
     }
 
+    func testConflictNotifiesEvenWhenAlreadyUnavailableAndSurvivesBackgroundClose() async throws {
+        let h = try Harness(format: .nativeV3)
+        let positive = try nativeV3SourceRasterFixture(base: fixture())
+        let parsed = try EluNativeV3ConfigParser.parse(positive)
+        try await h.install(positive, expectedBase: parsed.configV2Data)
+        await h.driver.refresh(); try await h.waitForRequests(2)
+        await h.transport.resolve(1, data: Data("{}".utf8))
+        try await h.waitForState(.unavailable(.refreshFailed))
+        let before = h.notifications.value.count
+        XCTAssertNil(h.driver.authorityGate.pendingDenial())
+        await h.driver.refresh(); try await h.waitForRequests(3)
+        await h.transport.resolve(2, data: nativeV3SourceEnvelope(parsed.configV2Data))
+        try await h.waitForNotifications(before + 1)
+        let denial = try XCTUnwrap(h.driver.authorityGate.pendingDenial())
+        assertEqual(await h.state(), .unavailable(.refreshFailed))
+        await h.driver.setForeground(false)
+        XCTAssertTrue(h.driver.authorityGate.pendingDenial() === denial)
+        await h.stop()
+        XCTAssertTrue(h.driver.authorityGate.pendingDenial() === denial)
+        XCTAssertNil(h.driver.authorityGate.witness(for: try XCTUnwrap(h.notifications.last)))
+    }
+
+    func testNewerReceiptWaitsForOriginalSQLThenRepublishesWithoutLeaseExtension() async throws {
+        let h = try Harness(format: .nativeV3)
+        let positive = try nativeV3SourceRasterFixture(base: fixture())
+        let old = try EluNativeV3ConfigParser.parse(positive)
+        try await h.install(positive, expectedBase: old.configV2Data)
+        await h.driver.refresh(); try await h.waitForRequests(2)
+        await h.transport.resolve(1, data: nativeV3SourceEnvelope(old.configV2Data))
+        try await h.waitForState(.unavailable(.refreshFailed))
+        let denial = try XCTUnwrap(h.driver.authorityGate.pendingDenial())
+        let newer = try fixture { $0["issuedAt"] = "2026-08-05T00:01:00.000Z" }
+        let bytes = nativeV3SourceEnvelope(newer), parsed = try EluNativeV3ConfigParser.parse(bytes)
+        await h.driver.refresh(); try await h.waitForRequests(3)
+        await h.transport.resolve(2, data: bytes)
+        try await h.waitForState(.document(newer))
+        let pendingToken = try XCTUnwrap(h.notifications.last)
+        XCTAssertNil(h.driver.authorityGate.witness(for: pendingToken))
+        XCTAssertTrue(h.driver.authorityGate.pendingDenial() === denial)
+        let budget = try XCTUnwrap(parsed.base.expiresAt.floorNanoseconds(after: h.clock.value.wallNow()))
+        let deadline = h.clock.value.continuousNow() + budget
+        h.clock.advance(seconds: 10, wall: false)
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("elu-lifecycle-denial-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let queue = try await EluSQLiteRuntimeQueue.openCaptureRuntime(rootDirectoryURL: root,
+            exactConstructorSiteKey: h.driver.authorityGate.siteKey,
+            clock: h.clock.value.wallNow, continuousClock: h.clock.value.continuousNow,
+            continuousBudgetConverter: { $0 }, configurationGate: h.driver.authorityGate)
+        _ = try await queue.persistConfigurationDenial()
+        await h.driver.configurationDenialSettled()
+        let token = try XCTUnwrap(h.notifications.last)
+        XCTAssertNotEqual(token, pendingToken)
+        let current = try XCTUnwrap(h.driver.authorityGate.witness(for: token))
+        XCTAssertEqual(current.nativeV3?.data, bytes); XCTAssertEqual(current.data, newer)
+        XCTAssertEqual(current.continuousDeadline, deadline)
+        XCTAssertEqual(current.expiresAt, parsed.base.expiresAt)
+        let fetchCount = await h.transport.count
+        XCTAssertEqual(fetchCount, 3, "Durable settlement does not create a replacement fetch")
+        await h.stop(); await queue.close()
+    }
+
     func testNativeV3OriginalPhysicalFetchMustFinishBeforeForegroundReplacement() async throws {
         let h = try Harness(format: .nativeV3)
         let base = try fixture(), envelope = nativeV3SourceEnvelope(base)

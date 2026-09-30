@@ -3712,6 +3712,7 @@ actor EluSQLiteRuntimeQueue {
         // No database work or task may run here. An unresolved original denial
         // retains resources only; exported guards must never keep this owner alive.
         if nativeScope.retainedClockDenial() != nil { held?.quarantineNativeClockDenial() }
+        if configurationGate?.pendingDenial() != nil { held?.quarantineNativeClockDenial() }
         if replayDispatch != nil { held?.quarantineReplay() }
         nativeCaptureEnrollment?.invalidateIntake()
         nativeCaptureEnrollment?.quarantine()
@@ -4232,15 +4233,19 @@ actor EluSQLiteRuntimeQueue {
               EluSQLiteRuntimeSchema.hasNativeReplayAuthority(databaseSchemaVersion) else {
             throw EluRuntimeQueueError.sourceAuthorityUnavailable
         }
+        try migrateNativeRasterSchema {
+            guard self.sourceIsCurrent(source) else { throw EluRuntimeQueueError.sourceAuthorityUnavailable }
+        }
+    }
+
+    private func migrateNativeRasterSchema(validate: () throws -> Void) throws {
         if EluSQLiteRuntimeSchema.hasRaster(databaseSchemaVersion) {
             try EluRuntimeDatabase.verifySchema(try requireResources().connection, databaseVersion: databaseSchemaVersion)
             return
         }
         let target = databaseSchemaVersion + 128
         guard EluSQLiteRuntimeSchema.hasRaster(target) else { throw EluRuntimeQueueError.unsupportedSchemaVersion(target) }
-        try replayStorageTransaction(validate: {
-            guard self.sourceIsCurrent(source) else { throw EluRuntimeQueueError.sourceAuthorityUnavailable }
-        }) { connection, _ in
+        try replayStorageTransaction(validate: validate) { connection, _ in
             try EluRuntimeDatabase.verifySchema(connection, databaseVersion: databaseSchemaVersion)
             try connection.execute("ALTER TABLE replay_state RENAME TO replay_state_previous")
             try connection.execute("ALTER TABLE replay_chunks RENAME TO replay_chunks_previous")
@@ -4256,10 +4261,50 @@ actor EluSQLiteRuntimeQueue {
         databaseSchemaVersion = target
     }
 
+    /// Drain the original source's restrictive receipt on this queue. Only an
+    /// actual validated wrapper conflict can reach this lazy migration. It grants
+    /// no replay admission, creates no session, and preserves all queued bodies.
+    /// Clear the exact pending slot only after known SQL settlement. A newer
+    /// source receipt arriving during the transaction remains pending instead.
+    @discardableResult
+    func persistConfigurationDenial() throws -> Bool {
+        guard let gate = configurationGate, let denial = gate.pendingDenial() else { return false }
+        guard exactConstructorSiteKey == gate.siteKey else { throw EluRuntimeQueueError.sourceAuthorityUnavailable }
+        let validate = {
+            guard gate.retainsDenial(denial) else { throw EluRuntimeQueueError.sourceAuthorityUnavailable }
+        }
+        nativeScope.invalidate()
+        flagScopeFence.invalidate()
+        eventDeliveryFence.invalidate()
+        try validate()
+        if !EluSQLiteRuntimeSchema.hasRaster(databaseSchemaVersion) {
+            try ensureReplaySchema()
+            try ensureReplayDeliverySchema()
+            try ensureNativeReplayAuthoritySchema()
+            try migrateNativeRasterSchema(validate: validate)
+        }
+        try replayStorageTransaction(validate: validate) { connection, _ in
+            var ledger = try EluRuntimeDatabase.readReplayState(connection)
+            // An old delayed denial cannot poison a newer original durable
+            // wrapper or newer base-only issuance already accepted by this owner.
+            if ledger.rasterSource.map({ $0.issuedAt > denial.issuedAt }) == true
+                || ledger.witness.map({ $0.issuedAt > denial.issuedAt }) == true { return }
+            var rejected = ledger.rasterSource.flatMap { $0.issuedAt == denial.issuedAt ? $0 : nil }
+                ?? EluNativeRasterSourceLedger(issuedAt: denial.issuedAt, semanticHash: denial.semanticHash)
+            rejected.conflicted = true
+            ledger.rasterSource = rejected
+            ledger.admissionEnabled = false
+            try EluRuntimeDatabase.writeReplayState(connection, ledger)
+        }
+        gate.acknowledgeDenial(denial)
+        return true
+    }
+
     /// Persist the complete wrapper's ordering witness on the original ledger.
     /// Conflict is committed before returning denial; throwing in that transaction
     /// would roll back the very poison which must survive process restart.
     func reconcileNativeRasterSource(_ source: EluV2ConfigAuthorityWitness) throws {
+        try persistConfigurationDenial()
         guard EluSQLiteRuntimeSchema.hasRaster(databaseSchemaVersion), sourceIsCurrent(source) else {
             throw EluRuntimeQueueError.sourceAuthorityUnavailable
         }
@@ -4308,6 +4353,7 @@ actor EluSQLiteRuntimeQueue {
     /// restart. This metadata-only transaction never reads row ages or grants
     /// raster permission; replay-clock uncertainty must not disable analytics.
     private func reconcileNativeRasterOrdering(_ source: EluV2ConfigAuthorityWitness) throws {
+        try persistConfigurationDenial()
         let wrapper = source.nativeV3
         // A new process may select the original v2 endpoint. That choice cannot
         // erase a known conflict at this issuance. A newer valid base may resume
@@ -4805,6 +4851,7 @@ actor EluSQLiteRuntimeQueue {
     func appendNativeRaster(_ prepared: EluNativeRasterPreparedRequest,
         admission: EluNativeRasterCaptureAdmission, physicalUse: EluNativeReplayCapturePhysicalUse
     ) throws -> EluNativeRasterCaptureAppendResult {
+        try persistConfigurationDenial()
         try requireNativeCaptureUse(physicalUse)
         guard admission.use === physicalUse, admission.isCurrent(),
               prepared.sourceIdentity === admission.permit.sourceIdentity else { throw EluNativeReplayAuthorityError.stale }
@@ -5145,6 +5192,7 @@ actor EluSQLiteRuntimeQueue {
         capabilities: EluNativeReplayCapabilities, timeZoneIdentifier: String?,
         support: EluReplayDeliverySupport = .wireframeOnly
     ) throws -> EluV2ReplayDeliveryAuthority? {
+        try persistConfigurationDenial()
         _ = try requireResources()
         guard EluSQLiteRuntimeSchema.hasReplayDelivery(databaseSchemaVersion),
               let gate = configurationGate, let siteKey = exactConstructorSiteKey,
@@ -5242,6 +5290,7 @@ actor EluSQLiteRuntimeQueue {
     }
 
     func claimNextReplay(_ authority: EluV2ReplayDeliveryAuthority) throws -> EluV2ReplayClaimResult {
+        try persistConfigurationDenial()
         guard EluSQLiteRuntimeSchema.hasReplayDelivery(databaseSchemaVersion), authority.owner == replayDeliveryOwner,
               authority.isCurrent() else { throw EluRuntimeQueueError.sourceAuthorityUnavailable }
         if replayClaim != nil { return .occupied }
@@ -7480,6 +7529,8 @@ actor EluSQLiteRuntimeQueue {
         sourceWitness: EluV2ConfigAuthorityWitness? = nil
     ) -> EluV1CaptureAuthorityUpdateResult {
         nativeScope.invalidate()
+        do { try persistConfigurationDenial() }
+        catch { return sourceUnavailableCaptureResult() }
         guard sourceIsCurrent(sourceWitness, data: configData) else { return sourceUnavailableCaptureResult() }
         // Lease time starts before any wall-clock read, decoding, hashing, or
         // policy validation. Validation latency must consume the lease.
@@ -9203,6 +9254,10 @@ actor EluSQLiteRuntimeQueue {
         flagScopeFence.invalidate(terminal: true)
         eventDeliveryFence.invalidate(terminal: true)
         if !isPoisoned {
+            do { try persistConfigurationDenial() }
+            catch { resources?.quarantineNativeClockDenial() }
+        }
+        if !isPoisoned {
             do { try persistNativeReplayClockDenial() }
             catch { /* Failed denial persistence retains installation occupancy. */ }
         }
@@ -10131,7 +10186,7 @@ actor EluSQLiteRuntimeQueue {
         // original lease while historical coverage could still be durable,
         // including an ambiguous opening write absent from in-memory state.
         if consentPersistenceInProgress || nativeDenialPersistenceInProgress || diagnosticsDenialPersistenceInProgress ||
-            diagnosticsMetadataPersistenceInProgress || state.diagnostics.hasCoverage {
+            diagnosticsMetadataPersistenceInProgress || state.diagnostics.hasCoverage || configurationGate?.pendingDenial() != nil {
             held?.quarantineNativeClockDenial()
         }
         held?.quarantineReplay()

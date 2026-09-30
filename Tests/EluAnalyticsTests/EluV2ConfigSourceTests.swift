@@ -388,6 +388,34 @@ final class EluV2ConfigSourceTests: XCTestCase {
         }
     }
 
+    func testActualConflictReceiptIsBoundedRetainedAndOnlyNewerConflictReplacesIt() async throws {
+        let (source, transport, _) = try makeSource(format: .nativeV3)
+        let positive = try nativeV3SourceRasterFixture(base: fixture())
+        let parsed = try EluNativeV3ConfigParser.parse(positive)
+        _ = await refresh(source, transport, data: positive)
+        _ = await refresh(source, transport, data: Data(" \n".utf8) + positive)
+        XCTAssertNil(source.denials.pending(), "Equivalent spelling is not a conflict")
+        _ = await refresh(source, transport, data: nativeV3SourceEnvelope(parsed.configV2Data))
+        let first = try XCTUnwrap(source.denials.pending())
+        XCTAssertEqual(first.issuedAt, parsed.base.issuedAt)
+        XCTAssertEqual(first.semanticHash, parsed.semanticHash)
+        XCTAssertNotEqual(first.semanticHash, first.conflictingSemanticHash)
+        XCTAssertEqual(first.semanticHash.utf8.count, 71)
+        await source.withdraw()
+        _ = await refresh(source, transport, data: positive)
+        XCTAssertTrue(source.denials.pending() === first)
+        let newer = try fixture { $0["issuedAt"] = "2026-08-05T00:01:00.000Z" }
+        let nextPositive = try nativeV3SourceRasterFixture(base: newer)
+        let nextParsed = try EluNativeV3ConfigParser.parse(nextPositive)
+        _ = await refresh(source, transport, data: nextPositive)
+        _ = await refresh(source, transport, data: nativeV3SourceEnvelope(nextParsed.configV2Data))
+        let second = try XCTUnwrap(source.denials.pending())
+        XCTAssertFalse(first === second); XCTAssertGreaterThan(second.issuedAt, first.issuedAt)
+        source.denials.acknowledge(first)
+        XCTAssertTrue(source.denials.pending() === second, "Old settlement cannot erase the replacement")
+        await source.close(); XCTAssertTrue(source.denials.pending() === second)
+    }
+
     func testNativeV3MalformedExtensionWithdrawsWithoutDroppingIntoBaseOnly() async throws {
         let (source, transport, _) = try makeSource(format: .nativeV3)
         let base = try fixture(), valid = nativeV3SourceEnvelope(base)

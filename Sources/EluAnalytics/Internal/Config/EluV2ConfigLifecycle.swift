@@ -50,6 +50,7 @@ actor EluV2ConfigLifecycle {
     private var invalidations = 0
     private var failures = 0
     private var publishedLease: EluV2ConfigLease?
+    private var publishedDenial: EluV2ConfigSourceDenial?
     private var state: EluV2ConfigLifecycleState = .unavailable(.notStarted)
     private var token = EluV2ConfigLifecycleToken()
     private var expiryTimer: (UUID, any EluV2ConfigScheduledTask)?
@@ -70,7 +71,7 @@ actor EluV2ConfigLifecycle {
         onUnchangedRefresh: @escaping @Sendable (EluV2ConfigLifecycleToken) -> Void = { _ in }
     ) throws {
         source = try EluV2ConfigSource(siteKey: siteKey, configHost: configHost, endpointPolicy: endpointPolicy, format: format, transport: transport, clock: clock)
-        authorityGate = EluV2ConfigAuthorityGate(siteKey: siteKey, clock: clock)
+        authorityGate = EluV2ConfigAuthorityGate(siteKey: siteKey, clock: clock, sourceDenials: source.denials)
         self.clock = clock
         self.scheduler = scheduler
         self.onChange = onChange
@@ -105,14 +106,23 @@ actor EluV2ConfigLifecycle {
         launchIfNeeded()
     }
 
-    func close() {
+    func close() async {
         guard !closed else { return }
         closed = true
         authorityGate.close()
         started = false
         invalidate(.closed, resume: false)
-        let source = source
-        Task { await source.close() }
+        // Join the original source actor before the stack closes its queue, so a
+        // conflict already being validated cannot arrive after the final drain.
+        await source.close()
+    }
+
+    /// Republish only the already retained original receipt/lease after durable
+    /// denial settlement. No fetch, new grant, or lease extension is introduced.
+    func configurationDenialSettled() {
+        guard !closed, publishedDenial != nil, authorityGate.pendingDenial() == nil else { return }
+        validatePublishedLease()
+        publish(state, receiptChanged: true)
     }
 
     /// The callback receives data only while its notification token is current.
@@ -294,8 +304,10 @@ actor EluV2ConfigLifecycle {
     private func cancelRefreshTimer() { refreshTimer?.1.cancel(); refreshTimer = nil }
 
     private func publish(_ next: EluV2ConfigLifecycleState, receiptChanged: Bool = false) {
-        guard next != state || receiptChanged else { return }
+        let denial = authorityGate.pendingDenial()
+        guard next != state || receiptChanged || denial !== publishedDenial else { return }
         state = next
+        publishedDenial = denial
         token = EluV2ConfigLifecycleToken()
         authorityGate.publish(token: token, lease: publishedLease)
         onChange(token)
