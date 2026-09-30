@@ -54,6 +54,19 @@ class V2RuntimeBoundaryTests(unittest.TestCase):
                                  "replayProtocolGeneration"))
         self.assertTrue(SCAN("Sources/EluAnalytics/EluNativeReplayCaptureOwner.swift", source))
 
+    def test_native_v3_parser_reads_base_generation_without_v2_endpoint_or_transport(self) -> None:
+        relative = "Sources/EluAnalytics/Internal/Config/EluNativeV3ConfigParser.swift"
+        source = (ROOT / relative).read_text()
+        self.assertIn("EluV1ConfigManager.prepareConfig(baseData, endpointPolicy: endpointPolicy)", source)
+        self.assertIn('retainingRootProperty: "configV2"', source)
+        self.assertEqual([], SCAN(relative, source))
+        self.assertTrue(SCAN(relative, '"/v2/replay"'))
+        self.assertTrue(SCAN(relative, '"elu-http-v2"'))
+        for sibling in ["Other.swift", "EluV2ConfigSource.swift"]:
+            self.assertTrue(SCAN("Sources/EluAnalytics/Internal/Config/" + sibling,
+                                 "replayProtocolGeneration"))
+        self.assertTrue(SCAN("Sources/EluAnalytics/EluNativeV3ConfigParser.swift", source))
+
     def test_local_policy_and_both_replay_projections_are_required(self) -> None:
         sources = {relative: (ROOT / relative).read_text()
                    for relative in MODULE["V2_ENDPOINT_PROJECTION"]}

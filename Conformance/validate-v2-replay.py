@@ -786,6 +786,7 @@ def verify_public_contract_clean() -> None:
 
 
 V2_GENERATION_SOURCES = frozenset({
+    "Sources/EluAnalytics/Internal/Config/EluNativeV3ConfigParser.swift",
     "Sources/EluAnalytics/Internal/Config/EluV1ConfigContract.swift",
     "Sources/EluAnalytics/Internal/Config/EluV1ConfigManager.swift",
     "Sources/EluAnalytics/Internal/Replay/EluNativeReplayAuthority.swift",

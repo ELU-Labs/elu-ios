@@ -214,7 +214,7 @@ final class EluV1ConfigManager: @unchecked Sendable {
     static let maximumConfigBytes = 65_536
     static let maximumPrivacyStateBytes = 32_768
 
-    private struct PreparedConfig {
+    struct PreparedConfig {
         let document: EluV1ConfigDocument
         let canonicalData: Data
         let semanticHash: String
@@ -1047,7 +1047,7 @@ final class EluV1ConfigManager: @unchecked Sendable {
         }
     }
 
-    private static func prepareConfig(_ data: Data, endpointPolicy: EluEndpointPolicy) throws -> PreparedConfig {
+    static func prepareConfig(_ data: Data, endpointPolicy: EluEndpointPolicy) throws -> PreparedConfig {
         let (document, strictDocument) = try decodeConfig(data)
         guard document.issuedAt < document.expiresAt else {
             throw EluV1ConfigResolutionError.invalidConfigValidityWindow

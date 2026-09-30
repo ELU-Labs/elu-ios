@@ -7,6 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		ECF7F297DF37EF87EF6E275E /* EluNativeV3ConfigParserTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 553C23A8CA8BCE6B69198020 /* EluNativeV3ConfigParserTests.swift */; };
 		C769EC8BB8A14CB8EBD76C8C /* EluNativeRasterSealerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E9B5FBD160D9A727F9E7F59B /* EluNativeRasterSealerTests.swift */; };
 		8E926CE62DC6DC39E278C090 /* EluSwiftUIReplayCollectorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 75936F55DE10AD8692A6AE9E /* EluSwiftUIReplayCollectorTests.swift */; };
 		3DC98BF7F801F1F54CE242D2 /* EluMetricKitCrashReportTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DC092DEB25CE485EABAFF689 /* EluMetricKitCrashReportTests.swift */; };
@@ -100,6 +101,7 @@
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
+		553C23A8CA8BCE6B69198020 /* EluNativeV3ConfigParserTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluNativeV3ConfigParserTests.swift; sourceTree = "<group>"; };
 		E9B5FBD160D9A727F9E7F59B /* EluNativeRasterSealerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluNativeRasterSealerTests.swift; sourceTree = "<group>"; };
 		75936F55DE10AD8692A6AE9E /* EluSwiftUIReplayCollectorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluSwiftUIReplayCollectorTests.swift; sourceTree = "<group>"; };
 		DC092DEB25CE485EABAFF689 /* EluMetricKitCrashReportTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluMetricKitCrashReportTests.swift; sourceTree = "<group>"; };
@@ -224,6 +226,7 @@
 		A0928195822C53907FA0C692 /* EluAnalyticsTests */ = {
 			isa = PBXGroup;
 			children = (
+				553C23A8CA8BCE6B69198020 /* EluNativeV3ConfigParserTests.swift */,
 				E9B5FBD160D9A727F9E7F59B /* EluNativeRasterSealerTests.swift */,
 				75936F55DE10AD8692A6AE9E /* EluSwiftUIReplayCollectorTests.swift */,
 				DC092DEB25CE485EABAFF689 /* EluMetricKitCrashReportTests.swift */,
@@ -404,6 +407,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				ECF7F297DF37EF87EF6E275E /* EluNativeV3ConfigParserTests.swift in Sources */,
 				C769EC8BB8A14CB8EBD76C8C /* EluNativeRasterSealerTests.swift in Sources */,
 				8E926CE62DC6DC39E278C090 /* EluSwiftUIReplayCollectorTests.swift in Sources */,
 				3DC98BF7F801F1F54CE242D2 /* EluMetricKitCrashReportTests.swift in Sources */,
