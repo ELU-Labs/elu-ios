@@ -43,7 +43,7 @@ class ReleasePreflightTests(unittest.TestCase):
     def test_preflight_requires_native_evidence_and_frozen_v2_contract(self) -> None:
         text = (ROOT / "scripts/release-preflight.sh").read_text()
         tag = text.index('python3 scripts/verify-release-tag.py "$release_tag"')
-        evidence = text.index('python3 scripts/validate-runtime-network-evidence.py "$network_trace"')
+        evidence = text.index('python3 scripts/validate-runtime-network-evidence.py "$network_trace" --profile current-native')
         build = text.index("run_logged simulator-tests")
         self.assertLess(tag, evidence)
         self.assertLess(evidence, build)

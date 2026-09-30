@@ -19,7 +19,7 @@ fi
 network_trace="$(cd "$(dirname "$network_trace")" && pwd)/$(basename "$network_trace")"
 
 python3 scripts/verify-release-tag.py "$release_tag"
-python3 scripts/validate-runtime-network-evidence.py "$network_trace"
+python3 scripts/validate-runtime-network-evidence.py "$network_trace" --profile current-native
 if ! command -v xcodebuild >/dev/null 2>&1; then
   echo "release preflight requires full Xcode" >&2
   exit 1
