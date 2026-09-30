@@ -310,6 +310,34 @@ final class EluV1ConfigManagerTests: XCTestCase {
         assertUpdateError(.malformedConfig, config: invalidDate)
     }
 
+    func testTimestampMillisecondsFloorExactDecimalFractionsAndOffsets() throws {
+        let cases: [(String, Int64)] = [
+            ("2026-08-04T00:01:01.123999999Z", 1_785_801_661_123),
+            ("2026-08-04T00:01:01.999999999999999999Z", 1_785_801_661_999),
+            ("2026-08-04T00:01:01.000999999Z", 1_785_801_661_000),
+            ("2026-08-04T00:01:01.1Z", 1_785_801_661_100),
+            ("2026-08-04T00:01:01Z", 1_785_801_661_000),
+            ("2026-08-03T17:01:01.123999999-07:00", 1_785_801_661_123),
+            ("1969-12-31T23:59:59.999999999Z", -1),
+            ("1970-01-01T00:59:59.123999999+01:00", -877),
+            ("0000-01-01T00:00:00Z", -62_167_219_200_000),
+            ("9999-12-31T23:59:59.999999999Z", 253_402_300_799_999),
+        ]
+        for (source, expected) in cases {
+            XCTAssertEqual(try EluV1Timestamp(source).floorUnixMilliseconds, expected, source)
+        }
+    }
+
+    func testTimestampMillisecondsPreserveLeapSecondPOSIXProjection() throws {
+        let leap = try EluV1Timestamp("2016-12-31T23:59:60.123999999Z")
+        let offsetLeap = try EluV1Timestamp("2016-12-31T15:59:60.123999999-08:00")
+        let midnight = try EluV1Timestamp("2017-01-01T00:00:00Z")
+        XCTAssertEqual(leap.floorUnixMilliseconds, 1_483_228_800_123)
+        XCTAssertEqual(offsetLeap.floorUnixMilliseconds, leap.floorUnixMilliseconds)
+        // The projection does not replace exact RFC 3339 authority ordering.
+        XCTAssertLessThan(leap, midnight)
+    }
+
     func testRFC3339LeapSecondBoundariesAndExactOrdering() throws {
         XCTAssertNoThrow(try EluV1Timestamp("2016-12-31T23:59:60Z"))
         XCTAssertNoThrow(try EluV1Timestamp("1990-12-31T15:59:60-08:00"))

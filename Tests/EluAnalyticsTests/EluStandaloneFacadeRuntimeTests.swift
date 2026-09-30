@@ -430,6 +430,42 @@ final class EluStandaloneFacadeRuntimeTests: XCTestCase {
         }
     }
 
+    func testExposureFloorsExactEvaluationMillisecondsFromRemoteAndReopenedCache() async throws {
+        try await withTemporaryDirectory { root in
+            let transport = FacadeFlagTransport(evaluatedAt: "2026-08-04T00:01:01.123999999Z")
+            let first = try await makeHarness(root: root, flagTransport: transport)
+            first.backend.activate()
+            await first.backend.settled()
+            XCTAssertEqual(first.backend.featureFlag("variant") as? String, "variant-a")
+            await first.backend.settled()
+            _ = await first.runtime.flush()
+            let remoteEvents = try await first.transport.recordedEvents()
+                .filter { $0["name"] as? String == "$feature_flag_called" }
+            XCTAssertEqual(remoteEvents.count, 1)
+            let remote = try XCTUnwrap(remoteEvents.first?["properties"] as? [String: Any])
+            XCTAssertEqual(remote["$feature_flag_evaluated_at"] as? Int64, 1_785_801_661_123)
+            XCTAssertEqual(remote["$used_bootstrap_value"] as? Bool, false)
+            await first.close()
+
+            await transport.setFailing(true)
+            let reopened = try await makeHarness(root: root, flagTransport: transport)
+            reopened.backend.activate()
+            await reopened.backend.settled()
+            XCTAssertEqual(reopened.backend.featureFlag("variant") as? String, "variant-a")
+            XCTAssertEqual(reopened.backend.featureFlag("enabled") as? Bool, false)
+            await reopened.backend.settled()
+            _ = await reopened.runtime.flush()
+            let cachedEvents = try await reopened.transport.recordedEvents()
+                .filter { $0["name"] as? String == "$feature_flag_called" }
+            XCTAssertEqual(cachedEvents.count, 1, "The accepted variant exposure stays deduplicated")
+            let cached = try XCTUnwrap(cachedEvents.first?["properties"] as? [String: Any])
+            XCTAssertEqual(cached["$feature_flag"] as? String, "enabled")
+            XCTAssertEqual(cached["$feature_flag_evaluated_at"] as? Int64, 1_785_801_661_123)
+            XCTAssertEqual(cached["$used_bootstrap_value"] as? Bool, true)
+            await reopened.close()
+        }
+    }
+
     func testReopenedRemoteCacheKeepsVisitorLedgerAndReportsExplicitCacheProvenance() async throws {
         try await withTemporaryDirectory { root in
             let first = try await makeHarness(root: root, flagTransport: FacadeFlagTransport())
@@ -792,6 +828,12 @@ actor FacadeBatchTransport: EluV1BatchHTTPTransport {
 actor FacadeFlagTransport: EluV1FlagTransport {
     private var calls = 0
     private var failing = false
+    private let evaluatedAt: String
+
+    init(evaluatedAt: String = "2026-08-04T00:01:01.000Z") {
+        self.evaluatedAt = evaluatedAt
+    }
+
     func setFailing(_ value: Bool) { failing = value }
 
     func send(endpoint: URL, requestBody: Data) async throws -> Data {
@@ -809,7 +851,7 @@ actor FacadeFlagTransport: EluV1FlagTransport {
                 "contextRevision": request["contextRevision"] ?? 0,
                 "identityRevision": identity["revision"] ?? 0,
                 "flagsRevision": "flags-facade-1",
-                "evaluatedAt": "2026-08-04T00:01:01.000Z",
+                "evaluatedAt": evaluatedAt,
                 "expiresAt": "2026-08-04T00:04:00.000Z",
                 "flags": [
                     "variant": "variant-a",

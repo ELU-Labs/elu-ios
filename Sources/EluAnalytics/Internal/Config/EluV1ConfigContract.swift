@@ -916,6 +916,19 @@ struct EluV1Timestamp: Comparable, Sendable {
         fractionalDigits.map { String($0) }.joined()
     }
 
+    /// Floors the POSIX projection without rounding through Date/binary64.
+    /// Preserve Date's existing leap-second mapping to the following second;
+    /// exact authority ordering continues to use the original parsed fields.
+    var floorUnixMilliseconds: Int64 {
+        var milliseconds: Int64 = 0
+        for index in 0 ..< 3 {
+            milliseconds = milliseconds * 10
+                + (index < fractionalDigits.count ? Int64(fractionalDigits[index]) : 0)
+        }
+        // The parser's year 0000...9999 and offset bounds fit safely in Int64.
+        return (baseSecond + (isLeapSecond ? 1 : 0)) * 1_000 + milliseconds
+    }
+
     static func < (lhs: EluV1Timestamp, rhs: EluV1Timestamp) -> Bool {
         if lhs.baseSecond != rhs.baseSecond {
             return lhs.baseSecond < rhs.baseSecond

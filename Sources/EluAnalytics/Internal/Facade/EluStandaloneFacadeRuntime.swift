@@ -685,7 +685,7 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
         reported["$feature_flag_payload"] = payload?.eluJSONValue ?? .null
         reported["$feature_flag_request_id"] = .string(projection.snapshot.response.requestId)
         if let evaluatedAt = try? projection.snapshot.response.evaluatedAt.validated() {
-            reported["$feature_flag_evaluated_at"] = .integer(Int64((evaluatedAt.date.timeIntervalSince1970 * 1_000).rounded(.down)))
+            reported["$feature_flag_evaluated_at"] = .integer(evaluatedAt.floorUnixMilliseconds)
         }
         // Compatibility fields: this SDK accepts no customer bootstrap values.
         // "used" denotes a retained cache before this evaluation has a remote response.
