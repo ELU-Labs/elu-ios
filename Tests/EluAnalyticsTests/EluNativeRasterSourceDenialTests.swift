@@ -201,15 +201,30 @@ final class EluNativeRasterSourceDenialTests: XCTestCase {
                 Data(bytes: try XCTUnwrap(sqlite3_column_blob(statement, 0)), count: Int(sqlite3_column_bytes(statement, 0)))
             }
         }
+        private struct InspectionFailure: Error, CustomStringConvertible {
+            let stage: String
+            let status: Int32, extended: Int32
+            var description: String { "SQLite inspection \(stage): status=\(status), extended=\(extended)" }
+        }
         private func withStatement<T>(_ sql: String, read: (OpaquePointer) throws -> T) throws -> T {
             let path = try root.appendingPathComponent(EluV1SiteNamespace.directoryComponent(exactConstructorSiteKey: Self.key))
                 .appendingPathComponent("runtime-state-v1.sqlite3").path
             var database: OpaquePointer?, statement: OpaquePointer?
-            guard sqlite3_open_v2(path, &database, SQLITE_OPEN_READONLY, nil) == SQLITE_OK else { throw EluRuntimeQueueError.databaseUnavailable }
+            // The original test queue owns this existing writable WAL store.
+            // Match the other queue inspection helpers so SQLite can initialize
+            // its WAL index; never create a missing database or issue writes.
+            let opened = sqlite3_open_v2(path, &database, SQLITE_OPEN_READWRITE, nil)
             defer { sqlite3_close(database) }
-            guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK else { throw EluRuntimeQueueError.databaseUnavailable }
+            func failure(_ stage: String, _ status: Int32) -> InspectionFailure {
+                InspectionFailure(stage: stage, status: status, extended: sqlite3_extended_errcode(database))
+            }
+            guard opened == SQLITE_OK else { throw failure("open", opened) }
+            let prepared = sqlite3_prepare_v2(database, sql, -1, &statement, nil)
             defer { sqlite3_finalize(statement) }
-            guard sqlite3_step(statement) == SQLITE_ROW else { throw EluRuntimeQueueError.corruptStorage }
+            guard prepared == SQLITE_OK else { throw failure("prepare", prepared) }
+            guard sqlite3_stmt_readonly(statement) != 0 else { throw failure("read-only statement", SQLITE_MISUSE) }
+            let stepped = sqlite3_step(statement)
+            guard stepped == SQLITE_ROW else { throw failure("step", stepped) }
             return try read(XCTUnwrap(statement))
         }
     }
