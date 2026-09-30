@@ -66,6 +66,7 @@ REPLAY_TRANSPORT_NAME = "EluV2URLSessionReplayTransport"
 NATIVE_PROTOCOL_SOURCE = "Sources/EluAnalytics/Internal/Replay/EluNativeReplayProtocol.swift"
 NATIVE_AUTHORITY_SOURCE = "Sources/EluAnalytics/Internal/Replay/EluNativeReplayAuthority.swift"
 NATIVE_SEALER_SOURCE = "Sources/EluAnalytics/Internal/Replay/EluNativeReplaySealer.swift"
+NATIVE_RASTER_SEALER_SOURCE = "Sources/EluAnalytics/Internal/Replay/EluNativeRasterSealer.swift"
 NATIVE_CAPTURE_SOURCE = "Sources/EluAnalytics/Internal/Replay/EluNativeReplayCaptureOwner.swift"
 NATIVE_WINDOW_SOURCE = "Sources/EluAnalytics/EluReplayWindow.swift"
 NATIVE_COLLECTOR_SOURCE = "Sources/EluAnalytics/Internal/Replay/EluUIKitReplayCollector.swift"
@@ -211,7 +212,26 @@ def scan_replay_storage_source(path: pathlib.Path, text: str) -> list[str]:
                             "nativeReplayPermitGuard", "persistNativeReplayClockDenial")
         if references - {"EluV2ReplayPreparedRequest"} or any(re.search(rf"\b{token}\b", text) for token in state_operations):
             errors.append(f"{path} adds storage or delivery behavior to the pure native sealer")
-    if re.search(r"\bEluNativeReplaySealer\b", text) and exact not in {NATIVE_SEALER_SOURCE, NATIVE_CAPTURE_SOURCE}:
+    helper_only_raster = False
+    if exact == NATIVE_RASTER_SEALER_SOURCE:
+        # Reuse only the two existing static byte/timestamp helpers. Do not add
+        # this path to the v2 storage/capture allowlist or permit the old recorder.
+        remaining = re.sub(r"\bEluNativeReplaySealer\s*\.\s*(?:timestamp|gzip)\s*\(", "", text)
+        helper_only_raster = re.search(r"\bEluNativeReplaySealer\b", remaining) is None
+        forbidden = ("EluSQLiteRuntimeQueue", "EluNativeReplayAuthority", "EluNativeReplayCapabilities",
+            "EluNativeReplayScope", "EluNativeReplayPermit", "EluNativeReplaySynchronousGuard",
+            "EluNativeReplayPreparedAuthority", "EluNativeReplayProjectionInput", "appendNativeReplay",
+            "appendReplay", "reconcileReplay", "ensureReplaySchema", "ensureReplayDeliverySchema",
+            "ensureNativeReplayAuthoritySchema", "nativeReplayProjection", "installNativeReplayPrivacy",
+            "beginNativeReplayStartAccounting", "stopNativeReplayAccounting", "nativeReplayPermitGuard",
+            "persistNativeReplayClockDenial")
+        if not helper_only_raster or any(re.search(rf"\b{token}\b", text) for token in forbidden) or any(
+            token in text for token in (*NETWORK_TOKENS, "import UIKit")
+        ) or re.search(r"\bTask(?:\.detached)?\s*[{(]", text):
+            errors.append(f"{path} widens the pure raster sealer beyond static byte helpers and retained values")
+    if re.search(r"\bEluNativeRaster(?:Sealer|PreparedRequest|PolicyBinding|SealingError)\b", text) and exact != NATIVE_RASTER_SEALER_SOURCE:
+        errors.append(f"{path} installs the unintegrated raster sealer outside its exact value file")
+    if re.search(r"\bEluNativeReplaySealer\b", text) and exact not in {NATIVE_SEALER_SOURCE, NATIVE_CAPTURE_SOURCE} and not helper_only_raster:
         errors.append(f"{path} references the native sealer outside its exact physical owner")
     if (re.search(r"\bEluV2(?:Replay|SealedReplay)\w*\b", text) or "ensureReplaySchema" in text or "ensureReplayDeliverySchema" in text) and exact not in allowed:
         errors.append(f"{path} references owned replay storage outside its exact files")

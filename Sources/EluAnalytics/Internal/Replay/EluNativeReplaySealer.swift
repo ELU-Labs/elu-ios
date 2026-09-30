@@ -167,7 +167,7 @@ struct EluNativeReplaySealer: Sendable {
     private static func digest(_ value: Data) -> String {
         SHA256.hash(data: value).map { String(format: "%02x", $0) }.joined()
     }
-    private static func timestamp(_ milliseconds: Int64) throws -> String {
+    static func timestamp(_ milliseconds: Int64) throws -> String {
         guard (1 ... 253_402_300_799_999).contains(milliseconds) else { throw EluNativeEncodingError.invalidTimestamp }
         let formatter = ISO8601DateFormatter()
         formatter.timeZone = TimeZone(secondsFromGMT: 0); formatter.formatOptions = [.withInternetDateTime]
@@ -177,7 +177,7 @@ struct EluNativeReplaySealer: Sendable {
         _ = try EluV1Timestamp(value)
         return value
     }
-    private static func gzip(_ input: Data, maximumBytes: Int) throws -> Data {
+    static func gzip(_ input: Data, maximumBytes: Int) throws -> Data {
         guard (1 ... 16_777_216).contains(input.count), maximumBytes >= 18
         else { throw EluNativeReplaySealingError.requestLimit }
         var stream = z_stream()

@@ -23,6 +23,9 @@ final class EluSwiftUIReplayRegistry {
     private var revision: UInt64 = 0
     private var lastAttempt: TimeInterval?
     private var activeLease: EluSwiftUIReplayFrameLease?
+    private weak var sourceRoot: EluSwiftUIReplayMarkerView?
+    private weak var sourceWindow: UIWindow?
+    private var originalSource: EluSwiftUIReplaySourceIdentity?
 
     init(requiredRegions: Set<String>) {
         let valid = requiredRegions.count <= 64 && requiredRegions.allSatisfy {
@@ -37,6 +40,11 @@ final class EluSwiftUIReplayRegistry {
         activeLease?.revoke()
         if revision == .max { validDeclaration = false } else { revision += 1 }
     }
+    func rootBindingChanged(_ marker: EluSwiftUIReplayMarkerView) {
+        if marker === sourceRoot {
+            originalSource = nil; sourceRoot = nil; sourceWindow = nil
+        }
+    }
     func add(_ marker: EluSwiftUIReplayMarkerView) {
         markers.removeAll { $0.value == nil }
         guard !markers.contains(where: { $0.value === marker }) else { return }
@@ -48,6 +56,7 @@ final class EluSwiftUIReplayRegistry {
         markers.append(WeakMarker(marker)); geometryChanged()
     }
     func remove(_ marker: EluSwiftUIReplayMarkerView) {
+        rootBindingChanged(marker)
         markers.removeAll { $0.value == nil || $0.value === marker }
         geometryChanged()
     }
@@ -164,6 +173,22 @@ final class EluSwiftUIReplayRegistry {
         }
     }
 
+    /// Only the collector can create this detached source identity. It refers
+    /// to one registry's original root/window, not a caller-selected label or a
+    /// privacy grant. Current source permission remains an independent check.
+    func sourceIdentity() throws -> EluSwiftUIReplaySourceIdentity {
+        try sourceIdentity(for: plan())
+    }
+    private func sourceIdentity(for plan: Plan) throws -> EluSwiftUIReplaySourceIdentity {
+        guard let root = plan.witnesses.first?.marker, let window = plan.window else {
+            throw EluSwiftUIReplayFailure.staleGeometry
+        }
+        if let originalSource, sourceRoot === root, sourceWindow === window { return originalSource }
+        let identity = EluSwiftUIReplaySourceIdentity()
+        sourceRoot = root; sourceWindow = window; originalSource = identity
+        return identity
+    }
+
     /// The injected draw is an internal deterministic fault seam. Production's
     /// default invokes the original mounted window once, synchronously. Neither
     /// this seam nor a returned frame is public authority or a queue admission.
@@ -188,6 +213,7 @@ final class EluSwiftUIReplayRegistry {
         var accepted = false
         defer { if !accepted { lease.finish() } }
         let original = try plan(check: check)
+        let source = try sourceIdentity(for: original)
         guard let window = original.window else { throw EluSwiftUIReplayFailure.invalidGeometry }
         // Retain only whole pixels inside the root. Rounding its outer extent
         // upward could sample a neighboring window region outside this scope.
@@ -243,7 +269,7 @@ final class EluSwiftUIReplayRegistry {
         guard storage.isOpaque else { throw EluSwiftUIReplayFailure.invalidPixels }
         try check(); try validate(original, check: check)
         guard lease.isCurrent else { throw EluSwiftUIReplayFailure.staleGeometry }
-        let frame = EluSwiftUIReplayFrame(storage: storage, lease: lease)
+        let frame = EluSwiftUIReplayFrame(storage: storage, lease: lease, sourceIdentity: source)
         accepted = true
         return frame
     }
@@ -286,11 +312,20 @@ final class EluSwiftUIReplayMarkerView: UIView {
     override var transform: CGAffineTransform { didSet { if oldValue != transform { registry?.geometryChanged() } } }
     override var alpha: CGFloat { didSet { if oldValue != alpha { registry?.geometryChanged() } } }
     override var isHidden: Bool { didSet { if oldValue != isHidden { registry?.geometryChanged() } } }
-    override func didMoveToSuperview() { super.didMoveToSuperview(); registry?.geometryChanged() }
+    override func didMoveToSuperview() {
+        super.didMoveToSuperview(); registry?.rootBindingChanged(self); registry?.geometryChanged()
+    }
     override func didMoveToWindow() {
         super.didMoveToWindow()
+        registry?.rootBindingChanged(self)
         if window == nil { registry?.remove(self) } else { registry?.add(self) }
     }
+}
+
+/// Opaque collector-owned identity, with no UIKit references or caller minting.
+/// Object identity deliberately distinguishes otherwise identical live roots.
+final class EluSwiftUIReplaySourceIdentity: Sendable {
+    fileprivate init() {}
 }
 
 /// Detached revocation/slot state only; no UIKit reference crosses MainActor.
@@ -334,9 +369,12 @@ final class EluSwiftUIReplayFrame: @unchecked Sendable {
     private let lock = NSLock()
     private var storage: EluSwiftUIReplayPixels?
     private let lease: EluSwiftUIReplayFrameLease
+    let sourceIdentity: EluSwiftUIReplaySourceIdentity
     let width: Int, height: Int
-    fileprivate init(storage: EluSwiftUIReplayPixels, lease: EluSwiftUIReplayFrameLease) {
+    fileprivate init(storage: EluSwiftUIReplayPixels, lease: EluSwiftUIReplayFrameLease,
+                     sourceIdentity: EluSwiftUIReplaySourceIdentity) {
         self.storage = storage; self.lease = lease; width = storage.width; height = storage.height
+        self.sourceIdentity = sourceIdentity
     }
     /// One-shot encoding; all owned raw pixels are cleared even on compression,
     /// output-limit or revocation failure. Future admission remains independent.

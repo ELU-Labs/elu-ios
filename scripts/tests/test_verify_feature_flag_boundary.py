@@ -235,6 +235,29 @@ class FeatureFlagBoundaryScannerTests(unittest.TestCase):
             for token in ["EluNativeReplaySealer()", "let value: EluNativeReplaySealer"]:
                 self.assertTrue(MODULE.scan_replay_storage_source(pathlib.Path(path), token))
 
+    def test_raster_sealer_reuses_only_exact_static_helpers_without_authority(self) -> None:
+        exact = pathlib.Path(MODULE.NATIVE_RASTER_SEALER_SOURCE)
+        source = (ROOT / exact).read_text()
+        self.assertEqual([], MODULE.scan_replay_storage_source(exact, source))
+        for helper in ["timestamp", "gzip"]:
+            self.assertEqual([], MODULE.scan_replay_storage_source(exact, f"EluNativeReplaySealer.{helper}(value)"))
+        for token in ["EluNativeReplaySealer()", "EluNativeReplaySealer.init(value)",
+                      "EluNativeReplaySealer.seal(value)", "let alias = EluNativeReplaySealer.self",
+                      "let closure = EluNativeReplaySealer.gzip", "typealias Alias = EluNativeReplaySealer",
+                      "EluSQLiteRuntimeQueue", "queue.appendNativeReplay(value)", "queue.appendReplay(value)",
+                      "queue.reconcileReplay()", "queue.ensureReplaySchema()", "queue.ensureReplayDeliverySchema()",
+                      "EluNativeReplayAuthority", "EluNativeReplayPermit", "EluNativeReplayCapabilities",
+                      "EluNativeReplayCapturePhysicalUse", "EluV2ReplayPreparedRequest", "EluV2ReplayDeliveryCoordinator",
+                      "URLSession", "URLRequest", "import UIKit", "import Network", "Task { work() }"]:
+            self.assertTrue(MODULE.scan_replay_storage_source(exact, source + "\n" + token), token)
+
+    def test_raster_helper_exception_does_not_escape_to_siblings_or_runtime(self) -> None:
+        for path in [MODULE.STACK_SOURCE, MODULE.NATIVE_RUNTIME_SOURCE, "Sources/EluAnalytics/Elu.swift",
+                     "Sources/EluAnalytics/Internal/Replay/Other.swift", "Other/EluNativeRasterSealer.swift"]:
+            for token in ["EluNativeReplaySealer.timestamp(value)", "EluNativeReplaySealer.gzip(value)",
+                          "EluNativeRasterSealer()", "EluNativeRasterPreparedRequest", "EluNativeRasterPolicyBinding"]:
+                self.assertTrue(MODULE.scan_replay_storage_source(pathlib.Path(path), token), (path, token))
+
     def test_native_authority_has_only_one_explicit_activation_per_schema(self) -> None:
         for call in ["ensureReplaySchema", "ensureReplayDeliverySchema"]:
             with verification_root() as root:
