@@ -283,10 +283,12 @@ final class EluNativeReplayCaptureOwner: @unchecked Sendable {
          versions: EluVersionContext, wallClock: @escaping @Sendable () -> Date,
          continuousNanoseconds: @escaping @Sendable () -> UInt64?,
          mayCollect: @escaping @Sendable () -> Bool = { true },
-         onCommitted: @escaping @Sendable () -> Void = {}) {
+         onCommitted: @escaping @Sendable () -> Void = {},
+         afterInteractionDrainForTesting: (@Sendable ([EluNativeInteraction]) -> Void)? = nil) {
         let run = EluNativeReplayCaptureRun(queue: queue, authority: authority,
             prepared: prepared, selection: selection, versions: versions,
-            wallClock: wallClock, continuousNanoseconds: continuousNanoseconds, mayCollect: mayCollect, onCommitted: onCommitted)
+            wallClock: wallClock, continuousNanoseconds: continuousNanoseconds, mayCollect: mayCollect, onCommitted: onCommitted,
+            afterInteractionDrainForTesting: afterInteractionDrainForTesting)
         fence = run.fence
         // This task owns physical completion independently of the handle. It
         // deliberately captures run, never self, so deinit can withdraw intake.
@@ -361,18 +363,21 @@ private final class EluNativeReplayCaptureRun: @unchecked Sendable {
     private let continuousNanoseconds: @Sendable () -> UInt64?
     private let mayCollect: @Sendable () -> Bool
     private let onCommitted: @Sendable () -> Void
+    private let afterInteractionDrainForTesting: (@Sendable ([EluNativeInteraction]) -> Void)?
 
     init(queue: EluSQLiteRuntimeQueue, authority: EluNativeReplayAuthority,
          prepared: EluNativeReplayPreparedAuthority, selection: EluNativeReplaySelection,
          versions: EluVersionContext, wallClock: @escaping @Sendable () -> Date,
          continuousNanoseconds: @escaping @Sendable () -> UInt64?,
          mayCollect: @escaping @Sendable () -> Bool = { true },
-         onCommitted: @escaping @Sendable () -> Void = {}) {
+         onCommitted: @escaping @Sendable () -> Void = {},
+         afterInteractionDrainForTesting: (@Sendable ([EluNativeInteraction]) -> Void)? = nil) {
         self.queue = queue; self.authority = authority; self.prepared = prepared
         self.selection = selection; self.versions = versions
         self.wallClock = wallClock; self.continuousNanoseconds = continuousNanoseconds
         self.mayCollect = mayCollect
         self.onCommitted = onCommitted
+        self.afterInteractionDrainForTesting = afterInteractionDrainForTesting
     }
 
     private func checkLocalIntake() throws {
@@ -417,6 +422,9 @@ private final class EluNativeReplayCaptureRun: @unchecked Sendable {
         var latestProjection: EluUIKitReplayInteractionProjection?
         var lastGeometry: EluNativeInteractionTime?
         var active = false
+        // A mailbox drain transfers ownership. Keep that prefix through the
+        // MainActor hop until accepted, including a graceful stop at the hop.
+        var pendingInteractions: [EluNativeInteraction] = []
         let mailbox = EluNativeReplayInteractionMailbox()
         defer { buffer.withdraw(); mailbox.withdraw() }
 
@@ -507,7 +515,6 @@ private final class EluNativeReplayCaptureRun: @unchecked Sendable {
                 }
                 let ordinal = buffer.nextFrameOrdinal
                 let originalAttachment = attachment
-                var preceding: [EluNativeInteraction] = []
                 let captured: (EluNativeMaskedSnapshot, UInt64, EluUIKitReplayInteractionProjection, [EluNativeInteraction], Bool)
                 do {
                     captured = try await MainActor.run {
@@ -516,7 +523,7 @@ private final class EluNativeReplayCaptureRun: @unchecked Sendable {
                               let continuous = self.continuousNanoseconds() else { throw EluNativeReplayCaptureError.withdrawn }
                         if let originalAttachment {
                             guard let rows = originalAttachment.drain() else { throw EluNativeReplayCaptureError.withdrawn }
-                            preceding = rows
+                            pendingInteractions = rows
                         }
                         // No event can interleave this old-points/geometry/new-projection handoff.
                         let timestamp = try EluNativeReplayCaptureClock.milliseconds(self.wallClock())
@@ -536,8 +543,11 @@ private final class EluNativeReplayCaptureRun: @unchecked Sendable {
                         if let originalAttachment {
                             guard let rows = originalAttachment.handoff(projection, at: .init(timestamp: timestamp, continuous: continuous)) else { throw EluNativeReplayCaptureError.withdrawn }
                             terminal = rows
+                            pendingInteractions += rows
                         }
-                        try self.checkCollection(permit)
+                        // The frame and handoff already completed under intake.
+                        // Local stop must keep their ordering; withdrawal still wins.
+                        try self.check(permit)
                         guard admission.isCurrent() else { throw EluNativeReplayCaptureError.withdrawn }
                         return (frame, continuous, projection, terminal, originalAttachment?.active() ?? false)
                     }
@@ -546,7 +556,8 @@ private final class EluNativeReplayCaptureRun: @unchecked Sendable {
                     // Old proven points keep their order; the original observer
                     // will refuse its invalidated projection until the next frame.
                     try checkCollection(permit)
-                    try await accept(preceding)
+                    try await accept(pendingInteractions)
+                    pendingInteractions.removeAll(keepingCapacity: false)
                     if buffer.isReady, let seal = try buffer.beginSealing() { try await commit(seal) }
                     await wake.wait(1_000_000_000)
                     continue
@@ -561,8 +572,12 @@ private final class EluNativeReplayCaptureRun: @unchecked Sendable {
                     try await MainActor.run { try self.checkSelectedRoot() }
                     throw EluUIKitReplayCollectionError.withdrawn
                 }
-                try checkCollection(permit)
-                try await accept(preceding + captured.3)
+                afterInteractionDrainForTesting?(pendingInteractions)
+                // Finish this transferred prefix and its already collected geometry
+                // before observing local stop on the next intake iteration.
+                try check(permit)
+                try await accept(pendingInteractions)
+                pendingInteractions.removeAll(keepingCapacity: false)
                 if try buffer.appendGeometry(captured.0, continuous: captured.1, scrolling: active || captured.4) == .sealRequired {
                     guard let seal = try buffer.beginSealing() else { throw EluNativeInteractionError.invalidSeal }
                     try await commit(seal)
@@ -586,7 +601,8 @@ private final class EluNativeReplayCaptureRun: @unchecked Sendable {
                     return values
                 } ?? []
             }
-            try await accept(tail)
+            try await accept(pendingInteractions + tail)
+            pendingInteractions.removeAll(keepingCapacity: false)
             if let seal = try buffer.beginSealing(graceful: true) { try await commit(seal) }
         }
     }

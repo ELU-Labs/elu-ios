@@ -224,7 +224,9 @@ def scan_replay_storage_source(path: pathlib.Path, text: str) -> list[str]:
         required = ["switch try await queue.appendNativeReplay(request, admission: admission, physicalUse: use)",
             "try buffer.committed(seal)", "attachment = original", "original.install()",
             "originalAttachment.drain()", "originalAttachment.handoff(projection, at:",
-            "try await accept(preceding + captured.3)", "buffer.appendGeometry(captured.0",
+            "pendingInteractions = rows", "pendingInteractions += rows",
+            "try await accept(pendingInteractions)", "try await accept(pendingInteractions + tail)",
+            "pendingInteractions.removeAll(keepingCapacity: false)", "buffer.appendGeometry(captured.0",
             "if let interactionAttachment { await interactionAttachment.close() }", "physicalUse.settle()",
             "enrollment.quarantine(retaining: pendingRequest)", "root.window is EluReplayWindow"]
         if any(token not in text for token in required):

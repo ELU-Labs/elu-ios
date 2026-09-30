@@ -175,7 +175,9 @@ class FeatureFlagBoundaryScannerTests(unittest.TestCase):
         capture = (ROOT / capture_path).read_text()
         self.assertEqual([], MODULE.scan_replay_storage_source(capture_path, capture))
         for token in ["try buffer.committed(seal)", "attachment = original", "originalAttachment.drain()",
-                      "originalAttachment.handoff(projection, at:", "try await accept(preceding + captured.3)",
+                      "originalAttachment.handoff(projection, at:", "pendingInteractions = rows", "pendingInteractions += rows",
+                      "try await accept(pendingInteractions)", "try await accept(pendingInteractions + tail)",
+                      "pendingInteractions.removeAll(keepingCapacity: false)",
                       "if let interactionAttachment { await interactionAttachment.close() }",
                       "enrollment.quarantine(retaining: pendingRequest)"]:
             self.assertIn(token, capture)

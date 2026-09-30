@@ -83,6 +83,48 @@ final class EluNativeReplayInteractionCaptureTests: XCTestCase {
         }
     }
 
+    func testGracefulStopAfterGeometryDrainRetainsTransferredGestureExactlyOnce() async throws {
+        let fixture = try await make(), h = fixture.h
+        let safe = UIView(frame: CGRect(x: 10, y: 10, width: 100, height: 100))
+        fixture.root.addSubview(safe); fixture.root.layoutIfNeeded(); CATransaction.flush()
+        let stop = InteractionDrainStop()
+        let owner = try start(fixture, mayCollect: { stop.isCollecting },
+            afterInteractionDrainForTesting: { stop.observe($0) })
+        var settled = false
+        defer { fixture.removeWindow(); if settled { h.base.remove() } }
+        do {
+            try await wait { self.observer(fixture.window) != nil }
+            let original = try XCTUnwrap(observer(fixture.window)), finger = NSObject()
+            // No await between these detached inputs. The next geometry drain
+            // owns the whole gesture before the test closes only local intake.
+            h.base.testClock.advance(1)
+            original.observeForTesting(fact(.began, finger), originalView: safe) {}
+            h.base.testClock.advance(0.25)
+            original.observeForTesting(fact(.moved, finger, y: 60), originalView: safe) {}
+            h.base.testClock.advance(0.25)
+            original.observeForTesting(fact(.ended, finger, y: 60), originalView: safe) {}
+            try await wait("original geometry drain reached stop barrier") { !stop.isCollecting }
+            guard case .settled = await owner.finished() else { return XCTFail("Original graceful stop did not settle") }
+            XCTAssertEqual(stop.stopCount, 1)
+            XCTAssertNil(observer(fixture.window))
+            let rows = try await h.queue.storedReplayChunks()
+            let records = try rows.flatMap { try decoded($0.prepared) }.compactMap { $0["data"] as? [String: Any] }
+            for type in [7, 9] {
+                XCTAssertEqual(records.filter { ($0["source"] as? Int) == 2 && ($0["type"] as? Int) == type }.count, 1)
+            }
+            XCTAssertEqual(records.filter { ($0["source"] as? Int) == 6 }
+                .flatMap { $0["positions"] as? [[String: Any]] ?? [] }.count, 1)
+            XCTAssertFalse(records.contains { ($0["source"] as? Int) == 2 && ($0["type"] as? Int) == 10 })
+            await fixture.authority.close(); await h.queue.close(); try await h.reopen()
+            let reopened = try await h.queue.storedReplayChunks(); XCTAssertEqual(reopened, rows)
+            await h.queue.close(); settled = true
+        } catch {
+            let result = await owner.stop(); await fixture.authority.close(); await h.queue.close()
+            if case .settled = result { settled = true }
+            throw error
+        }
+    }
+
     func testOriginalRunEarlySealsBeforePeriodicFlushWithoutDroppingOrderedMoves() async throws {
         let fixture = try await make(), safe = UIView(frame: CGRect(x: 10, y: 10, width: 100, height: 100))
         fixture.root.addSubview(safe); fixture.root.layoutIfNeeded(); CATransaction.flush()
@@ -277,12 +319,14 @@ final class EluNativeReplayInteractionCaptureTests: XCTestCase {
         return Fixture(h: h, host: host, window: window, root: root, lifecycle: lifecycle,
             authority: authority, prepared: prepared, selection: selection)
     }
-    private func start(_ f: Fixture) throws -> EluNativeReplayCaptureOwner {
+    private func start(_ f: Fixture, mayCollect: @escaping @Sendable () -> Bool = { true },
+                       afterInteractionDrainForTesting: (@Sendable ([EluNativeInteraction]) -> Void)? = nil) throws -> EluNativeReplayCaptureOwner {
         let base = f.h.base
         return EluNativeReplayCaptureOwner(queue: f.h.queue, authority: f.authority, prepared: f.prepared,
             selection: f.selection, versions: try .init(runtime: .init(name: "elu-ios", version: "0.1.0"),
                 facade: .init(name: "elu-ios", version: "0.1.0")),
-            wallClock: { base.now }, continuousNanoseconds: { base.testClock.ticks() })
+            wallClock: { base.now }, continuousNanoseconds: { base.testClock.ticks() }, mayCollect: mayCollect,
+            afterInteractionDrainForTesting: afterInteractionDrainForTesting)
     }
     private func observer(_ window: EluReplayWindow) -> EluUIKitReplayTouchObserver? {
         guard let value = Mirror(reflecting: window).children.first(where: { $0.label == "replayObserver" })?.value else { return nil }
@@ -330,4 +374,17 @@ private struct InteractionCaptureWaitFailure: Error, CustomStringConvertible {
         "Timed out waiting for interaction fixture phase: \(phase)" + (diagnostics.map { ";" + $0 } ?? "")
     }
 }
+private final class InteractionDrainStop: @unchecked Sendable {
+    private let lock = NSLock()
+    private var collecting = true
+    private var count = 0
+    var isCollecting: Bool { lock.lock(); defer { lock.unlock() }; return collecting }
+    var stopCount: Int { lock.lock(); defer { lock.unlock() }; return count }
+    func observe(_ values: [EluNativeInteraction]) {
+        guard values.contains(where: { if case .end = $0 { return true }; return false }) else { return }
+        lock.lock(); defer { lock.unlock() }
+        if collecting { collecting = false; count += 1 }
+    }
+}
+
 #endif
