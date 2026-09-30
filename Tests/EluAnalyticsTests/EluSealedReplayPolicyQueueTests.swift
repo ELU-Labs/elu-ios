@@ -40,14 +40,14 @@ final class EluSealedReplayPolicyQueueTests: XCTestCase {
             readbackProvenProtocolGenerations: Set(EluNativeReplayProtocol.allCases.map(\.generation)))
         let authority = try await h.authority(proof: both), permission = try XCTUnwrap(authority)
         guard case let .claimed(claim) = try await h.base.queue.claimNextReplay(permission) else { return XCTFail("v2 original claim") }
-        XCTAssertEqual(claim.row.prepared.body, original.prepared.body)
+        XCTAssertEqual(claim.row, .wireframe(original))
         _ = try await h.base.queue.finishReplayClaim(claim, completion: .released)
         await h.base.queue.close(); h.base.queue = try await h.base.reopen()
         let reopened = try await h.base.queue.storedReplayChunks()
         XCTAssertEqual(reopened, originalRows); XCTAssertEqual(try h.base.schemaVersion(), beforeSchema)
         let fresh = try await h.authority(proof: both), current = try XCTUnwrap(fresh)
         guard case let .claimed(retry) = try await h.base.queue.claimNextReplay(current) else { return XCTFail("v2 retry") }
-        XCTAssertEqual(retry.row.prepared, original.prepared)
+        XCTAssertEqual(retry.row, .wireframe(original))
         _ = try await h.base.queue.finishReplayClaim(retry, completion: .response(.accepted))
         let remaining = try await h.base.queue.storedReplayChunks(); XCTAssertTrue(remaining.isEmpty)
         await h.base.queue.close()
@@ -64,7 +64,7 @@ final class EluSealedReplayPolicyQueueTests: XCTestCase {
         XCTAssertFalse(original.isCurrent())
         let next = try await h.authority(), current = try XCTUnwrap(next)
         guard case let .claimed(claim) = try await h.base.queue.claimNextReplay(current) else { return XCTFail("sealed original") }
-        XCTAssertEqual(claim.row, rows[0]); _ = try await h.base.queue.finishReplayClaim(claim, completion: .released)
+        XCTAssertEqual(claim.row, .wireframe(rows[0])); _ = try await h.base.queue.finishReplayClaim(claim, completion: .released)
         await h.base.queue.close()
     }
 
@@ -101,7 +101,7 @@ final class EluSealedReplayPolicyQueueTests: XCTestCase {
             let value = try await h.authority(), current = try XCTUnwrap(value)
             XCTAssertEqual(try n.bytes("SELECT metadata FROM native_replay_authority"), bytes)
             guard case let .claimed(claim) = try await n.queue.claimNextReplay(current) else { return XCTFail("original sealed row despite capture-only restriction") }
-            XCTAssertEqual(claim.row, rows[0])
+            XCTAssertEqual(claim.row, .wireframe(rows[0]))
             _ = try await n.queue.finishReplayClaim(claim, completion: .released)
             XCTAssertEqual(try n.bytes("SELECT metadata FROM native_replay_authority"), bytes)
             await n.queue.close()

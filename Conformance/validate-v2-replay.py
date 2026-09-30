@@ -809,6 +809,9 @@ V2_ENDPOINT_PROJECTION = {
         "parts.percentEncodedPath == prefix + path",
         "let prefix = declaredAPIOrigin.flatMap",
         "URLComponents(url: $0, resolvingAgainstBaseURL: false)?.percentEncodedPath",
+        'let original = declaredAPIOrigin?.absoluteString ?? "https://ingest.elu.dev"',
+        'guard ["https://ingest.elu.dev", "https://35-224-68-29.sslip.io"].contains(original),',
+        'value == original + "/v3/replay" else { return nil }',
     ),
     "Sources/EluAnalytics/Internal/Config/EluV1ConfigManager.swift": (
         "private let endpointPolicy: EluEndpointPolicy",
@@ -818,7 +821,8 @@ V2_ENDPOINT_PROJECTION = {
     "Sources/EluAnalytics/Internal/Replay/EluV2URLSessionReplayTransport.swift": (
         "private let endpointPolicy: EluEndpointPolicy",
         "self.endpointPolicy = endpointPolicy",
-        "guard endpointPolicy.endpoint(request.url.absoluteString, role: .replay) != nil,",
+        "let endpoint = use.format == .wireframe\n            ? endpointPolicy.endpoint(request.url.absoluteString, role: .replay)\n            : endpointPolicy.nativeRasterEndpoint(request.url.absoluteString)",
+        "guard endpoint == request.url,",
     ),
 }
 PUBLIC_FACADE_SOURCES = frozenset(

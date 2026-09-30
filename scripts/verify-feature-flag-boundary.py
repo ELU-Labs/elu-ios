@@ -68,6 +68,8 @@ NATIVE_AUTHORITY_SOURCE = "Sources/EluAnalytics/Internal/Replay/EluNativeReplayA
 NATIVE_SEALER_SOURCE = "Sources/EluAnalytics/Internal/Replay/EluNativeReplaySealer.swift"
 NATIVE_RASTER_SEALER_SOURCE = "Sources/EluAnalytics/Internal/Replay/EluNativeRasterSealer.swift"
 NATIVE_RASTER_RESPONSE_SOURCE = "Sources/EluAnalytics/Internal/Replay/EluNativeRasterResponse.swift"
+NATIVE_RASTER_DELIVERY_SOURCE = "Sources/EluAnalytics/Internal/Replay/EluV2ReplayDeliveryCoordinator.swift"
+NATIVE_RASTER_DELIVERY_STATE = "Sources/EluAnalytics/Internal/Replay/EluV2ReplayDeliveryState.swift"
 NATIVE_RASTER_STORAGE_SOURCE = "Sources/EluAnalytics/Internal/Replay/EluStoredReplayRecord.swift"
 NATIVE_RASTER_QUEUE_SOURCE = "Sources/EluAnalytics/Internal/Runtime/EluSQLiteRuntimeQueue.swift"
 NATIVE_CAPTURE_SOURCE = "Sources/EluAnalytics/Internal/Replay/EluNativeReplayCaptureOwner.swift"
@@ -246,17 +248,22 @@ def scan_replay_storage_source(path: pathlib.Path, text: str) -> list[str]:
             errors.append(f"{path} adds live authority, capture or delivery to restored raster values")
     raster_durable_owner = exact in {NATIVE_RASTER_QUEUE_SOURCE, NATIVE_AUTHORITY_SOURCE}
     if raster_durable_owner:
-        forbidden = ("EluNativeRasterSealer", "EluNativeRasterResponse", "EluNativeRasterResponseOutcome",
+        forbidden = ("EluNativeRasterSealer", "EluNativeRasterResponse",
             "EluSwiftUIReplayFrame", "EluSwiftUIReplayRegistry")
+        if exact == NATIVE_AUTHORITY_SOURCE:
+            forbidden += ("EluNativeRasterResponseOutcome",)
         if any(re.search(rf"\b{token}\b", text) for token in forbidden) or re.search(
             r"\bEluNativeRasterPreparedRequest\s*(?:\.\s*init)?\s*\(", text):
             errors.append(f"{path} adds a raster recorder, request constructor or response dispatch to durable admission")
     if re.search(r"\b(?:EluStoredReplayRecord|EluNativeRaster(?:Stored\w*|SourceLedger|Permit|PreparedAuthority|Capture\w*|AppendResult))\b", text) and not (
-        raster_durable_owner or exact == NATIVE_RASTER_STORAGE_SOURCE):
+        raster_durable_owner or exact == NATIVE_RASTER_STORAGE_SOURCE or (
+            exact == NATIVE_RASTER_RESPONSE_SOURCE and not re.search(
+                r"\b(?:EluStoredReplayRecord|EluNativeRaster(?:Stored\w*|SourceLedger|Permit|PreparedAuthority|Capture\w*|AppendResult))\b",
+                re.sub(r"\brequest\s*:\s*EluNativeRasterStoredRequest\b", "", text)))):
         errors.append(f"{path} consumes dormant raster storage/admission outside the original queue and authority")
     response_only_raster = False
     if exact == NATIVE_RASTER_RESPONSE_SOURCE:
-        remaining = re.sub(r"\brequest\s*:\s*EluNativeRasterPreparedRequest\b", "", text)
+        remaining = re.sub(r"\brequest\s*:\s*EluNativeRaster(?:Prepared|Stored)Request\b", "", text)
         remaining = re.sub(r"\bEluV2ReplayText\.equal\s*\(", "(", remaining)
         remaining = re.sub(r"\bEluV1BatchDeliveryCoordinator\.parseRetryAfter\s*\(", "(", remaining)
         forbidden = ("EluSQLiteRuntimeQueue", "EluStandaloneRuntime", "EluNativeReplayAuthority",
@@ -273,8 +280,18 @@ def scan_replay_storage_source(path: pathlib.Path, text: str) -> list[str]:
         )
         if not response_only_raster:
             errors.append(f"{path} widens the pure raster response classifier beyond original request reads and static helpers")
-    if re.search(r"\bEluNativeRaster(?:Response\w*|ConflictScope)\b", text) and exact != NATIVE_RASTER_RESPONSE_SOURCE:
-        errors.append(f"{path} installs the unintegrated raster response classifier outside its exact value file")
+    if re.search(r"\bEluNativeRaster(?:Response\w*|ConflictScope)\b", text) and exact not in {
+            NATIVE_RASTER_RESPONSE_SOURCE, NATIVE_RASTER_DELIVERY_SOURCE, NATIVE_RASTER_QUEUE_SOURCE}:
+        errors.append(f"{path} installs raster response handling outside the original value and delivery owners")
+    if exact == NATIVE_RASTER_DELIVERY_SOURCE:
+        remaining = re.sub(r"\bEluNativeRasterResponse\.classify\s*\(", "(", text)
+        if re.search(r"\bEluNativeRasterResponse\b|\bEluNativeRaster(?:Sealer|PreparedRequest|StoredRequest|PolicyBinding)\b", remaining):
+            errors.append(f"{path} constructs raster values or bypasses the exact response classifier")
+    delivery_selection_owners = {NATIVE_RASTER_QUEUE_SOURCE, NATIVE_RASTER_DELIVERY_STATE, REPLAY_TRANSPORT_SOURCE}
+    if re.search(r"\bEluReplayDelivery(?:Format|Support)\b|\.includingRaster\b", text) and exact not in delivery_selection_owners:
+        errors.append(f"{path} activates raster delivery outside its original explicit internal selection")
+    if exact == NATIVE_RASTER_QUEUE_SOURCE and "support: EluReplayDeliverySupport = .wireframeOnly" not in text:
+        errors.append(f"{path} changes the dormant raster delivery default")
     if re.search(r"\bEluNativeRaster(?:Sealer|PreparedRequest|PolicyBinding|SealingError)\b", text) and exact != NATIVE_RASTER_SEALER_SOURCE and not response_only_raster and not raster_durable_owner:
         errors.append(f"{path} installs the unintegrated raster sealer outside its exact value file")
     if re.search(r"\bEluNativeReplaySealer\b", text) and exact not in {NATIVE_SEALER_SOURCE, NATIVE_CAPTURE_SOURCE} and not helper_only_raster:

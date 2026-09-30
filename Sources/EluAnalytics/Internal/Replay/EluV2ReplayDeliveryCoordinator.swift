@@ -141,8 +141,21 @@ actor EluV2ReplayDeliveryCoordinator {
             var outcome: EluV2ReplayResponseOutcome?
             do {
                 let response = try await withTaskCancellationHandler(operation: { try await task.value }, onCancel: { task.cancel() })
-                let value = EluV2ReplayResponse.classify(response, request: claim.row.prepared, now: wallNow())
-                outcome = value; completion = .response(value)
+                switch claim.row {
+                case let .wireframe(row):
+                    let value = EluV2ReplayResponse.classify(response, request: row.prepared, now: wallNow())
+                    outcome = value; completion = .response(value)
+                case let .raster(row):
+                    let value = EluNativeRasterResponse.classify(response, request: row.prepared, now: wallNow())
+                    completion = .rasterResponse(value)
+                    switch value {
+                    case .accepted: outcome = .accepted
+                    case .identityConflict, .rejectedTooLarge, .protocolBlocked: outcome = .protocolBlocked
+                    case let .credentialBlocked(status): outcome = .credentialBlocked(status: status)
+                    case let .retry(afterSeconds): outcome = .retry(afterSeconds: afterSeconds)
+                    case let .endpointCooldown(seconds): outcome = .endpointCooldown(seconds: seconds)
+                    }
+                }
             } catch is CancellationError {
                 completion = .released
             } catch let error as EluV1BoundTransportError {
@@ -150,7 +163,8 @@ actor EluV2ReplayDeliveryCoordinator {
                 if error == .occupied { summary.stopped = .occupied }
             } catch let error as EluV1BatchDeliveryError {
                 if error == .malformedResponse || error == .responseTooLarge {
-                    outcome = .protocolBlocked; completion = .response(.protocolBlocked)
+                    outcome = .protocolBlocked
+                    completion = claim.format == .wireframe ? .response(.protocolBlocked) : .rasterResponse(.protocolBlocked)
                 } else { completion = .released }
             } catch { completion = .networkFailure }
             requestTask = nil
@@ -171,10 +185,9 @@ actor EluV2ReplayDeliveryCoordinator {
                 credentialRefusedAuthority = authority
                 summary.stopped = .withdrawn; return summary
             }
-            if case let .endpointCooldown(seconds) = outcome {
-                scheduleRetry(authority, after: UInt64(ceil(seconds * 1_000_000_000)), pass: pass)
-                summary.stopped = .deferred; return summary
-            }
+            // Reenter the same bounded claim loop: the refused endpoint is
+            // cooling down, while the other original endpoint may still progress.
+            // The queue returns deferred when no eligible endpoint remains.
         }
         // Yield the actor/executor between bounded passes while preserving the
         // original withdrawal fence. The seventeenth ready row is not stranded.

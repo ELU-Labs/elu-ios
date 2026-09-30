@@ -333,6 +333,26 @@ class FeatureFlagBoundaryScannerTests(unittest.TestCase):
                 self.assertTrue(MODULE.scan_replay_storage_source(pathlib.Path(path), token), (path, token))
             self.assertTrue(MODULE.scan_native_v3_source(pathlib.Path(path), "source.nativeV3"))
 
+    def test_raster_delivery_only_extends_original_dispatch_and_keeps_default_dormant(self) -> None:
+        for path in [MODULE.NATIVE_RASTER_QUEUE_SOURCE, MODULE.NATIVE_RASTER_DELIVERY_SOURCE,
+                     MODULE.NATIVE_RASTER_RESPONSE_SOURCE, MODULE.NATIVE_RASTER_DELIVERY_STATE,
+                     MODULE.REPLAY_TRANSPORT_SOURCE]:
+            source = (ROOT / path).read_text()
+            self.assertEqual([], MODULE.scan_replay_storage_source(pathlib.Path(path), source))
+        for path in [MODULE.STACK_SOURCE, MODULE.NATIVE_RUNTIME_SOURCE, MODULE.NATIVE_CAPTURE_SOURCE,
+                     "Sources/EluAnalytics/Elu.swift", "Sources/EluAnalytics/Internal/Replay/Other.swift"]:
+            for token in ["EluReplayDeliverySupport", "support: .includingRaster", "EluNativeRasterResponse.classify(value)"]:
+                self.assertTrue(MODULE.scan_replay_storage_source(pathlib.Path(path), token), (path, token))
+        path = pathlib.Path(MODULE.NATIVE_RASTER_DELIVERY_SOURCE)
+        source = (ROOT / path).read_text()
+        for token in ["let classify = EluNativeRasterResponse.classify", "EluNativeRasterResponse()",
+                      "EluNativeRasterStoredRequest(restoring: data)", "EluNativeRasterSealer()"]:
+            self.assertTrue(MODULE.scan_replay_storage_source(path, source + "\n" + token), token)
+        path = pathlib.Path(MODULE.NATIVE_RASTER_QUEUE_SOURCE)
+        source = (ROOT / path).read_text()
+        self.assertTrue(MODULE.scan_replay_storage_source(path, source.replace(
+            "support: EluReplayDeliverySupport = .wireframeOnly", "support: EluReplayDeliverySupport = .includingRaster")))
+
     def test_raster_restore_cannot_construct_live_requests_or_install_capture(self) -> None:
         path = pathlib.Path(MODULE.NATIVE_RASTER_STORAGE_SOURCE)
         source = (ROOT / path).read_text()

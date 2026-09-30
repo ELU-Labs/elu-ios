@@ -43,14 +43,14 @@ final class EluV2ReplayDeliveryTests: XCTestCase {
         let permission = try await h.deliveryAuthority()
         let first = try await claim(h.queue, permission)
         _ = try await h.queue.finishReplayClaim(first, completion: .networkFailure)
-        let second = try await claim(h.queue, permission); XCTAssertEqual(second.row.prepared.replayId, "other")
+        let second = try await claim(h.queue, permission); XCTAssertEqual(second.row.replayId, "other")
         _ = try await h.queue.finishReplayClaim(second, completion: .response(.accepted))
         guard case .deferred = try await h.queue.claimNextReplay(permission) else { return XCTFail("retry delay") }
         h.testClock.advance(1)
         try await h.renew(generation: h.generation, issued: "2026-08-05T00:00:01.000Z", support: h.generation)
         let next = try await h.deliveryAuthority()
         XCTAssertEqual(next.authorizationWitness, permission.authorizationWitness)
-        let retried = try await claim(h.queue, next); XCTAssertEqual(retried.row.prepared.body, first.row.prepared.body)
+        let retried = try await claim(h.queue, next); XCTAssertEqual(retried.row.body, first.row.body)
         XCTAssertEqual(retried.attemptCount, 2)
         _ = try await h.queue.finishReplayClaim(retried, completion: .response(.accepted))
         await h.queue.close()
@@ -61,7 +61,7 @@ final class EluV2ReplayDeliveryTests: XCTestCase {
         try await h.install()
         _ = try await h.append(request: h.request(chunkId: "later", sequence: 2)); _ = try await h.append()
         try await h.queue.ensureReplayDeliverySchema(); let permission = try await h.deliveryAuthority()
-        let first = try await claim(h.queue, permission); XCTAssertEqual(first.row.prepared.sequence, 1)
+        let first = try await claim(h.queue, permission); XCTAssertEqual(first.row.sequence, 1)
         _ = try await h.queue.finishReplayClaim(first, completion: .response(.protocolBlocked))
         guard case .idle = try await h.queue.claimNextReplay(permission) else { return XCTFail("blocked head skipped") }
         let count = try await awaitCount(h.queue); XCTAssertEqual(count, 2)
@@ -78,7 +78,7 @@ final class EluV2ReplayDeliveryTests: XCTestCase {
             try await h.renew(generation: h.generation, issued: "2026-08-05T00:00:01.000Z", support: h.generation)
             let next = try await h.deliveryAuthority()
             guard case .idle = try await h.queue.claimNextReplay(next) else { return XCTFail("refused row revived") }
-            let rows = try await h.queue.storedReplayChunks(); XCTAssertEqual(rows, [first.row])
+            let rows = try await h.queue.storedReplayChunks(); XCTAssertEqual(rows.map(EluStoredReplayRecord.wireframe), [first.row])
             await h.queue.close()
         }
     }
@@ -162,15 +162,16 @@ final class EluV2ReplayDeliveryTests: XCTestCase {
             await h.queue.close()
             return
         }
-        XCTAssertEqual(next.row.prepared.body, request.body)
+        XCTAssertEqual(next.row.body, request.body)
         XCTAssertEqual(next.attemptCount, 2)
         let enrolled = try await h.queue.enrollReplayDispatch(next, dispatchAllowed: { true })
         let dispatch = try XCTUnwrap(enrolled), use = try XCTUnwrap(dispatch.takePhysicalUse())
         let valid = await use.revalidate(); XCTAssertTrue(valid); XCTAssertTrue(use.beginOnce())
         XCTAssertEqual(use.request.body, request.body)
         use.settle()
-        let ack = Self.ack(next.row.prepared)
-        let outcome = EluV2ReplayResponse.classify(ack, request: next.row.prepared, now: h.now)
+        guard case let .wireframe(nextRow) = next.row else { return XCTFail("expected original wireframe") }
+        let ack = Self.ack(nextRow.prepared)
+        let outcome = EluV2ReplayResponse.classify(ack, request: nextRow.prepared, now: h.now)
         XCTAssertEqual(outcome, .accepted)
         let accepted = try await h.queue.finishReplayClaim(next, completion: .response(outcome))
         XCTAssertTrue(accepted)
@@ -202,7 +203,7 @@ final class EluV2ReplayDeliveryTests: XCTestCase {
         _ = try await h.queue.registerStandaloneSuperProperties(["plan":.string("new")])
         XCTAssertFalse(old.isCurrent())
         let next = try await h.deliveryAuthority()
-        let actual = try await claim(h.queue,next); XCTAssertEqual(actual.row,stored[0])
+        let actual = try await claim(h.queue,next); XCTAssertEqual(actual.row,.wireframe(stored[0]))
         _ = try await h.queue.finishReplayClaim(actual,completion:.response(.accepted))
         await h.queue.close()
     }
@@ -245,7 +246,7 @@ final class EluV2ReplayDeliveryTests: XCTestCase {
         h.testClock.advance(5); let retried = try await claim(h.queue,next)
         XCTAssertEqual(retried.row,first.row)
         _ = try await h.queue.finishReplayClaim(retried,completion:.response(.rejectedTooLarge))
-        let second = try await claim(h.queue,next); XCTAssertEqual(second.row.prepared.replayId,"second")
+        let second = try await claim(h.queue,next); XCTAssertEqual(second.row.replayId,"second")
         await h.queue.close()
     }
 

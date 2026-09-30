@@ -47,4 +47,13 @@ struct EluEndpointPolicy: Equatable, Sendable {
         let digest = SHA256.hash(data: material).map { String(format: "%02x", $0) }.joined()
         return root.appendingPathComponent("origin-" + digest, isDirectory: true)
     }
+
+    /// A selected raster request cannot expand the original setup origin. Keep
+    /// the parser's frozen issuer origins and exact path; no v1/v2 fallback.
+    func nativeRasterEndpoint(_ value: String) -> URL? {
+        let original = declaredAPIOrigin?.absoluteString ?? "https://ingest.elu.dev"
+        guard ["https://ingest.elu.dev", "https://35-224-68-29.sslip.io"].contains(original),
+              value == original + "/v3/replay" else { return nil }
+        return URL(string: value)
+    }
 }

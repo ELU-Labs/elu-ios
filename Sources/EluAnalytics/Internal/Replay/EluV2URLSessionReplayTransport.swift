@@ -23,7 +23,10 @@ final class EluV2URLSessionReplayTransport: EluV2ReplayHTTPTransport, @unchecked
         try Task.checkCancellation()
         if !(await binding.revalidate()) { throw EluV1BoundTransportError.staleAuthority }
         try Task.checkCancellation()
-        guard endpointPolicy.endpoint(request.url.absoluteString, role: .replay) != nil,
+        let endpoint = use.format == .wireframe
+            ? endpointPolicy.endpoint(request.url.absoluteString, role: .replay)
+            : endpointPolicy.nativeRasterEndpoint(request.url.absoluteString)
+        guard endpoint == request.url,
               Set(request.headers.keys) == ["Authorization", "Content-Type"],
               request.headers["Content-Type"] == "application/json",
               request.headers["Authorization"]?.range(of: #"\ABearer elu_pk_(live|test)_[A-Za-z0-9]{22,64}\z"#, options: .regularExpression) != nil,

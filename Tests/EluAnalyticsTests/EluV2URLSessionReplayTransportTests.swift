@@ -3,6 +3,22 @@ import XCTest
 @testable import EluAnalytics
 
 final class EluV2URLSessionReplayTransportTests: XCTestCase {
+    func testRasterEndpointIsClosedAndCannotChangeLegacyRoleSelection() throws {
+        let cloud = EluEndpointPolicy.cloud
+        XCTAssertEqual(cloud.nativeRasterEndpoint("https://ingest.elu.dev/v3/replay")?.path, "/v3/replay")
+        XCTAssertNil(cloud.endpoint("https://ingest.elu.dev/v3/replay", role: .replay))
+        XCTAssertEqual(cloud.endpoint("https://ingest.elu.dev/v2/replay", role: .replay)?.path, "/v2/replay")
+        for suffix in ["/v2/replay", "/v3/replay?x=1", "/v3/replay#fragment", "/v3/replay/", "/v3/%72eplay"] {
+            XCTAssertNil(cloud.nativeRasterEndpoint("https://ingest.elu.dev" + suffix))
+        }
+        for value in ["https://foreign.invalid/v3/replay", "http://ingest.elu.dev/v3/replay",
+                      "https://ingest.elu.dev:443/v3/replay", "https://user@ingest.elu.dev/v3/replay"] {
+            XCTAssertNil(cloud.nativeRasterEndpoint(value))
+        }
+        let declared = try EluEndpointPolicy(apiHost: URL(string: "https://35-224-68-29.sslip.io"))
+        XCTAssertEqual(declared.nativeRasterEndpoint("https://35-224-68-29.sslip.io/v3/replay")?.path, "/v3/replay")
+        XCTAssertNil(declared.nativeRasterEndpoint("https://ingest.elu.dev/v3/replay"))
+    }
     func testExactReplayRoleBytesHeadersAndNoAmbientCookies() async throws {
         let (h,dispatch,claim) = try await enrolled(); defer { h.remove() }
         ReplayTransportURLProtocol.hooks.set { request, client, instance in
@@ -90,7 +106,7 @@ final class EluV2URLSessionReplayTransportTests: XCTestCase {
         HTTPURLResponse(url:request.url!,statusCode:status,httpVersion:"HTTP/1.1",headerFields:headers)!
     }
 }
-private final class ReplayTransportURLProtocol:URLProtocol,@unchecked Sendable{
+final class ReplayTransportURLProtocol:URLProtocol,@unchecked Sendable{
     static let hooks=Hooks()
     final class Hooks:@unchecked Sendable{
         private let lock=NSLock()

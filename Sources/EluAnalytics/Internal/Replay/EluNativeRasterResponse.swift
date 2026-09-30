@@ -1,4 +1,3 @@
-#if canImport(SwiftUI) && canImport(UIKit)
 import Foundation
 
 enum EluNativeRasterConflictScope: String, Equatable, Sendable {
@@ -22,9 +21,31 @@ enum EluNativeRasterResponse {
     static let maximumBytes = 65_536
     static let maximumDelaySeconds: TimeInterval = 86_400
 
+    #if canImport(SwiftUI) && canImport(UIKit)
     static func classify(_ response: EluV1BatchHTTPResponse,
                          request: EluNativeRasterPreparedRequest,
                          now: Date) -> EluNativeRasterResponseOutcome {
+        classify(response, request: Binding(requestId: request.requestId, replayId: request.replayId,
+            chunkId: request.chunkId, sequence: request.sequence), now: now)
+    }
+    #endif
+
+    static func classify(_ response: EluV1BatchHTTPResponse,
+                         request: EluNativeRasterStoredRequest,
+                         now: Date) -> EluNativeRasterResponseOutcome {
+        classify(response, request: Binding(requestId: request.requestId, replayId: request.replayId,
+            chunkId: request.chunkId, sequence: request.sequence), now: now)
+    }
+
+    private struct Binding {
+        let requestId: String
+        let replayId: String
+        let chunkId: String
+        let sequence: Int64
+    }
+
+    private static func classify(_ response: EluV1BatchHTTPResponse, request: Binding,
+                                 now: Date) -> EluNativeRasterResponseOutcome {
         // Keep original credential-refusal precedence over unreadable bodies
         // and ambiguous headers. Physical refusal preservation remains upstream.
         if response.status == 401 || response.status == 403 {
@@ -111,4 +132,3 @@ private enum RasterResponseJSON {
         return number
     }
 }
-#endif
