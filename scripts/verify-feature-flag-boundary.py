@@ -68,6 +68,8 @@ NATIVE_AUTHORITY_SOURCE = "Sources/EluAnalytics/Internal/Replay/EluNativeReplayA
 NATIVE_SEALER_SOURCE = "Sources/EluAnalytics/Internal/Replay/EluNativeReplaySealer.swift"
 NATIVE_RASTER_SEALER_SOURCE = "Sources/EluAnalytics/Internal/Replay/EluNativeRasterSealer.swift"
 NATIVE_RASTER_RESPONSE_SOURCE = "Sources/EluAnalytics/Internal/Replay/EluNativeRasterResponse.swift"
+NATIVE_RASTER_STORAGE_SOURCE = "Sources/EluAnalytics/Internal/Replay/EluStoredReplayRecord.swift"
+NATIVE_RASTER_QUEUE_SOURCE = "Sources/EluAnalytics/Internal/Runtime/EluSQLiteRuntimeQueue.swift"
 NATIVE_CAPTURE_SOURCE = "Sources/EluAnalytics/Internal/Replay/EluNativeReplayCaptureOwner.swift"
 NATIVE_WINDOW_SOURCE = "Sources/EluAnalytics/EluReplayWindow.swift"
 NATIVE_COLLECTOR_SOURCE = "Sources/EluAnalytics/Internal/Replay/EluUIKitReplayCollector.swift"
@@ -230,6 +232,28 @@ def scan_replay_storage_source(path: pathlib.Path, text: str) -> list[str]:
             token in text for token in (*NETWORK_TOKENS, "import UIKit")
         ) or re.search(r"\bTask(?:\.detached)?\s*[{(]", text):
             errors.append(f"{path} widens the pure raster sealer beyond static byte helpers and retained values")
+    storage_only_raster = False
+    if exact == NATIVE_RASTER_STORAGE_SOURCE:
+        references = set(re.findall(r"\bEluV2(?:Replay|SealedReplay)\w*\b", text))
+        forbidden = ("EluSQLiteRuntimeQueue", "EluNativeReplayAuthority", "EluNativeRasterPermit",
+            "EluNativeRasterSealer", "EluNativeRasterPreparedRequest", "EluSwiftUIReplayFrame",
+            "EluSwiftUIReplayRegistry", "appendNativeRaster", "EluNativeRasterResponse")
+        storage_only_raster = not (references - {"EluV2ReplayStoredChunk", "EluV2ReplayText"}
+            or any(re.search(rf"\b{token}\b", text) for token in forbidden)
+            or any(token in text for token in (*NETWORK_TOKENS, "import UIKit"))
+            or re.search(r"\bTask(?:\.detached)?\s*[{(]", text))
+        if not storage_only_raster:
+            errors.append(f"{path} adds live authority, capture or delivery to restored raster values")
+    raster_durable_owner = exact in {NATIVE_RASTER_QUEUE_SOURCE, NATIVE_AUTHORITY_SOURCE}
+    if raster_durable_owner:
+        forbidden = ("EluNativeRasterSealer", "EluNativeRasterResponse", "EluNativeRasterResponseOutcome",
+            "EluSwiftUIReplayFrame", "EluSwiftUIReplayRegistry")
+        if any(re.search(rf"\b{token}\b", text) for token in forbidden) or re.search(
+            r"\bEluNativeRasterPreparedRequest\s*(?:\.\s*init)?\s*\(", text):
+            errors.append(f"{path} adds a raster recorder, request constructor or response dispatch to durable admission")
+    if re.search(r"\b(?:EluStoredReplayRecord|EluNativeRaster(?:Stored\w*|SourceLedger|Permit|PreparedAuthority|Capture\w*|AppendResult))\b", text) and not (
+        raster_durable_owner or exact == NATIVE_RASTER_STORAGE_SOURCE):
+        errors.append(f"{path} consumes dormant raster storage/admission outside the original queue and authority")
     response_only_raster = False
     if exact == NATIVE_RASTER_RESPONSE_SOURCE:
         remaining = re.sub(r"\brequest\s*:\s*EluNativeRasterPreparedRequest\b", "", text)
@@ -251,11 +275,11 @@ def scan_replay_storage_source(path: pathlib.Path, text: str) -> list[str]:
             errors.append(f"{path} widens the pure raster response classifier beyond original request reads and static helpers")
     if re.search(r"\bEluNativeRaster(?:Response\w*|ConflictScope)\b", text) and exact != NATIVE_RASTER_RESPONSE_SOURCE:
         errors.append(f"{path} installs the unintegrated raster response classifier outside its exact value file")
-    if re.search(r"\bEluNativeRaster(?:Sealer|PreparedRequest|PolicyBinding|SealingError)\b", text) and exact != NATIVE_RASTER_SEALER_SOURCE and not response_only_raster:
+    if re.search(r"\bEluNativeRaster(?:Sealer|PreparedRequest|PolicyBinding|SealingError)\b", text) and exact != NATIVE_RASTER_SEALER_SOURCE and not response_only_raster and not raster_durable_owner:
         errors.append(f"{path} installs the unintegrated raster sealer outside its exact value file")
     if re.search(r"\bEluNativeReplaySealer\b", text) and exact not in {NATIVE_SEALER_SOURCE, NATIVE_CAPTURE_SOURCE} and not helper_only_raster:
         errors.append(f"{path} references the native sealer outside its exact physical owner")
-    if (re.search(r"\bEluV2(?:Replay|SealedReplay)\w*\b", text) or "ensureReplaySchema" in text or "ensureReplayDeliverySchema" in text) and exact not in allowed and not response_only_raster:
+    if (re.search(r"\bEluV2(?:Replay|SealedReplay)\w*\b", text) or "ensureReplaySchema" in text or "ensureReplayDeliverySchema" in text) and exact not in allowed and not response_only_raster and not storage_only_raster:
         errors.append(f"{path} references owned replay storage outside its exact files")
     if exact in allowed and "/Replay/" in exact:
         permitted = {"URLSession", "URLRequest"} if exact == REPLAY_TRANSPORT_SOURCE else ({"import UIKit"} if exact == NATIVE_CAPTURE_SOURCE else set())
@@ -400,9 +424,10 @@ def scan_native_v3_source(path: pathlib.Path, text: str) -> list[str]:
     exact = path.as_posix()
     owners = {NATIVE_V3_SOURCE_PATH, NATIVE_V3_GATE_PATH, NATIVE_V3_LIFECYCLE_PATH}
     errors: list[str] = []
-    if "EluNativeV3ConfigParser" in text and exact not in owners | {NATIVE_V3_PARSER_PATH}:
+    durable_owners = {NATIVE_RASTER_QUEUE_SOURCE, NATIVE_AUTHORITY_SOURCE}
+    if "EluNativeV3ConfigParser" in text and exact not in owners | durable_owners | {NATIVE_V3_PARSER_PATH}:
         errors.append(f"{path} references native v3 outside its original configuration owner")
-    if re.search(r"\.nativeV3\b", text) and exact not in owners:
+    if re.search(r"\.nativeV3\b", text) and exact not in owners | durable_owners:
         errors.append(f"{path} activates or consumes dormant native v3 outside its original owner")
     required = {
         NATIVE_V3_SOURCE_PATH: [

@@ -135,6 +135,7 @@ private struct EluStoredReplayState {
     var maximumQueueBytes: Int64
     var observedWall: EluV1Timestamp?
     var clockDenied: Bool
+    var rasterSource: EluNativeRasterSourceLedger? = nil
 }
 
 private struct EluStoredQueueRecord: Sendable {
@@ -152,7 +153,15 @@ private enum EluSQLiteRuntimeSchema {
     static let flagReplayDatabaseVersion: Int64 = 4
     // Schemas 9...16 add installation capture history to owned schemas 1...8.
     // Unpublished import-ledger schemas 17...24 remain unsupported.
-    static func baseVersion(_ version: Int64) -> Int64 {
+    // A raster store preserves every original feature family with an outer
+    // discriminator. Old openers reject before touching original DB/WAL/SHM.
+    static func legacyVersion(_ version: Int64) -> Int64 { hasRaster(version) ? version - 128 : version }
+    static func hasRaster(_ version: Int64) -> Bool {
+        [135, 136, 143, 144, 159, 160, 167, 168, 175, 176, 183, 184, 191, 192].contains(version)
+    }
+    static func preservingRaster(_ target: Int64, from version: Int64) -> Int64 { target + (hasRaster(version) ? 128 : 0) }
+    static func baseVersion(_ original: Int64) -> Int64 {
+        let version = legacyVersion(original)
         if hasCrashReports(version) { return version - 56 }
         if hasRateLimiter(version) { return version - 48 }
         if hasFlagExposures(version) { return version - 40 }
@@ -160,15 +169,15 @@ private enum EluSQLiteRuntimeSchema {
         if hasDiagnostics(version) { return version - 24 }
         return version > 8 ? version - 8 : version
     }
-    static func supports(_ version: Int64) -> Bool { (1...16).contains(version) || hasDiagnostics(version) }
-    static func hasCrashReports(_ version: Int64) -> Bool { (57...64).contains(version) }
-    static func hasRateLimiter(_ version: Int64) -> Bool { (49...64).contains(version) }
-    static func hasFlagExposures(_ version: Int64) -> Bool { (41...64).contains(version) }
-    static func hasPersonIdentity(_ version: Int64) -> Bool { (33...64).contains(version) }
-    static func hasDiagnostics(_ version: Int64) -> Bool { (25...64).contains(version) }
-    static func hasCaptureHistory(_ version: Int64) -> Bool { (9...16).contains(version) || hasDiagnostics(version) }
+    static func supports(_ version: Int64) -> Bool { (1...16).contains(version) || (25...64).contains(version) || hasRaster(version) }
+    static func hasCrashReports(_ version: Int64) -> Bool { (57...64).contains(legacyVersion(version)) }
+    static func hasRateLimiter(_ version: Int64) -> Bool { (49...64).contains(legacyVersion(version)) }
+    static func hasFlagExposures(_ version: Int64) -> Bool { (41...64).contains(legacyVersion(version)) }
+    static func hasPersonIdentity(_ version: Int64) -> Bool { (33...64).contains(legacyVersion(version)) }
+    static func hasDiagnostics(_ version: Int64) -> Bool { (25...64).contains(legacyVersion(version)) }
+    static func hasCaptureHistory(_ version: Int64) -> Bool { (9...16).contains(legacyVersion(version)) || hasDiagnostics(version) }
     static func preservingCaptureHistory(_ base: Int64, from version: Int64) -> Int64 {
-        base + (hasCrashReports(version) ? 56 : hasRateLimiter(version) ? 48 : hasFlagExposures(version) ? 40 : hasPersonIdentity(version) ? 32 : hasDiagnostics(version) ? 24 : hasCaptureHistory(version) ? 8 : 0)
+        preservingRaster(base + (hasCrashReports(version) ? 56 : hasRateLimiter(version) ? 48 : hasFlagExposures(version) ? 40 : hasPersonIdentity(version) ? 32 : hasDiagnostics(version) ? 24 : hasCaptureHistory(version) ? 8 : 0), from: version)
     }
     // Selected capture runtimes add a site/base-scoped token bucket. Raw owned
     // queue fixtures may retain 41...48; all production openers select a limiter.
@@ -265,6 +274,11 @@ private enum EluSQLiteRuntimeSchema {
         UNIQUE (site_id, replay_id, sequence)
     )
     """
+    static let createRasterReplayState = createReplayState
+        .replacingOccurrences(of: "storage_schema = 1", with: "storage_schema = 2")
+        .replacingOccurrences(of: "clock_denied IN (0, 1))", with: "clock_denied IN (0, 1)),\n    raster_source BLOB CHECK (raster_source IS NULL OR (length(raster_source) > 0 AND length(raster_source) <= 1024))")
+    static let createRasterReplayChunks = createReplayChunks.replacingOccurrences(of: "storage_schema = 1", with: "storage_schema IN (1, 2)")
+    static var rasterReplayStateColumns: [String: String] { replayStateColumns.merging(["raster_source": "BLOB"]) { _, new in new } }
     static let replayStateColumns = ["singleton": "INTEGER", "storage_schema": "INTEGER", "site_id": "TEXT", "config_issued_at": "TEXT", "config_hash": "TEXT", "protocol_generation": "TEXT", "admission_enabled": "INTEGER", "next_ordinal": "INTEGER", "maximum_queue_bytes": "INTEGER", "observed_wall": "TEXT", "clock_denied": "INTEGER"]
     static let replayChunkColumns = ["ordinal": "INTEGER", "storage_schema": "INTEGER", "site_id": "TEXT", "request_id": "TEXT", "replay_id": "TEXT", "chunk_id": "TEXT", "sequence": "INTEGER", "capture_generation": "TEXT", "body": "BLOB", "masking_profile": "BLOB"]
     static let databaseFilename = "runtime-state-v1.sqlite3"
@@ -428,7 +442,7 @@ private final class EluRuntimeResources: @unchecked Sendable {
     private var closeRequested = false
     private var replayEnrollments = 0
     private var nativeCaptureEnrollments = 0
-    private var retainedNativeRequest: EluV2ReplayPreparedRequest?
+    private var retainedNativeRequest: Data?
     private var replayQuarantined = false
     func quarantineReplay() {
         lock.lock()
@@ -462,9 +476,12 @@ private final class EluRuntimeResources: @unchecked Sendable {
     }
 
     func quarantineNativeCapture(retaining prepared: EluV2ReplayPreparedRequest?) {
+        quarantineNativeCaptureBytes(prepared?.body)
+    }
+    func quarantineNativeCaptureBytes(_ body: Data?) {
         lock.lock()
         guard !isClosed, nativeCaptureEnrollments > 0 else { lock.unlock(); return }
-        if retainedNativeRequest == nil { retainedNativeRequest = prepared }
+        if retainedNativeRequest == nil { retainedNativeRequest = body }
         let first = !replayQuarantined
         replayQuarantined = true
         lock.unlock()
@@ -922,7 +939,7 @@ private enum EluRuntimeQueueBootstrap {
                                            state: EluStoredRuntimeState,
                                            faultInjector: (any EluRuntimeQueueFaultInjecting)?) throws -> Int64 {
         guard !EluSQLiteRuntimeSchema.hasDiagnostics(version) else { return version }
-        let target = EluSQLiteRuntimeSchema.baseVersion(version) + 24
+        let target = EluSQLiteRuntimeSchema.preservingRaster(EluSQLiteRuntimeSchema.baseVersion(version) + 24, from: version)
         try connection.execute("BEGIN IMMEDIATE")
         do {
             try EluRuntimeDatabase.verifySchema(connection, databaseVersion: version)
@@ -942,7 +959,7 @@ private enum EluRuntimeQueueBootstrap {
                                                state: EluStoredRuntimeState,
                                                faultInjector: (any EluRuntimeQueueFaultInjecting)?) throws -> Int64 {
         guard !EluSQLiteRuntimeSchema.hasPersonIdentity(version) else { return version }
-        let target = EluSQLiteRuntimeSchema.baseVersion(version) + 32
+        let target = EluSQLiteRuntimeSchema.preservingRaster(EluSQLiteRuntimeSchema.baseVersion(version) + 32, from: version)
         try connection.execute("BEGIN IMMEDIATE")
         do {
             try EluRuntimeDatabase.verifySchema(connection, databaseVersion: version)
@@ -963,7 +980,7 @@ private enum EluRuntimeQueueBootstrap {
                                              state: EluStoredRuntimeState,
                                              faultInjector: (any EluRuntimeQueueFaultInjecting)?) throws -> Int64 {
         guard !EluSQLiteRuntimeSchema.hasFlagExposures(version) else { return version }
-        let target = EluSQLiteRuntimeSchema.baseVersion(version) + 40
+        let target = EluSQLiteRuntimeSchema.preservingRaster(EluSQLiteRuntimeSchema.baseVersion(version) + 40, from: version)
         try connection.execute("BEGIN IMMEDIATE")
         do {
             try EluRuntimeDatabase.verifySchema(connection, databaseVersion: version)
@@ -2134,11 +2151,12 @@ private enum EluRuntimeDatabase {
         }
     }
     static func readReplayState(_ connection: EluSQLiteConnection) throws -> EluStoredReplayState {
-        try connection.withStatement("SELECT singleton,storage_schema,site_id,config_issued_at,config_hash,protocol_generation,admission_enabled,next_ordinal,maximum_queue_bytes,observed_wall,clock_denied FROM replay_state") { statement in
+        let raster = EluSQLiteRuntimeSchema.hasRaster(try connection.integerPragma("user_version"))
+        return try connection.withStatement("SELECT singleton,storage_schema,site_id,config_issued_at,config_hash,protocol_generation,admission_enabled,next_ordinal,maximum_queue_bytes,observed_wall,clock_denied" + (raster ? ",raster_source" : "") + " FROM replay_state") { statement in
             try connection.step(statement, expecting: SQLITE_ROW)
             guard try connection.requiredInteger(statement, column: 0) == 1 else { throw EluRuntimeQueueError.corruptStorage }
             let schema = try connection.requiredInteger(statement, column: 1)
-            guard schema == 1 else { throw EluRuntimeQueueError.unsupportedSchemaVersion(schema) }
+            guard schema == (raster ? 2 : 1) else { throw EluRuntimeQueueError.unsupportedSchemaVersion(schema) }
             func optional(_ column: Int32) throws -> String? {
                 sqlite3_column_type(statement, column) == SQLITE_NULL ? nil : try replayText(statement, column: column)
             }
@@ -2148,6 +2166,8 @@ private enum EluRuntimeDatabase {
             let maximumQueueBytes = try connection.requiredInteger(statement, column: 8)
             let observedWall = try optional(9).map(EluV1Timestamp.init)
             let clockDenied = try connection.requiredInteger(statement, column: 10)
+            let rasterSource = raster && sqlite3_column_type(statement, 11) != SQLITE_NULL
+                ? try EluNativeRasterSourceLedger(connection.requiredData(statement, column: 11, maximumBytes: 1_024)) : nil
             guard (0...1).contains(clockDenied), clockDenied == 0 || enabled == 0, (1...268_435_456).contains(maximumQueueBytes), (0...1).contains(enabled), (0...EluV2ReplayDeliveryState.maximumSafeInteger).contains(ordinal), sqlite3_step(statement) == SQLITE_DONE else { throw EluRuntimeQueueError.corruptStorage }
             let witness: EluV2ReplayConfigWitness?
             if let issued, let hash {
@@ -2160,12 +2180,14 @@ private enum EluRuntimeDatabase {
             if let generation { guard EluV1Validation.validString(generation, minimum: 1, maximum: 128) else { throw EluRuntimeQueueError.corruptStorage } }
             guard witness == nil || observedWall != nil,
                   enabled == 0 || (site != nil && generation != nil && witness != nil) else { throw EluRuntimeQueueError.corruptStorage }
-            return EluStoredReplayState(siteId: site, witness: witness, protocolGeneration: generation, admissionEnabled: enabled == 1, nextOrdinal: ordinal, maximumQueueBytes: maximumQueueBytes, observedWall: observedWall, clockDenied: clockDenied == 1)
+            return EluStoredReplayState(siteId: site, witness: witness, protocolGeneration: generation, admissionEnabled: enabled == 1, nextOrdinal: ordinal, maximumQueueBytes: maximumQueueBytes, observedWall: observedWall, clockDenied: clockDenied == 1, rasterSource: rasterSource)
         }
     }
 
     static func writeReplayState(_ connection: EluSQLiteConnection, _ state: EluStoredReplayState) throws {
-        try connection.withStatement("UPDATE replay_state SET site_id=?,config_issued_at=?,config_hash=?,protocol_generation=?,admission_enabled=?,next_ordinal=?,maximum_queue_bytes=?,observed_wall=?,clock_denied=? WHERE singleton=1") { statement in
+        let raster = EluSQLiteRuntimeSchema.hasRaster(try connection.integerPragma("user_version"))
+        guard raster || state.rasterSource == nil else { throw EluRuntimeQueueError.corruptStorage }
+        try connection.withStatement("UPDATE replay_state SET site_id=?,config_issued_at=?,config_hash=?,protocol_generation=?,admission_enabled=?,next_ordinal=?,maximum_queue_bytes=?,observed_wall=?,clock_denied=?" + (raster ? ",raster_source=?" : "") + " WHERE singleton=1") { statement in
             for (index, value) in [state.siteId, state.witness?.issuedAt.source, state.witness?.semanticHash, state.protocolGeneration].enumerated() {
                 if let value { try bindReplayText(connection, value, at: Int32(index + 1), to: statement) }
                 else { try connection.bindNull(at: Int32(index + 1), to: statement) }
@@ -2176,36 +2198,52 @@ private enum EluRuntimeDatabase {
             if let observed = state.observedWall { try bindReplayText(connection, observed.source, at: 8, to: statement) }
             else { try connection.bindNull(at: 8, to: statement) }
             try connection.bind(state.clockDenied ? Int64(1) : Int64(0), at: 9, to: statement)
+            if raster {
+                if let source = state.rasterSource { try connection.bind(source.encoded(), at: 10, to: statement) }
+                else { try connection.bindNull(at: 10, to: statement) }
+            }
             try connection.step(statement)
             guard try connection.changes() == 1 else { throw EluRuntimeQueueError.corruptStorage }
         }
     }
 
-    static func readReplayChunks(_ connection: EluSQLiteConnection, ordinal: Int64) throws -> [EluV2ReplayStoredChunk] {
-        try connection.withStatement("SELECT ordinal,storage_schema,site_id,request_id,replay_id,chunk_id,sequence,capture_generation,body,masking_profile FROM replay_chunks WHERE ordinal=?") { statement in
+    static func readReplayRecords(_ connection: EluSQLiteConnection, ordinal: Int64) throws -> [EluStoredReplayRecord] {
+        let raster = EluSQLiteRuntimeSchema.hasRaster(try connection.integerPragma("user_version"))
+        return try connection.withStatement("SELECT ordinal,storage_schema,site_id,request_id,replay_id,chunk_id,sequence,capture_generation,body,masking_profile FROM replay_chunks WHERE ordinal=?") { statement in
             try connection.bind(ordinal, at: 1, to: statement)
-            var rows: [EluV2ReplayStoredChunk] = []
-            var total: Int64 = 0
+            var rows: [EluStoredReplayRecord] = []
             while true {
                 let result = sqlite3_step(statement)
                 if result == SQLITE_DONE { return rows }
-                guard result == SQLITE_ROW, rows.count < 10_000 else { throw EluRuntimeQueueError.corruptStorage }
+                guard result == SQLITE_ROW, rows.isEmpty else { throw EluRuntimeQueueError.corruptStorage }
                 let schema = try connection.requiredInteger(statement, column: 1)
-                guard schema == 1 else { throw EluRuntimeQueueError.unsupportedSchemaVersion(schema) }
+                guard schema == 1 || (raster && schema == 2) else { throw EluRuntimeQueueError.unsupportedSchemaVersion(schema) }
                 let bytes = try connection.requiredData(statement, column: 8, maximumBytes: EluV2ReplayPreparedRequest.maximumBytes)
-                total += Int64(bytes.count)
-                guard total <= 268_435_456 else { throw EluRuntimeQueueError.corruptStorage }
-                let prepared = try EluV2ReplayPreparedRequest(bytes, captureProtocolGeneration: replayText(statement, column: 7))
-                guard prepared.body == bytes,
-                      EluV2ReplayText.equal(prepared.requestId, try replayText(statement, column: 3)),
-                      EluV2ReplayText.equal(prepared.replayId, try replayText(statement, column: 4)),
-                      EluV2ReplayText.equal(prepared.chunkId, try replayText(statement, column: 5)),
-                      prepared.sequence == (try connection.requiredInteger(statement, column: 6)) else { throw EluRuntimeQueueError.corruptStorage }
-                rows.append(try EluV2ReplayStoredChunk(ordinal: connection.requiredInteger(statement, column: 0),
-                    siteId: replayText(statement, column: 2), captureProtocolGeneration: replayText(statement, column: 7), prepared: prepared,
-                    maskingProfile: connection.requiredData(statement, column: 9, maximumBytes: 16_384)))
+                let generation = try replayText(statement, column: 7)
+                let profile = try connection.requiredData(statement, column: 9, maximumBytes: 16_384)
+                let row: EluStoredReplayRecord
+                if schema == 1 {
+                    let prepared = try EluV2ReplayPreparedRequest(bytes, captureProtocolGeneration: generation)
+                    row = .wireframe(try EluV2ReplayStoredChunk(ordinal: connection.requiredInteger(statement, column: 0),
+                        siteId: replayText(statement, column: 2), captureProtocolGeneration: generation,
+                        prepared: prepared, maskingProfile: profile))
+                } else {
+                    guard EluV2ReplayText.equal(generation, EluNativeRasterStoredRequest.generation),
+                          profile == EluNativeRasterStoredRequest.profile else { throw EluRuntimeQueueError.corruptStorage }
+                    row = .raster(try EluNativeRasterStoredChunk(ordinal: connection.requiredInteger(statement, column: 0),
+                        siteId: replayText(statement, column: 2), prepared: EluNativeRasterStoredRequest(restoring: bytes)))
+                }
+                guard row.body == bytes, EluV2ReplayText.equal(row.requestId, try replayText(statement, column: 3)),
+                      EluV2ReplayText.equal(row.replayId, try replayText(statement, column: 4)),
+                      EluV2ReplayText.equal(row.chunkId, try replayText(statement, column: 5)),
+                      row.sequence == (try connection.requiredInteger(statement, column: 6)) else { throw EluRuntimeQueueError.corruptStorage }
+                rows.append(row)
             }
         }
+    }
+
+    static func readReplayChunks(_ connection: EluSQLiteConnection, ordinal: Int64) throws -> [EluV2ReplayStoredChunk] {
+        try readReplayRecords(connection, ordinal: ordinal).compactMap { if case let .wireframe(row) = $0 { return row }; return nil }
     }
 
     static func replayOrdinals(_ connection: EluSQLiteConnection) throws -> [Int64] {
@@ -2222,31 +2260,45 @@ private enum EluRuntimeDatabase {
         }
     }
 
-    static func visitReplayChunks(_ connection: EluSQLiteConnection, _ visit: (EluV2ReplayStoredChunk) throws -> Void) throws {
-        // The ordinal inventory is bounded; statements are closed before mutation
-        // and only one request/profile pair is materialized at a time.
+    static func visitReplayRecords(_ connection: EluSQLiteConnection, _ visit: (EluStoredReplayRecord) throws -> Void) throws {
+        // A bounded ordinal inventory; one immutable envelope is restored at a time.
         var bytes: Int64 = 0
         for ordinal in try replayOrdinals(connection) {
             try autoreleasepool {
-                let rows = try readReplayChunks(connection, ordinal: ordinal)
+                let rows = try readReplayRecords(connection, ordinal: ordinal)
                 guard rows.count == 1, let row = rows.first else { throw EluRuntimeQueueError.corruptStorage }
-                bytes += Int64(row.prepared.body.count)
+                bytes += Int64(row.body.count)
                 guard bytes <= 268_435_456 else { throw EluRuntimeQueueError.corruptStorage }
                 try visit(row)
             }
         }
     }
 
+    static func visitReplayChunks(_ connection: EluSQLiteConnection, _ visit: (EluV2ReplayStoredChunk) throws -> Void) throws {
+        try visitReplayRecords(connection) { if case let .wireframe(row) = $0 { try visit(row) } }
+    }
+
     static func insertReplayChunk(_ connection: EluSQLiteConnection, _ row: EluV2ReplayStoredChunk) throws {
-        try connection.withStatement("INSERT INTO replay_chunks (ordinal,storage_schema,site_id,request_id,replay_id,chunk_id,sequence,capture_generation,body,masking_profile) VALUES (?,1,?,?,?,?,?,?,?,?)") { statement in
+        try insertReplayRecord(connection, .wireframe(row))
+    }
+
+    static func insertReplayRecord(_ connection: EluSQLiteConnection, _ row: EluStoredReplayRecord) throws {
+        let schema: Int
+        switch row {
+        case .wireframe: schema = 1
+        case .raster:
+            guard EluSQLiteRuntimeSchema.hasRaster(try connection.integerPragma("user_version")) else { throw EluRuntimeQueueError.invalidState }
+            schema = 2
+        }
+        try connection.withStatement("INSERT INTO replay_chunks (ordinal,storage_schema,site_id,request_id,replay_id,chunk_id,sequence,capture_generation,body,masking_profile) VALUES (?,\(schema),?,?,?,?,?,?,?,?)") { statement in
             try connection.bind(row.ordinal, at: 1, to: statement)
-            for (index, text) in [row.siteId, row.prepared.requestId, row.prepared.replayId, row.prepared.chunkId].enumerated() {
+            for (index, text) in [row.siteId, row.requestId, row.replayId, row.chunkId].enumerated() {
                 try bindReplayText(connection, text, at: Int32(index + 2), to: statement)
             }
-            try connection.bind(row.prepared.sequence, at: 6, to: statement)
-            try bindReplayText(connection, row.captureProtocolGeneration, at: 7, to: statement)
-            try connection.bind(row.prepared.body, at: 8, to: statement)
-            try connection.bind(row.maskingProfile, at: 9, to: statement)
+            try connection.bind(row.sequence, at: 6, to: statement)
+            try bindReplayText(connection, row.generation, at: 7, to: statement)
+            try connection.bind(row.body, at: 8, to: statement)
+            try connection.bind(row.profile, at: 9, to: statement)
             try connection.step(statement)
         }
     }
@@ -2413,12 +2465,12 @@ private enum EluRuntimeDatabase {
         if EluSQLiteRuntimeSchema.hasReplay(databaseVersion) {
             expectedObjects["replay_state"] = "table"
             expectedObjects["replay_chunks"] = "table"
-            try verifyColumns(connection, table: "replay_state", expected: EluSQLiteRuntimeSchema.replayStateColumns)
+            try verifyColumns(connection, table: "replay_state", expected: EluSQLiteRuntimeSchema.hasRaster(databaseVersion) ? EluSQLiteRuntimeSchema.rasterReplayStateColumns : EluSQLiteRuntimeSchema.replayStateColumns)
             try verifyColumns(connection, table: "replay_chunks", expected: EluSQLiteRuntimeSchema.replayChunkColumns)
-            try verifyCreateSQL(connection, table: "replay_state", expected: EluSQLiteRuntimeSchema.createReplayState)
-            try verifyCreateSQL(connection, table: "replay_chunks", expected: EluSQLiteRuntimeSchema.createReplayChunks)
+            try verifyCreateSQL(connection, table: "replay_state", expected: EluSQLiteRuntimeSchema.hasRaster(databaseVersion) ? EluSQLiteRuntimeSchema.createRasterReplayState : EluSQLiteRuntimeSchema.createReplayState)
+            try verifyCreateSQL(connection, table: "replay_chunks", expected: EluSQLiteRuntimeSchema.hasRaster(databaseVersion) ? EluSQLiteRuntimeSchema.createRasterReplayChunks : EluSQLiteRuntimeSchema.createReplayChunks)
             let replayState = try readReplayState(connection)
-            try visitReplayChunks(connection) { row in
+            try visitReplayRecords(connection) { row in
                 guard row.ordinal < replayState.nextOrdinal, EluV2ReplayText.equal(row.siteId, replayState.siteId) else { throw EluRuntimeQueueError.corruptStorage }
             }
         }
@@ -3423,6 +3475,12 @@ final class EluNativeReplayCaptureEnrollment: @unchecked Sendable {
         quarantined = true; intakeClosed = true; lock.unlock()
         resources.quarantineNativeCapture(retaining: prepared)
     }
+    fileprivate func quarantineRaster(retaining body: Data) {
+        lock.lock()
+        guard !released else { lock.unlock(); return }
+        quarantined = true; intakeClosed = true; lock.unlock()
+        resources.quarantineNativeCaptureBytes(body)
+    }
     fileprivate func invalidateIntake() { lock.lock(); intakeClosed = true; lock.unlock() }
     fileprivate func isCurrent() -> Bool {
         lock.lock(); defer { lock.unlock() }
@@ -3475,6 +3533,22 @@ struct EluNativeReplayCaptureAdmission: Sendable {
     fileprivate let use: EluNativeReplayCapturePhysicalUse
     func isCurrent() -> Bool { input.isCurrent() && permit.isCurrent() && use.isCurrent() }
 }
+
+#if canImport(SwiftUI) && canImport(UIKit)
+struct EluNativeRasterCaptureAdmission: Sendable {
+    fileprivate let input: EluNativeReplayProjectionInput
+    fileprivate let receipt: EluNativeReplayStartReceipt
+    fileprivate let permit: EluNativeRasterPermit
+    fileprivate let use: EluNativeReplayCapturePhysicalUse
+    func isCurrent() -> Bool { input.isCurrent() && permit.isCurrent() && use.isCurrent() }
+}
+enum EluNativeRasterAppendResult: Sendable {
+    case inserted(EluNativeRasterStoredChunk), duplicate(EluNativeRasterStoredChunk)
+}
+enum EluNativeRasterCaptureAppendResult: Sendable {
+    case committed(EluNativeRasterAppendResult), committedThenWithdrawn(EluNativeRasterAppendResult)
+}
+#endif
 
 /// An original SQLite/source observation, not recorder permission. Only this file can mint one.
 struct EluNativeReplaySessionObservation: Sendable {
@@ -4091,6 +4165,147 @@ actor EluSQLiteRuntimeQueue {
         }
     }
 
+    /// Lazy, original-queue migration. Older writable openers reject the outer
+    /// version before configuring SQLite durability; original v2 bodies are copied
+    /// as BLOBs without decode/re-encode. Selecting a wrapper without a raster
+    /// branch cannot activate this storage format.
+    func ensureNativeRasterSchema(source: EluV2ConfigAuthorityWitness) throws {
+        guard sourceIsCurrent(source), source.nativeV3?.raster != nil,
+              EluSQLiteRuntimeSchema.hasNativeReplayAuthority(databaseSchemaVersion) else {
+            throw EluRuntimeQueueError.sourceAuthorityUnavailable
+        }
+        if EluSQLiteRuntimeSchema.hasRaster(databaseSchemaVersion) {
+            try EluRuntimeDatabase.verifySchema(try requireResources().connection, databaseVersion: databaseSchemaVersion)
+            return
+        }
+        let target = databaseSchemaVersion + 128
+        guard EluSQLiteRuntimeSchema.hasRaster(target) else { throw EluRuntimeQueueError.unsupportedSchemaVersion(target) }
+        try replayStorageTransaction(validate: {
+            guard self.sourceIsCurrent(source) else { throw EluRuntimeQueueError.sourceAuthorityUnavailable }
+        }) { connection, _ in
+            try EluRuntimeDatabase.verifySchema(connection, databaseVersion: databaseSchemaVersion)
+            try connection.execute("ALTER TABLE replay_state RENAME TO replay_state_previous")
+            try connection.execute("ALTER TABLE replay_chunks RENAME TO replay_chunks_previous")
+            try connection.execute(EluSQLiteRuntimeSchema.createRasterReplayState)
+            try connection.execute(EluSQLiteRuntimeSchema.createRasterReplayChunks)
+            try connection.execute("INSERT INTO replay_state SELECT singleton,2,site_id,config_issued_at,config_hash,protocol_generation,admission_enabled,next_ordinal,maximum_queue_bytes,observed_wall,clock_denied,NULL FROM replay_state_previous")
+            try connection.execute("INSERT INTO replay_chunks SELECT * FROM replay_chunks_previous")
+            try connection.execute("DROP TABLE replay_chunks_previous")
+            try connection.execute("DROP TABLE replay_state_previous")
+            try connection.execute("PRAGMA user_version = \(target)")
+            try EluRuntimeDatabase.verifySchema(connection, databaseVersion: target)
+        }
+        databaseSchemaVersion = target
+    }
+
+    /// Persist the complete wrapper's ordering witness on the original ledger.
+    /// Conflict is committed before returning denial; throwing in that transaction
+    /// would roll back the very poison which must survive process restart.
+    func reconcileNativeRasterSource(_ source: EluV2ConfigAuthorityWitness) throws {
+        guard EluSQLiteRuntimeSchema.hasRaster(databaseSchemaVersion), sourceIsCurrent(source) else {
+            throw EluRuntimeQueueError.sourceAuthorityUnavailable
+        }
+        try reconcileNativeRasterOrdering(source)
+        let document = try JSONDecoder().decode(EluV1ConfigDocument.self, from: source.data)
+        let denied = try replayClockTransaction(validate: {
+            guard self.sourceIsCurrent(source) else { throw EluRuntimeQueueError.sourceAuthorityUnavailable }
+        }) { connection, disk, now in
+            var ledger = try EluRuntimeDatabase.readReplayState(connection)
+            if let site = ledger.siteId, let current = document.site?.id, !EluV2ReplayText.equal(site, current) {
+                throw EluRuntimeQueueError.generationMismatch
+            }
+            var denied = false
+            let baseHash = try EluV1StrictCanonicalJSON.hash(EluV1StrictCanonicalJSON.parse(source.data).canonicalData)
+            let baseWitness = EluV2ReplayConfigWitness(issuedAt: document.issuedAt, semanticHash: baseHash)
+            if let old = ledger.witness,
+               baseWitness.issuedAt < old.issuedAt || (baseWitness.issuedAt == old.issuedAt && baseWitness.semanticHash != old.semanticHash) {
+                denied = true
+            }
+            if !denied {
+                if ledger.witness != baseWitness { ledger.admissionEnabled = false }
+                ledger.witness = baseWitness
+                ledger.protocolGeneration = document.capabilities?.replay.replayProtocolGeneration
+            }
+            // Mere absent capability/source is not a deletion rule. A current
+            // explicit base denial or incompatible privacy floor still is.
+            try EluRuntimeDatabase.visitReplayRecords(connection) { record in
+                guard !denied, case .raster = record else { return }
+                if !Self.rasterBaseMayRetain(document) || disk.identity.optedOut
+                    || !EluV2ReplayText.equal(record.siteId, document.site?.id)
+                    || Self.replayExpired(record, now: now) {
+                    try EluRuntimeDatabase.deleteReplayChunk(connection, ordinal: record.ordinal)
+                }
+            }
+            if !denied {
+                ledger.siteId = document.site?.id ?? ledger.siteId
+                if let limit = document.limits?.queueBytes { ledger.maximumQueueBytes = Int64(min(limit, 268_435_456)) }
+            }
+            try EluRuntimeDatabase.writeReplayState(connection, ledger)
+            return denied
+        }
+        guard !denied else { throw EluRuntimeQueueError.generationMismatch }
+    }
+
+    /// Same original ordering ledger, also checked by capture authority after
+    /// restart. This metadata-only transaction never reads row ages or grants
+    /// raster permission; replay-clock uncertainty must not disable analytics.
+    private func reconcileNativeRasterOrdering(_ source: EluV2ConfigAuthorityWitness) throws {
+        let wrapper = source.nativeV3
+        // A new process may select the original v2 endpoint. That choice cannot
+        // erase a known conflict at this issuance. A newer valid base may resume
+        // legacy channels, without manufacturing or clearing a wrapper witness.
+        let issuedAt = try wrapper?.base.issuedAt ?? EluV1ConfigManager.prepareConfig(
+            source.data, endpointPolicy: endpointPolicy).document.issuedAt
+        let denied = try replayStorageTransaction(validate: {
+            guard self.sourceIsCurrent(source) else { throw EluRuntimeQueueError.sourceAuthorityUnavailable }
+        }) { connection, _ in
+            var ledger = try EluRuntimeDatabase.readReplayState(connection)
+            guard let wrapper else {
+                return ledger.rasterSource.map { $0.conflicted && issuedAt <= $0.issuedAt } ?? false
+            }
+            let next = EluNativeRasterSourceLedger(issuedAt: wrapper.base.issuedAt, semanticHash: wrapper.semanticHash)
+            var denied = false
+            if var old = ledger.rasterSource {
+                if next.issuedAt < old.issuedAt { denied = true }
+                else if next.issuedAt == old.issuedAt {
+                    if next.semanticHash != old.semanticHash { old.conflicted = true }
+                    ledger.rasterSource = old; denied = old.conflicted
+                } else { ledger.rasterSource = next }
+            } else { ledger.rasterSource = next }
+            try EluRuntimeDatabase.writeReplayState(connection, ledger)
+            return denied
+        }
+        guard !denied else { throw EluRuntimeQueueError.generationMismatch }
+    }
+
+    private static func rasterBaseMayRetain(_ document: EluV1ConfigDocument) -> Bool {
+        document.status == .enabled && document.features?.capture == true && document.features?.replay == true
+            && document.privacy?.capture.enabled == true && document.privacy?.replay.enabled == true
+            && document.privacy?.regionPolicy.mode != .block
+            && document.privacy?.masking.text == .sensitive && document.privacy?.masking.images == .allow
+            && document.privacy?.masking.platformRules?.contains(where: { $0.platform != .browser }) != true
+    }
+
+    /// Storage inspection only; no transport can dispatch the raster variant.
+    func storedReplayRecords(maximumCount: Int = 128, maximumBytes: Int = 5_242_880) throws -> [EluStoredReplayRecord] {
+        guard (1...128).contains(maximumCount), (1...5_242_880).contains(maximumBytes) else { throw EluRuntimeQueueError.invalidState }
+        guard EluSQLiteRuntimeSchema.hasReplay(databaseSchemaVersion) else { return [] }
+        let connection = try requireResources().connection
+        var result: [EluStoredReplayRecord] = []
+        var bytes = 0
+        for ordinal in try EluRuntimeDatabase.replayOrdinals(connection) {
+            guard result.count < maximumCount else { break }
+            let rows = try EluRuntimeDatabase.readReplayRecords(connection, ordinal: ordinal)
+            guard rows.count == 1, let row = rows.first else { throw EluRuntimeQueueError.corruptStorage }
+            guard bytes + row.body.count <= maximumBytes else {
+                if result.isEmpty { throw EluRuntimeQueueError.headRecordExceedsPeekLimit(Int64(row.body.count)) }
+                break
+            }
+            bytes += row.body.count; result.append(row)
+        }
+        return result
+    }
+
     private func nativeMetadata(_ connection: EluSQLiteConnection, disk: EluStoredRuntimeState) throws -> EluNativeReplaySessionState {
         guard EluSQLiteRuntimeSchema.hasNativeReplayAuthority(databaseSchemaVersion), let namespace = ownerNamespaceHash else {
             throw EluRuntimeQueueError.invalidState
@@ -4306,8 +4521,8 @@ actor EluSQLiteRuntimeQueue {
             let replayId = try value.allocateReplayID()
             // A restored/corrupt ordinal cannot overwrite an immutable previous replay.
             var collision = false
-            try EluRuntimeDatabase.visitReplayChunks(connection) { row in
-                if EluNativeReplaySessionState.same(row.prepared.replayId, replayId) { collision = true }
+            try EluRuntimeDatabase.visitReplayRecords(connection) { row in
+                if EluNativeReplaySessionState.same(row.replayId, replayId) { collision = true }
             }
             guard !collision, let session = value.session, let first = session.firstStartAt else { throw EluRuntimeQueueError.corruptStorage }
             if anchor?.key != session.key || anchor.map({ !EluNativeReplaySessionState.same($0.firstStartAt, first) }) == true {
@@ -4499,6 +4714,120 @@ actor EluSQLiteRuntimeQueue {
         return nativeGuard(observation: input.observation, receipt: receipt)
     }
 
+    #if canImport(SwiftUI) && canImport(UIKit)
+    func nativeRasterPermitGuard(input: EluNativeReplayProjectionInput,
+                                 receipt: EluNativeReplayStartReceipt) throws -> EluNativeReplaySynchronousGuard? {
+        guard input.owner == nativeAccountingOwner, receipt.owner == nativeAccountingOwner,
+              input.source == input.observation.source else { return nil }
+        try validateRasterSource(input.source, connection: try requireResources().connection)
+        _ = try nativeCurrentSource(input.source, disk: state, expected: input.observation.capture)
+        let metadata = try nativeMetadata(try requireResources().connection, disk: state)
+        guard let session = metadata.session, session.key == receipt.key,
+              session.activeEpoch.map({ EluV2ReplayText.equal($0, receipt.epoch) }) == true,
+              session.firstStartAt.map({ EluV2ReplayText.equal($0, receipt.firstStartAt) }) == true else { return nil }
+        return nativeGuard(observation: input.observation, receipt: receipt)
+    }
+
+    func makeNativeRasterCaptureAdmission(input: EluNativeReplayProjectionInput,
+        receipt: EluNativeReplayStartReceipt, permit: EluNativeRasterPermit,
+        physicalUse: EluNativeReplayCapturePhysicalUse) throws -> EluNativeRasterCaptureAdmission {
+        try requireNativeCaptureUse(physicalUse)
+        guard input.owner == nativeAccountingOwner, receipt.owner == nativeAccountingOwner,
+              nativeCaptureReceipt?.epoch == receipt.epoch, nativeCaptureReceipt?.replayId == receipt.replayId,
+              permit.replayId == receipt.replayId, input.isCurrent(), permit.isCurrent(),
+              let policy = input.source.nativeV3?.raster,
+              policy.effectivePolicyHash == permit.policy.effectivePolicyHash,
+              EluV2ReplayText.equal(policy.revision, permit.policy.revision) else { throw EluNativeReplayAuthorityError.stale }
+        try validateRasterSource(input.source, connection: try requireResources().connection)
+        return EluNativeRasterCaptureAdmission(input: input, receipt: receipt, permit: permit, use: physicalUse)
+    }
+
+    /// Only the original live authority + physical slot can admit a sealer-made
+    /// request. Stored values, profiles and missing branches grant no intake.
+    func appendNativeRaster(_ prepared: EluNativeRasterPreparedRequest,
+        admission: EluNativeRasterCaptureAdmission, physicalUse: EluNativeReplayCapturePhysicalUse
+    ) throws -> EluNativeRasterCaptureAppendResult {
+        try requireNativeCaptureUse(physicalUse)
+        guard admission.use === physicalUse, admission.isCurrent(),
+              prepared.sourceIdentity === admission.permit.sourceIdentity else { throw EluNativeReplayAuthorityError.stale }
+        do {
+            let restored = try EluNativeRasterStoredRequest(restoring: prepared.body)
+            let source = admission.input.source, receipt = admission.receipt
+            func validate(_ connection: EluSQLiteConnection, _ disk: EluStoredRuntimeState) throws {
+                try requireNativeCaptureUse(physicalUse)
+                try validateRasterSource(source, connection: connection)
+                let current = try nativeCurrentSource(source, disk: disk, expected: admission.input.observation.capture)
+                let metadata = try nativeMetadata(connection, disk: disk)
+                guard admission.input.owner == nativeAccountingOwner, receipt.owner == nativeAccountingOwner,
+                      nativeCaptureReceipt?.epoch == receipt.epoch, nativeCaptureReceipt?.replayId == receipt.replayId,
+                      receipt.key == admission.input.accounting.key, receipt.key == current.2,
+                      let session = metadata.session, session.key == receipt.key,
+                      session.activeEpoch.map({ EluV2ReplayText.equal($0, receipt.epoch) }) == true,
+                      !session.clockDenied, !session.interrupted, session.remainingMicroseconds > 0,
+                      EluV2ReplayText.equal(receipt.stream, disk.streamId),
+                      EluV2ReplayText.equal(restored.replayId, receipt.replayId),
+                      EluV2ReplayText.equal(restored.sessionId, disk.identity.session?.id),
+                      EluV2ReplayText.equal(restored.anonymousId, disk.identity.anonymousId),
+                      EluV2ReplayText.equal(restored.userId, disk.identity.userId),
+                      restored.identityRevision == disk.identity.revision,
+                      restored.contextRevision == disk.identity.contextRevision,
+                      restored.effectivePolicyHash == admission.permit.policy.effectivePolicyHash,
+                      EluV2ReplayText.equal(restored.policyRevision, admission.permit.policy.revision),
+                      try EluNativeReplayCaptureClock.admits(startedAt: restored.time, endedAt: restored.time,
+                          after: EluV1Timestamp(receipt.firstStartAt)),
+                      prepared.body.count <= admission.permit.policy.maximumRequestBytes,
+                      prepared.sourceIdentity === admission.permit.sourceIdentity, admission.isCurrent()
+                else { throw EluNativeReplayAuthorityError.stale }
+            }
+            let value: EluNativeRasterAppendResult = try replayClockTransaction(validate: {
+                try validate(self.requireResources().connection, self.state)
+            }) { connection, disk, now in
+                try validate(connection, disk)
+                var ledger = try EluRuntimeDatabase.readReplayState(connection)
+                let site = admission.input.accounting.siteId
+                let row = try EluNativeRasterStoredChunk(ordinal: ledger.nextOrdinal, siteId: site, prepared: restored)
+                guard now.floorNanoseconds(since: restored.time) != nil, !Self.replayExpired(.raster(row), now: now) else {
+                    throw EluRuntimeQueueError.invalidRecord
+                }
+                var duplicate: EluNativeRasterStoredChunk?
+                try EluRuntimeDatabase.visitReplayRecords(connection) { existing in
+                    if EluV2ReplayText.equal(existing.siteId, site) && (EluV2ReplayText.equal(existing.requestId, restored.requestId)
+                        || (EluV2ReplayText.equal(existing.replayId, restored.replayId)
+                            && (existing.sequence == restored.sequence || EluV2ReplayText.equal(existing.chunkId, restored.chunkId)))) {
+                        guard case let .raster(original) = existing, original.prepared.body == restored.body else {
+                            throw EluRuntimeQueueError.acknowledgementMismatch
+                        }
+                        duplicate = original
+                    }
+                }
+                if let duplicate { return .duplicate(duplicate) }
+                let totals = try EluRuntimeDatabase.replayTotals(connection)
+                guard disk.liveCount + totals.count + 1 <= Int64(limits.maximumCount) else { throw EluRuntimeQueueError.queueCountLimitExceeded }
+                guard disk.liveBytes + totals.bytes + Int64(prepared.body.count) <= min(Int64(limits.maximumBytes), ledger.maximumQueueBytes) else { throw EluRuntimeQueueError.queueByteLimitExceeded }
+                guard ledger.nextOrdinal < EluV2ReplayDeliveryState.maximumSafeInteger else { throw EluRuntimeQueueError.counterExhausted }
+                try EluRuntimeDatabase.insertReplayRecord(connection, .raster(row))
+                try EluRuntimeDatabase.writeReplayDelivery(connection, ordinal: row.ordinal, value: .pending)
+                try faultInjector?.hit(.afterRecordInsert(0))
+                ledger.nextOrdinal += 1
+                try EluRuntimeDatabase.writeReplayState(connection, ledger)
+                return .inserted(row)
+            }
+            return admission.isCurrent() ? .committed(value) : .committedThenWithdrawn(value)
+        } catch {
+            if isPoisoned { physicalUse.enrollment.quarantineRaster(retaining: prepared.body) }
+            throw error
+        }
+    }
+    #endif
+
+    private func validateRasterSource(_ source: EluV2ConfigAuthorityWitness, connection: EluSQLiteConnection) throws {
+        guard EluSQLiteRuntimeSchema.hasRaster(databaseSchemaVersion), sourceIsCurrent(source),
+              let wrapper = source.nativeV3, wrapper.raster != nil,
+              let ledger = try EluRuntimeDatabase.readReplayState(connection).rasterSource,
+              !ledger.conflicted, ledger.issuedAt == wrapper.base.issuedAt,
+              ledger.semanticHash == wrapper.semanticHash else { throw EluRuntimeQueueError.sourceAuthorityUnavailable }
+    }
+
     private func nativeGuard(observation: EluNativeReplaySessionObservation,
                              receipt: EluNativeReplayStartReceipt?) -> EluNativeReplaySynchronousGuard? {
         guard sourceIsCurrent(observation.source), case let .authorized(capture) = captureAuthority,
@@ -4589,6 +4918,13 @@ actor EluSQLiteRuntimeQueue {
                     || !EluV2ReplayText.equal(row.siteId, document.site?.id) || Self.replayExpired(row, now: now)
                     || !mayRetainProfile(row.maskingProfile) {
                     try EluRuntimeDatabase.deleteReplayChunk(connection, ordinal: row.ordinal); removed += 1
+                }
+            }
+            try EluRuntimeDatabase.visitReplayRecords(connection) { record in
+                guard case .raster = record else { return }
+                if !Self.rasterBaseMayRetain(document) || disk.identity.optedOut
+                    || !EluV2ReplayText.equal(record.siteId, document.site?.id) || Self.replayExpired(record, now: now) {
+                    try EluRuntimeDatabase.deleteReplayChunk(connection, ordinal: record.ordinal); removed += 1
                 }
             }
             current.siteId = document.site?.id ?? current.siteId
@@ -5098,8 +5434,9 @@ actor EluSQLiteRuntimeQueue {
         var bytes = 0
         for ordinal in try EluRuntimeDatabase.replayOrdinals(connection) where ordinal > afterOrdinal {
             guard rows.count < maximumCount else { break }
-            let found = try EluRuntimeDatabase.readReplayChunks(connection, ordinal: ordinal)
-            guard found.count == 1, let row = found.first else { throw EluRuntimeQueueError.corruptStorage }
+            let found = try EluRuntimeDatabase.readReplayRecords(connection, ordinal: ordinal)
+            guard found.count == 1, let record = found.first else { throw EluRuntimeQueueError.corruptStorage }
+            guard case let .wireframe(row) = record else { continue }
             guard bytes + row.prepared.body.count <= maximumBytes else {
                 if rows.isEmpty { throw EluRuntimeQueueError.headRecordExceedsPeekLimit(Int64(row.prepared.body.count)) }
                 break
@@ -5136,7 +5473,7 @@ actor EluSQLiteRuntimeQueue {
         return try replayClockTransaction { connection, _, now in
             guard try EluRuntimeDatabase.readReplayState(connection).witness == expectedConfigWitness else { throw EluRuntimeQueueError.generationMismatch }
             var removed = 0
-            try EluRuntimeDatabase.visitReplayChunks(connection) { row in
+            try EluRuntimeDatabase.visitReplayRecords(connection) { row in
                 if Self.replayExpired(row, now: now) { try EluRuntimeDatabase.deleteReplayChunk(connection, ordinal: row.ordinal); removed += 1 }
             }
             return removed
@@ -5144,7 +5481,11 @@ actor EluSQLiteRuntimeQueue {
     }
 
     private static func replayExpired(_ row: EluV2ReplayStoredChunk, now: EluV1Timestamp) -> Bool {
-        guard let age = now.floorNanoseconds(since: row.prepared.startedAt) else { return false }
+        replayExpired(.wireframe(row), now: now)
+    }
+
+    private static func replayExpired(_ row: EluStoredReplayRecord, now: EluV1Timestamp) -> Bool {
+        guard let age = now.floorNanoseconds(since: row.startedAt) else { return false }
         return age >= 604_800_000_000_000
     }
 
@@ -5160,10 +5501,10 @@ actor EluSQLiteRuntimeQueue {
                 let now = try observeReplayClock(connection)
                 // Check every stored age before any policy or age deletion. An
                 // unrepresentable age is uncertainty, including a future start.
-                try EluRuntimeDatabase.visitReplayChunks(connection) { row in
-                    guard now.floorNanoseconds(since: row.prepared.startedAt) != nil else {
+                try EluRuntimeDatabase.visitReplayRecords(connection) { row in
+                    guard now.floorNanoseconds(since: row.startedAt) != nil else {
                         replayClockDenied = true
-                        recordReplayClockDenial("replay-stored-age-unrepresentable", ["wall": now.source, "rowStartedAt": row.prepared.startedAt.source])
+                        recordReplayClockDenial("replay-stored-age-unrepresentable", ["wall": now.source, "rowStartedAt": row.startedAt.source])
                         throw EluRuntimeQueueError.sourceAuthorityUnavailable
                     }
                 }
@@ -6967,6 +7308,13 @@ actor EluSQLiteRuntimeQueue {
         // Lease time starts before any wall-clock read, decoding, hashing, or
         // policy validation. Validation latency must consume the lease.
         let monotonicOrigin = continuousClock()
+        if EluSQLiteRuntimeSchema.hasRaster(databaseSchemaVersion) {
+            guard let sourceWitness else { return sourceUnavailableCaptureResult() }
+            do { try reconcileNativeRasterOrdering(sourceWitness) }
+            catch {
+                return terminateCaptureAuthority(reason: error as? EluRuntimeQueueError == .generationMismatch ? .conflict : .stale)
+            }
+        }
         guard let manager = captureConfigManager,
               let ownerNamespaceHash,
               !isPoisoned,
@@ -7258,7 +7606,7 @@ actor EluSQLiteRuntimeQueue {
     private func initializeRateLimiting(_ options: EluRateLimitingOptions) throws {
         let connection = try requireResources().connection
         if !EluSQLiteRuntimeSchema.hasRateLimiter(databaseSchemaVersion) {
-            let target = EluSQLiteRuntimeSchema.baseVersion(databaseSchemaVersion) + 48
+            let target = EluSQLiteRuntimeSchema.preservingRaster(EluSQLiteRuntimeSchema.baseVersion(databaseSchemaVersion) + 48, from: databaseSchemaVersion)
             var attemptedCommit = false
             try connection.execute("BEGIN IMMEDIATE")
             do {
@@ -7420,7 +7768,7 @@ actor EluSQLiteRuntimeQueue {
         }
         guard !EluSQLiteRuntimeSchema.hasCrashReports(databaseSchemaVersion) else { return }
         let connection = try requireResources().connection
-        let target = EluSQLiteRuntimeSchema.baseVersion(databaseSchemaVersion) + 56
+        let target = EluSQLiteRuntimeSchema.preservingRaster(EluSQLiteRuntimeSchema.baseVersion(databaseSchemaVersion) + 56, from: databaseSchemaVersion)
         diagnosticsMetadataPersistenceInProgress = true
         defer { diagnosticsMetadataPersistenceInProgress = false }
         var attemptedCommit = false

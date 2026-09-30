@@ -152,6 +152,37 @@ struct EluNativeReplayPermit: Sendable {
     func isCurrent() -> Bool { authority.isCurrent() && selection.isCurrent() }
 }
 
+#if canImport(SwiftUI) && canImport(UIKit)
+/// Same original owner and accounting epoch, with a separately validated policy.
+/// There is no conversion from automatic-input privacy into a declared grant.
+struct EluNativeRasterPreparedAuthority: Sendable {
+    let policy: EluNativeV3ConfigParser.RasterPolicy
+    let identity: EluIdentitySnapshot
+    let sourceIdentity: EluSwiftUIReplaySourceIdentity
+    fileprivate let owner: UUID
+    fileprivate let invocation: UUID
+    fileprivate let projection: EluNativeReplayProjectionInput
+    func isCurrent() -> Bool { projection.isCurrent() }
+}
+
+struct EluNativeRasterPermit: Sendable {
+    let replayId: String
+    let policy: EluNativeV3ConfigParser.RasterPolicy
+    let identity: EluIdentitySnapshot
+    let sourceIdentity: EluSwiftUIReplaySourceIdentity
+    let selection: EluNativeReplaySelection
+    fileprivate let receipt: EluNativeReplayStartReceipt
+    fileprivate let authority: EluNativeReplaySynchronousGuard
+    fileprivate let invocation: UUID
+    func isCurrent() -> Bool { authority.isCurrent() && selection.isCurrent() }
+    func sealingPolicy() throws -> EluNativeRasterPolicyBinding {
+        try EluNativeRasterPolicyBinding(policyRevision: policy.revision,
+            effectivePolicyHash: policy.effectivePolicyHash,
+            contextRevision: identity.identity.contextRevision, maximumRequestBytes: policy.maximumRequestBytes)
+    }
+}
+#endif
+
 /// Serializes proof/start/stop only. This owner creates no physical capture work.
 actor EluNativeReplayAuthority {
     private nonisolated let fence = EluNativeReplayScope()
@@ -164,6 +195,17 @@ actor EluNativeReplayAuthority {
     private var captureUse: EluNativeReplayCapturePhysicalUse?
     private var activeProjection: EluNativeReplayProjectionInput?
     private var closed = false
+    #if canImport(SwiftUI) && canImport(UIKit)
+    private var rasterPrepared: EluNativeRasterPreparedAuthority?
+    private var rasterActive: EluNativeRasterPermit?
+    #endif
+    private var hasRasterActive: Bool {
+        #if canImport(SwiftUI) && canImport(UIKit)
+        return rasterActive != nil
+        #else
+        return false
+        #endif
+    }
 
     init(queue: EluSQLiteRuntimeQueue, clock: @escaping @Sendable () -> Date) {
         self.queue = queue; self.clock = clock
@@ -205,12 +247,7 @@ actor EluNativeReplayAuthority {
         try await settleActive()
         guard !closed, fence.current(invocation), queue.nativeSourceIsCurrent(source), unresolvedReceipt == nil, captureUse == nil else { throw EluNativeReplayAuthorityError.stale }
         // These are explicit optional storage migrations, not readiness claims.
-        try await queue.ensureReplaySchema()
-        guard fence.current(invocation), queue.nativeSourceIsCurrent(source) else { throw EluNativeReplayAuthorityError.stale }
-        try await queue.ensureReplayDeliverySchema()
-        guard fence.current(invocation), queue.nativeSourceIsCurrent(source) else { throw EluNativeReplayAuthorityError.stale }
-        try await queue.ensureNativeReplayAuthoritySchema()
-        guard fence.current(invocation), queue.nativeSourceIsCurrent(source) else { throw EluNativeReplayAuthorityError.stale }
+        try await ensureOriginalSchemas(source: source, invocation: invocation)
         let original = try await queue.nativeReplayProjection(source: source)
         guard fence.current(invocation), original.source == source, original.isCurrent() else { throw EluNativeReplayAuthorityError.stale }
         let profile = EluNativeMaskingProfile.select(for: original.context.policy.masking, platform: .ios)
@@ -244,7 +281,7 @@ actor EluNativeReplayAuthority {
 
     private func startCurrent(_ value: EluNativeReplayPreparedAuthority, selection: EluNativeReplaySelection,
                physicalUse: EluNativeReplayCapturePhysicalUse?) async throws -> EluNativeReplayPermit? {
-        guard !closed, active == nil, unresolvedReceipt == nil, captureUse == nil, value.owner == id,
+        guard !closed, active == nil, !hasRasterActive, unresolvedReceipt == nil, captureUse == nil, value.owner == id,
               fence.current(value.invocation), value.isCurrent(), selection.isCurrent(),
               case .authorized = value.resolution.replayAuthorization else { return nil }
         if physicalUse != nil {
@@ -252,7 +289,7 @@ actor EluNativeReplayAuthority {
                   EluV2ReplayText.equal(supported, value.resolution.replayProtocolGeneration) else { return nil }
         }
         let selected = await selection.validateCurrent()
-        guard selected, !closed, active == nil, unresolvedReceipt == nil, captureUse == nil,
+        guard selected, !closed, active == nil, !hasRasterActive, unresolvedReceipt == nil, captureUse == nil,
               fence.current(value.invocation), value.isCurrent(), selection.isCurrent() else { return nil }
         // Retain the physical capability before crossing the queue boundary: a
         // begin may commit without returning its receipt to this actor.
@@ -315,6 +352,81 @@ actor EluNativeReplayAuthority {
         return value
     }
 
+    private func ensureOriginalSchemas(source: EluV2ConfigAuthorityWitness, invocation: UUID) async throws {
+        try await queue.ensureReplaySchema()
+        guard fence.current(invocation), queue.nativeSourceIsCurrent(source) else { throw EluNativeReplayAuthorityError.stale }
+        try await queue.ensureReplayDeliverySchema()
+        guard fence.current(invocation), queue.nativeSourceIsCurrent(source) else { throw EluNativeReplayAuthorityError.stale }
+        try await queue.ensureNativeReplayAuthoritySchema()
+        guard fence.current(invocation), queue.nativeSourceIsCurrent(source) else { throw EluNativeReplayAuthorityError.stale }
+    }
+
+    #if canImport(SwiftUI) && canImport(UIKit)
+    func prepareRaster(source: EluV2ConfigAuthorityWitness, sourceIdentity: EluSwiftUIReplaySourceIdentity,
+                       timeZoneIdentifier: String?) async throws -> EluNativeRasterPreparedAuthority {
+        guard !closed, queue.nativeSourceIsCurrent(source) else { throw EluNativeReplayAuthorityError.stale }
+        fence.invalidate(); let invocation = fence.token()
+        prepared = nil; rasterPrepared = nil
+        try await settleActive()
+        guard fence.current(invocation), unresolvedReceipt == nil, captureUse == nil else { throw EluNativeReplayAuthorityError.stale }
+        // All three original migrations remain the only accounting/delivery store.
+        try await ensureOriginalSchemas(source: source, invocation: invocation)
+        if source.nativeV3?.raster != nil { try await queue.ensureNativeRasterSchema(source: source) }
+        try await queue.reconcileNativeRasterSource(source)
+        guard fence.current(invocation), let policy = source.nativeV3?.raster else { throw EluNativeReplayAuthorityError.unavailable }
+        let input = try await queue.nativeReplayProjection(source: source)
+        guard fence.current(invocation), input.isCurrent(), input.sessionEligible,
+              EluPrivacyStateProjector.onDeviceDecision(regionPolicy: input.context.policy.regionPolicy,
+                timeZoneIdentifier: timeZoneIdentifier, identityOptedOut: input.identity.identity.optedOut).decision == .allow
+        else { throw EluNativeReplayAuthorityError.stale }
+        let value = EluNativeRasterPreparedAuthority(policy: policy, identity: input.identity,
+            sourceIdentity: sourceIdentity, owner: id, invocation: invocation, projection: input)
+        rasterPrepared = value
+        return value
+    }
+
+    func startRaster(_ value: EluNativeRasterPreparedAuthority, selection: EluNativeReplaySelection,
+                     physicalUse: EluNativeReplayCapturePhysicalUse) async throws -> EluNativeRasterPermit? {
+        guard !closed, active == nil, rasterActive == nil, unresolvedReceipt == nil, captureUse == nil,
+              value.owner == id, fence.current(value.invocation), value.isCurrent(), selection.isCurrent() else { return nil }
+        let selected = await selection.validateCurrent()
+        guard selected, !closed, fence.current(value.invocation), value.isCurrent(), selection.isCurrent(),
+              active == nil, rasterActive == nil, captureUse == nil else { return nil }
+        captureUse = physicalUse
+        guard let receipt = try await queue.beginNativeReplayStartAccounting(value.projection, physicalUse: physicalUse) else { return nil }
+        unresolvedReceipt = receipt
+        guard let original = try await queue.nativeRasterPermitGuard(input: value.projection, receipt: receipt),
+              fence.current(value.invocation), original.isCurrent(), selection.isCurrent() else {
+            try await settleActive(); return nil
+        }
+        let stillSelected = await selection.validateCurrent()
+        guard stillSelected, !closed, fence.current(value.invocation), original.isCurrent() else { try await settleActive(); return nil }
+        let ownerFence = fence, invocation = value.invocation
+        let guardValue = EluNativeReplaySynchronousGuard {
+            ownerFence.current(invocation) && original.isCurrent() && selection.isCurrent() && ownerFence.current(invocation)
+        }
+        let permit = EluNativeRasterPermit(replayId: receipt.replayId, policy: value.policy,
+            identity: value.identity, sourceIdentity: value.sourceIdentity, selection: selection,
+            receipt: receipt, authority: guardValue, invocation: invocation)
+        guard permit.isCurrent() else { try await settleActive(); return nil }
+        rasterActive = permit; activeProjection = value.projection; unresolvedReceipt = nil
+        return permit
+    }
+
+    func captureAdmission(for permit: EluNativeRasterPermit,
+                          physicalUse: EluNativeReplayCapturePhysicalUse) async throws -> EluNativeRasterCaptureAdmission {
+        guard !closed, captureUse === physicalUse, rasterActive?.invocation == permit.invocation,
+              rasterActive?.replayId == permit.replayId, let input = activeProjection,
+              input.isCurrent(), permit.isCurrent() else { throw EluNativeReplayAuthorityError.stale }
+        try await queue.reconcileNativeRasterSource(input.source)
+        let admission = try await queue.makeNativeRasterCaptureAdmission(input: input, receipt: permit.receipt,
+            permit: permit, physicalUse: physicalUse)
+        guard !closed, captureUse === physicalUse, rasterActive?.invocation == permit.invocation,
+              admission.isCurrent() else { throw EluNativeReplayAuthorityError.stale }
+        return admission
+    }
+    #endif
+
     @discardableResult
     func stop() async throws -> EluNativeReplayStopOutcome {
         fence.invalidate(); queue.invalidateNativeProjection(); prepared = nil
@@ -325,6 +437,11 @@ actor EluNativeReplayAuthority {
         do { try await settleActive() } catch { /* Original unresolved epoch remains fail-closed. */ }
     }
     private func settleWithdrawn() async {
+        #if canImport(SwiftUI) && canImport(UIKit)
+        if let rasterActive, rasterActive.isCurrent() { return }
+        if let rasterPrepared, fence.current(rasterPrepared.invocation), rasterPrepared.isCurrent(), unresolvedReceipt == nil { return }
+        rasterPrepared = nil
+        #endif
         if let active, active.isCurrent() { return }
         if let prepared, fence.current(prepared.invocation), prepared.isCurrent(), unresolvedReceipt == nil { return }
         prepared = nil
@@ -333,6 +450,9 @@ actor EluNativeReplayAuthority {
     @discardableResult
     private func settleActive() async throws -> EluNativeReplayStopOutcome {
         if let active { unresolvedReceipt = active.receipt; self.active = nil }
+        #if canImport(SwiftUI) && canImport(UIKit)
+        if let rasterActive { unresolvedReceipt = rasterActive.receipt; self.rasterActive = nil }
+        #endif
         activeProjection = nil
         if let use = captureUse {
             let result = try await queue.stopNativeReplayCaptureAccounting(use)

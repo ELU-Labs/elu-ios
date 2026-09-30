@@ -7,6 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		089134C4C32012D2063184D7 /* EluNativeRasterQueueTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C052E212E94E405D87AB4448 /* EluNativeRasterQueueTests.swift */; };
 		38479F2E11178FE12A35EB52 /* EluNativeRasterResponseTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 95848F8382DC7A2B02166E08 /* EluNativeRasterResponseTests.swift */; };
 		ECF7F297DF37EF87EF6E275E /* EluNativeV3ConfigParserTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 553C23A8CA8BCE6B69198020 /* EluNativeV3ConfigParserTests.swift */; };
 		C769EC8BB8A14CB8EBD76C8C /* EluNativeRasterSealerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E9B5FBD160D9A727F9E7F59B /* EluNativeRasterSealerTests.swift */; };
@@ -102,6 +103,7 @@
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
+		C052E212E94E405D87AB4448 /* EluNativeRasterQueueTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluNativeRasterQueueTests.swift; sourceTree = "<group>"; };
 		95848F8382DC7A2B02166E08 /* EluNativeRasterResponseTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluNativeRasterResponseTests.swift; sourceTree = "<group>"; };
 		553C23A8CA8BCE6B69198020 /* EluNativeV3ConfigParserTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluNativeV3ConfigParserTests.swift; sourceTree = "<group>"; };
 		E9B5FBD160D9A727F9E7F59B /* EluNativeRasterSealerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluNativeRasterSealerTests.swift; sourceTree = "<group>"; };
@@ -228,6 +230,7 @@
 		A0928195822C53907FA0C692 /* EluAnalyticsTests */ = {
 			isa = PBXGroup;
 			children = (
+				C052E212E94E405D87AB4448 /* EluNativeRasterQueueTests.swift */,
 				95848F8382DC7A2B02166E08 /* EluNativeRasterResponseTests.swift */,
 				553C23A8CA8BCE6B69198020 /* EluNativeV3ConfigParserTests.swift */,
 				E9B5FBD160D9A727F9E7F59B /* EluNativeRasterSealerTests.swift */,
@@ -410,6 +413,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				089134C4C32012D2063184D7 /* EluNativeRasterQueueTests.swift in Sources */,
 				38479F2E11178FE12A35EB52 /* EluNativeRasterResponseTests.swift in Sources */,
 				ECF7F297DF37EF87EF6E275E /* EluNativeV3ConfigParserTests.swift in Sources */,
 				C769EC8BB8A14CB8EBD76C8C /* EluNativeRasterSealerTests.swift in Sources */,

@@ -51,17 +51,24 @@ struct EluNativeRasterPreparedRequest: Equatable, Sendable {
     let effectivePolicyHash: String
     let width: Int
     let height: Int
+    let sourceIdentity: EluSwiftUIReplaySourceIdentity
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.body == rhs.body && lhs.width == rhs.width && lhs.height == rhs.height
+            && lhs.sourceIdentity === rhs.sourceIdentity
+    }
     var codec: String { EluNativeRasterSealer.codec }
     var captureProtocolGeneration: String { EluNativeRasterSealer.protocolGeneration }
 
     fileprivate init(body: Data, requestId: String, chunkId: String, replayId: String,
                      sessionId: String, sequence: Int64, timestamp: Int64,
-                     contextRevision: Int64, effectivePolicyHash: String, width: Int, height: Int) {
+                     contextRevision: Int64, effectivePolicyHash: String, width: Int, height: Int, sourceIdentity: EluSwiftUIReplaySourceIdentity) {
         self.body = body; self.requestId = requestId; self.chunkId = chunkId
         digest = "sha256:" + EluNativeRasterSealer.digest(body)
         self.replayId = replayId; self.sessionId = sessionId; self.sequence = sequence
         self.timestamp = timestamp; self.contextRevision = contextRevision
         self.effectivePolicyHash = effectivePolicyHash; self.width = width; self.height = height
+        self.sourceIdentity = sourceIdentity
     }
 }
 
@@ -203,7 +210,7 @@ struct EluNativeRasterSealer: Sendable {
         let prepared = EluNativeRasterPreparedRequest(body: body, requestId: requestId, chunkId: chunkId,
             replayId: replayId, sessionId: sessionId, sequence: nextSequence, timestamp: timestamp,
             contextRevision: policy.contextRevision, effectivePolicyHash: policy.effectivePolicyHash,
-            width: frame.width, height: frame.height)
+            width: frame.width, height: frame.height, sourceIdentity: sourceIdentity)
         // Recheck after the final digest/copy as well as after encoding. The
         // existing admission path must check this original witness again at SQL.
         try checkSource()
