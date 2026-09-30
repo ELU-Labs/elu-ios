@@ -271,6 +271,30 @@
     {
       "kind": "swift.init",
       "name": "EluDiagnosticsOptions.init(enabled:launchSummaries:crashReports:crashReportDetails:)"
+    },
+    {
+      "kind": "swift.class",
+      "name": "EluSwiftUIReplayScope"
+    },
+    {
+      "kind": "swift.init",
+      "name": "EluSwiftUIReplayScope.init(requiredRegions:)"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluSwiftUIReplayScope.objectWillChange"
+    },
+    {
+      "kind": "swift.method",
+      "name": "View.eluBlock(_:region:)"
+    },
+    {
+      "kind": "swift.method",
+      "name": "View.eluMask(_:region:)"
+    },
+    {
+      "kind": "swift.method",
+      "name": "View.eluReplayRoot(_:)"
     }
   ]
 }
