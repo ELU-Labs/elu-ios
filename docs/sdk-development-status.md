@@ -38,12 +38,16 @@ scroll, but does not discover inputs or native `.privacySensitive()` markings,
 and adds no SwiftUI interaction markers. General self-hosted raster endpoints
 are unsupported. See the README for the exact customer obligations.
 
-The new bootstrap/consumer tests are authored, not yet compiled or executed.
-The latest runtime candidate's hosted run executed 1,126 tests with three
-assertion failures in two fixtures: lost-ACK retry semantics and root-source
-revocation on resize. Their separate corrections preserve production behavior
-and await fresh execution. No current all-green or package qualification is
-inferred from earlier collector/parser tests or source review.
+Candidate `0a0c438` passed all three jobs in [hosted CI run
+36721141678](https://github.com/ELU-Labs/elu-ios/actions/runs/36721141678):
+1,132 Swift tests, 97 owned-store upgrade tests and 186 release-tool controls,
+with no failures. Public API verification found 99 symbols; UIKit and SwiftUI
+consumer builds, source archive generation and artifact scans passed. This
+includes the corrected lost-ACK and root-source fixtures and the public
+declared-region setup option. The tested archive belongs to PR merge `c71640e9`;
+its packaged file contents and executable modes match reviewed `0a0c438`.
+These are source-validation results, not installed-package or release
+qualification; version 0.2.0 remains an unreleased candidate.
 
 Customer request metrics require the explicit `EluURLSession` wrapper; URLs,
 headers and bodies are omitted. Opt-in native performance includes process
@@ -69,19 +73,20 @@ success is inferred from that historical run or API-ledger additions.
 
 Exact distribution installation, owned upgrades, real Lab engine readback,
 customer-player rendering, privacy/fault cohorts and bounded resource checks
-remain release gates. Physical devices are deferred by the owner for this
-release effort; simulator qualification cannot establish real-device resource
-costs or OS diagnostic availability. A source or consumer compile is not final
-artifact or end-to-end qualification. Keep private artifacts, logs, device data,
-credentials and provenance receipts out of public source commits.
+remain release gates. Final qualification on a local simulator using the exact
+artifacts is still pending; hosted CI does not replace it. Physical-device
+behavior, performance and OS diagnostic availability remain unverified. A source
+or consumer compile is not final artifact or end-to-end qualification. Keep
+private artifacts, logs, device data, credentials and provenance receipts out
+of public source commits.
 
 The per-report MetricKit path is a separately opted-in no-stack implementation:
 iOS 14 Mach/signal fields, optional iOS 17 Objective-C details under another local
 permission, a current empty-suppression exception grant, and independent durable
 local interval consent. Native control-plane grant emission is still unavailable;
-manual exception capture and numeric diagnostic opt-in do not activate it. New
-report/queue/migration/close controls are authored but not yet compiled or run.
-No actual OS delivery, crash-stack mapping, global Swift error interception,
-full browser suppression/override parity or final artifact qualification is
-claimed. See README and CONTRACT for receipt-time attribution and downgrade
-limits. Historical CI totals above predate this source slice.
+manual exception capture and numeric diagnostic opt-in do not activate it.
+Report, queue, migration and close controls are included in the passing hosted
+Swift suites above. Those controls do not demonstrate actual OS report delivery,
+crash-stack mapping, global Swift error interception, full browser
+suppression/override parity or final artifact qualification. See README and
+CONTRACT for receipt-time attribution and downgrade limits.

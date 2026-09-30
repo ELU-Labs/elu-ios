@@ -28,9 +28,10 @@ dependencies: [
 ]
 ```
 
-Then add `EluAnalytics` to your target's dependencies. Install version 0.2.0 only
-when its reviewed release and matching tag are available at the link above.
-Use unpublished source as a local Swift package for development.
+Then add `EluAnalytics` to your target's dependencies. Version 0.2.0 is an
+unreleased candidate; install it only after its reviewed release and matching
+tag are available at the link above. Use unpublished source as a local Swift
+package for development.
 
 ## Setup
 
@@ -371,8 +372,8 @@ Elu.blockView(paymentContainer) // Excludes content and descendants.
 ```
 
 Restrictions last for the view's lifetime and cannot weaken remote policy.
-Unknown native blocking rules disable replay. Replay remains subject to engine,
-player, privacy, and device qualification before release.
+Unknown native blocking rules disable replay. Exact-artifact local simulator,
+engine, player and privacy qualification remain required before release.
 
 ### Annotated SwiftUI replay (unreleased candidate)
 
@@ -523,7 +524,8 @@ use the new geometry. Private/opaque crossing, unsafe clipping, changed text or
 uncertain hierarchy cancels coordinates through physical lift. Opaque paint may
 veto its full unclipped ancestor extent; coordinates are not clamped or assigned
 a fallback target. Actual UIKit gesture delivery, useful scrolling, resource cost
-and customer-player rendering remain separate hosted qualification gates.
+and customer-player rendering remain part of the required exact-artifact local
+simulator qualification. Hosted CI does not replace that gate.
 
 `captureException` records errors explicitly supplied by your app, including
 bounded cause chains. It does not install a synchronous fatal-crash handler.
