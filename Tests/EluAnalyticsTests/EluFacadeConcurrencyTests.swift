@@ -62,6 +62,11 @@ final class EluFacadeConcurrencyTests: XCTestCase {
         XCTAssertNil(Elu.getFeatureFlag("missing"))
         XCTAssertNil(Elu.getFeatureFlagPayload("missing"))
         XCTAssertFalse(Elu.isFeatureEnabled("missing"))
+        XCTAssertNil(Elu.getFeatureFlag("missing", options: .init(sendEvent: false)))
+        XCTAssertNil(Elu.getFeatureFlagResult("missing", options: .init(fresh: true)))
+        XCTAssertNil(Elu.isFeatureEnabled("missing", options: .init()))
+        XCTAssertEqual(Elu.isFeatureEnabled("missing", options: .init(), defaultValue: true), true)
+        XCTAssertEqual(Elu.isFeatureEnabled("missing", options: .init(), defaultValue: false), false)
     }
 
     func testPreSetupCallsFromConcurrentQueuesDoNotThrowOrBlock() {

@@ -159,6 +159,10 @@ public enum Elu {
         EluCore.shared.getFeatureFlag(key)
     }
 
+    public static func getFeatureFlag(_ key: String, options: EluFeatureFlagOptions) -> Any? {
+        EluCore.shared.getFeatureFlag(key, options: options)
+    }
+
     public static func getFeatureFlagPayload(_ key: String) -> Any? {
         EluCore.shared.getFeatureFlagPayload(key)
     }
@@ -169,8 +173,18 @@ public enum Elu {
         EluCore.shared.getFeatureFlagResult(key)
     }
 
+    public static func getFeatureFlagResult(_ key: String, options: EluFeatureFlagOptions) -> EluFeatureFlagResult? {
+        EluCore.shared.getFeatureFlagResult(key, options: options)
+    }
+
     public static func isFeatureEnabled(_ key: String) -> Bool {
         EluCore.shared.isFeatureEnabled(key)
+    }
+
+    /// Returns nil for an unavailable or absent flag unless a default is supplied.
+    /// A present false value is never replaced by the default.
+    public static func isFeatureEnabled(_ key: String, options: EluFeatureFlagOptions, defaultValue: Bool? = nil) -> Bool? {
+        EluCore.shared.isFeatureEnabled(key, options: options) ?? defaultValue
     }
 
     public static func reloadFeatureFlags(_ completion: (() -> Void)? = nil) {

@@ -597,7 +597,11 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
     }
 
     func featureFlag(_ key: String) -> Any? {
-        guard let read = readFlag(key, reportsExposure: true) else { return nil }
+        featureFlag(key, options: .init())
+    }
+
+    func featureFlag(_ key: String, options: EluFeatureFlagOptions) -> Any? {
+        guard let read = readFlag(key, reportsExposure: options.sendEvent, fresh: options.fresh) else { return nil }
         return EluFacadeJSON.flagValue(read.value)
     }
 
@@ -613,14 +617,22 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
     }
 
     func featureFlagResult(_ key: String) -> EluFeatureFlagResult? {
-        guard let read = readFlag(key, reportsExposure: true) else { return nil }
+        featureFlagResult(key, options: .init())
+    }
+
+    func featureFlagResult(_ key: String, options: EluFeatureFlagOptions) -> EluFeatureFlagResult? {
+        guard let read = readFlag(key, reportsExposure: options.sendEvent, fresh: options.fresh) else { return nil }
         return EluFeatureFlagResult(key: key, enabled: EluFacadeJSON.flagIsEnabled(read.value),
             variant: EluFacadeJSON.flagValue(read.value) as? String,
             payload: read.payload.map(EluFacadeJSON.payload))
     }
 
     func isFeatureEnabled(_ key: String) -> Bool {
-        guard let read = readFlag(key, reportsExposure: true) else { return false }
+        isFeatureEnabled(key, options: .init()) ?? false
+    }
+
+    func isFeatureEnabled(_ key: String, options: EluFeatureFlagOptions) -> Bool? {
+        guard let read = readFlag(key, reportsExposure: options.sendEvent, fresh: options.fresh) else { return nil }
         return EluFacadeJSON.flagIsEnabled(read.value)
     }
 
@@ -642,11 +654,12 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
 
     private func readFlag(
         _ key: String,
-        reportsExposure: Bool
+        reportsExposure: Bool,
+        fresh: Bool = false
     ) -> (value: EluV1FlagValue, payload: EluV1FlagJSONValue?)? {
         guard !key.isEmpty else { return nil }
         lock.lock()
-        guard !isShutDown, pendingFlagIntents.isEmpty, flagsLoadedState,
+        guard !isShutDown, pendingFlagIntents.isEmpty, flagsLoadedState, (!fresh || flagsFromRemote),
               let flagCache, flagCache.authority.isCurrent() else {
             lock.unlock()
             return nil

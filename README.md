@@ -164,6 +164,24 @@ default (the default sentinel is `"None"`). `getFeatureFlagResult` returns one
 current snapshot with `key`, `enabled`, `variant`, and JSON-compatible `payload`;
 nil means the flag is missing or unavailable.
 
+Pass `EluFeatureFlagOptions` to control one read:
+
+```swift
+let options = EluFeatureFlagOptions(sendEvent: false, fresh: true)
+let variant = Elu.getFeatureFlag("checkout", options: options)
+let result = Elu.getFeatureFlagResult("checkout", options: options)
+let enabled = Elu.isFeatureEnabled("checkout", options: options, defaultValue: false)
+```
+
+`sendEvent: false` suppresses exposure telemetry without consuming its deduplication
+entry. `fresh: true` requires the current evaluation to have been received from
+the flag endpoint during this SDK owner's lifetime; it does not fetch flags or
+extend expiry. Call `reloadFeatureFlags` to request an evaluation. The options
+overload of `isFeatureEnabled` returns `Bool?`: an absent or unavailable flag uses
+`defaultValue` (nil when omitted), while a present false value stays false.
+Existing overloads retain their defaults: exposure enabled, eligible cached
+values allowed, and false for unavailable `isFeatureEnabled` calls.
+
 Exposure events (`$feature_flag_called`) are deduplicated durably by anonymous
 visitor, flag key, and typed value. Relaunch, identify, consent changes, and
 configuration renewal retain that history; either reset variant clears it.

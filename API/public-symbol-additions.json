@@ -299,6 +299,34 @@
     {
       "kind": "swift.property",
       "name": "EluSetupOptions.declaredRegionReplayEnabled"
+    },
+    {
+      "kind": "swift.type.method",
+      "name": "Elu.getFeatureFlag(_:options:)"
+    },
+    {
+      "kind": "swift.type.method",
+      "name": "Elu.getFeatureFlagResult(_:options:)"
+    },
+    {
+      "kind": "swift.type.method",
+      "name": "Elu.isFeatureEnabled(_:options:defaultValue:)"
+    },
+    {
+      "kind": "swift.struct",
+      "name": "EluFeatureFlagOptions"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluFeatureFlagOptions.sendEvent"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluFeatureFlagOptions.fresh"
+    },
+    {
+      "kind": "swift.init",
+      "name": "EluFeatureFlagOptions.init(sendEvent:fresh:)"
     }
   ]
 }

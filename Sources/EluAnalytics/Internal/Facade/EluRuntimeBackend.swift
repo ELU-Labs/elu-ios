@@ -68,6 +68,9 @@ protocol EluRuntimeBackend: AnyObject {
     func featureFlagPayload(_ key: String) -> Any?
     func featureFlagResult(_ key: String) -> EluFeatureFlagResult?
     func isFeatureEnabled(_ key: String) -> Bool
+    func featureFlag(_ key: String, options: EluFeatureFlagOptions) -> Any?
+    func featureFlagResult(_ key: String, options: EluFeatureFlagOptions) -> EluFeatureFlagResult?
+    func isFeatureEnabled(_ key: String, options: EluFeatureFlagOptions) -> Bool?
     func reloadFeatureFlags(_ completion: (() -> Void)?)
     func flush()
 
@@ -150,6 +153,21 @@ extension EluRuntimeBackend {
     func groups() -> [String: String] { [:] }
     func isOptedOut() -> Bool { false }
     func featureFlagResult(_ key: String) -> EluFeatureFlagResult? { nil }
+    // Injected test backends without a projection cannot establish a fresh or
+    // exposure-free read. The installed backend implements these requirements.
+    func featureFlag(_ key: String, options: EluFeatureFlagOptions) -> Any? {
+        guard options.sendEvent, !options.fresh else { return nil }
+        return featureFlag(key)
+    }
+    func featureFlagResult(_ key: String, options: EluFeatureFlagOptions) -> EluFeatureFlagResult? {
+        guard options.sendEvent, !options.fresh else { return nil }
+        return featureFlagResult(key)
+    }
+    func isFeatureEnabled(_ key: String, options: EluFeatureFlagOptions) -> Bool? {
+        guard let value = featureFlag(key, options: options) else { return nil }
+        if let value = value as? Bool { return value }
+        return (value as? String).map { !$0.isEmpty }
+    }
     func flagNotificationPredicate() -> (@Sendable () -> Bool)? {
         guard flagsAreLoaded else { return nil }
         return { [weak self] in self?.flagsAreLoaded == true }

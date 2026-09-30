@@ -247,6 +247,10 @@ final class EluCore {
         }
     }
 
+    func getFeatureFlag(_ key: String, options: EluFeatureFlagOptions) -> Any? {
+        queue.sync { state == .running ? backend?.featureFlag(key, options: options) : nil }
+    }
+
     func getFeatureFlagPayload(_ key: String) -> Any? {
         queue.sync {
             guard state == .running else { return nil }
@@ -261,11 +265,19 @@ final class EluCore {
         }
     }
 
+    func getFeatureFlagResult(_ key: String, options: EluFeatureFlagOptions) -> EluFeatureFlagResult? {
+        queue.sync { state == .running ? backend?.featureFlagResult(key, options: options) : nil }
+    }
+
     func isFeatureEnabled(_ key: String) -> Bool {
         queue.sync {
             guard state == .running else { return false }
             return backend?.isFeatureEnabled(key) ?? false
         }
+    }
+
+    func isFeatureEnabled(_ key: String, options: EluFeatureFlagOptions) -> Bool? {
+        queue.sync { state == .running ? backend?.isFeatureEnabled(key, options: options) : nil }
     }
 
     func reloadFeatureFlags(_ completion: (() -> Void)?) {

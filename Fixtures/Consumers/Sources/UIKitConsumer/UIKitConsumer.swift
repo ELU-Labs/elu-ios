@@ -9,6 +9,10 @@ public final class FixtureAppDelegate: NSObject, UIApplicationDelegate {
     ) -> Bool {
         Elu.setup(siteKey: "fixture-site-key")
         Elu.register(["fixture": "uikit"])
+        let flags = EluFeatureFlagOptions(sendEvent: false, fresh: true)
+        _ = Elu.getFeatureFlag("checkout", options: flags)
+        _ = Elu.getFeatureFlagResult("checkout", options: flags)
+        let _: Bool? = Elu.isFeatureEnabled("checkout", options: flags, defaultValue: false)
         return true
     }
 

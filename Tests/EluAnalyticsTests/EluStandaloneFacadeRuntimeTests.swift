@@ -423,6 +423,73 @@ final class EluStandaloneFacadeRuntimeTests: XCTestCase {
         }
     }
 
+    func testFlagReadOptionsSuppressExposureWithoutConsumingItsDurableEntry() async throws {
+        try await withTemporaryDirectory { root in
+            let harness = try await makeHarness(root: root, flagTransport: FacadeFlagTransport())
+            harness.backend.activate()
+            await harness.backend.settled()
+            let quiet = EluFeatureFlagOptions(sendEvent: false, fresh: true)
+            XCTAssertEqual(harness.backend.featureFlag("variant", options: quiet) as? String, "variant-a")
+            XCTAssertEqual(harness.backend.featureFlagResult("variant", options: quiet)?.variant, "variant-a")
+            XCTAssertEqual(harness.backend.isFeatureEnabled("enabled", options: quiet), false)
+            XCTAssertNil(harness.backend.isFeatureEnabled("absent", options: quiet))
+            await harness.backend.settled()
+            _ = await harness.runtime.flush()
+            var exposures = try await harness.transport.recordedEvents().filter { $0["name"] as? String == "$feature_flag_called" }
+            XCTAssertTrue(exposures.isEmpty)
+
+            // A quiet read cannot consume the first later requested exposure.
+            _ = harness.backend.featureFlagResult("variant", options: .init(fresh: true))
+            _ = harness.backend.featureFlag("variant")
+            await harness.backend.settled()
+            _ = await harness.runtime.flush()
+            exposures = try await harness.transport.recordedEvents().filter { $0["name"] as? String == "$feature_flag_called" }
+            XCTAssertEqual(exposures.count, 1)
+            XCTAssertEqual((exposures.first?["properties"] as? [String: Any])?["$feature_flag"] as? String, "variant")
+            await harness.close()
+        }
+    }
+
+    func testFreshFlagReadRejectsRestoredCacheUntilCurrentRemoteResponse() async throws {
+        try await withTemporaryDirectory { root in
+            let transport = FacadeFlagTransport()
+            let first = try await makeHarness(root: root, flagTransport: transport)
+            first.backend.activate()
+            await first.backend.settled()
+            await first.close()
+            await transport.setFailing(true)
+            let reopened = try await makeHarness(root: root, flagTransport: transport)
+            reopened.backend.activate()
+            await reopened.backend.settled()
+            XCTAssertEqual(reopened.backend.featureFlag("variant", options: .init(sendEvent: false)) as? String, "variant-a")
+            XCTAssertNil(reopened.backend.featureFlag("variant", options: .init(fresh: true)))
+            XCTAssertNil(reopened.backend.featureFlagResult("variant", options: .init(fresh: true)))
+            XCTAssertNil(reopened.backend.isFeatureEnabled("enabled", options: .init(fresh: true)))
+            await reopened.backend.settled()
+            _ = await reopened.runtime.flush()
+            let rejected = try await reopened.transport.recordedEvents().filter { $0["name"] as? String == "$feature_flag_called" }
+            XCTAssertTrue(rejected.isEmpty, "Rejected fresh reads must not consume or emit exposure")
+
+            await transport.setFailing(false)
+            let loaded = expectation(description: "remote flags")
+            reopened.backend.reloadFeatureFlags { loaded.fulfill() }
+            await reopened.backend.settled()
+            await fulfillment(of: [loaded], timeout: 5)
+            XCTAssertEqual(reopened.backend.featureFlag("variant", options: .init(fresh: true)) as? String, "variant-a")
+            XCTAssertEqual(reopened.backend.isFeatureEnabled("enabled", options: .init(sendEvent: false, fresh: true)), false)
+            await reopened.backend.settled()
+            _ = await reopened.runtime.flush()
+            let remote = try await reopened.transport.recordedEvents().filter { $0["name"] as? String == "$feature_flag_called" }
+            XCTAssertEqual(remote.count, 1)
+
+            let finish = reopened.backend.beginPendingOperation(.reset)
+            XCTAssertNil(reopened.backend.featureFlag("variant", options: .init(sendEvent: false, fresh: true)))
+            XCTAssertNil(reopened.backend.featureFlagResult("variant", options: .init(sendEvent: false)))
+            finish?()
+            await reopened.close()
+        }
+    }
+
     func testExposureIsReportedOncePerVisitorKeyAndTypedValueAcrossIdentifyAndReload() async throws {
         try await withTemporaryDirectory { root in
             let harness = try await makeHarness(root: root, flagTransport: FacadeFlagTransport())

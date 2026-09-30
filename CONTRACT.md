@@ -69,6 +69,15 @@ to the current evaluation context; unavailable flags do not imply a successful
 evaluation. `ForFlags` setters and resets change evaluation context only, without
 sending person or group property updates. The README lists the public methods.
 
+`EluFeatureFlagOptions` controls individual value/result/enabled reads. Disabling
+`sendEvent` does not consume an exposure entry. Requiring `fresh` refuses a cache
+restored from another SDK owner until the current logical evaluation has a remote
+response; all original identity, consent, configuration and expiry gates still
+apply. Fresh reads do not start a request. The options-enabled Boolean overload
+returns nil for missing/unavailable values unless a default is supplied, and never
+replaces an evaluated false value with that default. Existing overloads keep their
+behavior.
+
 Exposure deduplication is durable for the anonymous visitor/key/typed value and
 commits in the same transaction as the accepted exposure event. Identify,
 relaunch and config renewal retain it; reset clears it. A full 4,096-entry ledger
