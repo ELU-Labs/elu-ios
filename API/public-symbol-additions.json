@@ -295,6 +295,10 @@
     {
       "kind": "swift.method",
       "name": "View.eluReplayRoot(_:)"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluSetupOptions.declaredRegionReplayEnabled"
     }
   ]
 }
