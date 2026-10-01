@@ -52,6 +52,7 @@ final class EluRuntimeSelectorTests: XCTestCase {
         options.propertyDenylist = []
         options.beforeSend = { _ in nil }
         core.setup(siteKey: uniqueSiteKey(), options: options)
+        drain(core)
         let filter = try XCTUnwrap(factory.eventPolicies().first)
         let command = EluV1CaptureCommand(kind: .capture, name: "event", occurredAt: Date(), properties: [:],
             versions: try .init(runtime: .init(name: "elu-ios", version: "0.2.0"), facade: .init(name: "Elu", version: "1")))

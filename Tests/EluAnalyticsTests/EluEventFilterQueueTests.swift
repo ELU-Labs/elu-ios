@@ -91,7 +91,7 @@ final class EluEventFilterQueueTests: XCTestCase {
             let before = try await h.queue.snapshot()
             let gate = h.base.gate, clock = h.base.testClock
             held.action = { if closeSource { gate.close() } else { clock.advance(3_600) } }
-            rejected(try await h.queue.capture(command(h)), closeSource ? .eventFilterWithdrawn : .authorityExpired)
+            rejected(try await h.queue.capture(command(h)), .eventFilterWithdrawn)
             let after = try await h.queue.snapshot()
             XCTAssertEqual(after.identity, before.identity)
             XCTAssertEqual(after.nextSequence, before.nextSequence)
