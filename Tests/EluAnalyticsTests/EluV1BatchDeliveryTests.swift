@@ -663,11 +663,42 @@ final class EluV1BatchDeliveryTests: XCTestCase {
         }
     }
 
+    func testURLSessionDenialPreservesOldAndNewRowsWithoutReusingAuthorization() async throws {
+        for status in [401, 403] {
+            let directory = try temporaryDirectory()
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let queue = try await makeQueue(directory: directory)
+            let original = try await appendRecords(queue, count: 1)
+            DeniedBatchURLProtocol.state.reset(status: status)
+            let transport = EluV1URLSessionBatchTransport(protocolClasses: [DeniedBatchURLProtocol.self])
+            let coordinator = try self.coordinator(queue: queue, transport: transport)
+
+            let denied = await coordinator.trigger()
+            XCTAssertEqual(denied, .preserved(.permanentHTTP(status)))
+            let preserved = try await queue.peek(maximumCount: 10, maximumBytes: 1_000_000)
+            XCTAssertEqual(preserved, original)
+            let added = try await appendRecords(queue, count: 1)
+            let repeated = await coordinator.trigger()
+            XCTAssertEqual(repeated, denied)
+            XCTAssertEqual(DeniedBatchURLProtocol.state.callCount(), 1)
+            let retained = try await queue.peek(maximumCount: 10, maximumBytes: 1_000_000)
+            XCTAssertEqual(retained, original + added)
+
+            // A separately issued coordinator may deliver the preserved rows.
+            let renewed = try self.coordinator(queue: queue, transport: TestBatchTransport(replies: [.accept]))
+            let recovered = await renewed.trigger()
+            XCTAssertEqual(recovered, .resolved(delivered: 2, terminallyDiscarded: 0))
+            let snapshot = try await queue.snapshot()
+            XCTAssertEqual(snapshot.queuedCount, 0)
+            await queue.close()
+        }
+    }
+
     func testTransportErrorBodyLimitAcceptsExactBoundaryAndBlocksOneByteOver() async throws {
         for (size, expected) in [
             (
                 EluV1BatchDeliveryCoordinator.maximumErrorResponseBytes,
-                EluV1BatchDeliveryTriggerResult.preserved(.permanentHTTP(401))
+                EluV1BatchDeliveryTriggerResult.deferred(untilMonotonicNanoseconds: 30_000_000_000)
             ),
             (
                 EluV1BatchDeliveryCoordinator.maximumErrorResponseBytes + 1,
@@ -679,7 +710,7 @@ final class EluV1BatchDeliveryTests: XCTestCase {
             let queue = try await makeQueue(directory: directory)
             _ = try await appendRecords(queue, count: 1)
             let transport = TestBatchTransport(
-                replies: [.httpWithBodySize(401, nil, size)]
+                replies: [.httpWithBodySize(503, "30", size)]
             )
             let coordinator = try self.coordinator(queue: queue, transport: transport)
 
@@ -691,6 +722,7 @@ final class EluV1BatchDeliveryTests: XCTestCase {
             XCTAssertEqual(calls, 1)
             let snapshot = try await queue.snapshot()
             XCTAssertEqual(snapshot.queuedCount, 1)
+            await coordinator.cancel()
             await queue.close()
         }
     }
@@ -946,7 +978,7 @@ final class EluV1BatchDeliveryTests: XCTestCase {
     private func coordinator(
         queue: EluSQLiteRuntimeQueue,
         byteLimit: Int = 1_000_000,
-        transport: TestBatchTransport,
+        transport: any EluV1BatchHTTPTransport,
         clock: TestBatchClock? = nil,
         randomUnit: Double = 0.5,
         authorizationExpiry: Date? = nil
@@ -1032,6 +1064,44 @@ final class EluV1BatchDeliveryTests: XCTestCase {
         )
         return directory
     }
+}
+
+private final class DeniedBatchURLProtocol: URLProtocol, @unchecked Sendable {
+    static let state = State()
+
+    final class State: @unchecked Sendable {
+        private let lock = NSLock()
+        private var status = 401
+        private var calls = 0
+
+        func reset(status: Int) {
+            lock.lock(); defer { lock.unlock() }
+            self.status = status
+            calls = 0
+        }
+
+        func begin() -> Int {
+            lock.lock(); defer { lock.unlock() }
+            calls += 1
+            return status
+        }
+
+        func callCount() -> Int {
+            lock.lock(); defer { lock.unlock() }
+            return calls
+        }
+    }
+
+    override class func canInit(with _: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+    override func startLoading() {
+        let response = HTTPURLResponse(url: request.url!, statusCode: Self.state.begin(),
+            httpVersion: "HTTP/1.1", headerFields: ["Content-Length": "99999999", "Retry-After": "invalid"])!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: Data("not JSON".utf8))
+        client?.urlProtocolDidFinishLoading(self)
+    }
+    override func stopLoading() {}
 }
 
 private enum TestBatchReply: Sendable {

@@ -473,6 +473,14 @@ actor EluV1BatchDeliveryCoordinator {
         } catch {
             return scheduleRetry(records: prepared.records, attempt: attempt + 1, retryAfter: 0)
         }
+        // URLSession stops reading denied responses at their headers. A denial
+        // applies to this authorization even when no error body is available;
+        // adding records must not turn it into another send with the same key.
+        if response.status == 401 || response.status == 403 {
+            let reason = EluV1BatchPreservationReason.permanentHTTP(response.status)
+            authorizationBlock = reason
+            return .preserved(reason)
+        }
         guard response.body.count <= Self.maximumResponseBytes else {
             return blockRequest(prepared.requestId, reason: .protocolFailure)
         }
@@ -583,14 +591,6 @@ actor EluV1BatchDeliveryCoordinator {
         }
 
         switch response.status {
-        case 401, 403:
-            guard retryAfterHeader == nil else {
-                return blockRequest(prepared.requestId, reason: .protocolFailure)
-            }
-            let reason = EluV1BatchPreservationReason.permanentHTTP(response.status)
-            authorizationBlock = reason
-            return .preserved(reason)
-
         case 413:
             guard retryAfterHeader == nil else {
                 return blockRequest(prepared.requestId, reason: .protocolFailure)
