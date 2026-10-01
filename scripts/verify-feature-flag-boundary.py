@@ -12,10 +12,10 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 PINNED = {
-    "Sources/EluAnalytics/Elu.swift": "2e882b564a1480adde8d3b0d378cece4ce2b35cb56a7606dde8e7738a3ce06f2",
-    "Sources/EluAnalytics/EluState.swift": "47794ca453e603e3faa7f501b9591a0a61629a8e82d96923b670f8722c84782d",
+    "Sources/EluAnalytics/Elu.swift": "f7b187de9f2a40e96a1f2c424e408c4af02cfccd96af3866384de03f365ebfda",
+    "Sources/EluAnalytics/EluState.swift": "6f46cf409118c27744fe4fbb096d5c2215dc4a332db2e7d2019c0a1d6e945adc",
     "Sources/EluAnalytics/EluConfigClient.swift": "152abfb01a6d0aa81e470d3185ecd4db3aeeef26d8626e67bab8f0a41e20d43d",
-    "Sources/EluAnalytics/Internal/Facade/EluRuntimeBackend.swift": "7ff4cab047a7ae5f81bdaae1afda51939825d00c92d79bb89c70ec98f3dbd926",
+    "Sources/EluAnalytics/Internal/Facade/EluRuntimeBackend.swift": "c4301255933760a5d247a63d90296186ce666e374564747d8472db0b04d99bd5",
     "Package.swift": "86701aa42833ddfff4b928e8ed59608cfe46f54e2765656f8166a75633219398",
     "Conformance/V1/manifest.json": "98152d8725c286f29402ba3e420bda8dd364200fb6fdf1cfe49b2da9b8f63e54",
 }
@@ -496,7 +496,7 @@ def scan_outside_source(path: pathlib.Path, text: str) -> list[str]:
             "configHost: context.configHost, endpointPolicy: context.endpointPolicy, configTransport: configTransport, "
             + DECLARED_BOOTSTRAP_SELECTION + ", declaredRegionReplaySupported: context.declaredRegionReplayEnabled, "
             "performance: context.performance, diagnostics: context.diagnostics, personProfiles: context.personProfiles, "
-            "persistence: context.persistence, rateLimiting: context.rateLimiting ) }"
+            "persistence: context.persistence, rateLimiting: context.rateLimiting, eventFilter: context.eventFilter ) }"
         )
         if normalized.count(owned_stack) != 1 or len(re.findall(r"\bEluStandaloneStack\.make\s*\(", text)) != 1:
             errors.append(f"{path} changed the exact owned bootstrap host/callback or atomic declared-region option binding")

@@ -35,6 +35,7 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
     private let flagSnapshotDidLoad: @Sendable (EluFeatureFlagPublication) -> Void
     private let networkExcludedHosts: Set<String>
     private let personProfiles: EluPersonProfilesMode
+    private let captureHookCanChangePerson: Bool
     private var guardedFlagsDidLoad: (@Sendable (@escaping @Sendable () -> Bool) -> Void)?
     private var stack: EluStandaloneStack?
     private let nativeLifecycle = EluNativeReplayLifecycle()
@@ -83,6 +84,7 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
         flagsDidLoad = context.flagsDidLoad
         flagSnapshotDidLoad = context.flagSnapshotDidLoad
         personProfiles = context.personProfiles
+        captureHookCanChangePerson = context.eventFilter.beforeSend != nil
         networkExcludedHosts = Set([context.configHost.host?.lowercased(), context.endpointPolicy.declaredAPIOrigin?.host].compactMap { $0 })
         self.flagTransport = flagTransport
         if let initialConsent = context.initialConsent { acceptConsent(initialConsent) }
@@ -102,6 +104,7 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
         flagsDidLoad = context.flagsDidLoad
         flagSnapshotDidLoad = context.flagSnapshotDidLoad
         personProfiles = context.personProfiles
+        captureHookCanChangePerson = context.eventFilter.beforeSend != nil
         networkExcludedHosts = Set([context.configHost.host?.lowercased(), context.endpointPolicy.declaredAPIOrigin?.host].compactMap { $0 })
         flagTransport = nil
         self.guardedFlagsDidLoad = guardedFlagsDidLoad
@@ -203,7 +206,7 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
             configurationFormat: context.declaredRegionReplayEnabled ? .nativeV3 : .v2,
             declaredRegionReplaySupported: context.declaredRegionReplayEnabled,
             performance: context.performance, diagnostics: context.diagnostics, personProfiles: context.personProfiles,
-            persistence: context.persistence, rateLimiting: context.rateLimiting
+            persistence: context.persistence, rateLimiting: context.rateLimiting, eventFilter: context.eventFilter
         )
     }
 
@@ -322,7 +325,9 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
 
     func beginPendingOperation(_ op: EluBufferedOp) -> (() -> Void)? {
         if case let .consent(operation) = op { acceptConsent(operation) }
-        guard op.changesFlagContext else { return nil }
+        let hookMayChangePerson: Bool
+        if case .capture = op { hookMayChangePerson = captureHookCanChangePerson } else { hookMayChangePerson = false }
+        guard op.changesFlagContext || hookMayChangePerson else { return nil }
         let pending = withLock { () -> EluStandaloneFacadePendingIntent? in
             guard !isShutDown else { return nil }
             flagGeneration = UUID()
@@ -362,15 +367,16 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
             let name = event
             let projected = project(properties)
             let person = project(set), personOnce = project(setOnce)
-            let hasPersonIntent = set != nil || setOnce != nil
-            let permitsPerson = personProfiles != .never && hasPersonIntent
+            let hasPersonIntent = set != nil || setOnce != nil || captureHookCanChangePerson
+            let permitsPerson = personProfiles != .never
             enqueue(affectsFlags: hasPersonIntent) { runtime, owner in
                 let current = hasPersonIntent ? owner.capturePersonAdmission() : nil
-                let result = await runtime.capture(name, properties: projected, occurredAt: timestamp,
+                let submitted = await runtime.captureWithPersonChanges(name, properties: projected, occurredAt: timestamp,
+                    person: .init(set: set == nil ? nil : person, setOnce: setOnce == nil ? nil : personOnce),
                     admissionGuard: current)
-                owner.record(result)
-                guard permitsPerson, let current, current(), case let .accepted(_, accepted) = result else { return }
-                owner.apply(await runtime.setPersonProperties(person, propertiesOnce: personOnce,
+                owner.record(submitted.result)
+                guard permitsPerson, submitted.person.hasIntent, let current, current(), case let .accepted(_, accepted) = submitted.result else { return }
+                owner.apply(await runtime.setPersonProperties(submitted.person.set ?? [:], propertiesOnce: submitted.person.setOnce ?? [:],
                     afterAcceptedCapture: accepted, admissionGuard: current))
                 // Match capture-associated mutation semantics: no extra flag reload.
             }
@@ -954,6 +960,8 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
                 count(.storage)
             case .rateLimited:
                 count(.rateLimited)
+            case .eventFiltered, .eventFilterInvalid, .eventFilterUnsupportedPersonChanges:
+                count(.filtered)
             default:
                 count(.unauthorized)
             }

@@ -330,14 +330,50 @@ and configuration are required; rate limiting never grants capture permission.
 
 A token is taken before canonical event validation, enrichment or queue admission
 and is not refunded if those later steps reject the event. Customer `Any`/`Error`
-values are converted to bounded JSON before crossing into the runtime; this SDK
-has no customer capture-hook API. On the first limited call after accepted calls,
+values are converted to bounded JSON before crossing into the runtime. On the
+first limited call after accepted calls,
 the SDK attempts one `$$client_ingestion_warning` through normal event authority
 and storage, bypassing only its own limiter. Consecutive drops do not repeat it;
 warning delivery is not guaranteed if consent, configuration or storage rejects it.
 A customer event with that name still consumes a token. Warnings triggered by
 passive native telemetry retain its existing-session requirement and do not
 extend user-activity time.
+
+Customer event filtering is selected once at setup:
+
+```swift
+var options = EluSetupOptions()
+options.propertyDenylist = ["email", "internalNotes"]
+options.beforeSend = { event in
+    guard event.event != "Sensitive screen" else { return nil }
+    var event = event
+    event.properties.removeValue(forKey: "phone")
+    event.set?.removeValue(forKey: "phone")
+    return event
+}
+Elu.setup(siteKey: "YOUR_SITE_KEY", options: options)
+```
+
+The denylist removes exact top-level names after super properties and event
+properties are merged. The hook then receives a detached `EluEvent` and may
+replace it or return `nil`; it can deliberately re-add a denylisted property.
+A thrown error, invalid value, oversized replacement or changed capture authority
+drops the event without sending the unfiltered original. Callbacks are synchronous:
+return promptly and do not wait for SDK work, perform networking, or access UIKit.
+Runtime identity/session/version fields remain protected. Existing native event
+name, timestamp and passive-session constraints still apply to replacements.
+
+Manual capture uses the hook's `set` and `setOnce`, including maps introduced by
+the hook, only after the original event is accepted. These remain separate
+ordered writes and use the person mutator's wall clock. No extra flag reload is
+scheduled. A dropped flag event does not consume its durable exposure marker.
+Filtering covers manual events, screens, exceptions and automatic native event
+producers; replay frames are governed by their separate privacy rules.
+
+This unreleased slice does not yet apply property hooks to identify, alias, or
+standalone person/group mutations. Hook-introduced person maps on automatic
+events are refused with the event, rather than silently ignored. Those paths
+remain required follow-on parity work before complete hook support is claimed.
 
 Persistent mode keeps bucket state across restarts, identify, reset (including
 device reset), and consent changes. Memory mode discards the bucket with the

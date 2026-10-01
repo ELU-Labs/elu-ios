@@ -28,6 +28,14 @@ public struct EluSetupOptions {
     /// Site-scoped capture token bucket; identity reset does not reset this budget.
     public var rateLimiting = EluRateLimitingOptions()
 
+    /// Top-level customer property names removed after merging super properties
+    /// and before `beforeSend`. Runtime-owned identity metadata is protected.
+    public var propertyDenylist: [String] = []
+    /// Runs once per event on the SDK event path, outside SDK locks.
+    /// Return a replacement or nil to drop it. Errors/invalid results drop safely.
+    /// Keep this synchronous callback short; replay frames do not pass through it.
+    public var beforeSend: (@Sendable (EluEvent) throws -> EluEvent?)? = nil
+
     /// Internal construction marker for the owned runtime. Customer code
     /// cannot select or construct another backend.
     var runtimeSelection: EluRuntimeSelection = .standalone

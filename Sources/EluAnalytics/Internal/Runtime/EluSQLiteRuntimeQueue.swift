@@ -3268,19 +3268,28 @@ private final class EluV1FlagOwnerFence: @unchecked Sendable {
     private let lock = NSLock()
     private let owner = UUID()
     private var generation = UUID()
+    private var restrictionGeneration = UUID()
     private var pending: Set<UUID> = []
     private var terminal = false
     private var lastWall: Date?
     private var lastContinuous: UInt64?
     func token() -> UUID { lock.lock(); defer { lock.unlock() }; return generation }
+    func restrictionToken() -> UUID { lock.lock(); defer { lock.unlock() }; return restrictionGeneration }
+    /// Restriction only, never a flag grant. A new intent or invalidation
+    /// withdraws this attempt. Finishing its own facade handoff does not.
+    func unchangedRestriction(_ token: UUID) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return !terminal && restrictionGeneration == token
+    }
     func invalidate(terminal: Bool = false) {
-        lock.lock(); generation = UUID(); self.terminal = self.terminal || terminal; lock.unlock()
+        lock.lock(); generation = UUID(); restrictionGeneration = UUID(); self.terminal = self.terminal || terminal; lock.unlock()
     }
     func beginIntent() -> EluV1FlagProjectionIntent {
         lock.lock(); defer { lock.unlock() }
         let token = UUID()
         pending.insert(token)
         generation = UUID()
+        restrictionGeneration = UUID()
         return EluV1FlagProjectionIntent(owner: owner, token: token)
     }
     func finishIntent(_ intent: EluV1FlagProjectionIntent) {
@@ -3816,6 +3825,7 @@ actor EluSQLiteRuntimeQueue {
     private var isPoisoned = false
     private var rateLimiter: EluCaptureRateLimiter?
     private let rateLimitOwner = UUID()
+    private let eventFilter: EluEventFilter
 
     static func open(
         directoryURL: URL,
@@ -3873,6 +3883,7 @@ actor EluSQLiteRuntimeQueue {
         personProfiles: EluPersonProfilesMode = .identifiedOnly,
         persistence: EluPersistenceMode = .persistent,
         rateLimiting: EluRateLimitingOptions? = nil,
+        eventFilter: EluEventFilter = .init(),
         limits: EluRuntimeQueueLimits,
         clock: @escaping @Sendable () -> Date = { Date() },
         continuousClock: @escaping @Sendable () -> UInt64 = EluMachContinuousClock.now,
@@ -3937,7 +3948,8 @@ actor EluSQLiteRuntimeQueue {
             continuousBudgetConverter: continuousBudgetConverter,
             nativeContinuousNanoseconds: nativeContinuousNanoseconds,
             flagStoreEpochGenerator: flagStoreEpochGenerator,
-            configurationGate: configurationGate
+            configurationGate: configurationGate,
+            eventFilter: eventFilter
         )
         try await queue.reconcileStoredConsent()
         if let rateLimiting {
@@ -3953,6 +3965,7 @@ actor EluSQLiteRuntimeQueue {
         personProfiles: EluPersonProfilesMode = .identifiedOnly,
         persistence: EluPersistenceMode = .persistent,
         rateLimiting: EluRateLimitingOptions? = nil,
+        eventFilter: EluEventFilter = .init(),
         clock: @escaping @Sendable () -> Date = { Date() },
         continuousClock: @escaping @Sendable () -> UInt64 = EluMachContinuousClock.now,
         continuousBudgetConverter: @escaping @Sendable (UInt64) -> UInt64? =
@@ -3979,6 +3992,7 @@ actor EluSQLiteRuntimeQueue {
             personProfiles: personProfiles,
             persistence: persistence,
             rateLimiting: rateLimiting,
+            eventFilter: eventFilter,
             limits: EluRuntimeQueueLimits(),
             clock: clock,
             continuousClock: continuousClock,
@@ -4041,9 +4055,11 @@ actor EluSQLiteRuntimeQueue {
         flagStoreEpochGenerator: @escaping @Sendable () -> String = {
             "flag_store_\(EluRuntimeIdentifier.compactUUID())"
         },
-        configurationGate: EluV2ConfigAuthorityGate? = nil
+        configurationGate: EluV2ConfigAuthorityGate? = nil,
+        eventFilter: EluEventFilter = .init()
     ) {
         self.configurationGate = configurationGate
+        self.eventFilter = eventFilter
         self.resources = resources
         self.state = state
         self.limits = limits
@@ -7901,17 +7917,17 @@ actor EluSQLiteRuntimeQueue {
         return decision
     }
 
-    func capture(_ command: EluV1CaptureCommand, rateAttempt: EluCaptureRateAttempt? = nil, admissionGuard: (@Sendable () -> Bool)? = nil) -> EluV1CaptureResult {
-        capture(command, performanceSample: false, rateAttempt: rateAttempt, admissionGuard: admissionGuard)
+    func capture(_ command: EluV1CaptureCommand, rateAttempt: EluCaptureRateAttempt? = nil, filterAttempt: EluEventFilterAttempt? = nil, admissionGuard: (@Sendable () -> Bool)? = nil) -> EluV1CaptureResult {
+        capture(command, performanceSample: false, rateAttempt: rateAttempt, filterAttempt: filterAttempt, admissionGuard: admissionGuard)
     }
 
-    func captureFlagExposure(_ command: EluV1CaptureCommand, exposure: EluFlagExposureRequest, rateAttempt: EluCaptureRateAttempt? = nil,
+    func captureFlagExposure(_ command: EluV1CaptureCommand, exposure: EluFlagExposureRequest, rateAttempt: EluCaptureRateAttempt? = nil, filterAttempt: EluEventFilterAttempt? = nil,
                              admissionGuard: @escaping @Sendable () -> Bool) -> EluV1CaptureResult {
         guard command.kind == .capture, command.name == "$feature_flag_called",
               EluFlagExposureLedger.validDigest(exposure.digest) else {
             return .rejected(.invalidEvent, snapshot: state.snapshot)
         }
-        return capture(command, performanceSample: false, flagExposure: exposure, rateAttempt: rateAttempt, admissionGuard: admissionGuard)
+        return capture(command, performanceSample: false, flagExposure: exposure, rateAttempt: rateAttempt, filterAttempt: filterAttempt, admissionGuard: admissionGuard)
     }
 
     /// A passive sample requires an existing live foreground session. It may
@@ -8110,7 +8126,8 @@ actor EluSQLiteRuntimeQueue {
         return capture(command, performanceSample: false, networkObservation: true, admissionGuard: admissionGuard)
     }
 
-    private func capture(_ command: EluV1CaptureCommand, performanceSample: Bool, networkObservation: Bool = false, diagnosticSummary: EluNativeDiagnosticSummary? = nil, crashReport: EluMetricKitCrashBatch.Item? = nil, flagExposure: EluFlagExposureRequest? = nil, rateAttempt: EluCaptureRateAttempt? = nil, bypassRateLimit: Bool = false, passiveWarning: Bool = false, admissionGuard: (@Sendable () -> Bool)?) -> EluV1CaptureResult {
+    private func capture(_ originalCommand: EluV1CaptureCommand, performanceSample: Bool, networkObservation: Bool = false, diagnosticSummary: EluNativeDiagnosticSummary? = nil, crashReport: EluMetricKitCrashBatch.Item? = nil, flagExposure: EluFlagExposureRequest? = nil, rateAttempt: EluCaptureRateAttempt? = nil, filterAttempt: EluEventFilterAttempt? = nil, bypassRateLimit: Bool = false, passiveWarning: Bool = false, admissionGuard: (@Sendable () -> Bool)?) -> EluV1CaptureResult {
+        var command = originalCommand
         let before = state.snapshot
         let sourceWitness = captureSourceWitness
         guard sourceIsCurrent(sourceWitness), admissionGuard?() ?? true else { return .rejected(.authorityAbsent, snapshot: before) }
@@ -8135,7 +8152,7 @@ actor EluSQLiteRuntimeQueue {
             return .rejected(.authorityExpired, snapshot: before)
         }
 
-        let reportUpdate: EluNativeDiagnosticsState?
+        var reportUpdate: EluNativeDiagnosticsState?
         if let crashReport {
             guard EluSQLiteRuntimeSchema.hasCrashReports(databaseSchemaVersion),
                   crashReportGrantEpoch == authority.ownerEpoch,
@@ -8184,6 +8201,49 @@ actor EluSQLiteRuntimeQueue {
         if flagExposure != nil, state.flagExposures.digests.count >= EluFlagExposureLedger.maximumEntries {
             return .rejected(.exposureLedgerFull, snapshot: state.snapshot)
         }
+        var filteredProperties: [String: EluJSONValue]?
+        var filterCurrent: (@Sendable () -> Bool)?
+        if eventFilter.active {
+            let scope = flagScopeFence, token = scope.restrictionToken(), gate = configurationGate
+            let current: @Sendable () -> Bool = {
+                scope.unchangedRestriction(token) && (gate?.isCurrent(sourceWitness) ?? true) && (admissionGuard?() ?? true)
+            }
+            filterCurrent = current
+            var merged = diagnosticSummary == nil && crashReport == nil ? state.identity.superProperties : [:]
+            for (key, value) in command.properties { merged[key] = value }
+            let attempt = filterAttempt ?? EluEventFilterAttempt()
+            do {
+                let original = command
+                let value = try attempt.apply(owner: rateLimitOwner, command: original, mergedProperties: merged,
+                    isCurrent: current) {
+                    try eventFilter.apply(original, mergedProperties: merged, person: attempt.person,
+                        allowsPersonChanges: attempt.allowsPersonChanges)
+                }
+                guard current(), sourceIsCurrent(sourceWitness), authorityWitnessMatches(authority, diskState: state) else {
+                    return .rejected(.eventFilterWithdrawn, snapshot: state.snapshot)
+                }
+                guard authorityIsLive(authority, wallNow: clock(), monotonicNow: continuousClock()) else {
+                    latchExpiredAuthority(authority)
+                    return .rejected(.authorityExpired, snapshot: state.snapshot)
+                }
+                command = value.command
+                filteredProperties = command.properties
+                if let crashReport {
+                    guard let update = try? state.diagnostics.acceptingReport(crashReport, at: command.occurredAt,
+                        identityRevision: state.identity.revision) else { return .rejected(.eventFilterInvalid, snapshot: state.snapshot) }
+                    reportUpdate = update
+                }
+            } catch let failure as EluEventFilterFailure {
+                let reason: EluV1CaptureRejection
+                switch failure {
+                case .dropped: reason = .eventFiltered
+                case .invalid: reason = .eventFilterInvalid
+                case .withdrawn: reason = .eventFilterWithdrawn
+                case .unsupportedPersonChanges: reason = .eventFilterUnsupportedPersonChanges
+                }
+                return .rejected(reason, snapshot: state.snapshot)
+            } catch { return .rejected(.eventFilterInvalid, snapshot: state.snapshot) }
+        }
         // Diagnostic-kind records are runtime internal, never caller commands.
         guard command.kind != .diagnostic, validCaptureName(command.name),
               validateCaptureProperties(command.properties), let occurredAt = canonicalDate(command.occurredAt),
@@ -8204,12 +8264,14 @@ actor EluSQLiteRuntimeQueue {
                 occurredAt: occurredAt,
                 authority: authority,
                 performanceSample: passiveWarning || performanceSample || diagnosticSummary != nil || crashReport != nil || (networkObservation && state.identity.session != nil),
-                includeContext: diagnosticSummary == nil && crashReport == nil
+                includeContext: diagnosticSummary == nil && crashReport == nil,
+                mergedProperties: filteredProperties
             )
         } catch {
             return .rejected(.invalidEvent, snapshot: before)
         }
 
+        let retainedFilterCurrent = filterCurrent
         for attempt in 0 ... 1 {
             do {
                 let result = try commitPrepared(
@@ -8226,7 +8288,7 @@ actor EluSQLiteRuntimeQueue {
                     flagExposure: flagExposure,
                     surfaceProvenNotCommitted: true,
                     prewriteValidation: { diskState in
-                        guard self.sourceIsCurrent(sourceWitness), admissionGuard?() ?? true,
+                        guard self.sourceIsCurrent(sourceWitness), admissionGuard?() ?? true, retainedFilterCurrent?() ?? true,
                               crashReport == nil || self.crashReportGrantEpoch == authority.ownerEpoch else { throw EluRuntimeQueueError.sourceAuthorityUnavailable }
                         guard self.authorityWitnessMatches(authority, diskState: diskState) else {
                             throw EluRuntimeQueueError.generationMismatch
@@ -8240,7 +8302,7 @@ actor EluSQLiteRuntimeQueue {
                         }
                     },
                     precommitValidation: {
-                        guard self.sourceIsCurrent(sourceWitness), admissionGuard?() ?? true,
+                        guard self.sourceIsCurrent(sourceWitness), admissionGuard?() ?? true, retainedFilterCurrent?() ?? true,
                               crashReport == nil || self.crashReportGrantEpoch == authority.ownerEpoch else { throw EluRuntimeQueueError.sourceAuthorityUnavailable }
                     }
                 )
@@ -8251,7 +8313,7 @@ actor EluSQLiteRuntimeQueue {
             } catch EluRuntimeQueueError.sourceAuthorityUnavailable {
                 return .rejected(.authorityAbsent, snapshot: state.snapshot)
             } catch EluRuntimeQueueError.provenNotCommitted where attempt == 0 {
-                guard sourceIsCurrent(sourceWitness), admissionGuard?() ?? true else { return .rejected(.authorityAbsent, snapshot: state.snapshot) }
+                guard sourceIsCurrent(sourceWitness), admissionGuard?() ?? true, retainedFilterCurrent?() ?? true else { return .rejected(.authorityAbsent, snapshot: state.snapshot) }
                 guard !isPoisoned, resources != nil else {
                     return .rejected(
                         .storageProvenNotCommitted,
@@ -9457,10 +9519,11 @@ actor EluSQLiteRuntimeQueue {
         occurredAt: Date,
         authority: EluV1CaptureAuthoritySnapshot,
         performanceSample: Bool,
-        includeContext: Bool = true
+        includeContext: Bool = true,
+        mergedProperties: [String: EluJSONValue]? = nil
     ) throws -> (identity: EluIdentityState, draft: EluEventDraft) {
-        var properties = includeContext ? state.identity.superProperties : [:]
-        for (key, value) in command.properties { properties[key] = value }
+        var properties = mergedProperties ?? (includeContext ? state.identity.superProperties : [:])
+        if mergedProperties == nil { for (key, value) in command.properties { properties[key] = value } }
         properties["$elu_contract_version"] = .string(command.versions.contractVersion)
         properties["$elu_sdk_version"] = .string(command.versions.runtime.version)
         properties["$elu_facade_version"] = .string(command.versions.facade.version)

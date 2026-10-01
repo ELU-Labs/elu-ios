@@ -654,6 +654,8 @@ class FeatureFlagBoundaryScannerTests(unittest.TestCase):
             source.replace("performance: context.performance", "performance: otherPerformance", 1),
             source.replace("diagnostics: context.diagnostics", "diagnostics: otherDiagnostics", 1),
             source.replace("personProfiles: context.personProfiles", "personProfiles: .always", 1),
+            source.replace(", eventFilter: context.eventFilter", "", 1),
+            source.replace("eventFilter: context.eventFilter", "eventFilter: .init()", 1),
             source.replace("guardedFlagsDidLoad: context.guardedFlagsDidLoad", "guardedFlagsDidLoad: unchecked", 1),
             source.replace("try await EluStandaloneStack.make(", "try await EluStandaloneRuntime.make(", 1),
         ]:

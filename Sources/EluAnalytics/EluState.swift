@@ -30,6 +30,7 @@ final class EluCore {
     private var personProfiles: EluPersonProfilesMode = .identifiedOnly
     private var persistence: EluPersistenceMode = .persistent
     private var rateLimiting = EluRateLimitingOptions()
+    private var eventFilter = EluEventFilter()
     private var configHost = URL(string: "https://elu.dev")!
     private var endpointPolicy = EluEndpointPolicy.cloud
     private var buffer = EluEventBuffer()
@@ -77,6 +78,7 @@ final class EluCore {
             personProfiles = options.personProfiles
             persistence = options.persistence
             rateLimiting = options.rateLimiting.normalized
+            eventFilter = EluEventFilter(propertyDenylist: options.propertyDenylist, beforeSend: options.beforeSend)
 
             // The owned source, including independent flags/privacy, decides
             // readiness. No legacy cache or v1 request participates.
@@ -108,7 +110,7 @@ final class EluCore {
         EluRuntimeBackendContext(siteKey: siteKey, config: config, configDocument: document,
             isNewUser: isNewUser, flagsDidLoad: { [weak self] in
                 self?.dispatchFlagNotification(ifCurrent: { true })
-            }, configHost: configHost, endpointPolicy: endpointPolicy, performance: performance, diagnostics: diagnostics, declaredRegionReplayEnabled: declaredRegionReplayEnabled, personProfiles: personProfiles, persistence: persistence, rateLimiting: rateLimiting, initialConsent: initialConsent, guardedFlagsDidLoad: { [weak self] predicate in
+            }, configHost: configHost, endpointPolicy: endpointPolicy, performance: performance, diagnostics: diagnostics, declaredRegionReplayEnabled: declaredRegionReplayEnabled, personProfiles: personProfiles, persistence: persistence, rateLimiting: rateLimiting, eventFilter: eventFilter, initialConsent: initialConsent, guardedFlagsDidLoad: { [weak self] predicate in
                 self?.dispatchFlagNotification(ifCurrent: predicate)
             }, flagSnapshotDidLoad: { [weak self] publication in
                 guard let self else { return }

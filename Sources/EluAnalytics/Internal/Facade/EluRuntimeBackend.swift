@@ -22,6 +22,8 @@ enum EluFacadeDropReason: String, Equatable, Sendable {
     case storage
     /// The site-scoped capture bucket declined this attempt.
     case rateLimited
+    /// Customer filtering dropped or refused this event. No payload is logged.
+    case filtered
 }
 
 /// Controls the original native collector. Local preference never supplies
@@ -102,6 +104,7 @@ struct EluRuntimeBackendContext {
     let personProfiles: EluPersonProfilesMode
     let persistence: EluPersistenceMode
     let rateLimiting: EluRateLimitingOptions
+    let eventFilter: EluEventFilter
     /// Installed synchronously by the constructor, then persisted before any
     /// configuration or lifecycle work can authorize collection.
     let initialConsent: EluConsentOperation?
@@ -119,6 +122,7 @@ struct EluRuntimeBackendContext {
          personProfiles: EluPersonProfilesMode = .identifiedOnly,
          persistence: EluPersistenceMode = .persistent,
          rateLimiting: EluRateLimitingOptions = .init(),
+         eventFilter: EluEventFilter = .init(),
          initialConsent: EluConsentOperation? = nil,
          guardedFlagsDidLoad: (@Sendable (@escaping @Sendable () -> Bool) -> Void)? = nil,
          flagSnapshotDidLoad: @escaping @Sendable (EluFeatureFlagPublication) -> Void = { _ in },
@@ -136,6 +140,7 @@ struct EluRuntimeBackendContext {
         self.personProfiles = personProfiles
         self.persistence = persistence
         self.rateLimiting = rateLimiting.normalized
+        self.eventFilter = eventFilter
         self.initialConsent = initialConsent
         self.guardedFlagsDidLoad = guardedFlagsDidLoad ?? { predicate in
             if predicate() { flagsDidLoad() }

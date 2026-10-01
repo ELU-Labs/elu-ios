@@ -1205,6 +1205,94 @@ final class EluStandaloneFacadeRuntimeTests: XCTestCase {
         }
     }
 
+    func testHookIntroducesPersonMapsWithoutInitialCaptureOptionsAndDoesNotReloadFlags() async throws {
+        try await withTemporaryDirectory { root in
+            let flags = FacadeFlagTransport(), calls = EventFilterCounter()
+            let transport = FacadeBatchTransport(held: true)
+            let h = try await makeHarness(root: root, flagTransport: flags, batchTransport: transport,
+                eventFilter: .init(beforeSend: { event in
+                    calls.hit(); var event = event
+                    event.set = ["tier": "introduced"]
+                    event.setOnce = ["source": "hook"]
+                    return event
+                }))
+            do {
+                h.backend.reloadFeatureFlags(nil); await h.backend.settled()
+                let reloads = await flags.callCount()
+                h.backend.execute(.capture(event: "plain-options", properties: nil))
+                XCTAssertFalse(h.backend.flagsAreLoaded)
+                await h.backend.settled()
+                let saved = try await h.runtime.queueSnapshot()
+                XCTAssertEqual(saved.queuedCount, 2)
+                XCTAssertEqual(saved.flagContext.personProperties["tier"], .string("introduced"))
+                XCTAssertEqual(saved.flagContext.personProperties["source"], .string("hook"))
+                let finalReloads = await flags.callCount(); XCTAssertEqual(finalReloads, reloads)
+                XCTAssertEqual(calls.count, 1)
+                try await drainCaptureRecords(h)
+                let records = try await transport.recordedRecords()
+                XCTAssertEqual(records.compactMap { $0["kind"] as? String }, ["event", "mutation"])
+                await h.close()
+            } catch { await transport.release(); await h.close(); throw error }
+        }
+    }
+
+    func testHookCanRemoveAssociatedMapsAndDropCannotApplyPersonChanges() async throws {
+        try await withTemporaryDirectory { root in
+            let transport = FacadeBatchTransport(held: true)
+            let h = try await makeHarness(root: root, batchTransport: transport, eventFilter: .init(beforeSend: { event in
+                if event.event == "drop" { return nil }
+                var event = event; event.set = nil; event.setOnce = nil; return event
+            }))
+            h.backend.execute(.capture(event: "scrub", properties: nil, set: ["secret": "x"], setOnce: [:]))
+            h.backend.execute(.capture(event: "drop", properties: nil, set: ["secret": "y"]))
+            await h.backend.settled()
+            let saved = try await h.runtime.queueSnapshot()
+            XCTAssertEqual(saved.queuedCount, 1)
+            XCTAssertNil(saved.flagContext.personProperties["secret"])
+            XCTAssertEqual(h.backend.dropCounts[.filtered], 1)
+            await transport.release(); await h.close()
+        }
+    }
+
+    func testSynchronousHookGetterAndNewIdentityIntentCannotCommitOldEventOrPerson() async throws {
+        try await withTemporaryDirectory { root in
+            let owner = EventHookFacadeOwner(), completion = CapturePersonCompletion()
+            let transport = FacadeBatchTransport(held: true)
+            let h = try await makeHarness(root: root, batchTransport: transport, eventFilter: .init(beforeSend: { event in
+                guard let backend = owner.read() else { XCTFail("Original owner missing"); return nil }
+                XCTAssertNotNil(backend.distinctId())
+                completion.store(backend.beginPendingOperation(.reset))
+                var event = event; event.set = ["mustNotPersist": true]; return event
+            }))
+            owner.bind(h.backend)
+            let before = try await h.runtime.queueSnapshot()
+            h.backend.execute(.capture(event: "withdrawn-in-hook", properties: nil))
+            await h.backend.settled()
+            let after = try await h.runtime.queueSnapshot()
+            XCTAssertEqual(after.nextSequence, before.nextSequence)
+            XCTAssertEqual(after.identity, before.identity)
+            XCTAssertNil(after.flagContext.personProperties["mustNotPersist"])
+            completion.finish()
+            await transport.release(); await h.close()
+        }
+    }
+
+    func testHookRunsOnceAcrossOriginalAuthorityRenewalRetry() async throws {
+        try await withTemporaryDirectory { root in
+            let calls = EventFilterCounter(), fault = CapturePersonFault()
+            let transport = FacadeBatchTransport(held: true)
+            let h = try await makeHarness(root: root, batchTransport: transport,
+                eventFilter: .init(beforeSend: { event in calls.hit(); return event }), faultInjector: fault)
+            fault.arm(.afterStateRead) { throw EluRuntimeQueueError.generationMismatch }
+            h.backend.execute(.capture(event: "one-original-call", properties: nil))
+            await h.backend.settled()
+            XCTAssertTrue(fault.fired)
+            XCTAssertEqual(calls.count, 1)
+            let saved = try await h.runtime.queueSnapshot(); XCTAssertEqual(saved.queuedCount, 1)
+            await transport.release(); await h.close()
+        }
+    }
+
     private func drainCaptureRecords(_ h: Harness) async throws {
         await h.transport.release()
         _ = await h.runtime.flush()
@@ -1240,6 +1328,7 @@ final class EluStandaloneFacadeRuntimeTests: XCTestCase {
         snapshotObserver: @escaping @Sendable (EluFeatureFlagPublication) -> Void = { _ in },
         batchTransport: FacadeBatchTransport? = nil,
         rateLimiting: EluRateLimitingOptions = .init(),
+        eventFilter: EluEventFilter = .init(),
         faultInjector: (any EluRuntimeQueueFaultInjecting)? = nil
     ) async throws -> Harness {
         let transport = batchTransport ?? FacadeBatchTransport()
@@ -1266,7 +1355,7 @@ final class EluStandaloneFacadeRuntimeTests: XCTestCase {
             anonymousIdGenerator: { "anon_facade_\(identifiers.next())" },
             streamIdGenerator: { "stream_facade" },
             sessionIdGenerator: { "session_facade_\(identifiers.next())" },
-            personProfiles: personProfiles, rateLimiting: rateLimiting, faultInjector: faultInjector
+            personProfiles: personProfiles, rateLimiting: rateLimiting, eventFilter: eventFilter, faultInjector: faultInjector
         )
         let announcements = FacadeCounter()
         let context = EluRuntimeBackendContext(
@@ -1276,6 +1365,7 @@ final class EluStandaloneFacadeRuntimeTests: XCTestCase {
             isNewUser: true,
             flagsDidLoad: { _ = announcements.next() },
             personProfiles: personProfiles,
+            eventFilter: eventFilter,
             initialConsent: initialConsent,
             flagSnapshotDidLoad: snapshotObserver
         )
@@ -1547,4 +1637,11 @@ private final class CapturePersonCompletion: @unchecked Sendable {
     private var pending: (() -> Void)?
     func store(_ value: (() -> Void)?) { lock.lock(); pending = value; lock.unlock() }
     func finish() { lock.lock(); let value = pending; pending = nil; lock.unlock(); value?() }
+}
+
+private final class EventHookFacadeOwner: @unchecked Sendable {
+    private let lock = NSLock()
+    private weak var backend: EluStandaloneFacadeRuntime?
+    func bind(_ backend: EluStandaloneFacadeRuntime) { lock.lock(); self.backend = backend; lock.unlock() }
+    func read() -> EluStandaloneFacadeRuntime? { lock.lock(); defer { lock.unlock() }; return backend }
 }

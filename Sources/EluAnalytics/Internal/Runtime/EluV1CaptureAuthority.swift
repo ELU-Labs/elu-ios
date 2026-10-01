@@ -76,6 +76,10 @@ enum EluV1CaptureRejection: Equatable, Sendable {
     case rateLimited
     case exposureAlreadyRecorded
     case exposureLedgerFull
+    case eventFiltered
+    case eventFilterInvalid
+    case eventFilterWithdrawn
+    case eventFilterUnsupportedPersonChanges
     case storageProvenNotCommitted
     case storageOutcomeUnknown
 }

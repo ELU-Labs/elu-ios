@@ -7,6 +7,8 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		09542CD3BA2B0414E6441DF2 /* EluEventFilterTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 91EB52FDCF618FF879943968 /* EluEventFilterTests.swift */; };
+		5ED9B6C29AB373976FC8BE45 /* EluEventFilterQueueTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = CC4A6D8B6BB2DC28F70F26D6 /* EluEventFilterQueueTests.swift */; };
 		722D3E41A9B1747E46641F89 /* EluNativeRasterCompositionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 11524264DB71986AB9D8C26A /* EluNativeRasterCompositionTests.swift */; };
 		937498441D1A339099B04401 /* EluNativeRasterSourceDenialTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9C560DCEDFB2579B14F7CDA3 /* EluNativeRasterSourceDenialTests.swift */; };
 		E11F5429F06AF70D5D36C99E /* EluNativeRasterDeliveryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6707DAE89634C793DA7A75F5 /* EluNativeRasterDeliveryTests.swift */; };
@@ -106,6 +108,8 @@
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
+		91EB52FDCF618FF879943968 /* EluEventFilterTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluEventFilterTests.swift; sourceTree = "<group>"; };
+		CC4A6D8B6BB2DC28F70F26D6 /* EluEventFilterQueueTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluEventFilterQueueTests.swift; sourceTree = "<group>"; };
 		11524264DB71986AB9D8C26A /* EluNativeRasterCompositionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluNativeRasterCompositionTests.swift; sourceTree = "<group>"; };
 		9C560DCEDFB2579B14F7CDA3 /* EluNativeRasterSourceDenialTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluNativeRasterSourceDenialTests.swift; sourceTree = "<group>"; };
 		6707DAE89634C793DA7A75F5 /* EluNativeRasterDeliveryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluNativeRasterDeliveryTests.swift; sourceTree = "<group>"; };
@@ -236,6 +240,8 @@
 		A0928195822C53907FA0C692 /* EluAnalyticsTests */ = {
 			isa = PBXGroup;
 			children = (
+				91EB52FDCF618FF879943968 /* EluEventFilterTests.swift */,
+				CC4A6D8B6BB2DC28F70F26D6 /* EluEventFilterQueueTests.swift */,
 				11524264DB71986AB9D8C26A /* EluNativeRasterCompositionTests.swift */,
 				9C560DCEDFB2579B14F7CDA3 /* EluNativeRasterSourceDenialTests.swift */,
 				6707DAE89634C793DA7A75F5 /* EluNativeRasterDeliveryTests.swift */,
@@ -422,6 +428,8 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				09542CD3BA2B0414E6441DF2 /* EluEventFilterTests.swift in Sources */,
+				5ED9B6C29AB373976FC8BE45 /* EluEventFilterQueueTests.swift in Sources */,
 				722D3E41A9B1747E46641F89 /* EluNativeRasterCompositionTests.swift in Sources */,
 				937498441D1A339099B04401 /* EluNativeRasterSourceDenialTests.swift in Sources */,
 				E11F5429F06AF70D5D36C99E /* EluNativeRasterDeliveryTests.swift in Sources */,

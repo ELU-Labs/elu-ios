@@ -8,7 +8,15 @@ public final class FixtureAppDelegate: NSObject, UIApplicationDelegate {
         _ application: UIApplication,
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
     ) -> Bool {
-        Elu.setup(siteKey: "fixture-site-key")
+        var setup = EluSetupOptions()
+        setup.propertyDenylist = ["private-note"]
+        setup.beforeSend = { event in
+            var filtered = EluEvent(event: event.event, properties: event.properties,
+                timestamp: event.timestamp, set: event.set, setOnce: event.setOnce)
+            filtered.properties.removeValue(forKey: "private-note")
+            return filtered
+        }
+        Elu.setup(siteKey: "fixture-site-key", options: setup)
         Elu.register(["fixture": "uikit"])
         let flags = EluFeatureFlagOptions(sendEvent: false, fresh: true)
         _ = Elu.getFeatureFlag("checkout", options: flags)

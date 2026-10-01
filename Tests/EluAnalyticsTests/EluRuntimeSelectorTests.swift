@@ -40,6 +40,29 @@ final class EluRuntimeSelectorTests: XCTestCase {
         )
     }
 
+    func testEventPolicyDefaultsOffAndIsCopiedThroughOriginalSetupOnce() throws {
+        XCTAssertTrue(EluSetupOptions().propertyDenylist.isEmpty)
+        XCTAssertNil(EluSetupOptions().beforeSend)
+        let factory = SelectorSpy(), core = EluCore(backendFactory: factory.factory)
+        let calls = EventFilterCounter()
+        var options = EluSetupOptions(configHost: inertConfigHost)
+        options.propertyDenylist = ["private"]
+        options.beforeSend = { event in calls.hit(); var event = event; event.event = "original-policy"; return event }
+        core.setup(siteKey: uniqueSiteKey(), options: options)
+        options.propertyDenylist = []
+        options.beforeSend = { _ in nil }
+        core.setup(siteKey: uniqueSiteKey(), options: options)
+        let filter = try XCTUnwrap(factory.eventPolicies().first)
+        let command = EluV1CaptureCommand(kind: .capture, name: "event", occurredAt: Date(), properties: [:],
+            versions: try .init(runtime: .init(name: "elu-ios", version: "0.2.0"), facade: .init(name: "Elu", version: "1")))
+        let result = try filter.apply(command, mergedProperties: ["private": .string("secret")],
+            person: .init(set: nil, setOnce: nil), allowsPersonChanges: false)
+        XCTAssertEqual(factory.eventPolicies().count, 1)
+        XCTAssertEqual(result.command.name, "original-policy")
+        XCTAssertNil(result.command.properties["private"])
+        XCTAssertEqual(calls.count, 1)
+    }
+
     func testConsentBeforeSetupIsRetainedOutsideTheBoundedEventBuffer() throws {
         let factory = SelectorSpy()
         let core = EluCore(backendFactory: factory.factory)
@@ -510,12 +533,14 @@ final class EluRuntimeSelectorTests: XCTestCase {
 final class SelectorSpy: @unchecked Sendable {
     private let lock = NSLock()
     private var requested: [EluRuntimeSelection] = []
+    private var policies: [EluEventFilter] = []
     private var backends: [EluRuntimeSelection: SelectorBackend] = [:]
 
     var factory: EluRuntimeBackendFactory {
         EluRuntimeBackendFactory { [self] selection, context in
             lock.lock()
             requested.append(selection)
+            policies.append(context.eventFilter)
             let backend = SelectorBackend(
                 selection: selection,
                 flagsDidLoad: context.flagsDidLoad,
@@ -526,6 +551,10 @@ final class SelectorSpy: @unchecked Sendable {
             lock.unlock()
             return backend
         }
+    }
+
+    func eventPolicies() -> [EluEventFilter] {
+        lock.lock(); defer { lock.unlock() }; return policies
     }
 
     func requestedSelections() -> [EluRuntimeSelection] {

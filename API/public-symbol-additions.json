@@ -515,6 +515,42 @@
     {
       "kind": "swift.property",
       "name": "EluFeatureFlagSnapshot.LoadError.hashValue"
+    },
+    {
+      "kind": "swift.struct",
+      "name": "EluEvent"
+    },
+    {
+      "kind": "swift.init",
+      "name": "EluEvent.init(event:properties:timestamp:set:setOnce:)"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluEvent.event"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluEvent.properties"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluEvent.timestamp"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluEvent.set"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluEvent.setOnce"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluSetupOptions.propertyDenylist"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluSetupOptions.beforeSend"
     }
   ]
 }
