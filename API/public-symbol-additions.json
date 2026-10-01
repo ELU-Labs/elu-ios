@@ -405,16 +405,8 @@
       "name": "EluFeatureFlagSnapshot.Source.unavailable"
     },
     {
-      "kind": "swift.typealias",
-      "name": "EluFeatureFlagSnapshot.Source.RawValue"
-    },
-    {
       "kind": "swift.init",
       "name": "EluFeatureFlagSnapshot.Source.init(rawValue:)"
-    },
-    {
-      "kind": "swift.property",
-      "name": "EluFeatureFlagSnapshot.Source.rawValue"
     },
     {
       "kind": "swift.func.op",
@@ -433,16 +425,8 @@
       "name": "EluFeatureFlagSnapshot.LoadError.invalidResponse"
     },
     {
-      "kind": "swift.typealias",
-      "name": "EluFeatureFlagSnapshot.LoadError.RawValue"
-    },
-    {
       "kind": "swift.init",
       "name": "EluFeatureFlagSnapshot.LoadError.init(rawValue:)"
-    },
-    {
-      "kind": "swift.property",
-      "name": "EluFeatureFlagSnapshot.LoadError.rawValue"
     },
     {
       "kind": "swift.func.op",
@@ -491,6 +475,22 @@
     {
       "kind": "swift.method",
       "name": "EluFeatureFlagSubscription.cancel()"
+    },
+    {
+      "kind": "swift.method",
+      "name": "EluFeatureFlagSnapshot.Source.hash(into:)"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluFeatureFlagSnapshot.Source.hashValue"
+    },
+    {
+      "kind": "swift.method",
+      "name": "EluFeatureFlagSnapshot.LoadError.hash(into:)"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluFeatureFlagSnapshot.LoadError.hashValue"
     }
   ]
 }
