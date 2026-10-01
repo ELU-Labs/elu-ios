@@ -6,8 +6,9 @@ public struct EluEvent {
     public var event: String
     public var properties: [String: Any]
     public var timestamp: Date
-    /// Capture-associated person changes. They follow an accepted manual event
-    /// in a separate ordered write; they are not part of event properties.
+    /// Capture-associated person changes follow an accepted event in a separate
+    /// ordered write. For `$identify`, these are the projected person maps;
+    /// `$set` and `$groupidentify` use their nested `properties` maps instead.
     public var set: [String: Any]?
     public var setOnce: [String: Any]?
 

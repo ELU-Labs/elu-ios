@@ -36,9 +36,9 @@ struct EluEventFilter: Sendable {
     }
 
     func apply(_ command: EluV1CaptureCommand, mergedProperties: [String: EluJSONValue],
-               person: EluEventPersonChanges, allowsPersonChanges: Bool) throws -> EluFilteredEvent {
+               person: EluEventPersonChanges, allowsPersonChanges: Bool, mutationProjection: Bool = false) throws -> EluFilteredEvent {
         guard valid else { throw EluEventFilterFailure.invalid }
-        var mutable = mergedProperties.filter { !Self.protected($0.key) && !denylist.contains(Array($0.key.utf16)) }
+        var mutable = mergedProperties.filter { (mutationProjection || !Self.protected($0.key)) && !denylist.contains(Array($0.key.utf16)) }
         // Check the entire callback input before constructing Foundation values.
         var inputBudget = ProjectionBudget()
         try inputBudget.typed(.object(mutable), depth: 0)
@@ -53,16 +53,86 @@ struct EluEventFilter: Sendable {
             } catch let failure as EluEventFilterFailure { throw failure }
             catch { throw EluEventFilterFailure.invalid }
         }
-        guard EluFacadeJSON.identifier(transformed.event, maximumLength: 512) != nil,
-              transformed.timestamp.timeIntervalSinceReferenceDate.isFinite else { throw EluEventFilterFailure.invalid }
+        if !mutationProjection {
+            guard EluFacadeJSON.identifier(transformed.event, maximumLength: 512) != nil,
+                  transformed.timestamp.timeIntervalSinceReferenceDate.isFinite else { throw EluEventFilterFailure.invalid }
+        }
         var budget = ProjectionBudget()
         mutable = try budget.properties(transformed.properties)
         let set = try transformed.set.map { try budget.properties($0) }
         let setOnce = try transformed.setOnce.map { try budget.properties($0) }
         let changes = EluEventPersonChanges(set: set, setOnce: setOnce)
         guard allowsPersonChanges || !changes.hasIntent else { throw EluEventFilterFailure.unsupportedPersonChanges }
-        return EluFilteredEvent(command: EluV1CaptureCommand(kind: command.kind, name: transformed.event,
-            occurredAt: transformed.timestamp, properties: mutable, versions: command.versions), person: changes)
+        return EluFilteredEvent(command: EluV1CaptureCommand(kind: command.kind, name: mutationProjection ? command.name : transformed.event,
+            occurredAt: mutationProjection ? command.occurredAt : transformed.timestamp, properties: mutable, versions: command.versions), person: changes)
+    }
+
+    /// Mutation envelopes are projections only: their name, clock and identity
+    /// targets are not event records and cannot be replaced by customer code.
+    /// A missing result is a deliberate no-op, not an unfiltered fallback.
+    func applyMutation(_ transition: EluRuntimeMutationTransition, identity: EluIdentityState,
+                       occurredAt: Date, versions: EluVersionContext) throws -> EluRuntimeMutationTransition? {
+        guard active else { return transition }
+        func project(_ name: String, _ properties: [String: EluJSONValue],
+                     person: EluEventPersonChanges = .init(set: nil, setOnce: nil)) throws -> EluFilteredEvent {
+            var merged = identity.superProperties
+            merged.merge(properties) { _, new in new }
+            return try apply(.init(kind: .capture, name: name, occurredAt: occurredAt,
+                properties: properties, versions: versions), mergedProperties: merged,
+                person: person, allowsPersonChanges: true, mutationProjection: true)
+        }
+        func object(_ value: EluJSONValue?) throws -> [String: EluJSONValue]? {
+            guard let value else { return nil }
+            if case .null = value { return nil }
+            guard case let .object(map) = value else { throw EluEventFilterFailure.invalid }
+            // Nested mutation maps obey the same protected-name rules as an
+            // ordinary caller's person properties, after the hook has finished.
+            return map.filter { !Self.protected($0.key) }
+        }
+        func person(_ set: [String: EluJSONValue], _ once: [String: EluJSONValue]) throws -> EluRuntimeMutationTransition? {
+            let value = try project("$set", ["$set": .object(set), "$set_once": .object(once)])
+            let next = try object(value.command.properties["$set"]), nextOnce = try object(value.command.properties["$set_once"])
+            guard !(next ?? [:]).isEmpty || !(nextOnce ?? [:]).isEmpty else { return nil }
+            return .setPersonProperties(set: next ?? [:], setOnce: nextOnce ?? [:], unset: [])
+        }
+        func group(_ type: String, _ key: String, _ set: [String: EluJSONValue]?) throws -> EluRuntimeMutationTransition? {
+            let changed = identity.groups[type] != key
+            guard changed || set != nil else { return nil }
+            var properties: [String: EluJSONValue] = ["$group_type": .string(type), "$group_key": .string(key)]
+            if let set { properties["$group_set"] = .object(set) }
+            let value = try project("$groupidentify", properties)
+            let next = try object(value.command.properties["$group_set"])
+            if let next {
+                return changed ? .group(groupType: type, groupKey: key, set: next, setOnce: [:], unset: [])
+                    : .setGroupProperties(groupType: type, groupKey: key, set: next, setOnce: [:], unset: [])
+            }
+            return changed ? .associateGroup(groupType: type, groupKey: key) : nil
+        }
+        switch transition {
+        case let .identify(userId, set, setOnce):
+            if identity.userId == userId {
+                guard !set.isEmpty || !setOnce.isEmpty else { return nil }
+                return try person(set, setOnce)
+            }
+            let value = try project("$identify", ["distinct_id": .string(userId),
+                "$anon_distinct_id": .string(identity.userId ?? identity.anonymousId)],
+                person: .init(set: set, setOnce: setOnce))
+            return .identify(userId: userId, set: value.person.set ?? [:], setOnce: value.person.setOnce ?? [:])
+        case let .linkAlias(aliasId):
+            guard let canonical = identity.userId else { throw EluEventFilterFailure.invalid }
+            _ = try project("$create_alias", ["alias": .string(aliasId), "distinct_id": .string(canonical)])
+            return transition
+        case let .setPersonProperties(set, setOnce, unset):
+            // The released unset operation is not a legacy event projection.
+            guard unset.isEmpty else { return transition }
+            return try person(set, setOnce)
+        case let .associateGroup(type, key): return try group(type, key, nil)
+        case let .group(type, key, set, setOnce, unset), let .setGroupProperties(type, key, set, setOnce, unset):
+            // Public group supplies a set map only. Do not silently erase typed
+            // internal set-once/unset operations that have no legacy envelope.
+            guard setOnce.isEmpty, unset.isEmpty else { return transition }
+            return try group(type, key, set)
+        }
     }
 
     private static func unbox(_ values: [String: EluJSONValue]) -> [String: Any] {
@@ -176,17 +246,23 @@ struct EluEventFilter: Sendable {
 final class EluEventFilterAttempt: @unchecked Sendable {
     let person: EluEventPersonChanges
     let allowsPersonChanges: Bool
+    private let continuationAdmission: @Sendable () -> Bool
     private let lock = NSLock()
     private var original: (UUID, EluV1CaptureCommand, [String: EluJSONValue])?
     private var current: (@Sendable () -> Bool)?
     private var outcome: Result<EluFilteredEvent, EluEventFilterFailure>?
+    private var continuation: (@Sendable () -> Bool)?
+    private var acceptedWarning: (EluV1CaptureResult, EluEventFilterAttempt)?
 
-    init(person: EluEventPersonChanges = .init(set: nil, setOnce: nil), allowsPersonChanges: Bool = false) {
+    init(person: EluEventPersonChanges = .init(set: nil, setOnce: nil), allowsPersonChanges: Bool = false,
+         continuationAdmission: @escaping @Sendable () -> Bool = { true }) {
         self.person = person; self.allowsPersonChanges = allowsPersonChanges
+        self.continuationAdmission = continuationAdmission
     }
 
     func apply(owner: UUID, command: EluV1CaptureCommand, mergedProperties: [String: EluJSONValue],
                isCurrent: @escaping @Sendable () -> Bool,
+               continuationIsCurrent: (@Sendable () -> Bool)? = nil,
                body: () throws -> EluFilteredEvent) throws -> EluFilteredEvent {
         lock.lock()
         if let original {
@@ -197,6 +273,7 @@ final class EluEventFilterAttempt: @unchecked Sendable {
             return try result.get()
         }
         original = (owner, command, mergedProperties); current = isCurrent
+        continuation = continuationIsCurrent
         lock.unlock()
         let result: Result<EluFilteredEvent, EluEventFilterFailure>
         do {
@@ -208,6 +285,29 @@ final class EluEventFilterAttempt: @unchecked Sendable {
         catch { result = .failure(.invalid) }
         lock.lock(); outcome = result; lock.unlock()
         return try result.get()
+    }
+
+    /// The queue can emit at most one bypassed warning for this consumed rate
+    /// attempt. Retain its accepted result for the same Runtime, never a retry
+    /// of the rejected outer event or a second independent queue owner.
+    func warningAttempt() -> EluEventFilterAttempt {
+        EluEventFilterAttempt(allowsPersonChanges: allowsPersonChanges, continuationAdmission: continuationAdmission)
+    }
+    func retainWarning(_ result: EluV1CaptureResult, attempt: EluEventFilterAttempt) {
+        guard case .accepted = result else { return }
+        lock.lock(); defer { lock.unlock() }
+        if acceptedWarning == nil { acceptedWarning = (result, attempt) }
+    }
+    func takeWarning() -> (EluV1CaptureResult, EluEventFilterAttempt)? {
+        lock.lock(); defer { lock.unlock() }
+        let value = acceptedWarning; acceptedWarning = nil; return value
+    }
+
+    /// The callback's original source/intent survives its own context commit,
+    /// but cannot be reused after a new external intent or source replacement.
+    func mayContinuePersonMutation() -> Bool {
+        lock.lock(); let validate = continuation; lock.unlock()
+        return validate?() == true && continuationAdmission()
     }
 
     func acceptedPersonChanges() -> EluEventPersonChanges {

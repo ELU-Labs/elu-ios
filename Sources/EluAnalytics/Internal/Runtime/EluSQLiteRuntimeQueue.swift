@@ -3269,27 +3269,40 @@ private final class EluV1FlagOwnerFence: @unchecked Sendable {
     private let owner = UUID()
     private var generation = UUID()
     private var restrictionGeneration = UUID()
+    private var intentGeneration = UUID()
     private var pending: Set<UUID> = []
     private var terminal = false
     private var lastWall: Date?
     private var lastContinuous: UInt64?
     func token() -> UUID { lock.lock(); defer { lock.unlock() }; return generation }
     func restrictionToken() -> UUID { lock.lock(); defer { lock.unlock() }; return restrictionGeneration }
-    /// Restriction only, never a flag grant. A new intent or invalidation
+    /// Restriction only, never a flag grant. A restrictive intent or invalidation
     /// withdraws this attempt. Finishing its own facade handoff does not.
     func unchangedRestriction(_ token: UUID) -> Bool {
         lock.lock(); defer { lock.unlock() }
         return !terminal && restrictionGeneration == token
     }
-    func invalidate(terminal: Bool = false) {
-        lock.lock(); generation = UUID(); restrictionGeneration = UUID(); self.terminal = self.terminal || terminal; lock.unlock()
+    /// Restrictions acquired from the original caller, independent of a
+    /// successful mutation invalidating its own published flag projection.
+    func intentToken() -> UUID { lock.lock(); defer { lock.unlock() }; return intentGeneration }
+    func unchangedIntent(_ token: UUID) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return !terminal && intentGeneration == token
     }
-    func beginIntent() -> EluV1FlagProjectionIntent {
+    func invalidate(terminal: Bool = false, externalIntent: Bool = false) {
+        lock.lock(); generation = UUID(); restrictionGeneration = UUID()
+        if terminal || externalIntent { intentGeneration = UUID() }
+        self.terminal = self.terminal || terminal; lock.unlock()
+    }
+    func beginIntent(restrictsCapture: Bool = true) -> EluV1FlagProjectionIntent {
         lock.lock(); defer { lock.unlock() }
         let token = UUID()
         pending.insert(token)
         generation = UUID()
-        restrictionGeneration = UUID()
+        if restrictsCapture {
+            restrictionGeneration = UUID()
+            intentGeneration = UUID()
+        }
         return EluV1FlagProjectionIntent(owner: owner, token: token)
     }
     func finishIntent(_ intent: EluV1FlagProjectionIntent) {
@@ -7073,11 +7086,13 @@ actor EluSQLiteRuntimeQueue {
     nonisolated var requiresBoundFlagTransport: Bool { configurationGate != nil }
 
     /// Invalidates existing guards without representing queued work (for close).
-    nonisolated func invalidateFlagProjection() { flagScopeFence.invalidate() }
+    nonisolated func invalidateFlagProjection() { flagScopeFence.invalidate(externalIntent: true) }
 
     /// Facade/config acceptance closes projection and send-guard export until all
     /// corresponding queued owner operations settle. A reread cannot bypass it.
-    nonisolated func beginFlagProjectionIntent() -> EluV1FlagProjectionIntent { flagScopeFence.beginIntent() }
+    nonisolated func beginFlagProjectionIntent(restrictsCapture: Bool = true) -> EluV1FlagProjectionIntent {
+        flagScopeFence.beginIntent(restrictsCapture: restrictsCapture)
+    }
     nonisolated func finishFlagProjectionIntent(_ intent: EluV1FlagProjectionIntent) { flagScopeFence.finishIntent(intent) }
 
     func flagSendGuard(token: EluV1FlagBeginToken) -> EluV1FlagSynchronousGuard? {
@@ -7932,11 +7947,11 @@ actor EluSQLiteRuntimeQueue {
 
     /// A passive sample requires an existing live foreground session. It may
     /// neither start/resume a session nor extend its user-activity timeout.
-    func capturePerformanceSample(_ command: EluV1CaptureCommand, admissionGuard: @escaping @Sendable () -> Bool) -> EluV1CaptureResult {
+    func capturePerformanceSample(_ command: EluV1CaptureCommand, filterAttempt: EluEventFilterAttempt? = nil, admissionGuard: @escaping @Sendable () -> Bool) -> EluV1CaptureResult {
         guard command.kind == .capture, command.name == "$performance_sample" else {
             return .rejected(.invalidEvent, snapshot: state.snapshot)
         }
-        return capture(command, performanceSample: true, admissionGuard: admissionGuard)
+        return capture(command, performanceSample: true, filterAttempt: filterAttempt, admissionGuard: admissionGuard)
     }
 
     /// Metadata updates do not create a session or consume replay audience.
@@ -8085,7 +8100,7 @@ actor EluSQLiteRuntimeQueue {
         return state.diagnostics
     }
 
-    func captureNativeDiagnostic(_ summary: EluNativeDiagnosticSummary, versions: EluVersionContext,
+    func captureNativeDiagnostic(_ summary: EluNativeDiagnosticSummary, versions: EluVersionContext, filterAttempt: EluEventFilterAttempt? = nil,
         admissionGuard: @escaping @Sendable () -> Bool) -> EluV1CaptureResult {
         let now = clock()
         // An observed wall regression permanently closes this historical interval.
@@ -8095,10 +8110,10 @@ actor EluSQLiteRuntimeQueue {
         }
         let command = EluV1CaptureCommand(kind: .capture, name: summary.kind.eventName,
             occurredAt: now, properties: summary.properties, versions: versions)
-        return capture(command, performanceSample: false, diagnosticSummary: summary, admissionGuard: admissionGuard)
+        return capture(command, performanceSample: false, diagnosticSummary: summary, filterAttempt: filterAttempt, admissionGuard: admissionGuard)
     }
 
-    func captureMetricKitCrashReport(_ report: EluMetricKitCrashBatch.Item, versions: EluVersionContext,
+    func captureMetricKitCrashReport(_ report: EluMetricKitCrashBatch.Item, versions: EluVersionContext, filterAttempt: EluEventFilterAttempt? = nil,
         admissionGuard: @escaping @Sendable () -> Bool) -> EluV1CaptureResult {
         let now = clock()
         if let observed = state.diagnostics.observedAt.flatMap(EluRFC3339.date(from:)), now < observed {
@@ -8107,12 +8122,12 @@ actor EluSQLiteRuntimeQueue {
         }
         let command = EluV1CaptureCommand(kind: .exception, name: "$exception", occurredAt: now,
             properties: report.report.properties, versions: versions)
-        return capture(command, performanceSample: false, crashReport: report, admissionGuard: admissionGuard)
+        return capture(command, performanceSample: false, crashReport: report, filterAttempt: filterAttempt, admissionGuard: admissionGuard)
     }
 
     /// Completion retains its request-start ownership. It never extends an
     /// existing session, but can atomically create the first actual session.
-    func captureNetworkObservation(_ command: EluV1CaptureCommand, context: EluNetworkObservationContext,
+    func captureNetworkObservation(_ command: EluV1CaptureCommand, context: EluNetworkObservationContext, filterAttempt: EluEventFilterAttempt? = nil,
                                    admissionGuard: @escaping @Sendable () -> Bool) -> EluV1CaptureResult {
         guard command.kind == .capture, command.name == "$network_request" else {
             return .rejected(.invalidEvent, snapshot: state.snapshot)
@@ -8123,7 +8138,7 @@ actor EluSQLiteRuntimeQueue {
               state.identity.session?.startedAt == context.sessionStartedAt else {
             return .rejected(.authorityWitnessChanged, snapshot: state.snapshot)
         }
-        return capture(command, performanceSample: false, networkObservation: true, admissionGuard: admissionGuard)
+        return capture(command, performanceSample: false, networkObservation: true, filterAttempt: filterAttempt, admissionGuard: admissionGuard)
     }
 
     private func capture(_ originalCommand: EluV1CaptureCommand, performanceSample: Bool, networkObservation: Bool = false, diagnosticSummary: EluNativeDiagnosticSummary? = nil, crashReport: EluMetricKitCrashBatch.Item? = nil, flagExposure: EluFlagExposureRequest? = nil, rateAttempt: EluCaptureRateAttempt? = nil, filterAttempt: EluEventFilterAttempt? = nil, bypassRateLimit: Bool = false, passiveWarning: Bool = false, admissionGuard: (@Sendable () -> Bool)?) -> EluV1CaptureResult {
@@ -8185,9 +8200,11 @@ actor EluSQLiteRuntimeQueue {
                         let command = EluV1CaptureCommand(kind: .capture, name: EluCaptureRateLimiter.warningEvent,
                             occurredAt: clock(), properties: [EluCaptureRateLimiter.warningProperty: .string(warning)],
                             versions: command.versions)
-                        _ = capture(command, performanceSample: false, bypassRateLimit: true,
+                        let warningAttempt = filterAttempt?.warningAttempt()
+                        let result = capture(command, performanceSample: false, filterAttempt: warningAttempt, bypassRateLimit: true,
                             passiveWarning: performanceSample || diagnosticSummary != nil || crashReport != nil || networkObservation,
                             admissionGuard: admissionGuard)
+                        if let warningAttempt { filterAttempt?.retainWarning(result, attempt: warningAttempt) }
                     }
                     return .rejected(.rateLimited, snapshot: state.snapshot)
                 }
@@ -8204,7 +8221,7 @@ actor EluSQLiteRuntimeQueue {
         var filteredProperties: [String: EluJSONValue]?
         var filterCurrent: (@Sendable () -> Bool)?
         if eventFilter.active {
-            let scope = flagScopeFence, token = scope.restrictionToken(), gate = configurationGate
+            let scope = flagScopeFence, token = scope.restrictionToken(), intent = scope.intentToken(), gate = configurationGate
             let current: @Sendable () -> Bool = {
                 scope.unchangedRestriction(token) && (gate?.isCurrent(sourceWitness) ?? true) && (admissionGuard?() ?? true)
             }
@@ -8215,7 +8232,9 @@ actor EluSQLiteRuntimeQueue {
             do {
                 let original = command
                 let value = try attempt.apply(owner: rateLimitOwner, command: original, mergedProperties: merged,
-                    isCurrent: current) {
+                    isCurrent: current, continuationIsCurrent: {
+                        scope.unchangedIntent(intent) && (gate?.isCurrent(sourceWitness) ?? true)
+                    }) {
                     try eventFilter.apply(original, mergedProperties: merged, person: attempt.person,
                         allowsPersonChanges: attempt.allowsPersonChanges)
                 }
@@ -8557,7 +8576,8 @@ actor EluSQLiteRuntimeQueue {
         allowWire: Bool = true,
         wireGuard: @escaping @Sendable () -> Bool = { true },
         admissionGuard: (@Sendable () -> Bool)? = nil,
-        minimumOccurredAt: Date? = nil
+        minimumOccurredAt: Date? = nil,
+        filterMutation: Bool = false
     ) throws -> EluRuntimeQueueSnapshot {
         guard admissionGuard?() ?? true else { throw EluRuntimeQueueError.sourceAuthorityUnavailable }
         guard ownerNamespaceHash != nil else {
@@ -8565,6 +8585,14 @@ actor EluSQLiteRuntimeQueue {
         }
         guard expectedGeneration == state.generation else {
             throw EluRuntimeQueueError.generationMismatch
+        }
+        let scope = flagScopeFence, intent = scope.intentToken()
+        let suppliedAdmission = admissionGuard, originalSource = captureSourceWitness, gate = configurationGate
+        let checksHookIntent = filterMutation && eventFilter.active
+        let checksHookSource = checksHookIntent && originalSource != nil && (gate?.isCurrent(originalSource) ?? true)
+        let admissionGuard: @Sendable () -> Bool = {
+            (!checksHookIntent || scope.unchangedIntent(intent)) && (suppliedAdmission?() ?? true) &&
+                (!checksHookSource || (gate?.isCurrent(originalSource) ?? true))
         }
         let prepared: (
             identity: EluIdentityState,
@@ -8580,9 +8608,20 @@ actor EluSQLiteRuntimeQueue {
                 guard occurredAt.timeIntervalSinceReferenceDate.isFinite,
                       occurredAt >= minimumOccurredAt else { throw EluRuntimeQueueError.invalidState }
             }
+            let next: EluRuntimeMutationTransition
+            if filterMutation, eventFilter.active {
+                let token = scope.restrictionToken()
+                let filtered = try eventFilter.applyMutation(transition, identity: state.identity,
+                    occurredAt: occurredAt, versions: versions)
+                guard scope.unchangedRestriction(token), admissionGuard() else {
+                    throw EluRuntimeQueueError.sourceAuthorityUnavailable
+                }
+                guard let filtered else { return state.snapshot }
+                next = filtered
+            } else { next = transition }
             prepared = try prepareMutationTransition(
-                transition,
-                occurredAt: occurredAt,
+                next,
+                occurredAt: filterMutation && eventFilter.active ? clock() : occurredAt,
                 versions: versions
             )
         } catch {
@@ -8602,7 +8641,7 @@ actor EluSQLiteRuntimeQueue {
                 maximumQueueBytes: maximumQueueBytes,
                 personIdentityUpdate: prepared.personIdentity,
                 prewriteValidation: { diskState in
-                    guard admissionGuard?() ?? true else { throw EluRuntimeQueueError.sourceAuthorityUnavailable }
+                    guard admissionGuard() else { throw EluRuntimeQueueError.sourceAuthorityUnavailable }
                     if admitsWire && !prepared.drafts.isEmpty &&
                         (!wireGuard() || (self.configurationGate != nil &&
                         !self.freshMutationSourceIsCurrent(witness, diskState: diskState))) {
@@ -8610,7 +8649,7 @@ actor EluSQLiteRuntimeQueue {
                     }
                 },
                 precommitValidation: {
-                    guard admissionGuard?() ?? true else { throw EluRuntimeQueueError.sourceAuthorityUnavailable }
+                    guard admissionGuard() else { throw EluRuntimeQueueError.sourceAuthorityUnavailable }
                     if admitsWire && !prepared.drafts.isEmpty && (!wireGuard() || !self.sourceIsCurrent(witness)) {
                         throw EluRuntimeQueueError.sourceAuthorityUnavailable
                     }
@@ -8619,14 +8658,14 @@ actor EluSQLiteRuntimeQueue {
         } catch EluRuntimeQueueError.sourceAuthorityUnavailable {
             // Ordinary person calls retain their existing local fallback. An
             // associated capture's superseded admission cannot use that fallback.
-            guard admissionGuard?() ?? true else { throw EluRuntimeQueueError.sourceAuthorityUnavailable }
+            guard admissionGuard() else { throw EluRuntimeQueueError.sourceAuthorityUnavailable }
             return try commitPrepared(expectedGeneration: expectedGeneration,
                 identity: prepared.identity, flagContext: prepared.flagContext, drafts: [],
                 personIdentityUpdate: prepared.personIdentity,
                 prewriteValidation: { _ in
-                    guard admissionGuard?() ?? true else { throw EluRuntimeQueueError.sourceAuthorityUnavailable }
+                    guard admissionGuard() else { throw EluRuntimeQueueError.sourceAuthorityUnavailable }
                 }, precommitValidation: {
-                    guard admissionGuard?() ?? true else { throw EluRuntimeQueueError.sourceAuthorityUnavailable }
+                    guard admissionGuard() else { throw EluRuntimeQueueError.sourceAuthorityUnavailable }
                 }).snapshot
         }
     }

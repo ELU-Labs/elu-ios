@@ -152,6 +152,7 @@ actor EluStandaloneRuntime {
     private var declaredRegionObserver: UUID?
     #endif
     private var closeTask: Task<Void, Never>?
+    private(set) var automaticPersonMutationRefusals: UInt64 = 0
     private(set) var diagnosticsCloseSettlement: EluNativeDiagnosticsCloseSettlement?
     private(set) var nativeReplayCompositionSettlement: EluNativeReplayComposition.CloseOutcome?
     private let nativeContinuousNow: @Sendable () -> UInt64?
@@ -433,9 +434,9 @@ actor EluStandaloneRuntime {
         return await commit(snapshot)
     }
 
-    nonisolated func beginFlagProjectionIntent() -> EluStandaloneFlagProjectionIntent {
+    nonisolated func beginFlagProjectionIntent(restrictsCapture: Bool = true) -> EluStandaloneFlagProjectionIntent {
         let performance = performanceMonitor.beginMutation()
-        return .init(flags: queue.beginFlagProjectionIntent(), performance: performance, diagnostics: diagnosticsGate.begin(), network: networkGate.beginMutation())
+        return .init(flags: queue.beginFlagProjectionIntent(restrictsCapture: restrictsCapture), performance: performance, diagnostics: diagnosticsGate.begin(), network: networkGate.beginMutation())
     }
     nonisolated func finishFlagProjectionIntent(_ intent: EluStandaloneFlagProjectionIntent) {
         queue.finishFlagProjectionIntent(intent.flags)
@@ -733,7 +734,9 @@ actor EluStandaloneRuntime {
     func captureWithPersonChanges(_ name: String, properties: [String: EluJSONValue], occurredAt: Date?,
                                   person: EluEventPersonChanges, admissionGuard: (@Sendable () -> Bool)?)
         async -> (result: EluV1CaptureResult, person: EluEventPersonChanges) {
-        let attempt = EluEventFilterAttempt(person: person, allowsPersonChanges: true)
+        let fence = deliveryFence, decision = fence.token()
+        let attempt = EluEventFilterAttempt(person: person, allowsPersonChanges: true,
+            continuationAdmission: { fence.isCurrent(decision) && (admissionGuard?() ?? true) })
         let result = await submit(.init(kind: .capture, name: name, occurredAt: occurredAt ?? clock(),
             properties: properties, versions: versions), admissionGuard: admissionGuard, filterAttempt: attempt)
         return (result, attempt.acceptedPersonChanges())
@@ -934,7 +937,8 @@ actor EluStandaloneRuntime {
                   versions: versions,
                   expectedGeneration: generation,
                   allowWire: phase == .capturing,
-                  wireGuard: { fence.isCurrent(decision) }
+                  wireGuard: { fence.isCurrent(decision) },
+                  admissionGuard: { fence.token() == decision }, filterMutation: true
               )
         else {
             return nil
@@ -1043,8 +1047,10 @@ actor EluStandaloneRuntime {
               summary.kind != .launch || (diagnosticsOptions.launchSummaries && document.capturePerformance?.mainThreadStalls == true)
         else { return }
         let fence = deliveryFence, decision = fence.token()
-        let result = await queue.captureNativeDiagnostic(summary, versions: versions,
+        let attempt = automaticFilterAttempt()
+        let captured = await queue.captureNativeDiagnostic(summary, versions: versions, filterAttempt: attempt,
             admissionGuard: { isCurrent() && fence.isCurrent(decision) })
+        let result = await finishAutomaticPersonChanges(captured, attempt: attempt)
         switch result {
         case let .accepted(_, snapshot): lastSnapshot = snapshot; armFlushTimer()
         case let .rejected(_, snapshot):
@@ -1066,8 +1072,10 @@ actor EluStandaloneRuntime {
                   let document = try? JSONDecoder().decode(EluV1ConfigDocument.self, from: data),
                   document.captureExceptions?.allowsMetricKitReports == true else { return }
             let fence = deliveryFence, decision = fence.token()
-            let result = await queue.captureMetricKitCrashReport(item, versions: versions,
+            let attempt = automaticFilterAttempt()
+            let captured = await queue.captureMetricKitCrashReport(item, versions: versions, filterAttempt: attempt,
                 admissionGuard: { isCurrent() && fence.isCurrent(decision) })
+            let result = await finishAutomaticPersonChanges(captured, attempt: attempt)
             switch result {
             case let .accepted(_, snapshot): lastSnapshot = snapshot; armFlushTimer()
             case let .rejected(_, snapshot):
@@ -1219,7 +1227,7 @@ actor EluStandaloneRuntime {
             return .rejected(.authorityAbsent, snapshot: lastSnapshot)
         }
         let rateAttempt = EluCaptureRateAttempt()
-        let filterAttempt = suppliedAttempt ?? EluEventFilterAttempt()
+        let filterAttempt = suppliedAttempt ?? automaticFilterAttempt()
         var result = await record(command, flagExposure: flagExposure, rateAttempt: rateAttempt, filterAttempt: filterAttempt, admissionGuard: admissionGuard)
         // Authority is bound to the identity witness it was derived from. If
         // that witness moved under this call, one renewal decides whether the
@@ -1233,7 +1241,42 @@ actor EluStandaloneRuntime {
             }
             result = await record(command, flagExposure: flagExposure, rateAttempt: rateAttempt, filterAttempt: filterAttempt, admissionGuard: admissionGuard)
         }
-        return result
+        if suppliedAttempt == nil { return await finishAutomaticPersonChanges(result, attempt: filterAttempt) }
+        return await finishAcceptedWarning(result, attempt: filterAttempt)
+    }
+
+    private func automaticFilterAttempt() -> EluEventFilterAttempt {
+        let fence = deliveryFence, decision = fence.token()
+        return EluEventFilterAttempt(allowsPersonChanges: true,
+            continuationAdmission: { fence.isCurrent(decision) })
+    }
+
+    private func finishAcceptedWarning(_ result: EluV1CaptureResult, attempt: EluEventFilterAttempt) async -> EluV1CaptureResult {
+        guard let (warning, warningAttempt) = attempt.takeWarning() else { return result }
+        let completed = await finishAutomaticPersonChanges(warning, attempt: warningAttempt)
+        guard case let .accepted(_, snapshot) = completed else { return result }
+        switch result {
+        case let .accepted(record, _): return .accepted(record, snapshot: snapshot)
+        case let .rejected(reason, _): return .rejected(reason, snapshot: snapshot)
+        }
+    }
+
+    /// Event and person rows have separate original commits. A failure in the
+    /// second write does not undo or misreport the already accepted event.
+    private func finishAutomaticPersonChanges(_ result: EluV1CaptureResult, attempt: EluEventFilterAttempt) async -> EluV1CaptureResult {
+        let result = await finishAcceptedWarning(result, attempt: attempt)
+        guard case let .accepted(record, accepted) = result else { return result }
+        let person = attempt.acceptedPersonChanges()
+        guard person.hasIntent else { return result }
+        let fence = deliveryFence, decision = fence.token()
+        let current: @Sendable () -> Bool = { fence.isCurrent(decision) && attempt.mayContinuePersonMutation() }
+        guard let next = await setPersonProperties(person.set ?? [:], propertiesOnce: person.setOnce ?? [:],
+            afterAcceptedCapture: accepted, admissionGuard: current) else {
+            automaticPersonMutationRefusals = automaticPersonMutationRefusals == UInt64.max
+                ? UInt64.max : automaticPersonMutationRefusals + 1
+            return result
+        }
+        return .accepted(record, snapshot: next)
     }
 
     private func record(_ command: EluV1CaptureCommand, flagExposure: EluFlagExposureRequest? = nil, rateAttempt: EluCaptureRateAttempt? = nil, filterAttempt: EluEventFilterAttempt? = nil, performanceSample: Bool = false, networkContext: EluNetworkObservationContext? = nil, admissionGuard: (@Sendable () -> Bool)? = nil) async -> EluV1CaptureResult {
@@ -1243,13 +1286,15 @@ actor EluStandaloneRuntime {
         let current: @Sendable () -> Bool = {
             fence.isCurrent(decision) && (admissionGuard?() ?? true)
         }
-        let result: EluV1CaptureResult
+        let originalAttempt = filterAttempt ?? automaticFilterAttempt()
+        var result: EluV1CaptureResult
         if let flagExposure {
-            result = await queue.captureFlagExposure(command, exposure: flagExposure, rateAttempt: rateAttempt, filterAttempt: filterAttempt, admissionGuard: current)
-        } else if performanceSample { result = await queue.capturePerformanceSample(command, admissionGuard: current) }
+            result = await queue.captureFlagExposure(command, exposure: flagExposure, rateAttempt: rateAttempt, filterAttempt: originalAttempt, admissionGuard: current)
+        } else if performanceSample { result = await queue.capturePerformanceSample(command, filterAttempt: originalAttempt, admissionGuard: current) }
         else if let networkContext {
-            result = await queue.captureNetworkObservation(command, context: networkContext, admissionGuard: current)
-        } else { result = await queue.capture(command, rateAttempt: rateAttempt, filterAttempt: filterAttempt, admissionGuard: current) }
+            result = await queue.captureNetworkObservation(command, context: networkContext, filterAttempt: originalAttempt, admissionGuard: current)
+        } else { result = await queue.capture(command, rateAttempt: rateAttempt, filterAttempt: originalAttempt, admissionGuard: current) }
+        if filterAttempt == nil { result = await finishAutomaticPersonChanges(result, attempt: originalAttempt) }
         switch result {
         case let .accepted(_, snapshot):
             lastSnapshot = snapshot

@@ -363,17 +363,27 @@ return promptly and do not wait for SDK work, perform networking, or access UIKi
 Runtime identity/session/version fields remain protected. Existing native event
 name, timestamp and passive-session constraints still apply to replacements.
 
-Manual capture uses the hook's `set` and `setOnce`, including maps introduced by
+Captures use the hook's `set` and `setOnce`, including maps introduced by
 the hook, only after the original event is accepted. These remain separate
 ordered writes and use the person mutator's wall clock. No extra flag reload is
 scheduled. A dropped flag event does not consume its durable exposure marker.
 Filtering covers manual events, screens, exceptions and automatic native event
 producers; replay frames are governed by their separate privacy rules.
 
-This unreleased slice does not yet apply property hooks to identify, alias, or
-standalone person/group mutations. Hook-introduced person maps on automatic
-events are refused with the event, rather than silently ignored. Those paths
-remain required follow-on parity work before complete hook support is claimed.
+This also applies to automatic events and the rate-limit warning, while keeping
+the original event's typed privacy and session constraints. A later identity,
+consent, source or clock refusal can prevent the separate person write without
+undoing the accepted event; `personProfiles = .never` still prevents person updates.
+
+Identity and property calls use mutation projections through the same hook:
+`$identify` takes `set`/`setOnce`; `$set` takes `properties["$set"]` and
+`properties["$set_once"]`; `$groupidentify` takes `properties["$group_set"]`.
+`$create_alias` can be dropped. These projections create only the existing typed
+mutations, not extra events. Their name, timestamp, user/alias and group targets
+cannot be changed. Returning `nil` prevents the mutation; removing all `$set`
+maps makes that property update a no-op. The denylist applies to top-level merged
+properties, so filter individual person fields inside the relevant maps.
+Flag-only local property overrides do not pass through this hook.
 
 Persistent mode keeps bucket state across restarts, identify, reset (including
 device reset), and consent changes. Memory mode discards the bucket with the

@@ -134,6 +134,65 @@ final class EluEventFilterQueueTests: XCTestCase {
         await h.queue.close()
     }
 
+    func testMutationHookWithdrawalCannotUseLocalFallbackOrConsumeASequence() async throws {
+        for boundary in ["callback-intent", "callback-source", "precommit-intent"] {
+            let held = EventFilterQueueOwner(), calls = EventFilterCounter(), fault = DeliveryFault()
+            let h = try await make(.init(beforeSend: { event in calls.hit(); held.action?(); return event }), fault: fault)
+            defer { h.base.remove() }
+            let before = try await h.queue.snapshot(), queue = h.queue, gate = h.base.gate
+            if boundary == "callback-intent" { held.action = { queue.finishFlagProjectionIntent(queue.beginFlagProjectionIntent()) } }
+            else if boundary == "callback-source" { held.action = { gate.close() } }
+            else { fault.action = { point in
+                if point == .beforeCommit { queue.finishFlagProjectionIntent(queue.beginFlagProjectionIntent()) }
+            } }
+            do {
+                _ = try await queue.applyOwnedMutation(.identify(userId: "must-not-appear", set: ["secret": .bool(true)], setOnce: [:]),
+                    versions: command(h).versions, expectedGeneration: before.generation, filterMutation: true)
+                XCTFail("Withdrawn mutation must fail: \(boundary)")
+            } catch { }
+            let after = try await queue.snapshot()
+            XCTAssertEqual(after.identity, before.identity, boundary)
+            XCTAssertEqual(after.flagContext, before.flagContext, boundary)
+            XCTAssertEqual(after.nextSequence, before.nextSequence, boundary)
+            XCTAssertEqual(calls.count, 1)
+            fault.action = nil; await queue.close()
+        }
+    }
+
+    func testMutationProjectionRunsBeforeSQLAndNeverRepeatsForLocalFallback() async throws {
+        let calls = EventFilterCounter(), wire = EventFilterCounter(), fault = DeliveryFault()
+        let h = try await make(.init(beforeSend: { event in
+            calls.hit(); var event = event; event.set = ["safe": true]; return event
+        }), fault: fault); defer { h.base.remove() }
+        let before = try await h.queue.snapshot()
+        fault.action = { point in if point == .afterRecordInsert(0) { wire.withdraw() } }
+        let after = try await h.queue.applyOwnedMutation(.identify(userId: "original", set: [:], setOnce: [:]),
+            versions: command(h).versions, expectedGeneration: before.generation,
+            wireGuard: { wire.current }, filterMutation: true)
+        XCTAssertEqual(after.identity.userId, "original")
+        XCTAssertEqual(after.flagContext.personProperties["safe"], .bool(true))
+        XCTAssertEqual(after.queuedCount, 0, "Ordinary local fallback does not backfill a wire mutation")
+        XCTAssertEqual(after.nextSequence, before.nextSequence); XCTAssertEqual(calls.count, 1)
+        fault.action = nil; await h.queue.close()
+    }
+
+    func testAcceptedFilterContinuationRetainsSourceAndIntentButNotItsOwnProjectionGeneration() async throws {
+        let h = try await make(.init(beforeSend: { event in var event = event; event.set = ["accepted": true]; return event }))
+        defer { h.base.remove() }
+        let attempt = EluEventFilterAttempt(allowsPersonChanges: true)
+        let result = try await h.queue.capture(command(h), filterAttempt: attempt)
+        guard case let .accepted(_, accepted) = result else { XCTFail("Expected accepted event"); await h.queue.close(); return }
+        XCTAssertTrue(attempt.mayContinuePersonMutation())
+        let after = try await h.queue.applyOwnedMutation(.setPersonProperties(set: ["accepted": .bool(true)], setOnce: [:], unset: []),
+            versions: command(h).versions, expectedGeneration: accepted.generation,
+            admissionGuard: { attempt.mayContinuePersonMutation() }, minimumOccurredAt: accepted.identity.updatedAt)
+        XCTAssertEqual(after.queuedCount, 2)
+        XCTAssertTrue(attempt.mayContinuePersonMutation(), "Own projection invalidation is not a new external intent")
+        h.queue.finishFlagProjectionIntent(h.queue.beginFlagProjectionIntent())
+        XCTAssertFalse(attempt.mayContinuePersonMutation())
+        await h.queue.close()
+    }
+
     func testPassiveNativeEventsCanBeDroppedButCannotBecomeActivityThroughTransform() async throws {
         let calls = EventFilterCounter()
         let h = try await make(.init(beforeSend: { event in

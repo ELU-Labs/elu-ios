@@ -42,7 +42,7 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
     private var foregroundIntent = false
     private var foregroundGeneration = UUID()
     private var flagGeneration = UUID()
-    // New intent invalidates capture admission; finishing its own handoff does not.
+    // Identity/consent/config restrictions invalidate capture; later queued captures do not.
     private var capturePersonGeneration = UUID()
     private var pendingFlagIntents: [UUID: EluStandaloneFacadePendingIntent] = [:]
     private let flagTransport: (any EluV1FlagTransport)?
@@ -57,6 +57,14 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
     private var pendingIdentityOperations = 0
     private var consentProjection: (id: UUID, optedOut: Bool)?
 
+    // Comparison metadata only; a quiet handoff must reread the original queue
+    // and acquire a new current guard before this value can be published again.
+    private struct QuietFlagPublication: Sendable {
+        let snapshot: EluV1FlagCacheSnapshot
+        let value: EluFeatureFlagSnapshot?
+        let fromRemote: Bool
+    }
+    private var quietFlagPublication: QuietFlagPublication?
     private var flagCache: EluV1FlagCacheProjection?
     private var flagsLoadedState = false
     private var flagSnapshot: EluFeatureFlagSnapshot?
@@ -328,12 +336,12 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
         let hookMayChangePerson: Bool
         if case .capture = op { hookMayChangePerson = captureHookCanChangePerson } else { hookMayChangePerson = false }
         guard op.changesFlagContext || hookMayChangePerson else { return nil }
+        let restrictsCapture: Bool
+        if case .capture = op { restrictsCapture = false } else { restrictsCapture = true }
         let pending = withLock { () -> EluStandaloneFacadePendingIntent? in
             guard !isShutDown else { return nil }
-            flagGeneration = UUID()
-            capturePersonGeneration = UUID()
-            clearFlagsLocked()
-            let pending = EluStandaloneFacadePendingIntent()
+            withdrawFlagsLocked(restrictsCapture: restrictsCapture)
+            let pending = EluStandaloneFacadePendingIntent(restrictsCapture: restrictsCapture)
             if let runtime = started?.runtime { pending.bind(runtime) }
             pendingFlagIntents[pending.id] = pending
             return pending
@@ -369,7 +377,7 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
             let person = project(set), personOnce = project(setOnce)
             let hasPersonIntent = set != nil || setOnce != nil || captureHookCanChangePerson
             let permitsPerson = personProfiles != .never
-            enqueue(affectsFlags: hasPersonIntent) { runtime, owner in
+            enqueue(affectsFlags: hasPersonIntent, restrictsCapture: false) { runtime, owner in
                 let current = hasPersonIntent ? owner.capturePersonAdmission() : nil
                 let submitted = await runtime.captureWithPersonChanges(name, properties: projected, occurredAt: timestamp,
                     person: .init(set: set == nil ? nil : person, setOnce: setOnce == nil ? nil : personOnce),
@@ -830,9 +838,11 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
         }
     }
 
-    private func publish(_ projection: EluV1FlagCacheProjection, error: EluFeatureFlagSnapshot.LoadError? = nil) {
+    private func publish(_ projection: EluV1FlagCacheProjection, error: EluFeatureFlagSnapshot.LoadError? = nil,
+        expectedGeneration: UUID? = nil, restoring: QuietFlagPublication? = nil) {
         lock.lock()
-        guard !isShutDown, pendingFlagIntents.isEmpty, projection.authority.isCurrent() else { lock.unlock(); return }
+        guard !isShutDown, pendingFlagIntents.isEmpty, projection.authority.isCurrent(),
+              expectedGeneration == nil || expectedGeneration == flagGeneration else { lock.unlock(); return }
         if let previous = flagCache?.snapshot.response {
             let next = projection.snapshot.response
             if previous.flagsRevision != next.flagsRevision || previous.flags != next.flags || previous.payloads != next.payloads {
@@ -843,11 +853,19 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
         flagCache = projection
         flagSnapshot = try? EluFeatureFlagSnapshot(response: projection.snapshot.response,
             source: projection.receivedFromRemote ? .remote : .cache, error: error)
+        if let restoring, restoring.snapshot == projection.snapshot {
+            flagsFromRemote = restoring.fromRemote
+            flagSnapshot = restoring.value ?? flagSnapshot
+        }
+        quietFlagPublication = nil
         flagPublicationId = UUID()
         flagsLoadedState = true
         let generation = flagGeneration
         let publication = flagPublicationLocked()
         lock.unlock()
+        // A local reread is not a new load. Notifying here lets a listener that
+        // captures recursively trigger itself through unchanged cache recovery.
+        if restoring != nil { return }
         if let publication { flagSnapshotDidLoad(publication) }
         notifyFlags { [weak self] in
             self?.withLock { self?.projectionIsCurrentLocked(projection, generation: generation) ?? false } ?? false
@@ -889,7 +907,18 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
         lock.unlock()
     }
 
+    private func withdrawFlagsLocked(restrictsCapture: Bool) {
+        let retained = quietFlagPublication ?? flagCache.map {
+            QuietFlagPublication(snapshot: $0.snapshot, value: flagSnapshot, fromRemote: flagsFromRemote)
+        }
+        flagGeneration = UUID()
+        if restrictsCapture { capturePersonGeneration = UUID() }
+        clearFlagsLocked()
+        if !restrictsCapture { quietFlagPublication = retained }
+    }
+
     private func clearFlagsLocked() {
+        quietFlagPublication = nil
         flagCache = nil
         flagSnapshot = nil
         flagPublicationId = UUID()
@@ -982,6 +1011,7 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
     private func enqueue(
         settlesProjection: Bool = false,
         affectsFlags: Bool = false,
+        restrictsCapture: Bool = true,
         whileShutDown: Bool = false,
         always: (@Sendable () -> Void)? = nil,
         _ operation: @escaping @Sendable (EluStandaloneRuntime, EluStandaloneFacadeRuntime)
@@ -990,10 +1020,8 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
         lock.lock()
         let pending: EluStandaloneFacadePendingIntent?
         if affectsFlags {
-            flagGeneration = UUID()
-            capturePersonGeneration = UUID()
-            clearFlagsLocked()
-            let value = EluStandaloneFacadePendingIntent()
+            withdrawFlagsLocked(restrictsCapture: restrictsCapture)
+            let value = EluStandaloneFacadePendingIntent(restrictsCapture: restrictsCapture)
             if let runtime = started?.runtime { value.bind(runtime) }
             pendingFlagIntents[value.id] = value
             pending = value
@@ -1035,10 +1063,24 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
     }
 
     private func finishPendingIntent(_ intent: EluStandaloneFacadePendingIntent) {
-        withLock {
-            guard pendingFlagIntents.removeValue(forKey: intent.id) != nil else { return }
+        let refresh = withLock { () -> UUID? in
+            guard pendingFlagIntents.removeValue(forKey: intent.id) != nil else { return nil }
             intent.finish()
             flagGeneration = UUID()
+            guard !isShutDown, pendingFlagIntents.isEmpty, !intent.restrictsCapture,
+                  quietFlagPublication != nil else { return nil }
+            return flagGeneration
+        }
+        guard let refresh else { return }
+        enqueue { _, owner in
+            guard let retained = owner.withLock({ () -> QuietFlagPublication? in
+                guard !owner.isShutDown, owner.pendingFlagIntents.isEmpty,
+                      owner.flagGeneration == refresh else { return nil }
+                return owner.quietFlagPublication
+            }), let client = owner.currentFlagClient(), let projection = await client.readProjection() else { return }
+            // No HTTP, exposure, or retained guard reuse. An actual changed
+            // context/lease/expiry is refused by this original queue reread.
+            owner.publish(projection, expectedGeneration: refresh, restoring: retained)
         }
     }
 
@@ -1129,13 +1171,15 @@ private final class EluFacadeCallback: @unchecked Sendable {
 
 private final class EluStandaloneFacadePendingIntent: @unchecked Sendable {
     let id = UUID()
+    let restrictsCapture: Bool
+    init(restrictsCapture: Bool = true) { self.restrictsCapture = restrictsCapture }
     private var runtime: EluStandaloneRuntime?
     private var token: EluStandaloneFlagProjectionIntent?
     private var nativeToken: EluNativeReplayIntent?
     func bind(_ owner: EluStandaloneRuntime) {
         guard runtime == nil else { return }
         runtime = owner
-        token = owner.beginFlagProjectionIntent()
+        token = owner.beginFlagProjectionIntent(restrictsCapture: restrictsCapture)
         nativeToken = owner.beginNativeProjectionIntent()
     }
     func finish() {
