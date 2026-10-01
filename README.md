@@ -189,6 +189,30 @@ overload of `isFeatureEnabled` returns `Bool?`: an absent or unavailable flag us
 Existing overloads retain their defaults: exposure enabled, eligible cached
 values allowed, and false for unavailable `isFeatureEnabled` calls.
 
+Read all current flags without exposure telemetry using `Elu.featureFlagSnapshot()`.
+It returns nil while unavailable; a valid evaluation may contain no entries.
+For load updates, retain a subscription token:
+
+```swift
+let subscription = Elu.subscribeToFeatureFlags { snapshot in
+    // Main queue. Entries preserve false, variants, numbers and null.
+    let checkout = snapshot.entry(forKey: "checkout")
+    // snapshot.source is remote, cache or unavailable.
+    // snapshot.error reports an actual transport or invalid-response failure.
+}
+// Later:
+subscription.cancel()
+```
+
+Dropping the token also cancels. A callback already admitted may finish; queued
+callbacks recheck cancellation and the original identity/configuration. Legacy
+`onFeatureFlagsLoaded` remains available. Snapshot values are immutable historical
+data, not permission for future reads. `flagsJSON` and `payloadsJSON` contain the
+complete canonical objects, including exact Unicode keys and explicit nulls.
+Startup cache alone is not an error; a failed refresh may return still-valid
+cached values with an error. An unavailable callback carries no flags or response
+metadata, and the synchronous getter stays nil. Neither surface emits exposures.
+
 Exposure events (`$feature_flag_called`) are deduplicated durably by anonymous
 visitor, flag key, and typed value. Relaunch, identify, consent changes, and
 configuration renewal retain that history; either reset variant clears it.

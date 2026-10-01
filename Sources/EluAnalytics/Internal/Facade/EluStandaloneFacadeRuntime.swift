@@ -32,6 +32,7 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
     private var replayLocallyEnabled = true
 
     private let flagsDidLoad: () -> Void
+    private let flagSnapshotDidLoad: @Sendable (EluFeatureFlagPublication) -> Void
     private let networkExcludedHosts: Set<String>
     private let personProfiles: EluPersonProfilesMode
     private var guardedFlagsDidLoad: (@Sendable (@escaping @Sendable () -> Bool) -> Void)?
@@ -55,6 +56,8 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
 
     private var flagCache: EluV1FlagCacheProjection?
     private var flagsLoadedState = false
+    private var flagSnapshot: EluFeatureFlagSnapshot?
+    private var flagPublicationId = UUID()
     private var flagLoadDeferred = true
     private var flagReloadScheduled = false
 
@@ -76,6 +79,7 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
         observeApplicationLifecycle: Bool = false
     ) {
         flagsDidLoad = context.flagsDidLoad
+        flagSnapshotDidLoad = context.flagSnapshotDidLoad
         personProfiles = context.personProfiles
         networkExcludedHosts = Set([context.configHost.host?.lowercased(), context.endpointPolicy.declaredAPIOrigin?.host].compactMap { $0 })
         self.flagTransport = flagTransport
@@ -94,6 +98,7 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
         guardedFlagsDidLoad: @escaping @Sendable (@escaping @Sendable () -> Bool) -> Void
     ) {
         flagsDidLoad = context.flagsDidLoad
+        flagSnapshotDidLoad = context.flagSnapshotDidLoad
         personProfiles = context.personProfiles
         networkExcludedHosts = Set([context.configHost.host?.lowercased(), context.endpointPolicy.declaredAPIOrigin?.host].compactMap { $0 })
         flagTransport = nil
@@ -596,6 +601,26 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
             (flagCache?.authority.isCurrent() ?? true)
     }
 
+    func featureFlagPublication() -> EluFeatureFlagPublication? {
+        withLock { flagPublicationLocked() }
+    }
+
+    private func flagPublicationLocked() -> EluFeatureFlagPublication? {
+        guard !isShutDown, pendingFlagIntents.isEmpty, flagsLoadedState,
+              flagCache?.authority.isCurrent() ?? true, let snapshot = flagSnapshot else { return nil }
+        let publication = flagPublicationId
+        let generation = flagGeneration
+        let projection = flagCache
+        return EluFeatureFlagPublication(snapshot: snapshot, isCurrent: { [weak self] in
+            self?.withLock {
+                guard let self else { return false }
+                return !self.isShutDown && self.pendingFlagIntents.isEmpty && self.flagsLoadedState
+                    && self.flagGeneration == generation && self.flagPublicationId == publication
+                    && (projection?.authority.isCurrent() ?? true)
+            } ?? false
+        })
+    }
+
     func featureFlag(_ key: String) -> Any? {
         featureFlag(key, options: .init())
     }
@@ -755,15 +780,22 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
             publishFlagsLoaded()
             return
         }
+        var failure: EluFeatureFlagSnapshot.LoadError?
+        var failureGeneration: UUID?
         for _ in 0 ..< Self.flagReloadAttempts {
             guard !isStopped else { return }
-            if let projection = await client.reloadProjection() {
-                publish(projection)
+            let before = withLock { flagGeneration }
+            let observation = await client.reloadProjectionObservation()
+            if let projection = observation.projection {
+                publish(projection, error: observation.error)
                 return
             }
             guard !isStopped else { return }
+            failure = observation.error
+            failureGeneration = before
         }
-        publishFlagsLoaded()
+        // A superseded attempt cannot attach its error to a newer identity.
+        publishFlagsLoaded(error: failure, expectedGeneration: failureGeneration)
     }
 
     private func scheduleFlagReload() {
@@ -779,7 +811,7 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
         }
     }
 
-    private func publish(_ projection: EluV1FlagCacheProjection) {
+    private func publish(_ projection: EluV1FlagCacheProjection, error: EluFeatureFlagSnapshot.LoadError? = nil) {
         lock.lock()
         guard !isShutDown, pendingFlagIntents.isEmpty, projection.authority.isCurrent() else { lock.unlock(); return }
         if let previous = flagCache?.snapshot.response {
@@ -790,21 +822,30 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
         }
         if projection.receivedFromRemote { flagsFromRemote = true }
         flagCache = projection
+        flagSnapshot = try? EluFeatureFlagSnapshot(response: projection.snapshot.response,
+            source: projection.receivedFromRemote ? .remote : .cache, error: error)
+        flagPublicationId = UUID()
         flagsLoadedState = true
         let generation = flagGeneration
+        let publication = flagPublicationLocked()
         lock.unlock()
+        if let publication { flagSnapshotDidLoad(publication) }
         notifyFlags { [weak self] in
             self?.withLock { self?.projectionIsCurrentLocked(projection, generation: generation) ?? false } ?? false
         }
     }
 
-    private func publishFlagsLoaded() {
+    private func publishFlagsLoaded(error: EluFeatureFlagSnapshot.LoadError? = nil, expectedGeneration: UUID? = nil) {
         lock.lock()
-        guard !isShutDown, pendingFlagIntents.isEmpty else { lock.unlock(); return }
+        guard !isShutDown, pendingFlagIntents.isEmpty,
+              expectedGeneration == nil || expectedGeneration == flagGeneration else { lock.unlock(); return }
         clearFlagsLocked()
         flagsLoadedState = true
+        flagSnapshot = EluFeatureFlagSnapshot(unavailable: error)
         let generation = flagGeneration
+        let publication = flagPublicationLocked()
         lock.unlock()
+        if let publication { flagSnapshotDidLoad(publication) }
         notifyFlags { [weak self] in
             self?.withLock { self?.flagGeneration == generation && self?.isShutDown == false && self?.pendingFlagIntents.isEmpty == true } ?? false
         }
@@ -831,6 +872,8 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
 
     private func clearFlagsLocked() {
         flagCache = nil
+        flagSnapshot = nil
+        flagPublicationId = UUID()
         flagsLoadedState = false
         flagsFromRemote = false
     }

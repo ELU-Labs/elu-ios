@@ -7,12 +7,12 @@ protocol EluV1FlagTransport: Sendable {
 }
 
 actor EluV1FlagClient {
-    private typealias ReloadContinuation = CheckedContinuation<EluV1FlagReloadResult, Never>
+    private typealias ReloadContinuation = CheckedContinuation<EluV1FlagReloadObservation, Never>
 
     private struct ActiveReload {
         let witnessHash: String?
         let generation: UUID
-        let task: Task<EluV1FlagReloadResult, Never>
+        let task: Task<EluV1FlagReloadObservation, Never>
         var waiters: [ReloadContinuation]
         var isInvalidated: Bool
     }
@@ -82,6 +82,10 @@ actor EluV1FlagClient {
     }
 
     func reload() async -> EluV1FlagReloadResult {
+        await reloadObservation().result
+    }
+
+    private func reloadObservation() async -> EluV1FlagReloadObservation {
         guard !closed, !configurationWithdrawn else { return .stale }
         let acceptedGeneration = generation
         let fingerprint = await runtime.flagWitnessFingerprint(versions: versions)
@@ -133,7 +137,7 @@ actor EluV1FlagClient {
         let runtime = self.runtime
         let transport = self.transport
         let versions = self.versions
-        let task = Task<EluV1FlagReloadResult, Never> {
+        let task = Task<EluV1FlagReloadObservation, Never> {
             await Self.performReload(
                 runtime: runtime,
                 transport: transport,
@@ -156,7 +160,7 @@ actor EluV1FlagClient {
 
     private func finishReload(
         generation: UUID,
-        result: EluV1FlagReloadResult
+        result: EluV1FlagReloadObservation
     ) {
         guard let completed = activeReload, completed.generation == generation else { return }
         activeReload = nil
@@ -236,17 +240,28 @@ actor EluV1FlagClient {
     }
 
     func reloadProjection() async -> EluV1FlagCacheProjection? {
+        await reloadProjectionObservation().projection
+    }
+
+    func reloadProjectionObservation() async -> EluV1FlagProjectionObservation {
         let acceptedGeneration = generation
-        let result = await reload()
+        let observation = await reloadObservation()
+        guard !closed, !configurationWithdrawn, generation == acceptedGeneration else {
+            return EluV1FlagProjectionObservation(projection: nil, error: nil)
+        }
         let snapshot: EluV1FlagCacheSnapshot
         let fromRemote: Bool
-        switch result {
+        switch observation.result {
         case let .updated(value): snapshot = value; fromRemote = true
         case let .cached(value): snapshot = value; fromRemote = false
-        default: return nil
+        default: return EluV1FlagProjectionObservation(projection: nil, error: observation.error)
         }
-        guard let projection = await readProjection(), generation == acceptedGeneration, projection.snapshot == snapshot else { return nil }
-        return fromRemote ? projection.markingRemoteResponse() : projection
+        guard let projection = await readProjection(), generation == acceptedGeneration,
+              projection.snapshot == snapshot else {
+            return EluV1FlagProjectionObservation(projection: nil, error: nil)
+        }
+        return EluV1FlagProjectionObservation(
+            projection: fromRemote ? projection.markingRemoteResponse() : projection, error: observation.error)
     }
 
     private static func performReload(
@@ -254,7 +269,7 @@ actor EluV1FlagClient {
         transport: any EluV1FlagTransport,
         versions: EluVersionContext,
         requestId: String
-    ) async -> EluV1FlagReloadResult {
+    ) async -> EluV1FlagReloadObservation {
         let begun = await runtime.beginFlagReload(
             requestId: requestId,
             versions: versions
@@ -298,7 +313,7 @@ actor EluV1FlagClient {
             }
         } catch {
             if Task.isCancelled { return .stale }
-            return await retainedCache(runtime: runtime, versions: versions, expected: request.token)
+            return await retainedCache(runtime: runtime, versions: versions, expected: request.token, error: .transport)
         }
         guard !Task.isCancelled else { return .stale }
 
@@ -309,7 +324,7 @@ actor EluV1FlagClient {
                 for: request.request
             )
         } catch {
-            return await retainedCache(runtime: runtime, versions: versions, expected: request.token)
+            return await retainedCache(runtime: runtime, versions: versions, expected: request.token, error: .invalidResponse)
         }
 
         switch await runtime.commitFlagReload(token: request.token, response: response) {
@@ -335,14 +350,17 @@ actor EluV1FlagClient {
     private static func retainedCache(
         runtime: EluSQLiteRuntimeQueue,
         versions: EluVersionContext,
-        expected: EluV1FlagBeginToken
-    ) async -> EluV1FlagReloadResult {
+        expected: EluV1FlagBeginToken,
+        error: EluFeatureFlagSnapshot.LoadError
+    ) async -> EluV1FlagReloadObservation {
         guard await runtime.authorizeFlagSend(token: expected) == .allowed else { return .stale }
         switch await runtime.readFlagCache(versions: versions) {
-        case let .hit(snapshot): return snapshot.witness == expected.witness ? .cached(snapshot) : .stale
+        case let .hit(snapshot): return snapshot.witness == expected.witness ? EluV1FlagReloadObservation(.cached(snapshot), error: error) : .stale
         case let .restricted(reason): return .restricted(reason)
         case .terminal: return .terminal
-        case .miss: return .stale
+        case .miss:
+            guard await runtime.authorizeFlagSend(token: expected) == .allowed else { return .stale }
+            return EluV1FlagReloadObservation(.stale, error: error)
         }
     }
 }

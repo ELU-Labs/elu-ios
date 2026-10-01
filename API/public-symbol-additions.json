@@ -331,6 +331,166 @@
     {
       "kind": "swift.init",
       "name": "EluFeatureFlagOptions.init(sendEvent:fresh:)"
+    },
+    {
+      "kind": "swift.type.method",
+      "name": "Elu.featureFlagSnapshot()"
+    },
+    {
+      "kind": "swift.type.method",
+      "name": "Elu.subscribeToFeatureFlags(_:)"
+    },
+    {
+      "kind": "swift.struct",
+      "name": "EluFeatureFlagSnapshot"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluFeatureFlagSnapshot.source"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluFeatureFlagSnapshot.error"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluFeatureFlagSnapshot.entries"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluFeatureFlagSnapshot.flagsJSON"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluFeatureFlagSnapshot.payloadsJSON"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluFeatureFlagSnapshot.requestId"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluFeatureFlagSnapshot.flagsRevision"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluFeatureFlagSnapshot.evaluatedAt"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluFeatureFlagSnapshot.expiresAt"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluFeatureFlagSnapshot.isAvailable"
+    },
+    {
+      "kind": "swift.method",
+      "name": "EluFeatureFlagSnapshot.entry(forKey:)"
+    },
+    {
+      "kind": "swift.enum",
+      "name": "EluFeatureFlagSnapshot.Source"
+    },
+    {
+      "kind": "swift.enum.case",
+      "name": "EluFeatureFlagSnapshot.Source.remote"
+    },
+    {
+      "kind": "swift.enum.case",
+      "name": "EluFeatureFlagSnapshot.Source.cache"
+    },
+    {
+      "kind": "swift.enum.case",
+      "name": "EluFeatureFlagSnapshot.Source.unavailable"
+    },
+    {
+      "kind": "swift.typealias",
+      "name": "EluFeatureFlagSnapshot.Source.RawValue"
+    },
+    {
+      "kind": "swift.init",
+      "name": "EluFeatureFlagSnapshot.Source.init(rawValue:)"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluFeatureFlagSnapshot.Source.rawValue"
+    },
+    {
+      "kind": "swift.func.op",
+      "name": "EluFeatureFlagSnapshot.Source.!=(_:_:)"
+    },
+    {
+      "kind": "swift.enum",
+      "name": "EluFeatureFlagSnapshot.LoadError"
+    },
+    {
+      "kind": "swift.enum.case",
+      "name": "EluFeatureFlagSnapshot.LoadError.transport"
+    },
+    {
+      "kind": "swift.enum.case",
+      "name": "EluFeatureFlagSnapshot.LoadError.invalidResponse"
+    },
+    {
+      "kind": "swift.typealias",
+      "name": "EluFeatureFlagSnapshot.LoadError.RawValue"
+    },
+    {
+      "kind": "swift.init",
+      "name": "EluFeatureFlagSnapshot.LoadError.init(rawValue:)"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluFeatureFlagSnapshot.LoadError.rawValue"
+    },
+    {
+      "kind": "swift.func.op",
+      "name": "EluFeatureFlagSnapshot.LoadError.!=(_:_:)"
+    },
+    {
+      "kind": "swift.struct",
+      "name": "EluFeatureFlagSnapshot.Entry"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluFeatureFlagSnapshot.Entry.key"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluFeatureFlagSnapshot.Entry.value"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluFeatureFlagSnapshot.Entry.payloadJSON"
+    },
+    {
+      "kind": "swift.enum",
+      "name": "EluFeatureFlagSnapshot.Entry.Value"
+    },
+    {
+      "kind": "swift.enum.case",
+      "name": "EluFeatureFlagSnapshot.Entry.Value.bool(_:)"
+    },
+    {
+      "kind": "swift.enum.case",
+      "name": "EluFeatureFlagSnapshot.Entry.Value.string(_:)"
+    },
+    {
+      "kind": "swift.enum.case",
+      "name": "EluFeatureFlagSnapshot.Entry.Value.number(_:)"
+    },
+    {
+      "kind": "swift.enum.case",
+      "name": "EluFeatureFlagSnapshot.Entry.Value.null"
+    },
+    {
+      "kind": "swift.class",
+      "name": "EluFeatureFlagSubscription"
+    },
+    {
+      "kind": "swift.method",
+      "name": "EluFeatureFlagSubscription.cancel()"
     }
   ]
 }

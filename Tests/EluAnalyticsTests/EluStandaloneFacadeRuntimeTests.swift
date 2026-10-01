@@ -423,6 +423,101 @@ final class EluStandaloneFacadeRuntimeTests: XCTestCase {
         }
     }
 
+    func testFullFlagPublicationIsQuietAndOriginalIntentRevokesIt() async throws {
+        try await withTemporaryDirectory { root in
+            let publications = FacadePublications()
+            let harness = try await makeHarness(root: root, flagTransport: FacadeFlagTransport(), snapshotObserver: { publications.append($0) })
+            XCTAssertNil(harness.backend.featureFlagPublication())
+            harness.backend.activate(); await harness.backend.settled()
+            let publication = try XCTUnwrap(harness.backend.featureFlagPublication())
+            XCTAssertTrue(publication.isCurrent())
+            XCTAssertEqual(publication.snapshot.source, .remote)
+            XCTAssertEqual(publication.snapshot.entries.count, 3)
+            XCTAssertNil(publication.snapshot.error)
+            XCTAssertEqual(publications.values().count, 1)
+            for _ in 0 ..< 3 { _ = harness.backend.featureFlagPublication() }
+            _ = await harness.runtime.flush()
+            let exposures = try await harness.transport.recordedEvents().filter { $0["name"] as? String == "$feature_flag_called" }
+            XCTAssertTrue(exposures.isEmpty)
+            let finish = harness.backend.beginPendingOperation(.reset)
+            XCTAssertFalse(publication.isCurrent())
+            XCTAssertNil(harness.backend.featureFlagPublication())
+            finish?()
+            XCTAssertFalse(publication.isCurrent(), "Released intent cannot revive an old publication")
+            XCTAssertEqual(publication.snapshot.entries.count, 3, "Detached historical data stays immutable")
+            await harness.close()
+        }
+    }
+
+    func testCachePublicationCarriesOnlyActualReloadFailureAndSuccessClearsIt() async throws {
+        try await withTemporaryDirectory { root in
+            let transport = FacadeFlagTransport()
+            let first = try await makeHarness(root: root, flagTransport: transport)
+            first.backend.activate(); await first.backend.settled(); await first.close()
+            await transport.setFailing(true)
+            let publications = FacadePublications()
+            let reopened = try await makeHarness(root: root, flagTransport: transport, snapshotObserver: { publications.append($0) })
+            reopened.backend.activate(); await reopened.backend.settled()
+            let observed = publications.values()
+            XCTAssertEqual(observed.count, 2)
+            XCTAssertEqual(observed.first?.snapshot.source, .cache)
+            XCTAssertNil(observed.first?.snapshot.error, "Startup cache is not a failed reload")
+            XCTAssertEqual(observed.last?.snapshot.error, .transport)
+            XCTAssertEqual(observed.last?.snapshot.source, .cache)
+            XCTAssertFalse(observed[0].isCurrent(), "Later publication retires queued earlier metadata")
+            XCTAssertTrue(observed[1].isCurrent())
+            await transport.setFailing(false); await transport.setMalformed(true)
+            reopened.backend.reloadFeatureFlags(nil); await reopened.backend.settled()
+            XCTAssertEqual(reopened.backend.featureFlagPublication()?.snapshot.error, .invalidResponse)
+            XCTAssertEqual(reopened.backend.featureFlagPublication()?.snapshot.source, .cache)
+            await transport.setMalformed(false)
+            reopened.backend.reloadFeatureFlags(nil); await reopened.backend.settled()
+            XCTAssertEqual(reopened.backend.featureFlagPublication()?.snapshot.source, .remote)
+            XCTAssertNil(reopened.backend.featureFlagPublication()?.snapshot.error)
+            XCTAssertFalse(observed[1].isCurrent())
+            await reopened.close()
+        }
+    }
+
+    func testSupersededPhysicalFailureCannotPublishErrorForNewIdentity() async throws {
+        try await withTemporaryDirectory { root in
+            let sent = expectation(description: "original send")
+            let transport = SnapshotHeldFailureTransport { sent.fulfill() }
+            let publications = FacadePublications()
+            let harness = try await makeHarness(root: root, flagTransport: transport, snapshotObserver: { publications.append($0) })
+            harness.backend.activate()
+            await fulfillment(of: [sent], timeout: 5)
+            let finish = harness.backend.beginPendingOperation(.reset)
+            await transport.release()
+            await harness.backend.settled()
+            XCTAssertTrue(publications.values().isEmpty)
+            XCTAssertNil(harness.backend.featureFlagPublication())
+            finish?()
+            XCTAssertNil(harness.backend.featureFlagPublication())
+            await harness.close()
+        }
+    }
+
+    func testFailedReloadWithoutCachePublishesUnavailableMetadataOnly() async throws {
+        try await withTemporaryDirectory { root in
+            let transport = FacadeFlagTransport()
+            await transport.setFailing(true)
+            let harness = try await makeHarness(root: root, flagTransport: transport)
+            harness.backend.activate(); await harness.backend.settled()
+            let transportFailure = try XCTUnwrap(harness.backend.featureFlagPublication())
+            XCTAssertTrue(transportFailure.isCurrent())
+            XCTAssertEqual(transportFailure.snapshot.source, .unavailable)
+            XCTAssertEqual(transportFailure.snapshot.error, .transport)
+            XCTAssertTrue(transportFailure.snapshot.entries.isEmpty)
+            XCTAssertNil(transportFailure.snapshot.requestId)
+            await transport.setFailing(false); await transport.setMalformed(true)
+            harness.backend.reloadFeatureFlags(nil); await harness.backend.settled()
+            XCTAssertEqual(harness.backend.featureFlagPublication()?.snapshot.error, .invalidResponse)
+            XCTAssertFalse(transportFailure.isCurrent())
+            await harness.close()
+        }
+    }
+
     func testFlagReadOptionsSuppressExposureWithoutConsumingItsDurableEntry() async throws {
         try await withTemporaryDirectory { root in
             let harness = try await makeHarness(root: root, flagTransport: FacadeFlagTransport())
@@ -808,18 +903,35 @@ final class EluStandaloneFacadeRuntimeTests: XCTestCase {
             XCTAssertTrue(beforeSend.isEmpty)
             await harness.close()
 
-            let reopened = try await makeHarness(root: root)
-            let restored = try await reopened.runtime.queueSnapshot()
-            XCTAssertEqual(restored.queuedCount, 1)
-            XCTAssertEqual(restored.identity, saved.identity)
-            _ = await reopened.runtime.flush()
-            let events = try await reopened.transport.recordedEvents()
-            XCTAssertEqual(events.count, 1)
-            let event = try XCTUnwrap(events.first)
-            XCTAssertEqual(event["name"] as? String, "explicit-time")
-            XCTAssertEqual(event["occurredAt"] as? String, EluRFC3339.string(from: timestamp))
-            XCTAssertEqual((event["properties"] as? [String: Any])?["amount"] as? Int, 42)
-            await reopened.close()
+            // Configuration can automatically drain a reopened backlog. Hold
+            // its original transport until the durable restoration is observed.
+            let transport = FacadeBatchTransport(held: true)
+            let reopened = try await makeHarness(root: root, batchTransport: transport)
+            do {
+                let restored = try await reopened.runtime.queueSnapshot()
+                XCTAssertEqual(restored.queuedCount, 1)
+                XCTAssertEqual(restored.identity, saved.identity)
+                await transport.release()
+                _ = await reopened.runtime.flush() // May lawfully coalesce with the automatic pass.
+                let deadline = DispatchTime.now().uptimeNanoseconds + 5_000_000_000
+                var drained = false
+                while DispatchTime.now().uptimeNanoseconds < deadline {
+                    if try await reopened.runtime.queueSnapshot().queuedCount == 0 { drained = true; break }
+                    try await Task.sleep(nanoseconds: 10_000_000)
+                }
+                XCTAssertTrue(drained, "Join actual accepted-prefix retirement before examining delivery")
+                let events = try await reopened.transport.recordedEvents()
+                XCTAssertEqual(events.count, 1)
+                let event = try XCTUnwrap(events.first)
+                XCTAssertEqual(event["name"] as? String, "explicit-time")
+                XCTAssertEqual(event["occurredAt"] as? String, EluRFC3339.string(from: timestamp))
+                XCTAssertEqual((event["properties"] as? [String: Any])?["amount"] as? Int, 42)
+                await reopened.close()
+            } catch {
+                await transport.release()
+                await reopened.close()
+                throw error
+            }
         }
     }
 
@@ -871,9 +983,11 @@ final class EluStandaloneFacadeRuntimeTests: XCTestCase {
         document: Data? = nil,
         flagTransport: (any EluV1FlagTransport)? = nil,
         initialConsent: EluConsentOperation? = nil,
-        personProfiles: EluPersonProfilesMode = .identifiedOnly
+        personProfiles: EluPersonProfilesMode = .identifiedOnly,
+        snapshotObserver: @escaping @Sendable (EluFeatureFlagPublication) -> Void = { _ in },
+        batchTransport: FacadeBatchTransport? = nil
     ) async throws -> Harness {
-        let transport = FacadeBatchTransport()
+        let transport = batchTransport ?? FacadeBatchTransport()
         let clock = FacadeClock(wall: baseDate)
         let identifiers = FacadeCounter()
         let runtime = try await EluStandaloneRuntime.make(
@@ -907,7 +1021,8 @@ final class EluStandaloneFacadeRuntimeTests: XCTestCase {
             isNewUser: true,
             flagsDidLoad: { _ = announcements.next() },
             personProfiles: personProfiles,
-            initialConsent: initialConsent
+            initialConsent: initialConsent,
+            flagSnapshotDidLoad: snapshotObserver
         )
         let backend = EluStandaloneFacadeRuntime(
             context: context,
@@ -959,8 +1074,13 @@ private actor BootstrapConfigTransport: EluV2ConfigTransport {
 /// Accepts every batch and keeps the records it was handed.
 actor FacadeBatchTransport: EluV1BatchHTTPTransport {
     private var requests: [EluV1BatchHTTPRequest] = []
+    private var held: Bool
+    private var waiting: CheckedContinuation<Void, Never>?
+    init(held: Bool = false) { self.held = held }
+    func release() { held = false; let original = waiting; waiting = nil; original?.resume() }
 
     func send(_ request: EluV1BatchHTTPRequest) async throws -> EluV1BatchHTTPResponse {
+        if held { await withCheckedContinuation { waiting = $0 } }
         requests.append(request)
         guard let root = try JSONSerialization.jsonObject(with: request.body) as? [String: Any],
               let requestId = root["requestId"] as? String,
@@ -1019,6 +1139,7 @@ actor FacadeBatchTransport: EluV1BatchHTTPTransport {
 actor FacadeFlagTransport: EluV1FlagTransport {
     private var calls = 0
     private var failing = false
+    private var malformed = false
     private let evaluatedAt: String
 
     init(evaluatedAt: String = "2026-08-04T00:01:01.000Z") {
@@ -1026,10 +1147,12 @@ actor FacadeFlagTransport: EluV1FlagTransport {
     }
 
     func setFailing(_ value: Bool) { failing = value }
+    func setMalformed(_ value: Bool) { malformed = value }
 
     func send(endpoint: URL, requestBody: Data) async throws -> Data {
         calls += 1
         if failing { throw URLError(.notConnectedToInternet) }
+        if malformed { return Data("not valid JSON".utf8) }
         guard let request = try JSONSerialization.jsonObject(with: requestBody) as? [String: Any],
               let identity = request["identity"] as? [String: Any]
         else {
@@ -1115,4 +1238,28 @@ final class FacadeCounter: @unchecked Sendable {
         defer { lock.unlock() }
         return count
     }
+}
+
+private final class FacadePublications: @unchecked Sendable {
+    private let lock = NSLock()
+    private var retained: [EluFeatureFlagPublication] = []
+    func append(_ value: EluFeatureFlagPublication) { lock.lock(); retained.append(value); lock.unlock() }
+    func values() -> [EluFeatureFlagPublication] { lock.lock(); defer { lock.unlock() }; return retained }
+}
+
+private actor SnapshotHeldFailureTransport: EluV1FlagTransport {
+    private let sent: @Sendable () -> Void
+    private var held: CheckedContinuation<Void, Never>?
+    private var released = false
+    init(sent: @escaping @Sendable () -> Void) { self.sent = sent }
+    func send(endpoint: URL, requestBody: Data) async throws -> Data {
+        if !released {
+            await withCheckedContinuation { continuation in
+                held = continuation
+                sent()
+            }
+        }
+        throw URLError(.notConnectedToInternet)
+    }
+    func release() { released = true; let value = held; held = nil; value?.resume() }
 }

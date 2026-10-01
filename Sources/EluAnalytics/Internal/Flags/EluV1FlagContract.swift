@@ -530,6 +530,25 @@ enum EluV1FlagReloadResult: Equatable, Sendable {
     case terminal
 }
 
+/// Error metadata belongs to this physical reload, never a mutable latest-error slot.
+struct EluV1FlagReloadObservation: Sendable {
+    let result: EluV1FlagReloadResult
+    let error: EluFeatureFlagSnapshot.LoadError?
+    init(_ result: EluV1FlagReloadResult, error: EluFeatureFlagSnapshot.LoadError? = nil) {
+        self.result = result
+        self.error = error
+    }
+    static var stale: Self { Self(.stale) }
+    static var terminal: Self { Self(.terminal) }
+    static func restricted(_ reason: EluV1FlagRestriction) -> Self { Self(.restricted(reason)) }
+    static func updated(_ value: EluV1FlagCacheSnapshot) -> Self { Self(.updated(value)) }
+}
+
+struct EluV1FlagProjectionObservation: Sendable {
+    let projection: EluV1FlagCacheProjection?
+    let error: EluFeatureFlagSnapshot.LoadError?
+}
+
 enum EluV1FlagCodec {
     static let schemaVersion: Int64 = 1
 

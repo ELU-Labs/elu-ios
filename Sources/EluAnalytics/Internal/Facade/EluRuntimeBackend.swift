@@ -46,6 +46,7 @@ protocol EluRuntimeBackend: AnyObject {
     var flagsAreLoaded: Bool { get }
     /// Captures the original projection for a callback that may run later.
     func flagNotificationPredicate() -> (@Sendable () -> Bool)?
+    func featureFlagPublication() -> EluFeatureFlagPublication?
     /// Synchronous intent before the core queue hop. Completion transfers
     /// protection to execute's own ordered work, or releases a discarded call.
     func beginPendingOperation(_ op: EluBufferedOp) -> (() -> Void)?
@@ -105,6 +106,7 @@ struct EluRuntimeBackendContext {
     /// configuration or lifecycle work can authorize collection.
     let initialConsent: EluConsentOperation?
     let guardedFlagsDidLoad: @Sendable (@escaping @Sendable () -> Bool) -> Void
+    let flagSnapshotDidLoad: @Sendable (EluFeatureFlagPublication) -> Void
     let initialConfigurationReady: @Sendable (@escaping @Sendable () -> Bool) -> Void
 
     init(siteKey: String, config: EluRemoteConfig? = nil, configDocument: Data? = nil,
@@ -119,6 +121,7 @@ struct EluRuntimeBackendContext {
          rateLimiting: EluRateLimitingOptions = .init(),
          initialConsent: EluConsentOperation? = nil,
          guardedFlagsDidLoad: (@Sendable (@escaping @Sendable () -> Bool) -> Void)? = nil,
+         flagSnapshotDidLoad: @escaping @Sendable (EluFeatureFlagPublication) -> Void = { _ in },
          initialConfigurationReady: @escaping @Sendable (@escaping @Sendable () -> Bool) -> Void = { _ in }) {
         self.siteKey = siteKey
         self.config = config
@@ -137,6 +140,7 @@ struct EluRuntimeBackendContext {
         self.guardedFlagsDidLoad = guardedFlagsDidLoad ?? { predicate in
             if predicate() { flagsDidLoad() }
         }
+        self.flagSnapshotDidLoad = flagSnapshotDidLoad
         self.initialConfigurationReady = initialConfigurationReady
     }
 }
@@ -150,6 +154,7 @@ struct EluRuntimeBackendFactory {
 // Simple injected test backends have no retained projection. The owned
 // backend overrides both methods with original guards.
 extension EluRuntimeBackend {
+    func featureFlagPublication() -> EluFeatureFlagPublication? { nil }
     func groups() -> [String: String] { [:] }
     func isOptedOut() -> Bool { false }
     func featureFlagResult(_ key: String) -> EluFeatureFlagResult? { nil }

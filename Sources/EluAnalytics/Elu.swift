@@ -202,6 +202,18 @@ public enum Elu {
         EluCore.shared.onFeatureFlagsLoaded(callback)
     }
 
+    /// Quiet current snapshot; nil means unavailable, while an empty snapshot
+    /// is a valid evaluation. Reading does not emit flag exposure events.
+    public static func featureFlagSnapshot() -> EluFeatureFlagSnapshot? {
+        EluCore.shared.featureFlagSnapshot()
+    }
+
+    /// Main-queue snapshots from the original load path. Retain the returned
+    /// token; cancellation or token deinit stops callbacks not yet admitted.
+    public static func subscribeToFeatureFlags(_ callback: @escaping (EluFeatureFlagSnapshot) -> Void) -> EluFeatureFlagSubscription {
+        EluCore.shared.subscribeToFeatureFlags(callback)
+    }
+
     public static func setPersonPropertiesForFlags(_ properties: [String: Any]) {
         EluCore.shared.dispatch(.setPersonPropertiesForFlags(properties))
     }

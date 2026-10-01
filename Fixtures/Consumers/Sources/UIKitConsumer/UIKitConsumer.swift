@@ -3,6 +3,7 @@ import EluAnalytics
 import UIKit
 
 public final class FixtureAppDelegate: NSObject, UIApplicationDelegate {
+    private var flagSubscription: EluFeatureFlagSubscription?
     public func application(
         _ application: UIApplication,
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
@@ -13,6 +14,14 @@ public final class FixtureAppDelegate: NSObject, UIApplicationDelegate {
         _ = Elu.getFeatureFlag("checkout", options: flags)
         _ = Elu.getFeatureFlagResult("checkout", options: flags)
         let _: Bool? = Elu.isFeatureEnabled("checkout", options: flags, defaultValue: false)
+        flagSubscription = Elu.subscribeToFeatureFlags { snapshot in
+            let _: EluFeatureFlagSnapshot.Source = snapshot.source
+            let _: EluFeatureFlagSnapshot.LoadError? = snapshot.error
+            let _: EluFeatureFlagSnapshot.Entry? = snapshot.entry(forKey: "checkout")
+            _ = snapshot.flagsJSON
+            _ = snapshot.payloadsJSON
+        }
+        _ = Elu.featureFlagSnapshot()
         return true
     }
 

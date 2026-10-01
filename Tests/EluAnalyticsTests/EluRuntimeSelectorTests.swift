@@ -322,6 +322,69 @@ final class EluRuntimeSelectorTests: XCTestCase {
         wait(for: [fired], timeout: 5)
     }
 
+    func testSnapshotGetterDistinguishesUnavailableFromValidEmptyAndDoesNotReadFlags() throws {
+        let factory = SelectorSpy(), core = EluCore(backendFactory: factory.factory)
+        XCTAssertNil(core.featureFlagSnapshot())
+        core.setup(siteKey: uniqueSiteKey(), options: EluSetupOptions(configHost: inertConfigHost))
+        let backend = try XCTUnwrap(core.backendForTesting() as? SelectorBackend)
+        backend.announceConfigurationReady(); drain(core)
+        backend.publishSnapshot(EluFeatureFlagPublication(snapshot: .init(unavailable: .transport), isCurrent: { true }))
+        drain(core)
+        XCTAssertNil(core.featureFlagSnapshot())
+        let empty = try selectorEmptySnapshot()
+        backend.publishSnapshot(.init(snapshot: empty, isCurrent: { true })); drain(core)
+        XCTAssertEqual(core.featureFlagSnapshot()?.source, .remote)
+        XCTAssertEqual(core.featureFlagSnapshot()?.entries.count, 0)
+        XCTAssertEqual(backend.recordedCalls(), ["activate"], "Enumeration must not use exposure-producing getters")
+    }
+
+    func testSubscriptionCancellationBeforeSetupAndQueuedImmediateDelivery() throws {
+        let factory = SelectorSpy(), core = EluCore(backendFactory: factory.factory)
+        let absent = expectation(description: "cancelled callback"); absent.isInverted = true
+        let early = core.subscribeToFeatureFlags { _ in absent.fulfill() }
+        early.cancel()
+        core.setup(siteKey: uniqueSiteKey(), options: EluSetupOptions(configHost: inertConfigHost))
+        let backend = try XCTUnwrap(core.backendForTesting() as? SelectorBackend)
+        backend.announceConfigurationReady(); drain(core)
+        backend.publishSnapshot(.init(snapshot: try selectorEmptySnapshot(), isCurrent: { true })); drain(core)
+        let late = core.subscribeToFeatureFlags { _ in absent.fulfill() }
+        drain(core) // Immediate publication is enqueued, not yet run on main.
+        late.cancel()
+        wait(for: [absent], timeout: 0.1)
+        withExtendedLifetime([early, late]) {}
+    }
+
+    func testSubscriptionsDeliverOriginalSnapshotAndRecheckFenceDuringCallbacks() throws {
+        let factory = SelectorSpy(), core = EluCore(backendFactory: factory.factory)
+        core.setup(siteKey: uniqueSiteKey(), options: EluSetupOptions(configHost: inertConfigHost))
+        let backend = try XCTUnwrap(core.backendForTesting() as? SelectorBackend)
+        backend.announceConfigurationReady(); drain(core)
+        let fence = SelectorPublicationFence()
+        let first = expectation(description: "first snapshot")
+        let stale = expectation(description: "second stale snapshot"); stale.isInverted = true
+        let one = core.subscribeToFeatureFlags { snapshot in
+            XCTAssertTrue(Thread.isMainThread)
+            XCTAssertEqual(snapshot.source, .unavailable)
+            XCTAssertEqual(snapshot.error, .invalidResponse)
+            fence.invalidate(); first.fulfill()
+        }
+        let two = core.subscribeToFeatureFlags { _ in stale.fulfill() }
+        drain(core)
+        backend.publishSnapshot(.init(snapshot: .init(unavailable: .invalidResponse), isCurrent: { fence.current }))
+        drain(core)
+        wait(for: [first, stale], timeout: 0.1)
+        XCTAssertNil(core.featureFlagSnapshot())
+        withExtendedLifetime([one, two]) {}
+    }
+
+    private func selectorEmptySnapshot() throws -> EluFeatureFlagSnapshot {
+        try EluFeatureFlagSnapshot(response: EluV1FlagResponse(requestId: "selector_request", contextRevision: 1,
+            identityRevision: 1, flagsRevision: "selector_revision",
+            evaluatedAt: EluV1StoredTimestamp(try EluV1Timestamp("2026-08-04T00:01:01Z")),
+            expiresAt: EluV1StoredTimestamp(try EluV1Timestamp("2026-08-04T00:04:00Z")), flags: [], payloads: []),
+            source: .remote, error: nil)
+    }
+
     // MARK: - Helpers
 
     private static let everyMethodInCallOrder = [
@@ -456,6 +519,7 @@ final class SelectorSpy: @unchecked Sendable {
             let backend = SelectorBackend(
                 selection: selection,
                 flagsDidLoad: context.flagsDidLoad,
+                snapshotDidLoad: context.flagSnapshotDidLoad,
                 configurationReady: context.initialConfigurationReady
             )
             backends[selection] = backend
@@ -484,6 +548,8 @@ final class SelectorBackend: EluRuntimeBackend, @unchecked Sendable {
 
     private let lock = NSLock()
     private let flagsDidLoad: () -> Void
+    private let snapshotDidLoad: @Sendable (EluFeatureFlagPublication) -> Void
+    private var publication: EluFeatureFlagPublication?
     private let configurationReady: (@escaping @Sendable () -> Bool) -> Void
     private var calls: [String] = []
     private var shutDowns = 0
@@ -493,10 +559,21 @@ final class SelectorBackend: EluRuntimeBackend, @unchecked Sendable {
     private var optedOut = false
 
     init(selection: EluRuntimeSelection, flagsDidLoad: @escaping () -> Void,
+         snapshotDidLoad: @escaping @Sendable (EluFeatureFlagPublication) -> Void = { _ in },
          configurationReady: @escaping (@escaping @Sendable () -> Bool) -> Void = { _ in }) {
         self.selection = selection
         self.flagsDidLoad = flagsDidLoad
+        self.snapshotDidLoad = snapshotDidLoad
         self.configurationReady = configurationReady
+    }
+
+    func featureFlagPublication() -> EluFeatureFlagPublication? {
+        lock.lock(); defer { lock.unlock() }; return publication
+    }
+
+    func publishSnapshot(_ value: EluFeatureFlagPublication) {
+        lock.lock(); publication = value; lock.unlock()
+        snapshotDidLoad(value)
     }
 
     func announceConfigurationReady(ifCurrent: @escaping @Sendable () -> Bool = { true }) {
@@ -658,4 +735,11 @@ private final class SelectorReplayControl: EluReplayControl {
     func replayIsActive() -> Bool { active }
     func startReplay() { commands.append(true) }
     func stopReplay() { commands.append(false); active = false }
+}
+
+private final class SelectorPublicationFence: @unchecked Sendable {
+    private let lock = NSLock()
+    private var valid = true
+    var current: Bool { lock.lock(); defer { lock.unlock() }; return valid }
+    func invalidate() { lock.lock(); valid = false; lock.unlock() }
 }

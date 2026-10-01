@@ -41,6 +41,7 @@ final class EluCore {
     private let backendFactory: EluRuntimeBackendFactory
 
     private var flagCallbacks = EluCallbackRegistry()
+    private var flagSubscriptions = EluFeatureFlagSubscriptionRegistry()
 
     init(backendFactory: EluRuntimeBackendFactory = EluCore.defaultBackendFactory) {
         self.backendFactory = backendFactory
@@ -109,6 +110,12 @@ final class EluCore {
                 self?.dispatchFlagNotification(ifCurrent: { true })
             }, configHost: configHost, endpointPolicy: endpointPolicy, performance: performance, diagnostics: diagnostics, declaredRegionReplayEnabled: declaredRegionReplayEnabled, personProfiles: personProfiles, persistence: persistence, rateLimiting: rateLimiting, initialConsent: initialConsent, guardedFlagsDidLoad: { [weak self] predicate in
                 self?.dispatchFlagNotification(ifCurrent: predicate)
+            }, flagSnapshotDidLoad: { [weak self] publication in
+                guard let self else { return }
+                self.queue.async {
+                    guard self.state == .running, publication.isCurrent() else { return }
+                    self.flagSubscriptions.dispatch(publication, on: .main)
+                }
             }, initialConfigurationReady: { [weak self] predicate in
                 guard let self else { return }
                 self.queue.async {
@@ -298,6 +305,30 @@ final class EluCore {
     /// Test seam: pre-config calls the buffer cap discarded.
     func bufferDropCountForTesting() -> Int {
         queue.sync { buffer.droppedCount }
+    }
+
+    func featureFlagSnapshot() -> EluFeatureFlagSnapshot? {
+        queue.sync {
+            guard state == .running, let publication = backend?.featureFlagPublication(),
+                  publication.isCurrent(), publication.snapshot.isAvailable else { return nil }
+            return publication.snapshot
+        }
+    }
+
+    func subscribeToFeatureFlags(_ callback: @escaping (EluFeatureFlagSnapshot) -> Void) -> EluFeatureFlagSubscription {
+        let id = UUID()
+        let cancellation = EluFeatureFlagCancellation()
+        let registration = EluFeatureFlagSubscriptionRegistry.Registration(id: id, cancellation: cancellation, callback: callback)
+        let token = EluFeatureFlagSubscription(state: cancellation) { [weak self] in
+            self?.queue.async { [weak self] in self?.flagSubscriptions.remove(id) }
+        }
+        queue.async { [self] in
+            flagSubscriptions.append(registration)
+            if state == .running, let publication = backend?.featureFlagPublication() {
+                DispatchQueue.main.async { registration.deliver(publication) }
+            }
+        }
+        return token
     }
 
     func onFeatureFlagsLoaded(_ callback: @escaping () -> Void) {
