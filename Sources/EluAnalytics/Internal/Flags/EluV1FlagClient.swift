@@ -1,18 +1,18 @@
 import Foundation
 
-/// Test/integration boundary only. This module deliberately ships no concrete
-/// conformer and performs no network construction.
+/// Internal injected transport boundary. Concrete transports are constructed
+/// only by the separately selected runtime composition.
 protocol EluV1FlagTransport: Sendable {
     func send(endpoint: URL, requestBody: Data) async throws -> Data
 }
 
 actor EluV1FlagClient {
-    private typealias ReloadContinuation = CheckedContinuation<EluV1FlagReloadResult, Never>
+    private typealias ReloadContinuation = CheckedContinuation<EluV1FlagReloadObservation, Never>
 
     private struct ActiveReload {
         let witnessHash: String?
         let generation: UUID
-        let task: Task<EluV1FlagReloadResult, Never>
+        let task: Task<EluV1FlagReloadObservation, Never>
         var waiters: [ReloadContinuation]
         var isInvalidated: Bool
     }
@@ -28,6 +28,9 @@ actor EluV1FlagClient {
     private let requestIdGenerator: @Sendable () -> String
     private var activeReload: ActiveReload?
     private var pendingReload: PendingReload?
+    private var generation = UUID()
+    private var closed = false
+    private var configurationWithdrawn = false
 
     private init(
         runtime: EluSQLiteRuntimeQueue,
@@ -58,17 +61,35 @@ actor EluV1FlagClient {
         )
     }
 
-    func applyConfig(_ data: Data) async -> EluV1FlagAuthorization {
+    func applyConfig(_ data: Data, sourceWitness: EluV2ConfigAuthorityWitness? = nil) async -> EluV1FlagAuthorization {
+        guard !closed else { return .restricted(.missing) }
+        generation = UUID()
+        let acceptedGeneration = generation
+        configurationWithdrawn = true
+        let intent = runtime.beginFlagProjectionIntent()
+        defer { runtime.finishFlagProjectionIntent(intent) }
         invalidateActiveReload()
         if let pendingReload {
             pendingReload.waiters.forEach { $0.resume(returning: .stale) }
             self.pendingReload = nil
         }
-        return await runtime.submitFlagConfig(data)
+        let result = await runtime.submitFlagConfig(data, sourceWitness: sourceWitness)
+        guard !closed, generation == acceptedGeneration else { return .restricted(.missing) }
+        // Preserve the owner's terminal/revoked/opaque-storage classifications.
+        // Missing source alone stays withdrawn until an explicit current apply.
+        configurationWithdrawn = result == .restricted(.missing)
+        return result
     }
 
     func reload() async -> EluV1FlagReloadResult {
+        await reloadObservation().result
+    }
+
+    private func reloadObservation() async -> EluV1FlagReloadObservation {
+        guard !closed, !configurationWithdrawn else { return .stale }
+        let acceptedGeneration = generation
         let fingerprint = await runtime.flagWitnessFingerprint(versions: versions)
+        guard !closed, generation == acceptedGeneration else { return .stale }
         return await withCheckedContinuation { continuation in
             enqueueReload(fingerprint: fingerprint, continuation: continuation)
         }
@@ -116,7 +137,7 @@ actor EluV1FlagClient {
         let runtime = self.runtime
         let transport = self.transport
         let versions = self.versions
-        let task = Task<EluV1FlagReloadResult, Never> {
+        let task = Task<EluV1FlagReloadObservation, Never> {
             await Self.performReload(
                 runtime: runtime,
                 transport: transport,
@@ -139,7 +160,7 @@ actor EluV1FlagClient {
 
     private func finishReload(
         generation: UUID,
-        result: EluV1FlagReloadResult
+        result: EluV1FlagReloadObservation
     ) {
         guard let completed = activeReload, completed.generation == generation else { return }
         activeReload = nil
@@ -170,15 +191,77 @@ actor EluV1FlagClient {
         waiters.forEach { $0.resume(returning: .stale) }
     }
 
-    func read(_ key: String) async -> EluV1FlagLookup {
-        switch await runtime.readFlagCache(versions: versions) {
-        case let .hit(snapshot): return snapshot.lookup(key)
-        default: return .missing
+    /// Withdraw only published source authority; preserve ordering and original
+    /// cache deadlines so a same-document recovery cannot renew a lease.
+    func withdrawConfiguration() {
+        guard !closed else { return }
+        configurationWithdrawn = true
+        generation = UUID()
+        runtime.invalidateFlagProjection()
+        invalidateActiveReload()
+        if let pendingReload {
+            pendingReload.waiters.forEach { $0.resume(returning: .stale) }
+            self.pendingReload = nil
         }
     }
 
+    func close() {
+        guard !closed else { return }
+        closed = true
+        generation = UUID()
+        runtime.invalidateFlagProjection()
+        invalidateActiveReload()
+        if let pendingReload {
+            pendingReload.waiters.forEach { $0.resume(returning: .stale) }
+            self.pendingReload = nil
+        }
+    }
+
+    func read(_ key: String) async -> EluV1FlagLookup {
+        await readProjection()?.lookup(key) ?? .missing
+    }
+
+    /// Raw compatibility result for internal callers; retaining it does not
+    /// preserve authority. Synchronous facade getters must retain readProjection.
     func readAll() async -> EluV1FlagCacheReadResult {
-        await runtime.readFlagCache(versions: versions)
+        guard !closed, !configurationWithdrawn else { return .restricted(.missing) }
+        let acceptedGeneration = generation
+        let result = await runtime.readFlagCache(versions: versions)
+        guard !closed, generation == acceptedGeneration else { return .restricted(.missing) }
+        return result
+    }
+
+    func readProjection() async -> EluV1FlagCacheProjection? {
+        guard !closed, !configurationWithdrawn else { return nil }
+        let acceptedGeneration = generation
+        let projection = await runtime.readFlagProjection(versions: versions)
+        guard !closed, generation == acceptedGeneration, projection?.authority.isCurrent() == true else { return nil }
+        return projection
+    }
+
+    func reloadProjection() async -> EluV1FlagCacheProjection? {
+        await reloadProjectionObservation().projection
+    }
+
+    func reloadProjectionObservation() async -> EluV1FlagProjectionObservation {
+        let acceptedGeneration = generation
+        let observation = await reloadObservation()
+        guard !closed, !configurationWithdrawn, generation == acceptedGeneration else {
+            return EluV1FlagProjectionObservation(projection: nil, error: nil)
+        }
+        let snapshot: EluV1FlagCacheSnapshot
+        let fromRemote: Bool
+        switch observation.result {
+        case let .updated(value): snapshot = value; fromRemote = true
+        case let .cached(value): snapshot = value; fromRemote = false
+        default: return EluV1FlagProjectionObservation(projection: nil, error: observation.error)
+        }
+        guard let projection = await readProjection(), generation == acceptedGeneration,
+              projection.snapshot == snapshot else {
+            return EluV1FlagProjectionObservation(projection: nil, error: nil)
+        }
+        return EluV1FlagProjectionObservation(
+            projection: fromRemote ? projection.markingRemoteResponse() : projection, error: observation.error)
     }
 
     private static func performReload(
@@ -186,7 +269,7 @@ actor EluV1FlagClient {
         transport: any EluV1FlagTransport,
         versions: EluVersionContext,
         requestId: String
-    ) async -> EluV1FlagReloadResult {
+    ) async -> EluV1FlagReloadObservation {
         let begun = await runtime.beginFlagReload(
             requestId: requestId,
             versions: versions
@@ -213,13 +296,24 @@ actor EluV1FlagClient {
 
         let responseData: Data
         do {
-            responseData = try await transport.send(
-                endpoint: request.endpoint,
-                requestBody: request.request.canonicalData
-            )
+            if let bound = transport as? any EluV1AuthorizedFlagTransport {
+                guard let source = await runtime.flagSendGuard(token: request.token), !Task.isCancelled else { return .stale }
+                let authority = EluV1TransportAuthority(
+                    revalidate: { await runtime.authorizeFlagSend(token: request.token) == .allowed },
+                    isCurrent: { source.isCurrent() }
+                )
+                responseData = try await bound.send(endpoint: request.endpoint,
+                    requestBody: request.request.canonicalData, authority: authority)
+            } else {
+                guard !runtime.requiresBoundFlagTransport else { return .stale }
+                responseData = try await transport.send(
+                    endpoint: request.endpoint,
+                    requestBody: request.request.canonicalData
+                )
+            }
         } catch {
             if Task.isCancelled { return .stale }
-            return await retainedCache(runtime: runtime, versions: versions)
+            return await retainedCache(runtime: runtime, versions: versions, expected: request.token, error: .transport)
         }
         guard !Task.isCancelled else { return .stale }
 
@@ -230,7 +324,7 @@ actor EluV1FlagClient {
                 for: request.request
             )
         } catch {
-            return await retainedCache(runtime: runtime, versions: versions)
+            return await retainedCache(runtime: runtime, versions: versions, expected: request.token, error: .invalidResponse)
         }
 
         switch await runtime.commitFlagReload(token: request.token, response: response) {
@@ -255,13 +349,18 @@ actor EluV1FlagClient {
 
     private static func retainedCache(
         runtime: EluSQLiteRuntimeQueue,
-        versions: EluVersionContext
-    ) async -> EluV1FlagReloadResult {
+        versions: EluVersionContext,
+        expected: EluV1FlagBeginToken,
+        error: EluFeatureFlagSnapshot.LoadError
+    ) async -> EluV1FlagReloadObservation {
+        guard await runtime.authorizeFlagSend(token: expected) == .allowed else { return .stale }
         switch await runtime.readFlagCache(versions: versions) {
-        case let .hit(snapshot): return .cached(snapshot)
+        case let .hit(snapshot): return snapshot.witness == expected.witness ? EluV1FlagReloadObservation(.cached(snapshot), error: error) : .stale
         case let .restricted(reason): return .restricted(reason)
         case .terminal: return .terminal
-        case .miss: return .stale
+        case .miss:
+            guard await runtime.authorizeFlagSend(token: expected) == .allowed else { return .stale }
+            return EluV1FlagReloadObservation(.stale, error: error)
         }
     }
 }

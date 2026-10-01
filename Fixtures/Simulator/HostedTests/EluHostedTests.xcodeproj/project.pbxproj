@@ -1,0 +1,774 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		09542CD3BA2B0414E6441DF2 /* EluEventFilterTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 91EB52FDCF618FF879943968 /* EluEventFilterTests.swift */; };
+		5ED9B6C29AB373976FC8BE45 /* EluEventFilterQueueTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = CC4A6D8B6BB2DC28F70F26D6 /* EluEventFilterQueueTests.swift */; };
+		722D3E41A9B1747E46641F89 /* EluNativeRasterCompositionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 11524264DB71986AB9D8C26A /* EluNativeRasterCompositionTests.swift */; };
+		937498441D1A339099B04401 /* EluNativeRasterSourceDenialTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9C560DCEDFB2579B14F7CDA3 /* EluNativeRasterSourceDenialTests.swift */; };
+		E11F5429F06AF70D5D36C99E /* EluNativeRasterDeliveryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6707DAE89634C793DA7A75F5 /* EluNativeRasterDeliveryTests.swift */; };
+		089134C4C32012D2063184D7 /* EluNativeRasterQueueTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C052E212E94E405D87AB4448 /* EluNativeRasterQueueTests.swift */; };
+		38479F2E11178FE12A35EB52 /* EluNativeRasterResponseTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 95848F8382DC7A2B02166E08 /* EluNativeRasterResponseTests.swift */; };
+		ECF7F297DF37EF87EF6E275E /* EluNativeV3ConfigParserTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 553C23A8CA8BCE6B69198020 /* EluNativeV3ConfigParserTests.swift */; };
+		C769EC8BB8A14CB8EBD76C8C /* EluNativeRasterSealerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E9B5FBD160D9A727F9E7F59B /* EluNativeRasterSealerTests.swift */; };
+		8E926CE62DC6DC39E278C090 /* EluSwiftUIReplayCollectorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 75936F55DE10AD8692A6AE9E /* EluSwiftUIReplayCollectorTests.swift */; };
+		3DC98BF7F801F1F54CE242D2 /* EluMetricKitCrashReportTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DC092DEB25CE485EABAFF689 /* EluMetricKitCrashReportTests.swift */; };
+		8DBF84484C4FB7637D0FD628 /* EluMetricKitCrashQueueTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2EE0A147E1D2FF034DE55D0 /* EluMetricKitCrashQueueTests.swift */; };
+		6AAE3D8F7F23A6FE2E3A9068 /* EluReplayWindowTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DD73A1A69A3B576CF3631F00 /* EluReplayWindowTests.swift */; };
+		A0CB662675FD3E7A9F5F6409 /* EluNativeReplayInteractionCaptureTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C83557409E2C6DE11A377D0C /* EluNativeReplayInteractionCaptureTests.swift */; };
+		23CB5307D5AC20DC38D31F52 /* EluUIKitReplayTouchObserverTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9378999BFE02081482532291 /* EluUIKitReplayTouchObserverTests.swift */; };
+		5DCABA154F16556A08087983 /* EluUIKitReplayInteractionProjectionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 961FB96A7C2107CD57512DC6 /* EluUIKitReplayInteractionProjectionTests.swift */; };
+		A390C3B0DA95729193F38AE8 /* EluPersonIdentityQueueTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3EEB48084DBACB9D330FD9E0 /* EluPersonIdentityQueueTests.swift */; };
+		575F1AA4F39A979EF84FF05D /* EluNativeWireframeV2EncoderTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = CCC5EA7ED88D985E8596C7FC /* EluNativeWireframeV2EncoderTests.swift */; };
+		FCD9410B477F0A679BE09FE1 /* EluNativeReplayInteractionMailboxTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 47303B61D23AF40FC9E90160 /* EluNativeReplayInteractionMailboxTests.swift */; };
+		AA35F498769EA2F5A813F36C /* EluNativeReplayInteractionBufferTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3C0A02AD6F6F1D6DF2075703 /* EluNativeReplayInteractionBufferTests.swift */; };
+		0FC82A69EBF277473A777FAB /* EluMemoryPersistenceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5FFFCB01820A738B9E94A7FC /* EluMemoryPersistenceTests.swift */; };
+		E99D55D817347F06C3B96632 /* EluFlagExposureQueueTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DD8447F35F7020BB2720ED95 /* EluFlagExposureQueueTests.swift */; };
+		EA70684A25876EF123E2EC52 /* EluCaptureRateQueueTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A8DEC0D192EDCD6E1B8FF2E1 /* EluCaptureRateQueueTests.swift */; };
+		6C080589161D54E5463CBDFE /* EluCaptureRateLimiterTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 89EAAF02E2A2E329142F1757 /* EluCaptureRateLimiterTests.swift */; };
+		DD82CE02EA9481A564029708 /* EluSelfHostedEndpointTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B51865EB1392E9A11138BB6A /* EluSelfHostedEndpointTests.swift */; };
+		F7F31AC8DFD9C7C33F8EE5B7 /* EluNativeDiagnosticsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6BCF9C72884FE45EAAE48A4A /* EluNativeDiagnosticsTests.swift */; };
+		8CCA6EF97C8ED72EB179E803 /* EluNativeDiagnosticsRuntimeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 00C2F9566B2A1B535258B8D3 /* EluNativeDiagnosticsRuntimeTests.swift */; };
+		B32108CA473CBEE97317C89C /* EluNativeDiagnosticsQueueTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 859DF8396D138C3F06CCCF0F /* EluNativeDiagnosticsQueueTests.swift */; };
+		86A274B5BACCC4698FF1611E /* EluNetworkObservationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = EC85BF1AAAF4BAF0AD8F4073 /* EluNetworkObservationTests.swift */; };
+		4293546235FF9CB4EEA7065A /* EluNativeFrameCadenceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 63D98EC3B7E4918E6890598E /* EluNativeFrameCadenceTests.swift */; };
+		AAD102D11841569836D75FA1 /* EluReplayAudienceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D88D21C7E7C46DAB259E1D51 /* EluReplayAudienceTests.swift */; };
+		07C288CCD0F509519BFFBF5E /* EluRuntimeSelectorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 169092CA20908DA08ED626C8 /* EluRuntimeSelectorTests.swift */; };
+		084440C60E4F6326E164DCE6 /* EluCallbackRegistryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 06501176987CA3E140B8F7E0 /* EluCallbackRegistryTests.swift */; };
+		0A0DFAC68FF265D16A15B8B0 /* EluAnalytics in Frameworks */ = {isa = PBXBuildFile; productRef = 0813B487B7509563297B1464 /* EluAnalytics */; };
+		0E682CE763D984FC70952FD4 /* EluV1ConfigManagerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 01D64E34DC0BF973C1FD8A5F /* EluV1ConfigManagerTests.swift */; };
+		186CB363D14178EC3D637471 /* TestConfigFactory.swift in Sources */ = {isa = PBXBuildFile; fileRef = E83CAF1D64DF02661A1CA8FB /* TestConfigFactory.swift */; };
+		1F6B2536391946EF8F20A2F8 /* EluIdentityCoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 35B55DAABD037F08F5A24007 /* EluIdentityCoreTests.swift */; };
+		23B72E97FC1B4457C03F9981 /* EluNativeMaskingProfileTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 18923BFB1D749DF2E49AF09E /* EluNativeMaskingProfileTests.swift */; };
+		2A5F29C85CA3BD15A3C1075C /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 462B9426CC635998002D4FBC /* AppDelegate.swift */; };
+		30EBE4409DA3BB5D6F3EFCF2 /* EluPrivacyStateProjectorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7696CDAD15D30BC00B7B70C2 /* EluPrivacyStateProjectorTests.swift */; };
+		35EDDE2B7A1F31E6C4A43EE7 /* EluNativeReplayCaptureQueueTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5E5F16CA01EFC3993C29AA0F /* EluNativeReplayCaptureQueueTests.swift */; };
+		382BAB86AD3859BE14CFF6F1 /* EluConfigClientTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5D805DF2BE10F3396F6DDE26 /* EluConfigClientTests.swift */; };
+		4680B11A2DDEBDFE9A145D87 /* EluNativeReplayAuthorityTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AFB80C2CB321B1F29064FB65 /* EluNativeReplayAuthorityTests.swift */; };
+		48AE0E8CE026B8CF18859B5C /* EluV2ConfigManagerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 76D1407C7EBF088EB375ED97 /* EluV2ConfigManagerTests.swift */; };
+		548C75D30AE907C1E7A52DAF /* EluV1BatchDeliveryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B9BFBFF56E20135158216F7D /* EluV1BatchDeliveryTests.swift */; };
+		55D5C4C8CF5258A6041258A1 /* EluNativeReplayLifecycleTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C6CADDF5AB8C3CBDFD51210C /* EluNativeReplayLifecycleTests.swift */; };
+		57E29C50E0BFC47D481D5DEC /* EluV2URLSessionReplayTransportTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6AECEB34C4412BC884D0975C /* EluV2URLSessionReplayTransportTests.swift */; };
+		5A3A6C3061CA30048A85DFB5 /* EluStandaloneFacadeRuntimeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2D2F9133BD014C48791FCBF8 /* EluStandaloneFacadeRuntimeTests.swift */; };
+		5C043D816FFA15F686FF4E30 /* EluSealedReplayPolicyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1E9E91134FFF3E0D3ADF1AFB /* EluSealedReplayPolicyTests.swift */; };
+		5EA509A2E3863CC1F8639DDF /* EluNativeReplayCaptureUIKitTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 97482AFF11C548CC8460CE58 /* EluNativeReplayCaptureUIKitTests.swift */; };
+		60CD3BFC950F3AB82028746F /* EluV1URLSessionBatchTransportTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5DADF517AD6B9B335883923C /* EluV1URLSessionBatchTransportTests.swift */; };
+		61A497FF7D91651EC6C192F6 /* EluNativePerformanceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 235878AF38488DC49F945B22 /* EluNativePerformanceTests.swift */; };
+		62451233D64346F518FF645B /* EluSealedReplayPolicyQueueTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D8812DAF54816936AF9B3A5A /* EluSealedReplayPolicyQueueTests.swift */; };
+		651421BAA79E4A33C3057F25 /* EluV2ConfigAuthorityGateTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 55E60F8CDAABC39197DCF9D2 /* EluV2ConfigAuthorityGateTests.swift */; };
+		656FB91477E9F6139D46AEC4 /* EluNativeReplayCompositionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FAA9B2FBB524BC96B6F1C807 /* EluNativeReplayCompositionTests.swift */; };
+		6B67AF12799DEEEBD37EFAA8 /* EluNativeReplaySessionQueueTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E0EC2552FAEF93E168F263D2 /* EluNativeReplaySessionQueueTests.swift */; };
+		705EE07C0813CFFF3E617283 /* EluSQLiteRuntimeScratchTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 335CABD2025DCDD528D25EFC /* EluSQLiteRuntimeScratchTests.swift */; };
+		766FC96000E3A517E2A1D6E0 /* EluV2ReplayStorageTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C955B10D27F04610E2A57B4F /* EluV2ReplayStorageTests.swift */; };
+		771993C853B18C6112B03282 /* EluV1StrictCanonicalJSONTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2E08DA7DD5D741E159A7E87 /* EluV1StrictCanonicalJSONTests.swift */; };
+		7776098D9CA504C5C5F044F3 /* EluV1CaptureRuntimeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6A865DEE0029164159C2D209 /* EluV1CaptureRuntimeTests.swift */; };
+		7FEFF1AE03BA377A90D11014 /* EluEventBufferTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7750A256824F643DE06DD486 /* EluEventBufferTests.swift */; };
+		8043BAF23F5E0D4E44A26E01 /* EluReplayBudgetTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 799F922B752BF6DF1637FED2 /* EluReplayBudgetTests.swift */; };
+		8174F91B4740B7FD1883F068 /* EluRemoteConfigTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C086ED1669A3C402F457C51F /* EluRemoteConfigTests.swift */; };
+		89E07C70978ED98FDEF5041D /* EluNativeReplayMixedStartUIKitTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1F933DDE179B4A0216F34D0D /* EluNativeReplayMixedStartUIKitTests.swift */; };
+		8DC23A059B40E2BEF896DE4A /* EluLifecyclePolicyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 40B3580DF532F7A22EEA2740 /* EluLifecyclePolicyTests.swift */; };
+		90204844B9D0B370C311E608 /* EluUIKitReplayCollectorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DE1642748B25951BA86634D2 /* EluUIKitReplayCollectorTests.swift */; };
+		90EFDA381E04BE89FB84B109 /* EluV2URLSessionConfigTransportTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9F0BD1F222FF407CD9D08CE2 /* EluV2URLSessionConfigTransportTests.swift */; };
+		9B6ED86BE0FC7E91C6B207E5 /* EluNativeReplayCaptureOwnerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = BE01B464AE16E52284697F6A /* EluNativeReplayCaptureOwnerTests.swift */; };
+		9E5898978A8D55C5D14E690A /* EluEuGuardTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3391AC8AB007D69AD36BB5BB /* EluEuGuardTests.swift */; };
+		9FBBFFC45E91E91ABFC5EEBB /* EluV2ReplayDeliveryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 38AADF281F516CE691D2E8DC /* EluV2ReplayDeliveryTests.swift */; };
+		A193E163A9037620B203DE1F /* EluStandaloneStackTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = EF5F653095928AB21F4F215B /* EluStandaloneStackTests.swift */; };
+		A84B4F290BA92741A5878043 /* EluSQLiteRuntimeQueueTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3EBDA95518B3C9EADF617C17 /* EluSQLiteRuntimeQueueTests.swift */; };
+		AD33184E0740C03BB8A83D7F /* EluNativeWireframeEncoderTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9FDF8FA2A86FAD2844692F6C /* EluNativeWireframeEncoderTests.swift */; };
+		B23F1E8459647B5811D5C034 /* EluV2ReplayResponseTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 84492C63A73FF45DE5C67C1F /* EluV2ReplayResponseTests.swift */; };
+		B3BC55C5AB1E9CDD1ED76C68 /* EluApplicationLifecycleEmitterTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D219D17489BB111CD9D723AB /* EluApplicationLifecycleEmitterTests.swift */; };
+		B45C788C9AB8532AB96C7A67 /* EluV1URLSessionFlagTransportTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = BDE343C1FCA649150054A841 /* EluV1URLSessionFlagTransportTests.swift */; };
+		B4E3CACCFC37E9C7E339723D /* EluV2ConfigSourceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 86074F97ABFE274DDDAA57E0 /* EluV2ConfigSourceTests.swift */; };
+		B94581242492A669BEC4E823 /* EluV1CaptureAdmissionVectorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0497C44FB917199FFE0EC22F /* EluV1CaptureAdmissionVectorTests.swift */; };
+		BE58960BEA833B640CF22BC6 /* EluNativeReplaySealerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D266A8F740F5F0E331FE1033 /* EluNativeReplaySealerTests.swift */; };
+		C0B4D4FDB420EBE476210EB2 /* EluUIKitTestHost.swift in Sources */ = {isa = PBXBuildFile; fileRef = CBC851DFCF628C3A1C6EAAC3 /* EluUIKitTestHost.swift */; };
+		CE1624E798BF29D2292B5342 /* EluV2ConfigLifecycleTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 22EB9BCED252275B4D57545F /* EluV2ConfigLifecycleTests.swift */; };
+		CE2C549CF5FF35E4E3B3AA6F /* EluMigrationCoordinatorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 84FCC40521E90B9019796438 /* EluMigrationCoordinatorTests.swift */; };
+		D1D28DB9997FFFB1FF4F06AC /* EluFacadeConcurrencyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 455FB914B36F4720C2E8AFC3 /* EluFacadeConcurrencyTests.swift */; };
+		D6A4F45B1D94130EBEF11A68 /* EluNativeReplaySessionStateTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D19DBF39B292172718202C02 /* EluNativeReplaySessionStateTests.swift */; };
+		DC59802B0034D1DDB26D348B /* EluExceptionSerializerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8B73C9383602437EF8AEF858 /* EluExceptionSerializerTests.swift */; };
+		E12D49033042E6F6346EDCCC /* EluStandaloneRuntimeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9FAC052561329D9A362EBF80 /* EluStandaloneRuntimeTests.swift */; };
+		E2CCF7E0496759F7F229387E /* EluConfigHostAllowlistTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E93C461A74C868AE782D3075 /* EluConfigHostAllowlistTests.swift */; };
+		E79600853BBDCC7D661B24B3 /* EluV1FlagRuntimeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C97F78B5C9F82D003E0CE8A8 /* EluV1FlagRuntimeTests.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		8D8E0B466BFD7EFC20AD0DF0 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 73912F5FDDCA412A0A6D682E /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = D8F53F9C1CBEFBC2C43D7095;
+			remoteInfo = EluTestHost;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXFileReference section */
+		91EB52FDCF618FF879943968 /* EluEventFilterTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluEventFilterTests.swift; sourceTree = "<group>"; };
+		CC4A6D8B6BB2DC28F70F26D6 /* EluEventFilterQueueTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluEventFilterQueueTests.swift; sourceTree = "<group>"; };
+		11524264DB71986AB9D8C26A /* EluNativeRasterCompositionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluNativeRasterCompositionTests.swift; sourceTree = "<group>"; };
+		9C560DCEDFB2579B14F7CDA3 /* EluNativeRasterSourceDenialTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluNativeRasterSourceDenialTests.swift; sourceTree = "<group>"; };
+		6707DAE89634C793DA7A75F5 /* EluNativeRasterDeliveryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluNativeRasterDeliveryTests.swift; sourceTree = "<group>"; };
+		C052E212E94E405D87AB4448 /* EluNativeRasterQueueTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluNativeRasterQueueTests.swift; sourceTree = "<group>"; };
+		95848F8382DC7A2B02166E08 /* EluNativeRasterResponseTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluNativeRasterResponseTests.swift; sourceTree = "<group>"; };
+		553C23A8CA8BCE6B69198020 /* EluNativeV3ConfigParserTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluNativeV3ConfigParserTests.swift; sourceTree = "<group>"; };
+		E9B5FBD160D9A727F9E7F59B /* EluNativeRasterSealerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluNativeRasterSealerTests.swift; sourceTree = "<group>"; };
+		75936F55DE10AD8692A6AE9E /* EluSwiftUIReplayCollectorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluSwiftUIReplayCollectorTests.swift; sourceTree = "<group>"; };
+		DC092DEB25CE485EABAFF689 /* EluMetricKitCrashReportTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluMetricKitCrashReportTests.swift; sourceTree = "<group>"; };
+		B2EE0A147E1D2FF034DE55D0 /* EluMetricKitCrashQueueTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluMetricKitCrashQueueTests.swift; sourceTree = "<group>"; };
+		DD73A1A69A3B576CF3631F00 /* EluReplayWindowTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluReplayWindowTests.swift; sourceTree = "<group>"; };
+		C83557409E2C6DE11A377D0C /* EluNativeReplayInteractionCaptureTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluNativeReplayInteractionCaptureTests.swift; sourceTree = "<group>"; };
+		9378999BFE02081482532291 /* EluUIKitReplayTouchObserverTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluUIKitReplayTouchObserverTests.swift; sourceTree = "<group>"; };
+		961FB96A7C2107CD57512DC6 /* EluUIKitReplayInteractionProjectionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluUIKitReplayInteractionProjectionTests.swift; sourceTree = "<group>"; };
+		3EEB48084DBACB9D330FD9E0 /* EluPersonIdentityQueueTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluPersonIdentityQueueTests.swift; sourceTree = "<group>"; };
+		CCC5EA7ED88D985E8596C7FC /* EluNativeWireframeV2EncoderTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluNativeWireframeV2EncoderTests.swift; sourceTree = "<group>"; };
+		47303B61D23AF40FC9E90160 /* EluNativeReplayInteractionMailboxTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluNativeReplayInteractionMailboxTests.swift; sourceTree = "<group>"; };
+		3C0A02AD6F6F1D6DF2075703 /* EluNativeReplayInteractionBufferTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluNativeReplayInteractionBufferTests.swift; sourceTree = "<group>"; };
+		5FFFCB01820A738B9E94A7FC /* EluMemoryPersistenceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluMemoryPersistenceTests.swift; sourceTree = "<group>"; };
+		DD8447F35F7020BB2720ED95 /* EluFlagExposureQueueTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluFlagExposureQueueTests.swift; sourceTree = "<group>"; };
+		A8DEC0D192EDCD6E1B8FF2E1 /* EluCaptureRateQueueTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluCaptureRateQueueTests.swift; sourceTree = "<group>"; };
+		89EAAF02E2A2E329142F1757 /* EluCaptureRateLimiterTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluCaptureRateLimiterTests.swift; sourceTree = "<group>"; };
+		B51865EB1392E9A11138BB6A /* EluSelfHostedEndpointTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluSelfHostedEndpointTests.swift; sourceTree = "<group>"; };
+		6BCF9C72884FE45EAAE48A4A /* EluNativeDiagnosticsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluNativeDiagnosticsTests.swift; sourceTree = "<group>"; };
+		00C2F9566B2A1B535258B8D3 /* EluNativeDiagnosticsRuntimeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluNativeDiagnosticsRuntimeTests.swift; sourceTree = "<group>"; };
+		859DF8396D138C3F06CCCF0F /* EluNativeDiagnosticsQueueTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluNativeDiagnosticsQueueTests.swift; sourceTree = "<group>"; };
+		EC85BF1AAAF4BAF0AD8F4073 /* EluNetworkObservationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluNetworkObservationTests.swift; sourceTree = "<group>"; };
+		63D98EC3B7E4918E6890598E /* EluNativeFrameCadenceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluNativeFrameCadenceTests.swift; sourceTree = "<group>"; };
+		D88D21C7E7C46DAB259E1D51 /* EluReplayAudienceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluReplayAudienceTests.swift; sourceTree = "<group>"; };
+		01D64E34DC0BF973C1FD8A5F /* EluV1ConfigManagerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluV1ConfigManagerTests.swift; sourceTree = "<group>"; };
+		0497C44FB917199FFE0EC22F /* EluV1CaptureAdmissionVectorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluV1CaptureAdmissionVectorTests.swift; sourceTree = "<group>"; };
+		06501176987CA3E140B8F7E0 /* EluCallbackRegistryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluCallbackRegistryTests.swift; sourceTree = "<group>"; };
+		169092CA20908DA08ED626C8 /* EluRuntimeSelectorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluRuntimeSelectorTests.swift; sourceTree = "<group>"; };
+		18923BFB1D749DF2E49AF09E /* EluNativeMaskingProfileTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluNativeMaskingProfileTests.swift; sourceTree = "<group>"; };
+		1E9E91134FFF3E0D3ADF1AFB /* EluSealedReplayPolicyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluSealedReplayPolicyTests.swift; sourceTree = "<group>"; };
+		1F933DDE179B4A0216F34D0D /* EluNativeReplayMixedStartUIKitTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluNativeReplayMixedStartUIKitTests.swift; sourceTree = "<group>"; };
+		20E5A5E9F205F0865564E534 /* EluAnalytics */ = {isa = PBXFileReference; lastKnownFileType = folder; name = EluAnalytics; path = "../../.."; sourceTree = SOURCE_ROOT; };
+		22EB9BCED252275B4D57545F /* EluV2ConfigLifecycleTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluV2ConfigLifecycleTests.swift; sourceTree = "<group>"; };
+		235878AF38488DC49F945B22 /* EluNativePerformanceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluNativePerformanceTests.swift; sourceTree = "<group>"; };
+		2D2F9133BD014C48791FCBF8 /* EluStandaloneFacadeRuntimeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluStandaloneFacadeRuntimeTests.swift; sourceTree = "<group>"; };
+		335CABD2025DCDD528D25EFC /* EluSQLiteRuntimeScratchTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluSQLiteRuntimeScratchTests.swift; sourceTree = "<group>"; };
+		3391AC8AB007D69AD36BB5BB /* EluEuGuardTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluEuGuardTests.swift; sourceTree = "<group>"; };
+		35B55DAABD037F08F5A24007 /* EluIdentityCoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluIdentityCoreTests.swift; sourceTree = "<group>"; };
+		38AADF281F516CE691D2E8DC /* EluV2ReplayDeliveryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluV2ReplayDeliveryTests.swift; sourceTree = "<group>"; };
+		3DB6B3A3469B0CAEDEE0C29C /* EluAnalyticsTests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = EluAnalyticsTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		3EBDA95518B3C9EADF617C17 /* EluSQLiteRuntimeQueueTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluSQLiteRuntimeQueueTests.swift; sourceTree = "<group>"; };
+		40B3580DF532F7A22EEA2740 /* EluLifecyclePolicyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluLifecyclePolicyTests.swift; sourceTree = "<group>"; };
+		455FB914B36F4720C2E8AFC3 /* EluFacadeConcurrencyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluFacadeConcurrencyTests.swift; sourceTree = "<group>"; };
+		462B9426CC635998002D4FBC /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
+		55E60F8CDAABC39197DCF9D2 /* EluV2ConfigAuthorityGateTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluV2ConfigAuthorityGateTests.swift; sourceTree = "<group>"; };
+		5D805DF2BE10F3396F6DDE26 /* EluConfigClientTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluConfigClientTests.swift; sourceTree = "<group>"; };
+		5DADF517AD6B9B335883923C /* EluV1URLSessionBatchTransportTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluV1URLSessionBatchTransportTests.swift; sourceTree = "<group>"; };
+		5E5F16CA01EFC3993C29AA0F /* EluNativeReplayCaptureQueueTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluNativeReplayCaptureQueueTests.swift; sourceTree = "<group>"; };
+		6A865DEE0029164159C2D209 /* EluV1CaptureRuntimeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluV1CaptureRuntimeTests.swift; sourceTree = "<group>"; };
+		6AECEB34C4412BC884D0975C /* EluV2URLSessionReplayTransportTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluV2URLSessionReplayTransportTests.swift; sourceTree = "<group>"; };
+		7696CDAD15D30BC00B7B70C2 /* EluPrivacyStateProjectorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluPrivacyStateProjectorTests.swift; sourceTree = "<group>"; };
+		76D1407C7EBF088EB375ED97 /* EluV2ConfigManagerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluV2ConfigManagerTests.swift; sourceTree = "<group>"; };
+		7750A256824F643DE06DD486 /* EluEventBufferTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluEventBufferTests.swift; sourceTree = "<group>"; };
+		799F922B752BF6DF1637FED2 /* EluReplayBudgetTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluReplayBudgetTests.swift; sourceTree = "<group>"; };
+		84492C63A73FF45DE5C67C1F /* EluV2ReplayResponseTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluV2ReplayResponseTests.swift; sourceTree = "<group>"; };
+		84FCC40521E90B9019796438 /* EluMigrationCoordinatorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluMigrationCoordinatorTests.swift; sourceTree = "<group>"; };
+		86074F97ABFE274DDDAA57E0 /* EluV2ConfigSourceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluV2ConfigSourceTests.swift; sourceTree = "<group>"; };
+		8B73C9383602437EF8AEF858 /* EluExceptionSerializerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluExceptionSerializerTests.swift; sourceTree = "<group>"; };
+		97482AFF11C548CC8460CE58 /* EluNativeReplayCaptureUIKitTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluNativeReplayCaptureUIKitTests.swift; sourceTree = "<group>"; };
+		9F0BD1F222FF407CD9D08CE2 /* EluV2URLSessionConfigTransportTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluV2URLSessionConfigTransportTests.swift; sourceTree = "<group>"; };
+		9FAC052561329D9A362EBF80 /* EluStandaloneRuntimeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluStandaloneRuntimeTests.swift; sourceTree = "<group>"; };
+		9FDF8FA2A86FAD2844692F6C /* EluNativeWireframeEncoderTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluNativeWireframeEncoderTests.swift; sourceTree = "<group>"; };
+		A2E08DA7DD5D741E159A7E87 /* EluV1StrictCanonicalJSONTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluV1StrictCanonicalJSONTests.swift; sourceTree = "<group>"; };
+		AFB80C2CB321B1F29064FB65 /* EluNativeReplayAuthorityTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluNativeReplayAuthorityTests.swift; sourceTree = "<group>"; };
+		B9BFBFF56E20135158216F7D /* EluV1BatchDeliveryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluV1BatchDeliveryTests.swift; sourceTree = "<group>"; };
+		BDE343C1FCA649150054A841 /* EluV1URLSessionFlagTransportTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluV1URLSessionFlagTransportTests.swift; sourceTree = "<group>"; };
+		BE01B464AE16E52284697F6A /* EluNativeReplayCaptureOwnerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluNativeReplayCaptureOwnerTests.swift; sourceTree = "<group>"; };
+		C086ED1669A3C402F457C51F /* EluRemoteConfigTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluRemoteConfigTests.swift; sourceTree = "<group>"; };
+		C6CADDF5AB8C3CBDFD51210C /* EluNativeReplayLifecycleTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluNativeReplayLifecycleTests.swift; sourceTree = "<group>"; };
+		C955B10D27F04610E2A57B4F /* EluV2ReplayStorageTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluV2ReplayStorageTests.swift; sourceTree = "<group>"; };
+		C97F78B5C9F82D003E0CE8A8 /* EluV1FlagRuntimeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluV1FlagRuntimeTests.swift; sourceTree = "<group>"; };
+		CBC851DFCF628C3A1C6EAAC3 /* EluUIKitTestHost.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluUIKitTestHost.swift; sourceTree = "<group>"; };
+		D19DBF39B292172718202C02 /* EluNativeReplaySessionStateTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluNativeReplaySessionStateTests.swift; sourceTree = "<group>"; };
+		D219D17489BB111CD9D723AB /* EluApplicationLifecycleEmitterTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluApplicationLifecycleEmitterTests.swift; sourceTree = "<group>"; };
+		D266A8F740F5F0E331FE1033 /* EluNativeReplaySealerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluNativeReplaySealerTests.swift; sourceTree = "<group>"; };
+		D8812DAF54816936AF9B3A5A /* EluSealedReplayPolicyQueueTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluSealedReplayPolicyQueueTests.swift; sourceTree = "<group>"; };
+		D9F7FF7C2B7AACAC119D1A5D /* EluTestHost.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = EluTestHost.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		DE1642748B25951BA86634D2 /* EluUIKitReplayCollectorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluUIKitReplayCollectorTests.swift; sourceTree = "<group>"; };
+		E0EC2552FAEF93E168F263D2 /* EluNativeReplaySessionQueueTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluNativeReplaySessionQueueTests.swift; sourceTree = "<group>"; };
+		E83CAF1D64DF02661A1CA8FB /* TestConfigFactory.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TestConfigFactory.swift; sourceTree = "<group>"; };
+		E93C461A74C868AE782D3075 /* EluConfigHostAllowlistTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluConfigHostAllowlistTests.swift; sourceTree = "<group>"; };
+		EF5F653095928AB21F4F215B /* EluStandaloneStackTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluStandaloneStackTests.swift; sourceTree = "<group>"; };
+		FAA9B2FBB524BC96B6F1C807 /* EluNativeReplayCompositionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluNativeReplayCompositionTests.swift; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		FB65BE7FFCB4B176BBBF3C50 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				0A0DFAC68FF265D16A15B8B0 /* EluAnalytics in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		2ADAF878A2861D734FAA2034 /* Host */ = {
+			isa = PBXGroup;
+			children = (
+				462B9426CC635998002D4FBC /* AppDelegate.swift */,
+			);
+			path = Host;
+			sourceTree = "<group>";
+		};
+		695F5D45742D94E5B4EC1822 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				3DB6B3A3469B0CAEDEE0C29C /* EluAnalyticsTests.xctest */,
+				D9F7FF7C2B7AACAC119D1A5D /* EluTestHost.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		77884B4742F35B56FA62AFC4 /* Packages */ = {
+			isa = PBXGroup;
+			children = (
+				20E5A5E9F205F0865564E534 /* EluAnalytics */,
+			);
+			name = Packages;
+			sourceTree = "<group>";
+		};
+		A0928195822C53907FA0C692 /* EluAnalyticsTests */ = {
+			isa = PBXGroup;
+			children = (
+				91EB52FDCF618FF879943968 /* EluEventFilterTests.swift */,
+				CC4A6D8B6BB2DC28F70F26D6 /* EluEventFilterQueueTests.swift */,
+				11524264DB71986AB9D8C26A /* EluNativeRasterCompositionTests.swift */,
+				9C560DCEDFB2579B14F7CDA3 /* EluNativeRasterSourceDenialTests.swift */,
+				6707DAE89634C793DA7A75F5 /* EluNativeRasterDeliveryTests.swift */,
+				C052E212E94E405D87AB4448 /* EluNativeRasterQueueTests.swift */,
+				95848F8382DC7A2B02166E08 /* EluNativeRasterResponseTests.swift */,
+				553C23A8CA8BCE6B69198020 /* EluNativeV3ConfigParserTests.swift */,
+				E9B5FBD160D9A727F9E7F59B /* EluNativeRasterSealerTests.swift */,
+				75936F55DE10AD8692A6AE9E /* EluSwiftUIReplayCollectorTests.swift */,
+				DC092DEB25CE485EABAFF689 /* EluMetricKitCrashReportTests.swift */,
+				B2EE0A147E1D2FF034DE55D0 /* EluMetricKitCrashQueueTests.swift */,
+				DD73A1A69A3B576CF3631F00 /* EluReplayWindowTests.swift */,
+				C83557409E2C6DE11A377D0C /* EluNativeReplayInteractionCaptureTests.swift */,
+				9378999BFE02081482532291 /* EluUIKitReplayTouchObserverTests.swift */,
+				961FB96A7C2107CD57512DC6 /* EluUIKitReplayInteractionProjectionTests.swift */,
+				3EEB48084DBACB9D330FD9E0 /* EluPersonIdentityQueueTests.swift */,
+				CCC5EA7ED88D985E8596C7FC /* EluNativeWireframeV2EncoderTests.swift */,
+				47303B61D23AF40FC9E90160 /* EluNativeReplayInteractionMailboxTests.swift */,
+				3C0A02AD6F6F1D6DF2075703 /* EluNativeReplayInteractionBufferTests.swift */,
+				5FFFCB01820A738B9E94A7FC /* EluMemoryPersistenceTests.swift */,
+				DD8447F35F7020BB2720ED95 /* EluFlagExposureQueueTests.swift */,
+				A8DEC0D192EDCD6E1B8FF2E1 /* EluCaptureRateQueueTests.swift */,
+				89EAAF02E2A2E329142F1757 /* EluCaptureRateLimiterTests.swift */,
+				B51865EB1392E9A11138BB6A /* EluSelfHostedEndpointTests.swift */,
+				6BCF9C72884FE45EAAE48A4A /* EluNativeDiagnosticsTests.swift */,
+				00C2F9566B2A1B535258B8D3 /* EluNativeDiagnosticsRuntimeTests.swift */,
+				859DF8396D138C3F06CCCF0F /* EluNativeDiagnosticsQueueTests.swift */,
+				EC85BF1AAAF4BAF0AD8F4073 /* EluNetworkObservationTests.swift */,
+				63D98EC3B7E4918E6890598E /* EluNativeFrameCadenceTests.swift */,
+				D88D21C7E7C46DAB259E1D51 /* EluReplayAudienceTests.swift */,
+				D219D17489BB111CD9D723AB /* EluApplicationLifecycleEmitterTests.swift */,
+				06501176987CA3E140B8F7E0 /* EluCallbackRegistryTests.swift */,
+				5D805DF2BE10F3396F6DDE26 /* EluConfigClientTests.swift */,
+				E93C461A74C868AE782D3075 /* EluConfigHostAllowlistTests.swift */,
+				3391AC8AB007D69AD36BB5BB /* EluEuGuardTests.swift */,
+				7750A256824F643DE06DD486 /* EluEventBufferTests.swift */,
+				8B73C9383602437EF8AEF858 /* EluExceptionSerializerTests.swift */,
+				455FB914B36F4720C2E8AFC3 /* EluFacadeConcurrencyTests.swift */,
+				35B55DAABD037F08F5A24007 /* EluIdentityCoreTests.swift */,
+				40B3580DF532F7A22EEA2740 /* EluLifecyclePolicyTests.swift */,
+				84FCC40521E90B9019796438 /* EluMigrationCoordinatorTests.swift */,
+				18923BFB1D749DF2E49AF09E /* EluNativeMaskingProfileTests.swift */,
+				235878AF38488DC49F945B22 /* EluNativePerformanceTests.swift */,
+				AFB80C2CB321B1F29064FB65 /* EluNativeReplayAuthorityTests.swift */,
+				BE01B464AE16E52284697F6A /* EluNativeReplayCaptureOwnerTests.swift */,
+				5E5F16CA01EFC3993C29AA0F /* EluNativeReplayCaptureQueueTests.swift */,
+				97482AFF11C548CC8460CE58 /* EluNativeReplayCaptureUIKitTests.swift */,
+				FAA9B2FBB524BC96B6F1C807 /* EluNativeReplayCompositionTests.swift */,
+				C6CADDF5AB8C3CBDFD51210C /* EluNativeReplayLifecycleTests.swift */,
+				1F933DDE179B4A0216F34D0D /* EluNativeReplayMixedStartUIKitTests.swift */,
+				D266A8F740F5F0E331FE1033 /* EluNativeReplaySealerTests.swift */,
+				E0EC2552FAEF93E168F263D2 /* EluNativeReplaySessionQueueTests.swift */,
+				D19DBF39B292172718202C02 /* EluNativeReplaySessionStateTests.swift */,
+				9FDF8FA2A86FAD2844692F6C /* EluNativeWireframeEncoderTests.swift */,
+				7696CDAD15D30BC00B7B70C2 /* EluPrivacyStateProjectorTests.swift */,
+				C086ED1669A3C402F457C51F /* EluRemoteConfigTests.swift */,
+				799F922B752BF6DF1637FED2 /* EluReplayBudgetTests.swift */,
+				169092CA20908DA08ED626C8 /* EluRuntimeSelectorTests.swift */,
+				D8812DAF54816936AF9B3A5A /* EluSealedReplayPolicyQueueTests.swift */,
+				1E9E91134FFF3E0D3ADF1AFB /* EluSealedReplayPolicyTests.swift */,
+				3EBDA95518B3C9EADF617C17 /* EluSQLiteRuntimeQueueTests.swift */,
+				335CABD2025DCDD528D25EFC /* EluSQLiteRuntimeScratchTests.swift */,
+				2D2F9133BD014C48791FCBF8 /* EluStandaloneFacadeRuntimeTests.swift */,
+				9FAC052561329D9A362EBF80 /* EluStandaloneRuntimeTests.swift */,
+				EF5F653095928AB21F4F215B /* EluStandaloneStackTests.swift */,
+				DE1642748B25951BA86634D2 /* EluUIKitReplayCollectorTests.swift */,
+				CBC851DFCF628C3A1C6EAAC3 /* EluUIKitTestHost.swift */,
+				B9BFBFF56E20135158216F7D /* EluV1BatchDeliveryTests.swift */,
+				0497C44FB917199FFE0EC22F /* EluV1CaptureAdmissionVectorTests.swift */,
+				6A865DEE0029164159C2D209 /* EluV1CaptureRuntimeTests.swift */,
+				01D64E34DC0BF973C1FD8A5F /* EluV1ConfigManagerTests.swift */,
+				C97F78B5C9F82D003E0CE8A8 /* EluV1FlagRuntimeTests.swift */,
+				A2E08DA7DD5D741E159A7E87 /* EluV1StrictCanonicalJSONTests.swift */,
+				5DADF517AD6B9B335883923C /* EluV1URLSessionBatchTransportTests.swift */,
+				BDE343C1FCA649150054A841 /* EluV1URLSessionFlagTransportTests.swift */,
+				55E60F8CDAABC39197DCF9D2 /* EluV2ConfigAuthorityGateTests.swift */,
+				22EB9BCED252275B4D57545F /* EluV2ConfigLifecycleTests.swift */,
+				76D1407C7EBF088EB375ED97 /* EluV2ConfigManagerTests.swift */,
+				86074F97ABFE274DDDAA57E0 /* EluV2ConfigSourceTests.swift */,
+				38AADF281F516CE691D2E8DC /* EluV2ReplayDeliveryTests.swift */,
+				84492C63A73FF45DE5C67C1F /* EluV2ReplayResponseTests.swift */,
+				C955B10D27F04610E2A57B4F /* EluV2ReplayStorageTests.swift */,
+				9F0BD1F222FF407CD9D08CE2 /* EluV2URLSessionConfigTransportTests.swift */,
+				6AECEB34C4412BC884D0975C /* EluV2URLSessionReplayTransportTests.swift */,
+				E83CAF1D64DF02661A1CA8FB /* TestConfigFactory.swift */,
+			);
+			name = EluAnalyticsTests;
+			path = "../../../Tests/EluAnalyticsTests";
+			sourceTree = "<group>";
+		};
+		B10AB58788E7368482B766C8 = {
+			isa = PBXGroup;
+			children = (
+				A0928195822C53907FA0C692 /* EluAnalyticsTests */,
+				2ADAF878A2861D734FAA2034 /* Host */,
+				77884B4742F35B56FA62AFC4 /* Packages */,
+				695F5D45742D94E5B4EC1822 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		A51A5041BA112C37B12EB6B0 /* EluAnalyticsTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 15FFA44589ABDE9191501D48 /* Build configuration list for PBXNativeTarget "EluAnalyticsTests" */;
+			buildPhases = (
+				97650F5118D743D06D3E9A72 /* Sources */,
+				FB65BE7FFCB4B176BBBF3C50 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				747E56AE90DC2C9EDD6C7C96 /* PBXTargetDependency */,
+			);
+			name = EluAnalyticsTests;
+			packageProductDependencies = (
+				0813B487B7509563297B1464 /* EluAnalytics */,
+			);
+			productName = EluAnalyticsTests;
+			productReference = 3DB6B3A3469B0CAEDEE0C29C /* EluAnalyticsTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
+		D8F53F9C1CBEFBC2C43D7095 /* EluTestHost */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 814047AB4BA336BA1C2B80F5 /* Build configuration list for PBXNativeTarget "EluTestHost" */;
+			buildPhases = (
+				96ADF60FF959887E52465254 /* Sources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = EluTestHost;
+			packageProductDependencies = (
+			);
+			productName = EluTestHost;
+			productReference = D9F7FF7C2B7AACAC119D1A5D /* EluTestHost.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		73912F5FDDCA412A0A6D682E /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = YES;
+				LastUpgradeCheck = 1430;
+				TargetAttributes = {
+				};
+			};
+			buildConfigurationList = 0C41291767FFBB293014F90A /* Build configuration list for PBXProject "EluHostedTests" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				Base,
+				en,
+			);
+			mainGroup = B10AB58788E7368482B766C8;
+			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				0453F87EE5EDE466E7420282 /* XCLocalSwiftPackageReference "../../.." */,
+			);
+			preferredProjectObjectVersion = 77;
+			productRefGroup = 695F5D45742D94E5B4EC1822 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				D8F53F9C1CBEFBC2C43D7095 /* EluTestHost */,
+				A51A5041BA112C37B12EB6B0 /* EluAnalyticsTests */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXSourcesBuildPhase section */
+		96ADF60FF959887E52465254 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				2A5F29C85CA3BD15A3C1075C /* AppDelegate.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		97650F5118D743D06D3E9A72 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				09542CD3BA2B0414E6441DF2 /* EluEventFilterTests.swift in Sources */,
+				5ED9B6C29AB373976FC8BE45 /* EluEventFilterQueueTests.swift in Sources */,
+				722D3E41A9B1747E46641F89 /* EluNativeRasterCompositionTests.swift in Sources */,
+				937498441D1A339099B04401 /* EluNativeRasterSourceDenialTests.swift in Sources */,
+				E11F5429F06AF70D5D36C99E /* EluNativeRasterDeliveryTests.swift in Sources */,
+				089134C4C32012D2063184D7 /* EluNativeRasterQueueTests.swift in Sources */,
+				38479F2E11178FE12A35EB52 /* EluNativeRasterResponseTests.swift in Sources */,
+				ECF7F297DF37EF87EF6E275E /* EluNativeV3ConfigParserTests.swift in Sources */,
+				C769EC8BB8A14CB8EBD76C8C /* EluNativeRasterSealerTests.swift in Sources */,
+				8E926CE62DC6DC39E278C090 /* EluSwiftUIReplayCollectorTests.swift in Sources */,
+				3DC98BF7F801F1F54CE242D2 /* EluMetricKitCrashReportTests.swift in Sources */,
+				8DBF84484C4FB7637D0FD628 /* EluMetricKitCrashQueueTests.swift in Sources */,
+				6AAE3D8F7F23A6FE2E3A9068 /* EluReplayWindowTests.swift in Sources */,
+				A0CB662675FD3E7A9F5F6409 /* EluNativeReplayInteractionCaptureTests.swift in Sources */,
+				23CB5307D5AC20DC38D31F52 /* EluUIKitReplayTouchObserverTests.swift in Sources */,
+				5DCABA154F16556A08087983 /* EluUIKitReplayInteractionProjectionTests.swift in Sources */,
+				A390C3B0DA95729193F38AE8 /* EluPersonIdentityQueueTests.swift in Sources */,
+				575F1AA4F39A979EF84FF05D /* EluNativeWireframeV2EncoderTests.swift in Sources */,
+				FCD9410B477F0A679BE09FE1 /* EluNativeReplayInteractionMailboxTests.swift in Sources */,
+				AA35F498769EA2F5A813F36C /* EluNativeReplayInteractionBufferTests.swift in Sources */,
+				0FC82A69EBF277473A777FAB /* EluMemoryPersistenceTests.swift in Sources */,
+				E99D55D817347F06C3B96632 /* EluFlagExposureQueueTests.swift in Sources */,
+				EA70684A25876EF123E2EC52 /* EluCaptureRateQueueTests.swift in Sources */,
+				6C080589161D54E5463CBDFE /* EluCaptureRateLimiterTests.swift in Sources */,
+				DD82CE02EA9481A564029708 /* EluSelfHostedEndpointTests.swift in Sources */,
+				F7F31AC8DFD9C7C33F8EE5B7 /* EluNativeDiagnosticsTests.swift in Sources */,
+				8CCA6EF97C8ED72EB179E803 /* EluNativeDiagnosticsRuntimeTests.swift in Sources */,
+				B32108CA473CBEE97317C89C /* EluNativeDiagnosticsQueueTests.swift in Sources */,
+				86A274B5BACCC4698FF1611E /* EluNetworkObservationTests.swift in Sources */,
+				4293546235FF9CB4EEA7065A /* EluNativeFrameCadenceTests.swift in Sources */,
+				AAD102D11841569836D75FA1 /* EluReplayAudienceTests.swift in Sources */,
+				B3BC55C5AB1E9CDD1ED76C68 /* EluApplicationLifecycleEmitterTests.swift in Sources */,
+				084440C60E4F6326E164DCE6 /* EluCallbackRegistryTests.swift in Sources */,
+				382BAB86AD3859BE14CFF6F1 /* EluConfigClientTests.swift in Sources */,
+				E2CCF7E0496759F7F229387E /* EluConfigHostAllowlistTests.swift in Sources */,
+				9E5898978A8D55C5D14E690A /* EluEuGuardTests.swift in Sources */,
+				7FEFF1AE03BA377A90D11014 /* EluEventBufferTests.swift in Sources */,
+				DC59802B0034D1DDB26D348B /* EluExceptionSerializerTests.swift in Sources */,
+				D1D28DB9997FFFB1FF4F06AC /* EluFacadeConcurrencyTests.swift in Sources */,
+				1F6B2536391946EF8F20A2F8 /* EluIdentityCoreTests.swift in Sources */,
+				8DC23A059B40E2BEF896DE4A /* EluLifecyclePolicyTests.swift in Sources */,
+				CE2C549CF5FF35E4E3B3AA6F /* EluMigrationCoordinatorTests.swift in Sources */,
+				23B72E97FC1B4457C03F9981 /* EluNativeMaskingProfileTests.swift in Sources */,
+				61A497FF7D91651EC6C192F6 /* EluNativePerformanceTests.swift in Sources */,
+				4680B11A2DDEBDFE9A145D87 /* EluNativeReplayAuthorityTests.swift in Sources */,
+				9B6ED86BE0FC7E91C6B207E5 /* EluNativeReplayCaptureOwnerTests.swift in Sources */,
+				35EDDE2B7A1F31E6C4A43EE7 /* EluNativeReplayCaptureQueueTests.swift in Sources */,
+				5EA509A2E3863CC1F8639DDF /* EluNativeReplayCaptureUIKitTests.swift in Sources */,
+				656FB91477E9F6139D46AEC4 /* EluNativeReplayCompositionTests.swift in Sources */,
+				55D5C4C8CF5258A6041258A1 /* EluNativeReplayLifecycleTests.swift in Sources */,
+				89E07C70978ED98FDEF5041D /* EluNativeReplayMixedStartUIKitTests.swift in Sources */,
+				BE58960BEA833B640CF22BC6 /* EluNativeReplaySealerTests.swift in Sources */,
+				6B67AF12799DEEEBD37EFAA8 /* EluNativeReplaySessionQueueTests.swift in Sources */,
+				D6A4F45B1D94130EBEF11A68 /* EluNativeReplaySessionStateTests.swift in Sources */,
+				AD33184E0740C03BB8A83D7F /* EluNativeWireframeEncoderTests.swift in Sources */,
+				30EBE4409DA3BB5D6F3EFCF2 /* EluPrivacyStateProjectorTests.swift in Sources */,
+				8174F91B4740B7FD1883F068 /* EluRemoteConfigTests.swift in Sources */,
+				8043BAF23F5E0D4E44A26E01 /* EluReplayBudgetTests.swift in Sources */,
+				07C288CCD0F509519BFFBF5E /* EluRuntimeSelectorTests.swift in Sources */,
+				A84B4F290BA92741A5878043 /* EluSQLiteRuntimeQueueTests.swift in Sources */,
+				705EE07C0813CFFF3E617283 /* EluSQLiteRuntimeScratchTests.swift in Sources */,
+				62451233D64346F518FF645B /* EluSealedReplayPolicyQueueTests.swift in Sources */,
+				5C043D816FFA15F686FF4E30 /* EluSealedReplayPolicyTests.swift in Sources */,
+				5A3A6C3061CA30048A85DFB5 /* EluStandaloneFacadeRuntimeTests.swift in Sources */,
+				E12D49033042E6F6346EDCCC /* EluStandaloneRuntimeTests.swift in Sources */,
+				A193E163A9037620B203DE1F /* EluStandaloneStackTests.swift in Sources */,
+				90204844B9D0B370C311E608 /* EluUIKitReplayCollectorTests.swift in Sources */,
+				C0B4D4FDB420EBE476210EB2 /* EluUIKitTestHost.swift in Sources */,
+				548C75D30AE907C1E7A52DAF /* EluV1BatchDeliveryTests.swift in Sources */,
+				B94581242492A669BEC4E823 /* EluV1CaptureAdmissionVectorTests.swift in Sources */,
+				7776098D9CA504C5C5F044F3 /* EluV1CaptureRuntimeTests.swift in Sources */,
+				0E682CE763D984FC70952FD4 /* EluV1ConfigManagerTests.swift in Sources */,
+				E79600853BBDCC7D661B24B3 /* EluV1FlagRuntimeTests.swift in Sources */,
+				771993C853B18C6112B03282 /* EluV1StrictCanonicalJSONTests.swift in Sources */,
+				60CD3BFC950F3AB82028746F /* EluV1URLSessionBatchTransportTests.swift in Sources */,
+				B45C788C9AB8532AB96C7A67 /* EluV1URLSessionFlagTransportTests.swift in Sources */,
+				651421BAA79E4A33C3057F25 /* EluV2ConfigAuthorityGateTests.swift in Sources */,
+				CE1624E798BF29D2292B5342 /* EluV2ConfigLifecycleTests.swift in Sources */,
+				48AE0E8CE026B8CF18859B5C /* EluV2ConfigManagerTests.swift in Sources */,
+				B4E3CACCFC37E9C7E339723D /* EluV2ConfigSourceTests.swift in Sources */,
+				9FBBFFC45E91E91ABFC5EEBB /* EluV2ReplayDeliveryTests.swift in Sources */,
+				B23F1E8459647B5811D5C034 /* EluV2ReplayResponseTests.swift in Sources */,
+				766FC96000E3A517E2A1D6E0 /* EluV2ReplayStorageTests.swift in Sources */,
+				90EFDA381E04BE89FB84B109 /* EluV2URLSessionConfigTransportTests.swift in Sources */,
+				57E29C50E0BFC47D481D5DEC /* EluV2URLSessionReplayTransportTests.swift in Sources */,
+				186CB363D14178EC3D637471 /* TestConfigFactory.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		747E56AE90DC2C9EDD6C7C96 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = D8F53F9C1CBEFBC2C43D7095 /* EluTestHost */;
+			targetProxy = 8D8E0B466BFD7EFC20AD0DF0 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		3A78DED9B516F44455A6BA31 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = dev.elu.tests.host;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+		71F014389A665FFB4330CC92 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				CODE_SIGNING_ALLOWED = NO;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 13.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SUPPORTS_MACCATALYST = NO;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 5.9;
+				TARGETED_DEVICE_FAMILY = 1;
+			};
+			name = Release;
+		};
+		85F099BB4FF9F24E9094EE4A /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = dev.elu.tests.unit;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/EluTestHost.app/EluTestHost";
+			};
+			name = Debug;
+		};
+		95B118F87143B3ED490E642F /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = dev.elu.tests.host;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		C1E95064C7D67A8B4BDC3B3D /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				CODE_SIGNING_ALLOWED = NO;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					"DEBUG=1",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 13.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SUPPORTS_MACCATALYST = NO;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 5.9;
+				TARGETED_DEVICE_FAMILY = 1;
+			};
+			name = Debug;
+		};
+		F548254DE69D757A7233E1F9 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = dev.elu.tests.unit;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/EluTestHost.app/EluTestHost";
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		0C41291767FFBB293014F90A /* Build configuration list for PBXProject "EluHostedTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				C1E95064C7D67A8B4BDC3B3D /* Debug */,
+				71F014389A665FFB4330CC92 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		15FFA44589ABDE9191501D48 /* Build configuration list for PBXNativeTarget "EluAnalyticsTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				85F099BB4FF9F24E9094EE4A /* Debug */,
+				F548254DE69D757A7233E1F9 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		814047AB4BA336BA1C2B80F5 /* Build configuration list for PBXNativeTarget "EluTestHost" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				95B118F87143B3ED490E642F /* Debug */,
+				3A78DED9B516F44455A6BA31 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+/* End XCConfigurationList section */
+
+/* Begin XCLocalSwiftPackageReference section */
+		0453F87EE5EDE466E7420282 /* XCLocalSwiftPackageReference "../../.." */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = "../../..";
+		};
+/* End XCLocalSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		0813B487B7509563297B1464 /* EluAnalytics */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = EluAnalytics;
+		};
+/* End XCSwiftPackageProductDependency section */
+	};
+	rootObject = 73912F5FDDCA412A0A6D682E /* Project object */;
+}

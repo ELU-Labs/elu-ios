@@ -1,0 +1,383 @@
+import Darwin
+import Foundation
+
+/// Raw config data is not capture, flag, or replay authorization. Each channel
+/// must still apply its privacy and identity checks through the config manager.
+enum EluV2ConfigRefreshResult: Equatable, Sendable {
+    case document(Data)
+    case unavailable
+    case superseded
+}
+
+enum EluV2ConfigSourceError: Error, Equatable {
+    case invalidSiteKey
+    case untrustedConfigHost
+    case invalidResponse
+    case responseTooLarge
+    case invalidLease
+}
+
+struct EluV2ConfigRequest: Sendable {
+    /// Immutable selection on the original fetch owner. There is no version fallback.
+    enum Format: Equatable, Sendable { case v2, nativeV3 }
+    let url: URL
+    let format: Format
+    static let maximumResponseBytes = 65_536
+    static let timeoutSeconds: TimeInterval = 10
+
+    init(siteKey: String, configHost: URL, endpointPolicy: EluEndpointPolicy = .cloud,
+         format: Format = .v2) throws {
+        // Matches the public config service boundary. Do not trim or rewrite a
+        // credential, and never permit it to become URL syntax.
+        guard siteKey.range(
+            of: #"\Aelu_pk_(live|test)_[A-Za-z0-9]{22,64}\z"#,
+            options: .regularExpression
+        ) != nil else { throw EluV2ConfigSourceError.invalidSiteKey }
+        guard case let .approved(origin) = EluConfigHostAllowlist.resolve(
+            configHost: configHost, apiHost: endpointPolicy.declaredAPIOrigin
+        ) else { throw EluV2ConfigSourceError.untrustedConfigHost }
+        guard var components = URLComponents(url: origin, resolvingAgainstBaseURL: false) else {
+            throw EluV2ConfigSourceError.untrustedConfigHost
+        }
+        let version = format == .v2 ? "v2" : "v3"
+        components.percentEncodedPath += "/sdk/\(version)/\(siteKey)/config"
+        guard let requestURL = components.url else { throw EluV2ConfigSourceError.untrustedConfigHost }
+        url = requestURL
+        self.format = format
+    }
+}
+
+protocol EluV2ConfigTransport: Sendable {
+    /// Returns only a bounded HTTP 200 response from the exact request URL.
+    func fetch(_ request: EluV2ConfigRequest) async throws -> Data
+}
+
+struct EluV2ConfigLease: Equatable, Sendable {
+    /// Existing channel owners still receive the exact original embedded v2 value.
+    let data: Data
+    let expiresAt: EluV1Timestamp
+    let continuousDeadline: UInt64
+    /// The same original receipt and lease, not a second authority or renewed grant.
+    let nativeV3: EluNativeV3ConfigParser.Parsed?
+    var receiptData: Data { nativeV3?.data ?? data }
+
+    init(data: Data, expiresAt: EluV1Timestamp, continuousDeadline: UInt64,
+         nativeV3: EluNativeV3ConfigParser.Parsed? = nil) {
+        self.data = data; self.expiresAt = expiresAt
+        self.continuousDeadline = continuousDeadline; self.nativeV3 = nativeV3
+    }
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.data == rhs.data && lhs.receiptData == rhs.receiptData
+            && lhs.expiresAt == rhs.expiresAt && lhs.continuousDeadline == rhs.continuousDeadline
+    }
+}
+
+/// A restrictive fact produced only by the original validated source. This is
+/// neither a lease nor permission. It contains no response body or credentials.
+final class EluV2ConfigSourceDenial: Sendable {
+    let issuedAt: EluV1Timestamp
+    let semanticHash: String
+    let conflictingSemanticHash: String
+
+    fileprivate init(issuedAt: EluV1Timestamp, semanticHash: String, conflictingSemanticHash: String) {
+        self.issuedAt = issuedAt
+        self.semanticHash = semanticHash
+        self.conflictingSemanticHash = conflictingSemanticHash
+    }
+}
+
+/// One original-source slot. A newer conflict dominates an older one; ordinary
+/// withdrawal/close cannot erase an unsettled restrictive fact. The source alone
+/// creates receipts and only the exact original gate acknowledges SQL settlement.
+final class EluV2ConfigSourceDenials: @unchecked Sendable {
+    private let siteKey: String
+    private let lock = NSLock()
+    private var latest: EluV2ConfigSourceDenial?
+    private var settled = false
+    fileprivate init(siteKey: String) { self.siteKey = siteKey }
+    func belongs(to key: String) -> Bool { siteKey == key }
+
+    fileprivate func record(issuedAt: EluV1Timestamp, original: Data, conflicting: Data) {
+        lock.lock(); defer { lock.unlock() }
+        guard original != conflicting, latest.map({ $0.issuedAt < issuedAt }) ?? true else { return }
+        latest = EluV2ConfigSourceDenial(issuedAt: issuedAt,
+            semanticHash: EluV1StrictCanonicalJSON.hash(original),
+            conflictingSemanticHash: EluV1StrictCanonicalJSON.hash(conflicting))
+        settled = false
+    }
+
+    func pending() -> EluV2ConfigSourceDenial? {
+        lock.lock(); defer { lock.unlock() }
+        return settled ? nil : latest
+    }
+
+    func contains(_ candidate: EluV2ConfigSourceDenial) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return !settled && latest === candidate
+    }
+
+    func acknowledge(_ candidate: EluV2ConfigSourceDenial) {
+        lock.lock(); defer { lock.unlock() }
+        if latest === candidate { settled = true }
+    }
+}
+
+struct EluV2ConfigClock: Sendable {
+    let wallNow: @Sendable () -> Date
+    let continuousNow: @Sendable () -> UInt64
+    let floorTicks: @Sendable (UInt64) -> UInt64?
+    let floorNanoseconds: @Sendable (UInt64) -> UInt64?
+
+    init(
+        wallNow: @escaping @Sendable () -> Date,
+        continuousNow: @escaping @Sendable () -> UInt64,
+        floorTicks: @escaping @Sendable (UInt64) -> UInt64?,
+        floorNanoseconds: @escaping @Sendable (UInt64) -> UInt64? = {
+            EluV2ConfigClock.continuousNanoseconds(forTicks: $0)
+        }
+    ) {
+        self.wallNow = wallNow
+        self.continuousNow = continuousNow
+        self.floorTicks = floorTicks
+        self.floorNanoseconds = floorNanoseconds
+    }
+
+    private static func continuousNanoseconds(forTicks ticks: UInt64) -> UInt64? {
+        var info = mach_timebase_info_data_t()
+        guard mach_timebase_info(&info) == KERN_SUCCESS, info.numer > 0, info.denom > 0 else {
+            return nil
+        }
+        let numerator = UInt64(info.numer)
+        let denominator = UInt64(info.denom)
+        let (whole, overflow) = (ticks / denominator).multipliedReportingOverflow(by: numerator)
+        let (partial, partialOverflow) = (ticks % denominator).multipliedReportingOverflow(by: numerator)
+        guard !overflow, !partialOverflow else { return nil }
+        let (result, sumOverflow) = whole.addingReportingOverflow(partial / denominator)
+        return sumOverflow ? nil : result
+    }
+
+    static let live = EluV2ConfigClock(
+        wallNow: { Date() },
+        continuousNow: { EluMachContinuousClock.now() },
+        floorTicks: { EluMachContinuousClock.floorTicks(forNanoseconds: $0) }
+    )
+}
+
+/// Internal one-shot source, privately owned by EluV2ConfigLifecycle for renewal
+/// and independent withdrawal behind the public facade.
+/// No cached/provider fallback is used, and failed fetches retain the manager's
+/// anti-rollback boundary while withdrawing the published document.
+actor EluV2ConfigSource {
+    nonisolated let denials: EluV2ConfigSourceDenials
+    private let request: EluV2ConfigRequest
+    private let transport: any EluV2ConfigTransport
+    private let clock: EluV2ConfigClock
+    private let manager: EluV1ConfigManager
+    private let endpointPolicy: EluEndpointPolicy
+    private struct EnvelopeBoundary {
+        let issuedAt: EluV1Timestamp
+        let canonicalData: Data
+        var conflicted = false
+    }
+    private var envelopeBoundary: EnvelopeBoundary?
+    private var lease: EluV2ConfigLease?
+    private var acceptedIssuedAt: EluV1Timestamp?
+    private var acceptedDeadline: UInt64?
+    private var attempt: UUID?
+    private var pending: Task<Data, Error>?
+    private var closed = false
+    private var clockInvalid = false
+    private var lastWall: Date?
+    private var lastContinuous: UInt64?
+
+    init(
+        siteKey: String,
+        configHost: URL = URL(string: "https://elu.dev")!,
+        endpointPolicy: EluEndpointPolicy = .cloud,
+        format: EluV2ConfigRequest.Format = .v2,
+        transport: (any EluV2ConfigTransport)? = nil,
+        clock: EluV2ConfigClock = .live
+    ) throws {
+        request = try EluV2ConfigRequest(siteKey: siteKey, configHost: configHost, endpointPolicy: endpointPolicy, format: format)
+        denials = EluV2ConfigSourceDenials(siteKey: siteKey)
+        manager = EluV1ConfigManager(endpointPolicy: endpointPolicy, readbackProvenReplayTransports: EluStandaloneRuntime.readbackProvenReplayCapabilities.transports)
+        self.transport = transport ?? EluV2URLSessionConfigTransport(expectedRequestURL: request.url)
+        self.clock = clock
+        self.endpointPolicy = endpointPolicy
+    }
+
+    func currentDocument() -> Data? {
+        currentLease()?.data
+    }
+
+    func currentLease() -> EluV2ConfigLease? {
+        guard !closed, let sample = sampleClock() else {
+            lease = nil
+            return nil
+        }
+        guard let lease,
+              !lease.expiresAt.isAtOrBefore(sample.wall),
+              sample.continuous < lease.continuousDeadline
+        else {
+            lease = nil
+            return nil
+        }
+        return lease
+    }
+
+    func refresh() async -> EluV2ConfigRefreshResult {
+        guard !closed, !Task.isCancelled, let startedAt = sampleClock() else {
+            lease = nil
+            return .unavailable
+        }
+        _ = currentDocument()
+        pending?.cancel()
+        let token = UUID()
+        attempt = token
+        let request = request
+        let transport = transport
+        let task = Task { try await transport.fetch(request) }
+        pending = task
+        do {
+            let data = try await withTaskCancellationHandler(
+                operation: { try await task.value },
+                onCancel: { task.cancel() }
+            )
+            guard !closed, attempt == token else { return .superseded }
+            pending = nil
+            guard !Task.isCancelled, !task.isCancelled,
+                  let sample = sampleClock()
+            else { throw EluV2ConfigSourceError.invalidLease }
+            guard data.count <= EluV2ConfigRequest.maximumResponseBytes else {
+                throw EluV2ConfigSourceError.responseTooLarge
+            }
+            let nativeV3: EluNativeV3ConfigParser.Parsed?
+            let baseData: Data
+            let document: EluV1ConfigDocument
+            switch request.format {
+            case .v2:
+                nativeV3 = nil; baseData = data
+                let strict = try EluV1StrictCanonicalJSON.parse(data)
+                document = try JSONDecoder().decode(EluV1ConfigDocument.self, from: strict.canonicalData)
+            case .nativeV3:
+                let parsed = try EluNativeV3ConfigParser.parse(data, endpointPolicy: endpointPolicy)
+                nativeV3 = parsed; baseData = parsed.configV2Data; document = parsed.base
+            }
+            guard document.schemaVersion == EluV1ConfigDocument.v2SchemaVersion,
+                  Self.validWindow(document, now: sample.wall)
+            else { throw EluV2ConfigSourceError.invalidLease }
+
+            // The base manager alone cannot see a changed optional raster branch.
+            // Retain that complete-wrapper boundary in this same source, including
+            // across withdrawal/failure, and never restore a conflicted issuance.
+            if let nativeV3 {
+                if let previous = envelopeBoundary, document.issuedAt < previous.issuedAt {
+                    return currentDocument().map(EluV2ConfigRefreshResult.document) ?? .unavailable
+                }
+                if var previous = envelopeBoundary, document.issuedAt == previous.issuedAt {
+                    guard !previous.conflicted, previous.canonicalData == nativeV3.canonicalData else {
+                        denials.record(issuedAt: previous.issuedAt, original: previous.canonicalData,
+                                       conflicting: nativeV3.canonicalData)
+                        previous.conflicted = true; envelopeBoundary = previous
+                        throw EluV2ConfigSourceError.invalidLease
+                    }
+                } else {
+                    envelopeBoundary = EnvelopeBoundary(issuedAt: document.issuedAt,
+                                                        canonicalData: nativeV3.canonicalData)
+                }
+            }
+
+            // Update before testing remaining life: a validated expired/revoked
+            // document still establishes a boundary against older responses.
+            let update = try manager.update(configData: baseData, now: sample.wall)
+            if case .stale = update {
+                return currentDocument().map(EluV2ConfigRefreshResult.document) ?? .unavailable
+            }
+            guard !document.expiresAt.isAtOrBefore(sample.wall),
+                  let remaining = document.expiresAt.floorNanoseconds(after: sample.wall),
+                  remaining > 0, let ticks = clock.floorTicks(remaining), ticks > 0
+            else { throw EluV2ConfigSourceError.invalidLease }
+            let (receivedDeadline, overflow) = sample.continuous.addingReportingOverflow(ticks)
+            guard !overflow,
+                  let startingBudget = document.expiresAt.floorNanoseconds(after: startedAt.wall),
+                  let startingTicks = clock.floorTicks(startingBudget)
+            else { throw EluV2ConfigSourceError.invalidLease }
+            let (startedDeadline, startingOverflow) = startedAt.continuous.addingReportingOverflow(startingTicks)
+            guard !startingOverflow else { throw EluV2ConfigSourceError.invalidLease }
+            // Network time also consumes the lease if the wall clock stalls.
+            let deadline = min(receivedDeadline, startedDeadline)
+            let boundedDeadline: UInt64
+            if acceptedIssuedAt == document.issuedAt, let previous = acceptedDeadline {
+                boundedDeadline = min(previous, deadline)
+            } else {
+                boundedDeadline = deadline
+            }
+            acceptedIssuedAt = document.issuedAt
+            acceptedDeadline = boundedDeadline
+            guard sample.continuous < boundedDeadline else {
+                throw EluV2ConfigSourceError.invalidLease
+            }
+            lease = EluV2ConfigLease(data: baseData, expiresAt: document.expiresAt,
+                                    continuousDeadline: boundedDeadline, nativeV3: nativeV3)
+            return .document(baseData)
+        } catch {
+            guard !closed, attempt == token else { return .superseded }
+            pending = nil
+            lease = nil
+            return .unavailable
+        }
+    }
+
+    /// Revokes the published lease and pending attempt without forgetting
+    /// newest issuance/conflict or spent continuous-deadline witnesses.
+    func withdraw() {
+        attempt = nil
+        pending?.cancel()
+        pending = nil
+        lease = nil
+    }
+
+    func close() {
+        closed = true
+        withdraw()
+    }
+
+    private func sampleClock() -> (wall: Date, continuous: UInt64)? {
+        guard !clockInvalid else { return nil }
+        let wall = clock.wallNow()
+        let continuous = clock.continuousNow()
+        guard (try? EluV1Timestamp.exactClock(wall)) != nil,
+              lastWall.map({ wall >= $0 }) ?? true,
+              lastContinuous.map({ continuous >= $0 }) ?? true
+        else {
+            clockInvalid = true
+            lease = nil
+            return nil
+        }
+        lastWall = wall
+        lastContinuous = continuous
+        return (wall, continuous)
+    }
+
+    private static func validWindow(_ document: EluV1ConfigDocument, now: Date) -> Bool {
+        let start = document.issuedAt
+        let end = document.expiresAt
+        guard start < end, start.isAtOrBefore(now),
+              !start.storageIsLeapSecond, !end.storageIsLeapSecond
+        else { return false }
+        let seconds = (end.storageDay - start.storageDay) * 86_400
+            + end.storageSecondOfDay - start.storageSecondOfDay
+        if seconds < 600 { return true }
+        guard seconds == 600 else { return false }
+        // A subnanosecond excess must not pass through duration rounding.
+        let count = max(start.storageFractionDigits.count, end.storageFractionDigits.count)
+        let startFraction = start.storageFractionDigits.padding(
+            toLength: count, withPad: "0", startingAt: 0
+        )
+        let endFraction = end.storageFractionDigits.padding(
+            toLength: count, withPad: "0", startingAt: 0
+        )
+        return endFraction <= startFraction
+    }
+}

@@ -13,6 +13,109 @@ final class EluStandaloneRuntimeTests: XCTestCase {
         var errorDescription: String? { "checkout failed" }
     }
 
+    func testNetworkObservationUsesOwnedWireAndDropsAcrossAuthorityChanges() async throws {
+        try await withTemporaryDirectory { root in
+            let transport = RecordingBatchTransport(), clock = TestRuntimeClock(wall: baseDate)
+            let runtime = try await makeRuntime(root: root, transport: transport, clock: clock)
+            let request = URLRequest(url: URL(string: "https://customer.example/private?token=secret")!)
+            XCTAssertNil(runtime.beginNetworkObservation(request))
+            runtime.performanceLifecycleIntent(foreground: true)
+            await runtime.markForegrounded()
+            _ = await runtime.applyConfiguration(fixture("config-enabled.json"))
+            let first = try XCTUnwrap(runtime.beginNetworkObservation(request)); first.start(); first.finish(response: nil, failed: true)
+            try await awaitCondition { try await runtime.queueSnapshot().queuedCount == 1 }
+            _ = await runtime.flush()
+            let requests = await transport.recordedRequests()
+            let event = try XCTUnwrap(batchEvents(XCTUnwrap(requests.first)).first)
+            XCTAssertEqual(event["name"] as? String, "$network_request")
+            let properties = try XCTUnwrap(event["properties"] as? [String: Any])
+            XCTAssertEqual(properties["$network_failed"] as? Bool, true)
+            XCTAssertNotNil(properties["$device_id"] as? String)
+            XCTAssertEqual(properties["$is_identified"] as? Bool, false)
+            XCTAssertEqual(properties["$process_person_profile"] as? Bool, false)
+            XCTAssertNil(properties["$epp"])
+            XCTAssertNil(properties["$network_url"]); XCTAssertNil(properties["$pathname"])
+
+            let pendingMutation = try XCTUnwrap(runtime.beginNetworkObservation(request)); pendingMutation.start()
+            let intent = runtime.beginFlagProjectionIntent()
+            XCTAssertNil(runtime.beginNetworkObservation(request))
+            runtime.finishFlagProjectionIntent(intent)
+            pendingMutation.finish(response: nil, failed: false)
+            _ = await runtime.applyConfiguration(fixture("config-enabled.json"))
+            let oldConfiguration = try XCTUnwrap(runtime.beginNetworkObservation(request)); oldConfiguration.start()
+            _ = await runtime.applyConfiguration(fixture("config-enabled.json"))
+            oldConfiguration.finish(response: nil, failed: false)
+            let oldIdentity = try XCTUnwrap(runtime.beginNetworkObservation(request)); oldIdentity.start()
+            _ = await runtime.identify("user-b")
+            oldIdentity.finish(response: nil, failed: false)
+            let oldForeground = try XCTUnwrap(runtime.beginNetworkObservation(request)); oldForeground.start()
+            runtime.performanceLifecycleIntent(foreground: false)
+            _ = await runtime.applyConfiguration(fixture("config-enabled.json"))
+            XCTAssertNil(runtime.beginNetworkObservation(request), "Actor refresh cannot override synchronous background denial")
+            oldForeground.finish(response: nil, failed: false)
+            runtime.performanceLifecycleIntent(foreground: true)
+            await runtime.markForegrounded()
+            let oldConsent = try XCTUnwrap(runtime.beginNetworkObservation(request)); oldConsent.start()
+            let denial = UUID(); runtime.acceptConsentIntent(denial, optedOut: true)
+            XCTAssertNil(runtime.beginNetworkObservation(request))
+            oldConsent.finish(response: nil, failed: false)
+            _ = await runtime.setOptedOut(true, intent: denial)
+            let remaining = try await runtime.queueSnapshot()
+            // identify may emit its own mutation, but no stale network event.
+            XCTAssertLessThanOrEqual(remaining.queuedCount, 1)
+            await runtime.close(); XCTAssertNil(runtime.beginNetworkObservation(request))
+        }
+    }
+
+    func testOptInNativePerformanceUsesOwnedEventSerializationAndStopsOnConsent() async throws {
+        try await withTemporaryDirectory { root in
+            let transport = RecordingBatchTransport()
+            let clock = TestRuntimeClock(wall: Date(timeIntervalSince1970: 1_785_888_090))
+            let runtime = try await makeRuntime(root: root, transport: transport, clock: clock,
+                performance: .init(enabled: true, sampleIntervalMilliseconds: 5_000))
+            let fixtureURL = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+                .deletingLastPathComponent().deletingLastPathComponent()
+                .appendingPathComponent("Conformance/V2/fixtures/config-enabled.json")
+            var config = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: fixtureURL)) as? [String: Any])
+            config["capturePerformance"] = ["memory": true, "long_tasks": true, "sample_interval_ms": 5_000]
+            guard case .capturing = await runtime.applyConfiguration(try JSONSerialization.data(withJSONObject: config)) else {
+                await runtime.close(); return XCTFail("expected active performance policy")
+            }
+            _ = await runtime.capture("session-start")
+            runtime.performanceLifecycleIntent(foreground: true)
+            await runtime.markForegrounded()
+            _ = await runtime.flush()
+            let sessionBeforeSample = try await runtime.queueSnapshot().identity.session
+            clock.advance(seconds: 1)
+            try await awaitCondition(timeoutSeconds: 7) { try await runtime.queueSnapshot().queuedCount >= 1 }
+            let sessionAfterSample = try await runtime.queueSnapshot().identity.session
+            XCTAssertEqual(sessionAfterSample, sessionBeforeSample, "passive sampling cannot extend idle time")
+            runtime.performanceLifecycleIntent(foreground: false)
+            _ = await runtime.flush()
+            let requests = await transport.recordedRequests()
+            let events = try requests.flatMap { try batchEvents($0) }
+            let sample = try XCTUnwrap(events.first { $0["name"] as? String == "$performance_sample" })
+            let properties = try XCTUnwrap(sample["properties"] as? [String: Any])
+            XCTAssertEqual(properties["$performance_platform"] as? String, "ios")
+            XCTAssertEqual(properties["$performance_sample_interval_ms"] as? Int, 5_000)
+            XCTAssertEqual(properties["$app_foreground"] as? Bool, true)
+            XCTAssertNotNil(properties["$device_id"] as? String)
+            XCTAssertEqual(properties["$is_identified"] as? Bool, false)
+            XCTAssertEqual(properties["$process_person_profile"] as? Bool, false)
+            XCTAssertNil(properties["$epp"])
+            XCTAssertGreaterThan(try XCTUnwrap(properties["$memory_process_footprint_bytes"] as? Int), 0)
+            XCTAssertNotNil(properties["$main_thread_stall_count"])
+            XCTAssertNil(properties["$memory_used_js_heap_bytes"])
+            XCTAssertNil(properties["$long_task_count"])
+            let intent = UUID(); runtime.acceptConsentIntent(intent, optedOut: true)
+            _ = await runtime.setOptedOut(true, intent: intent)
+            let snapshot = try await runtime.queueSnapshot()
+            XCTAssertTrue(snapshot.identity.optedOut)
+            XCTAssertEqual(snapshot.queuedCount, 0)
+            await runtime.close()
+        }
+    }
+
     func testEnabledConfigActivatesCaptureAndFlushDrainsOneAuthorizedBatch() async throws {
         try await withTemporaryDirectory { root in
             let transport = RecordingBatchTransport()
@@ -318,8 +421,9 @@ final class EluStandaloneRuntimeTests: XCTestCase {
             guard case .capturing = await second.applyConfiguration(fixture("config-enabled.json")) else {
                 return XCTFail("Expected capture authority after restart")
             }
-            let secondFlush = await second.flush()
-            XCTAssertEqual(secondFlush, .triggered(.resolved(delivered: 1, terminallyDiscarded: 0)))
+            // Installing source authority resumes the retained batch without
+            // another caller-triggered flush. Inspect only after its ACK commits.
+            try await awaitCondition { try await second.queueSnapshot().queuedCount == 0 }
 
             let failingRequests = await failing.recordedRequests()
             let acceptingRequests = await accepting.recordedRequests()
@@ -478,6 +582,258 @@ final class EluStandaloneRuntimeTests: XCTestCase {
     }
     #endif
 
+    func testAutomaticCaptureFamiliesAppendHookPersonMapsAfterAcceptedEventWithoutSecondCallback() async throws {
+        try await withTemporaryDirectory { root in
+            let calls = EventFilterCounter(), transport = RecordingBatchTransport()
+            let runtime = try await makeRuntime(root: root, transport: transport, clock: TestRuntimeClock(wall: baseDate),
+                eventFilter: .init(beforeSend: { event in
+                    calls.hit(); var event = event
+                    event.set = ["lastEvent": event.event]; event.setOnce = ["firstEvent": event.event]
+                    return event
+                }))
+            _ = await runtime.applyConfiguration(fixture("config-enabled.json"))
+            let originalSequence = try await runtime.queueSnapshot().nextSequence
+            let results = [await runtime.capture(EluStandaloneRuntime.applicationOpenedEvent),
+                await runtime.screen("Checkout"), await runtime.captureException(properties: ["message": .string("bounded")])]
+            for (index, result) in results.enumerated() {
+                guard case let .accepted(record, snapshot) = result else { XCTFail("Expected accepted original event"); continue }
+                XCTAssertEqual(record.sequence, originalSequence + Int64(index * 2))
+                XCTAssertEqual(snapshot.nextSequence, record.sequence + 2)
+            }
+            let state = try await runtime.queueSnapshot()
+            XCTAssertEqual(calls.count, 3, "Person continuation must not invoke a second $set hook")
+            XCTAssertEqual(state.flagContext.personProperties["firstEvent"], .string(EluStandaloneRuntime.applicationOpenedEvent))
+            XCTAssertEqual(state.flagContext.personProperties["lastEvent"], .string("$exception"))
+            XCTAssertEqual(state.queuedCount, 6)
+            _ = await runtime.flush()
+            let requests = await transport.recordedRequests()
+            let records = try requests.flatMap { try XCTUnwrap(batchBody($0)["records"] as? [[String: Any]]) }
+            XCTAssertEqual(records.compactMap { $0["kind"] as? String }, ["event", "mutation", "event", "mutation", "event", "mutation"])
+            await runtime.close()
+        }
+    }
+
+    func testRateLimitedOuterCallStillCompletesOnlyItsAcceptedWarningPersonChanges() async throws {
+        try await withTemporaryDirectory { root in
+            let calls = EventFilterCounter()
+            let runtime = try await makeRuntime(root: root, transport: RecordingBatchTransport(), clock: TestRuntimeClock(wall: baseDate),
+                eventFilter: .init(beforeSend: { event in
+                    calls.hit(); var event = event
+                    if event.event == EluCaptureRateLimiter.warningEvent { event.set = ["fromWarning": true] }
+                    return event
+                }), rateLimiting: .init(eventsPerSecond: 1, eventsBurstLimit: 1))
+            _ = await runtime.applyConfiguration(fixture("config-enabled.json"))
+            _ = await runtime.capture("first")
+            let limited = await runtime.captureWithPersonChanges("rate-limited", properties: [:], occurredAt: nil,
+                person: .init(set: ["mustNotAppear": .bool(true)], setOnce: nil), admissionGuard: nil)
+            guard case let .rejected(.rateLimited, snapshot) = limited.result else {
+                XCTFail("Original event remains rate limited"); await runtime.close(); return
+            }
+            XCTAssertEqual(calls.count, 2, "Only first event and warning reach the hook")
+            XCTAssertEqual(snapshot.queuedCount, 3, "First event, warning, warning person mutation")
+            XCTAssertEqual(snapshot.flagContext.personProperties["fromWarning"], .bool(true))
+            XCTAssertNil(snapshot.flagContext.personProperties["mustNotAppear"])
+            let again = await runtime.capture("still-limited")
+            guard case let .rejected(.rateLimited, unchanged) = again else {
+                XCTFail("No new warning until original limiter permits"); await runtime.close(); return
+            }
+            XCTAssertEqual(unchanged.nextSequence, snapshot.nextSequence); XCTAssertEqual(calls.count, 2)
+            await runtime.close()
+        }
+    }
+
+    func testAutomaticDroppedEventAndFutureOrNeverPersonRefusalRemainDistinct() async throws {
+        for mode in ["drop", "future", "never"] {
+            try await withTemporaryDirectory { root in
+                let calls = EventFilterCounter(), future = baseDate.addingTimeInterval(1)
+                let runtime = try await makeRuntime(root: root, transport: RecordingBatchTransport(), clock: TestRuntimeClock(wall: baseDate),
+                    eventFilter: .init(beforeSend: { event in
+                        calls.hit(); if mode == "drop" { return nil }
+                        var event = event; event.set = ["forbidden": true]
+                        if mode == "future" { event.timestamp = future }
+                        return event
+                    }), personProfiles: mode == "never" ? .never : .identifiedOnly)
+                _ = await runtime.applyConfiguration(fixture("config-enabled.json"))
+                let result = await runtime.capture("automatic")
+                let state = try await runtime.queueSnapshot(), refusals = await runtime.automaticPersonMutationRefusals
+                if mode == "drop" {
+                    guard case .rejected(.eventFiltered, _) = result else { XCTFail("Expected original drop"); await runtime.close(); return }
+                    XCTAssertEqual(state.queuedCount, 0); XCTAssertEqual(refusals, 0)
+                } else {
+                    guard case .accepted = result else { XCTFail("Expected event retained"); await runtime.close(); return }
+                    XCTAssertEqual(state.queuedCount, 1); XCTAssertEqual(refusals, 1)
+                }
+                XCTAssertTrue(state.flagContext.personProperties.isEmpty); XCTAssertEqual(calls.count, 1)
+                await runtime.close()
+            }
+        }
+    }
+
+    func testAutomaticPersonContinuationCannotCrossANewIntentAfterEventCommit() async throws {
+        try await withTemporaryDirectory { root in
+            let fault = DeliveryFault(), held = EventFilterRuntimeOwner()
+            let runtime = try await makeRuntime(root: root, transport: RecordingBatchTransport(), clock: TestRuntimeClock(wall: baseDate),
+                eventFilter: .init(beforeSend: { event in var event = event; event.set = ["mustNotAppear": true]; return event }),
+                faultInjector: fault)
+            held.runtime = runtime
+            _ = await runtime.applyConfiguration(fixture("config-enabled.json"))
+            fault.action = { point in if point == .afterCommit { held.newIntent() } }
+            let result = await runtime.capture("accepted-before-intent")
+            fault.action = nil
+            guard case .accepted = result else { XCTFail("Original accepted event remains"); await runtime.close(); return }
+            let after = try await runtime.queueSnapshot(), refusals = await runtime.automaticPersonMutationRefusals
+            XCTAssertEqual(after.queuedCount, 1); XCTAssertTrue(after.flagContext.personProperties.isEmpty)
+            XCTAssertEqual(refusals, 1)
+            await runtime.close()
+        }
+    }
+
+    func testFlagExposurePersonContinuationSurvivesItsOwnFlagProjectionInvalidation() async throws {
+        try await withTemporaryDirectory { root in
+            let runtime = try await makeRuntime(root: root, transport: RecordingBatchTransport(), clock: TestRuntimeClock(wall: baseDate),
+                eventFilter: .init(beforeSend: { event in var event = event; event.set = ["fromExposure": true]; return event }))
+            _ = await runtime.applyConfiguration(fixture("config-enabled.json"))
+            let before = try await runtime.queueSnapshot()
+            let exposure = EluFlagExposureRequest(anonymousId: before.identity.anonymousId,
+                digest: try EluFlagExposureLedger.digest(key: "flag", value: .bool(true)))
+            let result = await runtime.captureFlagExposure(properties: ["$feature_flag": .string("flag")], exposure: exposure,
+                admissionGuard: { true })
+            guard case let .accepted(_, after) = result else { XCTFail("Expected accepted exposure"); await runtime.close(); return }
+            XCTAssertEqual(after.queuedCount, 2)
+            XCTAssertEqual(after.flagContext.personProperties["fromExposure"], .bool(true))
+            let repeated = await runtime.captureFlagExposure(properties: [:], exposure: exposure, admissionGuard: { true })
+            guard case .rejected(.exposureAlreadyRecorded, _) = repeated else {
+                XCTFail("Exposure remains deduplicated"); await runtime.close(); return
+            }
+            await runtime.close()
+        }
+    }
+
+    func testHookMutationProjectionsPreserveTargetsAndAvoidAdditionalEventRecords() async throws {
+        try await withTemporaryDirectory { root in
+            let calls = EventFilterCounter()
+            let runtime = try await makeRuntime(root: root, transport: RecordingBatchTransport(), clock: TestRuntimeClock(wall: baseDate),
+                eventFilter: .init(propertyDenylist: ["secret"], beforeSend: { event in
+                    calls.hit(); var event = event
+                    XCTAssertNil(event.properties["secret"])
+                    switch event.event {
+                    case "$identify":
+                        XCTAssertEqual(event.properties["distinct_id"] as? String, "user-a")
+                        event.properties["distinct_id"] = "forged"; event.set = ["tier": "safe"]; event.setOnce = [:]
+                    case "$set": event.properties["$set"] = ["tier": "updated"]; event.properties.removeValue(forKey: "$set_once")
+                    case "$groupidentify":
+                        event.properties["$group_type"] = "forged"; event.properties["$group_key"] = "forged"
+                        event.properties["$group_set"] = ["plan": "safe"]
+                    case "$create_alias": event.properties["alias"] = "forged"
+                    default: XCTFail("Unexpected mutation projection")
+                    }
+                    event.event = "ignored"; event.timestamp = Date(timeIntervalSince1970: .nan)
+                    return event
+                }))
+            _ = await runtime.applyConfiguration(fixture("config-enabled.json"))
+            _ = await runtime.registerSuperProperties(["secret": .string("hidden")])
+            let identified = await runtime.identify("user-a", properties: ["tier": .string("raw")])
+            XCTAssertEqual(identified?.identity.userId, "user-a")
+            XCTAssertEqual(identified?.flagContext.personProperties["tier"], .string("safe"))
+            let same = await runtime.identify("user-a", properties: ["tier": .string("raw")])
+            XCTAssertEqual(same?.flagContext.personProperties["tier"], .string("updated"))
+            let grouped = await runtime.group(type: "company", key: "original")
+            XCTAssertEqual(grouped?.identity.groups, ["company": "original"])
+            XCTAssertEqual(grouped?.flagContext.groupProperties["company"], ["plan": .string("safe")])
+            let aliased = await runtime.alias("original-alias")
+            XCTAssertNotNil(aliased)
+            XCTAssertEqual(aliased?.queuedCount, 5, "Only original typed mutations; group is association then properties")
+            XCTAssertEqual(calls.count, 4)
+            await runtime.close()
+        }
+    }
+
+    func testMutationMapRemovalCannotFallBackToOriginalProperties() async throws {
+        try await withTemporaryDirectory { root in
+            let runtime = try await makeRuntime(root: root, transport: RecordingBatchTransport(), clock: TestRuntimeClock(wall: baseDate),
+                eventFilter: .init(beforeSend: { event in
+                    var event = event
+                    event.properties.removeValue(forKey: "$set"); event.properties.removeValue(forKey: "$set_once")
+                    event.properties.removeValue(forKey: "$group_set")
+                    return event
+                }))
+            _ = await runtime.applyConfiguration(fixture("config-enabled.json"))
+            let before = try await runtime.queueSnapshot()
+            let person = await runtime.setPersonProperties(["raw": .bool(true)])
+            XCTAssertEqual(person?.nextSequence, before.nextSequence)
+            XCTAssertTrue(person?.flagContext.personProperties.isEmpty == true)
+            let group = await runtime.group(type: "company", key: "retained", properties: ["raw": .bool(true)])
+            XCTAssertEqual(group?.identity.groups, ["company": "retained"])
+            XCTAssertTrue(group?.flagContext.groupProperties["company"]?.isEmpty ?? true)
+            XCTAssertEqual(group?.nextSequence, before.nextSequence + 1, "Only original group association is retained")
+            let unchanged = await runtime.group(type: "company", key: "retained", properties: ["raw": .bool(true)])
+            XCTAssertEqual(unchanged?.nextSequence, group?.nextSequence)
+            await runtime.close()
+        }
+    }
+
+    func testNetworkCompletionUsesAutomaticPersonContinuationWithOriginalPassiveSession() async throws {
+        try await withTemporaryDirectory { root in
+            let clock = TestRuntimeClock(wall: baseDate), calls = EventFilterCounter()
+            let runtime = try await makeRuntime(root: root, transport: RecordingBatchTransport(), clock: clock,
+                eventFilter: .init(beforeSend: { event in
+                    if event.event != "$network_request" { return event }
+                    calls.hit(); var event = event; event.set = ["networkObserved": true]; return event
+                }))
+            runtime.performanceLifecycleIntent(foreground: true); await runtime.markForegrounded()
+            _ = await runtime.applyConfiguration(fixture("config-enabled.json"))
+            _ = await runtime.capture("original-activity")
+            let before = try await runtime.queueSnapshot()
+            clock.advance(seconds: 1)
+            let observation = try XCTUnwrap(runtime.beginNetworkObservation(URLRequest(url: URL(string: "https://customer.example/path")!)))
+            observation.start(); observation.finish(response: nil, failed: true)
+            try await awaitCondition {
+                try await runtime.queueSnapshot().flagContext.personProperties["networkObserved"] == .bool(true)
+            }
+            let after = try await runtime.queueSnapshot()
+            XCTAssertEqual(after.nextSequence, before.nextSequence + 2)
+            XCTAssertEqual(after.identity.session?.lastActivityAt, before.identity.session?.lastActivityAt)
+            XCTAssertEqual(after.identity.session?.id, before.identity.session?.id)
+            XCTAssertEqual(calls.count, 1)
+            await runtime.close()
+        }
+    }
+
+    func testMutationHooksKeepExistingLocalOptOutBehaviorWithoutWireAdmission() async throws {
+        try await withTemporaryDirectory { root in
+            let runtime = try await makeRuntime(root: root, transport: RecordingBatchTransport(), clock: TestRuntimeClock(wall: baseDate),
+                eventFilter: .init(beforeSend: { event in var event = event; event.set = ["local": true]; return event }))
+            _ = await runtime.applyConfiguration(fixture("config-enabled.json"))
+            let intent = UUID(); runtime.acceptConsentIntent(intent, optedOut: true)
+            _ = await runtime.setOptedOut(true, intent: intent)
+            let local = await runtime.identify("local-only")
+            XCTAssertEqual(local?.identity.userId, "local-only")
+            XCTAssertTrue(local?.identity.optedOut == true)
+            XCTAssertEqual(local?.flagContext.personProperties["local"], .bool(true))
+            XCTAssertEqual(local?.queuedCount, 0)
+            await runtime.close()
+        }
+    }
+
+    func testDroppedMutationAndForFlagsProjectionDoNotMutateOrInvokeAnExtraHook() async throws {
+        try await withTemporaryDirectory { root in
+            let calls = EventFilterCounter()
+            let runtime = try await makeRuntime(root: root, transport: RecordingBatchTransport(), clock: TestRuntimeClock(wall: baseDate),
+                eventFilter: .init(beforeSend: { _ in calls.hit(); return nil }))
+            _ = await runtime.applyConfiguration(fixture("config-enabled.json"))
+            let before = try await runtime.queueSnapshot()
+            let identified = await runtime.identify("dropped", properties: ["private": .bool(true)])
+            let grouped = await runtime.group(type: "company", key: "dropped", properties: ["private": .bool(true)])
+            XCTAssertNil(identified); XCTAssertNil(grouped)
+            let after = try await runtime.queueSnapshot()
+            XCTAssertEqual(after.identity, before.identity); XCTAssertEqual(after.nextSequence, before.nextSequence)
+            let local = await runtime.setFlagPersonProperties(["local": .bool(true)])
+            XCTAssertEqual(local?.flagContext.personProperties["local"], .bool(true)); XCTAssertEqual(calls.count, 2)
+            XCTAssertEqual(local?.queuedCount, 0)
+            await runtime.close()
+        }
+    }
+
     // MARK: - Harness
 
     private func makeRuntime(
@@ -486,7 +842,12 @@ final class EluStandaloneRuntimeTests: XCTestCase {
         clock: TestRuntimeClock,
         timeZoneIdentifier: String? = "America/New_York",
         backgroundHandoff: EluStandaloneBackgroundHandoff? = nil,
-        flushDelayNanoseconds: UInt64 = EluStandaloneRuntime.defaultFlushDelayNanoseconds
+        flushDelayNanoseconds: UInt64 = EluStandaloneRuntime.defaultFlushDelayNanoseconds,
+        performance: EluPerformanceOptions = .init(),
+        eventFilter: EluEventFilter = .init(),
+        personProfiles: EluPersonProfilesMode = .identifiedOnly,
+        rateLimiting: EluRateLimitingOptions = .init(),
+        faultInjector: (any EluRuntimeQueueFaultInjecting)? = nil
     ) async throws -> EluStandaloneRuntime {
         try await EluStandaloneRuntime.make(
             rootDirectoryURL: root,
@@ -503,7 +864,8 @@ final class EluStandaloneRuntimeTests: XCTestCase {
             flushDelayNanoseconds: flushDelayNanoseconds,
             anonymousIdGenerator: { "anon_runtime" },
             streamIdGenerator: { "stream_runtime" },
-            sessionIdGenerator: { "session_\(UUID().uuidString.lowercased())" }
+            sessionIdGenerator: { "session_\(UUID().uuidString.lowercased())" },
+            performance: performance, personProfiles: personProfiles, rateLimiting: rateLimiting, eventFilter: eventFilter, faultInjector: faultInjector
         )
     }
 
@@ -761,3 +1123,12 @@ private final class RuntimeBackgroundTaskManager: EluV1IOSBackgroundTaskManaging
     }
 }
 #endif
+
+private final class EventFilterRuntimeOwner: @unchecked Sendable {
+    // Assigned before capture; read synchronously only by the original fault hook.
+    var runtime: EluStandaloneRuntime?
+    func newIntent() {
+        guard let runtime else { return }
+        runtime.finishFlagProjectionIntent(runtime.beginFlagProjectionIntent())
+    }
+}

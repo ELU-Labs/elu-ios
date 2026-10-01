@@ -19,6 +19,510 @@ SPEC.loader.exec_module(MODULE)
 
 
 class FeatureFlagBoundaryScannerTests(unittest.TestCase):
+    def test_declared_bootstrap_uses_one_copied_default_off_option_and_original_stack(self) -> None:
+        checks = {
+            "Sources/EluAnalytics/Elu.swift": ["public var declaredRegionReplayEnabled = false"],
+            "Sources/EluAnalytics/EluState.swift": ["private var declaredRegionReplayEnabled = false",
+                "declaredRegionReplayEnabled = options.declaredRegionReplayEnabled",
+                "declaredRegionReplayEnabled: declaredRegionReplayEnabled"],
+            "Sources/EluAnalytics/Internal/Facade/EluRuntimeBackend.swift": ["declaredRegionReplayEnabled: Bool = false",
+                "self.declaredRegionReplayEnabled = declaredRegionReplayEnabled"],
+            MODULE.STANDALONE_FACADE_SOURCE: [MODULE.DECLARED_BOOTSTRAP_SELECTION,
+                "declaredRegionReplaySupported: context.declaredRegionReplayEnabled",
+                "makeStack(context: context, rootDirectoryURL: rootDirectoryURL)",
+                "configTransport: configTransport"],
+        }
+        for relative, tokens in checks.items():
+            path = pathlib.Path(relative); source = (ROOT / path).read_text()
+            self.assertEqual([], MODULE.scan_outside_source(path, source), relative)
+            for token in tokens:
+                self.assertEqual(source.count(token), 1, token)
+                self.assertTrue(MODULE.scan_outside_source(path, source.replace(token, "removed_original_binding")), token)
+        path = pathlib.Path(MODULE.STANDALONE_FACADE_SOURCE); source = (ROOT / path).read_text()
+        for changed in [source.replace("? .nativeV3 : .v2", "? .v2 : .nativeV3"),
+                        source.replace("declaredRegionReplaySupported: context.declaredRegionReplayEnabled", "declaredRegionReplaySupported: true"),
+                        source + "\nEluStandaloneStack.make()"]:
+            self.assertTrue(MODULE.scan_outside_source(path, changed))
+
+    def test_declared_bootstrap_allows_only_exact_original_format_selection(self) -> None:
+        path = pathlib.Path(MODULE.STANDALONE_FACADE_SOURCE); source = (ROOT / path).read_text()
+        self.assertEqual([], MODULE.scan_native_v3_source(path, source))
+        for token in [".nativeV3", "EluNativeV3ConfigParser.parse(data)", "EluV2ConfigSourceDenial()"]:
+            self.assertTrue(MODULE.scan_native_v3_source(path, source + "\n" + token), token)
+        for relative in ["Sources/EluAnalytics/Elu.swift", MODULE.STACK_SOURCE,
+                         "Sources/EluAnalytics/Internal/Facade/Other.swift"]:
+            self.assertTrue(MODULE.scan_native_v3_source(pathlib.Path(relative), MODULE.DECLARED_BOOTSTRAP_SELECTION), relative)
+
+    def test_raster_original_runtime_selection_and_physical_joins_remain_closed(self) -> None:
+        checks = {
+            MODULE.STACK_SOURCE: ["configurationFormat: EluV2ConfigRequest.Format = .v2",
+                "declaredRegionReplaySupported: Bool = false", "format: configurationFormat"],
+            MODULE.NATIVE_RUNTIME_SOURCE: ["declaredRegionReplaySupported: Bool = false",
+                "support: declaredRegionReplaySupported ? .includingRaster : .wireframeOnly",
+                "prepared.sourceIdentity === binding.sourceIdentity",
+                "authority?.withdraw(); relay.withdrawCapture(); relay.request()"],
+            MODULE.NATIVE_COMPOSITION_SOURCE: ["declaredSelection.sameRoot(as: selected)",
+                "blockedRaster.sameCaptureContext(as: value)", "retainEpochRefusal(outcome)",
+                "EluSwiftUIReplayRegistry.discover(in: selected)"],
+            MODULE.SWIFTUI_COLLECTOR_SOURCE: ["weak var host: UIView?", "weak var window: UIWindow?",
+                "Self.installed.count < 64", "Self.discoveryClosed = true",
+                "$0.value == nil && ($0.host == nil || $0.window == nil)",
+                "matches.allSatisfy({ $0.value != nil })", "originalSource?.revoke()", "bindingFence.withdraw()"],
+            MODULE.NATIVE_CAPTURE_SOURCE: ["authority.startRaster(prepared, selection: selection, physicalUse: physical)",
+                "sourceIdentity: binding.sourceIdentity", "sourceIsCurrent:",
+                "captured.2 - beginning >= minimum", "try await commit(retained)",
+                "queue.appendNativeRaster(request, admission: admission, physicalUse: physical)",
+                "EluRuntimeQueueError.nativeRasterEpochBlocked", "first = nil; fence.withdraw()"],
+        }
+        for relative, tokens in checks.items():
+            path = pathlib.Path(relative); source = (ROOT / path).read_text()
+            self.assertEqual([], MODULE.scan_replay_storage_source(path, source), relative)
+            for token in tokens:
+                self.assertIn(token, source)
+                self.assertTrue(MODULE.scan_replay_storage_source(path, source.replace(token, "removed_original_join")), token)
+        for relative in [MODULE.NATIVE_RUNTIME_SOURCE, MODULE.NATIVE_COMPOSITION_SOURCE]:
+            for extra in ["EluSwiftUIReplayFrame", "EluNativeRasterPermit", "EluNativeRasterSealer()",
+                          "appendNativeRaster()", "EluNativeRasterStoredRequest"]:
+                self.assertTrue(MODULE.scan_replay_storage_source(pathlib.Path(relative), extra), (relative, extra))
+        for relative in [MODULE.STACK_SOURCE, "Sources/EluAnalytics/Elu.swift", "Sources/EluAnalytics/Internal/Replay/Other.swift"]:
+            for extra in ["EluSwiftUIReplayRegistry", "EluSwiftUIReplayBinding", "EluSwiftUIReplayRegistration"]:
+                self.assertTrue(MODULE.scan_replay_storage_source(pathlib.Path(relative), extra), (relative, extra))
+
+    def test_source_denial_is_original_bounded_and_durably_settled(self) -> None:
+        checks = {
+            MODULE.NATIVE_V3_SOURCE_PATH: ["fileprivate init(issuedAt:", "latest.map({ $0.issuedAt < issuedAt }) ?? true",
+                "denials.record(issuedAt: previous.issuedAt, original: previous.canonicalData,"],
+            MODULE.NATIVE_V3_GATE_PATH: ["sourceDenials?.belongs(to: siteKey) == true",
+                "if sourceDenials?.pending() != nil { witness = nil; return false }"],
+            MODULE.NATIVE_V3_LIFECYCLE_PATH: ["sourceDenials: source.denials", "await source.close()", "denial !== publishedDenial"],
+            MODULE.NATIVE_RASTER_QUEUE_SOURCE: ["guard gate.retainsDenial(denial)",
+                "ledger.rasterSource.map({ $0.issuedAt > denial.issuedAt })",
+                "ledger.witness.map({ $0.issuedAt > denial.issuedAt })", "gate.acknowledgeDenial(denial)"],
+            MODULE.STACK_SOURCE: ["runtime.settleConfigurationDenial()"],
+            MODULE.NATIVE_RUNTIME_SOURCE: ["return try await queue.persistConfigurationDenial()"],
+        }
+        for relative, tokens in checks.items():
+            path = pathlib.Path(relative); source = (ROOT / path).read_text()
+            self.assertEqual([], MODULE.scan_native_v3_source(path, source), relative)
+            for token in tokens:
+                self.assertIn(token, source)
+                self.assertTrue(MODULE.scan_native_v3_source(path, source.replace(token, "removed_denial_join")), token)
+        for relative in [MODULE.STACK_SOURCE, MODULE.NATIVE_RUNTIME_SOURCE, "Sources/EluAnalytics/Elu.swift",
+                         "Sources/EluAnalytics/Internal/Config/Other.swift"]:
+            self.assertTrue(MODULE.scan_native_v3_source(pathlib.Path(relative), "EluV2ConfigSourceDenial(issuedAt: value)"))
+        stack = (ROOT / MODULE.STACK_SOURCE).read_text()
+        moved = stack.replace("await ready.wait()", "await ready.wait(); guard let self, self.isCurrent(decision) else { return }")
+        self.assertTrue(MODULE.scan_native_v3_source(pathlib.Path(MODULE.STACK_SOURCE), moved))
+        queue = (ROOT / MODULE.NATIVE_RASTER_QUEUE_SOURCE).read_text()
+        marker = "try replayStorageTransaction(validate: validate) { connection, _ in"
+        start = queue.index("func persistConfigurationDenial()")
+        self.assertIn(marker, queue[start:])
+        moved = queue[:start] + queue[start:].replace(marker, "gate.acknowledgeDenial(denial); " + marker, 1)
+        self.assertTrue(MODULE.scan_native_v3_source(pathlib.Path(MODULE.NATIVE_RASTER_QUEUE_SOURCE), moved))
+        for migration in ["try ensureReplaySchema()", "try ensureReplayDeliverySchema()",
+                          "try ensureNativeReplayAuthoritySchema()", "try migrateNativeRasterSchema(validate: validate)"]:
+            moved = queue[:start] + queue[start:].replace(migration, "removed_original_migration", 1) + "\n" + migration
+            self.assertTrue(MODULE.scan_native_v3_source(pathlib.Path(MODULE.NATIVE_RASTER_QUEUE_SOURCE), moved))
+
+    def test_native_v3_original_owner_preserves_whole_receipt_and_base_bytes(self) -> None:
+        source_path = pathlib.Path(MODULE.NATIVE_V3_SOURCE_PATH)
+        source = (ROOT / source_path).read_text()
+        self.assertEqual([], MODULE.scan_native_v3_source(source_path, source))
+        for old, new in [
+            ("format: Format = .v2", "format: Format = .nativeV3"),
+            ("format: EluV2ConfigRequest.Format = .v2", "format: EluV2ConfigRequest.Format = .nativeV3"),
+            ("baseData = parsed.configV2Data", "baseData = parsed.canonicalData"),
+            ("previous.canonicalData == nativeV3.canonicalData", "true"),
+            ("!previous.conflicted", "true"),
+            ("previous.conflicted = true; envelopeBoundary = previous", "lease = nil"),
+            ("manager.update(configData: baseData, now: sample.wall)", "manager.update(configData: data, now: sample.wall)"),
+            ("continuousDeadline: boundedDeadline, nativeV3: nativeV3)", "continuousDeadline: boundedDeadline)"),
+        ]:
+            self.assertIn(old, source)
+            self.assertTrue(MODULE.scan_native_v3_source(source_path, source.replace(old, new)), old)
+        for extra in ["transport.fetch(request)", "manager = EluV1ConfigManager(", "envelopeBoundary = nil",
+                      "EluSQLiteRuntimeQueue", "EluNativeRasterSealer", "URLSession"]:
+            self.assertTrue(MODULE.scan_native_v3_source(source_path, source + "\n" + extra), extra)
+
+    def test_native_v3_original_gate_lifecycle_and_dormant_scope_cannot_be_bypassed(self) -> None:
+        for relative, tokens in [
+            (MODULE.NATIVE_V3_GATE_PATH, ["$0.configV2Data == lease.data && $0.base.expiresAt == lease.expiresAt",
+                "retainedLease.receiptData == lease.receiptData", "nativeV3: pinned.nativeV3"]),
+            (MODULE.NATIVE_V3_LIFECYCLE_PATH, ["format: EluV2ConfigRequest.Format = .v2",
+                "publishedLease?.receiptData == lease.receiptData", "next != state || receiptChanged"]),
+        ]:
+            path = pathlib.Path(relative); source = (ROOT / path).read_text()
+            self.assertEqual([], MODULE.scan_native_v3_source(path, source))
+            for token in tokens:
+                self.assertIn(token, source)
+                self.assertTrue(MODULE.scan_native_v3_source(path, source.replace(token, "removed")), token)
+        for path in [MODULE.STACK_SOURCE, MODULE.NATIVE_RUNTIME_SOURCE, "Sources/EluAnalytics/Elu.swift",
+                     "Sources/EluAnalytics/Internal/Config/Other.swift", "Other/EluV2ConfigSource.swift"]:
+            for source in ["format: .nativeV3", "witness.nativeV3", "EluNativeV3ConfigParser.parse(data)"]:
+                self.assertTrue(MODULE.scan_native_v3_source(pathlib.Path(path), source), (path, source))
+
+    def test_explicit_window_and_original_commit_owner_are_closed(self) -> None:
+        path = pathlib.Path(MODULE.NATIVE_WINDOW_SOURCE)
+        source = (ROOT / path).read_text()
+        self.assertEqual([], MODULE.scan_replay_storage_source(path, source))
+        for token in ["original.observe(event) { super.sendEvent(event) }", "original.belongs(to: self)",
+                      "if replayObserver === original", "await withCheckedContinuation"]:
+            self.assertIn(token, source)
+            self.assertTrue(MODULE.scan_replay_storage_source(path, source.replace(token, "removed_original_join")))
+        for added in ["public func install() {}", "Task { collect() }", "EluNativeReplayPermit", "UIGestureRecognizer()"]:
+            self.assertTrue(MODULE.scan_replay_storage_source(path, source + "\n" + added))
+        capture_path = pathlib.Path(MODULE.NATIVE_CAPTURE_SOURCE)
+        capture = (ROOT / capture_path).read_text()
+        self.assertEqual([], MODULE.scan_replay_storage_source(capture_path, capture))
+        for token in ["try buffer.committed(seal)", "attachment = original", "originalAttachment.drain()",
+                      "originalAttachment.handoff(projection, at:", "pendingInteractions = rows", "pendingInteractions += rows",
+                      "try await accept(pendingInteractions)", "try await accept(pendingInteractions + tail)",
+                      "pendingInteractions.removeAll(keepingCapacity: false)",
+                      "if let interactionAttachment { await interactionAttachment.close() }",
+                      "enrollment.quarantine(retaining: pendingRequest)"]:
+            self.assertIn(token, capture)
+            self.assertTrue(MODULE.scan_replay_storage_source(capture_path, capture.replace(token, "removed_capture_guard")))
+        for relative in [MODULE.NATIVE_RUNTIME_SOURCE, MODULE.NATIVE_COMPOSITION_SOURCE,
+                         "Sources/EluAnalytics/Elu.swift", "Sources/EluAnalytics/Internal/Replay/Other.swift"]:
+            self.assertTrue(MODULE.scan_replay_storage_source(pathlib.Path(relative), "EluReplayWindow"))
+
+    def test_dormant_touch_projection_cannot_install_capture_or_intercept_host(self) -> None:
+        paths = [MODULE.NATIVE_INTERACTION_PROJECTION_SOURCE, MODULE.NATIVE_TOUCH_OBSERVER_SOURCE,
+                 MODULE.NATIVE_INTERACTION_MAILBOX_SOURCE]
+        for relative in paths:
+            path = pathlib.Path(relative)
+            source = (ROOT / path).read_text()
+            self.assertEqual([], MODULE.scan_replay_storage_source(path, source))
+            for token in ["EluSQLiteRuntimeQueue", "EluNativeReplayAuthority", "EluNativeReplayCapabilities",
+                          "EluNativeReplayPermit", "EluNativeWireframeV2Encoder", "EluNativeReplaySealer",
+                          "URLSession", "UIGestureRecognizer", "addGestureRecognizer", "method_exchangeImplementations",
+                          "UUID()", "Task { work() }", "class Hidden: UIWindow {}"]:
+                self.assertTrue(MODULE.scan_replay_storage_source(path, source + "\n" + token), (relative, token))
+        for relative in [MODULE.NATIVE_RUNTIME_SOURCE, MODULE.NATIVE_COMPOSITION_SOURCE,
+                         "Sources/EluAnalytics/Elu.swift", "Sources/EluAnalytics/Internal/Replay/Other.swift"]:
+            for token in ["EluUIKitReplayTouchObserver", "EluUIKitReplayTouchWorkBudget", "EluUIKitReplayTouchFact",
+                          "EluUIKitReplayInteractionProjection", "EluNativeReplayInteractionMailbox"]:
+                self.assertTrue(MODULE.scan_replay_storage_source(pathlib.Path(relative), token), (relative, token))
+        path = pathlib.Path(MODULE.NATIVE_COLLECTOR_SOURCE)
+        source = (ROOT / path).read_text()
+        self.assertTrue(MODULE.scan_replay_storage_source(path, source.replace("retainInteractionProjection: Bool = false", "retainInteractionProjection: Bool = true")))
+        for token in ["paintVetoes: interactionPaintVetoes", "let confined = view.clipsToBounds || layer.masksToBounds",
+                      "interactionPaintVetoes[projection.identity] = try rect(veto)",
+                      "interactionInheritedClip: interactionClip"]:
+            self.assertIn(token, source)
+            self.assertTrue(MODULE.scan_replay_storage_source(path, source.replace(token, "removed_paint_guard")), token)
+        projection_path = pathlib.Path(MODULE.NATIVE_INTERACTION_PROJECTION_SOURCE)
+        projection = (ROOT / projection_path).read_text()
+        self.assertTrue(MODULE.scan_replay_storage_source(projection_path,
+            projection.replace("for clip in current.1.values", "for clip in []")))
+        for token in ["let emittedInside = Double(x) >= clip.x", "if actualInside || emittedInside { return nil }"]:
+            self.assertIn(token, projection)
+            self.assertTrue(MODULE.scan_replay_storage_source(projection_path,
+                projection.replace(token, "removed_quantized_paint_guard")))
+        path = pathlib.Path(MODULE.NATIVE_TOUCH_OBSERVER_SOURCE)
+        source = (ROOT / path).read_text()
+        for token in ["maximumWorkNanoseconds: UInt64 = 2_000_000", "maximumWorkPerSecond: UInt64 = 20_000_000",
+                      "if delivering", "reentered = true", "original.projection === projection", "projection.privacyIsCurrent",
+                      "mailbox.withdraw()", "time.timestamp - old.timestamp < 100", "maximumCharges = 128",
+                      "charges.removeAll { now - $0.ended >= 1_000_000_000 }",
+                      "Charge(ended: second.ended, cost: merged)", "budget.charge(from: begun, through: preEnd)",
+                      "budget.charge(from: postBegin, through: continuous())",
+                      "time.continuous - old.continuous < 100_000_000 { retain = false }",
+                      "guard original.retain else { return }"]:
+            self.assertIn(token, source)
+            self.assertTrue(MODULE.scan_replay_storage_source(path, source.replace(token, "removed_guard")), token)
+
+    def test_exact_native_tuples_and_original_generation_reach_all_native_boundaries(self) -> None:
+        cases = {
+            MODULE.NATIVE_PROTOCOL_SOURCE: ['case .v2: return "elu-native-wireframe-v2"',
+                'case .v2: return "protocol-generation-v2"', 'compression.utf8.elementsEqual("gzip".utf8)'],
+            MODULE.NATIVE_AUTHORITY_SOURCE: ["capabilities.transports(for: original.context.capabilities.replay.replayProtocolGeneration)",
+                "capabilities.transports(for: prepared.resolution.replayProtocolGeneration).contains(pair)"],
+            "Sources/EluAnalytics/Internal/Runtime/EluPrivacyStateProjector.swift": ["capabilities.pairs(for: observation.context.capabilities.replay.replayProtocolGeneration)"],
+            "Sources/EluAnalytics/Internal/Runtime/EluSQLiteRuntimeQueue.swift": [
+                "if EluNativeReplayProtocol.isNativeCodec(prepared.codec), nativeAdmission == nil",
+                "pair == tuple.transport", "EluV2ReplayText.equal(tuple.generation, admission.permit.resolution.replayProtocolGeneration)",
+                "capabilities.transports(for: document.capabilities?.replay.replayProtocolGeneration)"],
+            "Sources/EluAnalytics/Internal/Config/EluV1ConfigManager.swift": ["generation: generation) != nil &&"],
+        }
+        for relative, controls in cases.items():
+            path = pathlib.Path(relative)
+            source = (ROOT / path).read_text()
+            self.assertEqual([], MODULE.scan_replay_storage_source(path, source))
+            for original in controls:
+                self.assertIn(original, source)
+                self.assertTrue(MODULE.scan_replay_storage_source(path, source.replace(original, "removed_tuple_guard", 1)), original)
+        source = (ROOT / MODULE.NATIVE_PROTOCOL_SOURCE).read_text()
+        for token in ["URLSession", "EluSQLiteRuntimeQueue", "EluNativeReplayPermit"]:
+            self.assertTrue(MODULE.scan_replay_storage_source(pathlib.Path(MODULE.NATIVE_PROTOCOL_SOURCE), source + "\n" + token))
+        self.assertTrue(MODULE.scan_replay_storage_source(pathlib.Path(MODULE.NATIVE_PROTOCOL_SOURCE),
+            source.replace("    case v2", "    case v2\n    case v3", 1)))
+
+    def test_public_composition_defers_until_initial_calls_and_uses_owned_capabilities(self) -> None:
+        path = pathlib.Path(MODULE.STANDALONE_FACADE_SOURCE)
+        source = (ROOT / path).read_text()
+        self.assertEqual([], MODULE.scan_outside_source(path, source))
+        for before in ["deferredUntilActivation: true", "await runtime.activateNativeReplayComposition()"]:
+            self.assertIn(before, source)
+            self.assertTrue(MODULE.scan_outside_source(path, source.replace(before, "removed_initial_gate")))
+        for relative in [MODULE.STACK_SOURCE, MODULE.STANDALONE_FACADE_SOURCE]:
+            for token in ["readbackProvenTransports", "readbackProvenProtocolGenerations"]:
+                self.assertTrue(MODULE.scan_outside_source(pathlib.Path(relative), (ROOT / relative).read_text() + "\n" + token))
+
+    def test_both_startup_paths_require_initial_projection_and_durable_consent(self) -> None:
+        path = pathlib.Path(MODULE.STANDALONE_FACADE_SOURCE)
+        source = (ROOT / path).read_text()
+        for before in [
+            "if let initialConsent = context.initialConsent { acceptConsent(initialConsent) }",
+            "guard accepted, await self.persistStartupConsent(to: stack.runtime) else",
+            "guard accepted, await persistStartupConsent(to: runtime) else",
+        ]:
+            self.assertIn(before, source)
+            self.assertTrue(MODULE.scan_outside_source(path, source.replace(before, "removed_consent_gate", 1)))
+
+    def test_native_capability_selection_is_exact_and_cannot_be_silently_disabled(self) -> None:
+        path = pathlib.Path(MODULE.NATIVE_RUNTIME_SOURCE)
+        source = (ROOT / path).read_text()
+        for before, after in [
+            ('codec: "elu-native-wireframe-v1", compression: .gzip', 'codec: "other", compression: .gzip'),
+            ('codec: "elu-native-wireframe-v1", compression: .gzip', 'codec: "elu-native-wireframe-v1", compression: .none'),
+            ('codec: "elu-native-wireframe-v2", compression: .gzip', 'codec: "other", compression: .gzip'),
+            ('codec: "elu-native-wireframe-v2", compression: .gzip', 'codec: "elu-native-wireframe-v2", compression: .none'),
+            ('EluV1ReplayTransportSelection(codec: "elu-native-wireframe-v2", compression: .gzip)!', ''),
+            ('readbackProvenProtocolGenerations: ["protocol-generation-v1", "protocol-generation-v2"]', 'readbackProvenProtocolGenerations: []'),
+            ('readbackProvenProtocolGenerations: ["protocol-generation-v1", "protocol-generation-v2"]', 'readbackProvenProtocolGenerations: ["protocol-generation-v1"]'),
+            ('readbackProvenProtocolGenerations: ["protocol-generation-v1", "protocol-generation-v2"]', 'readbackProvenProtocolGenerations: ["protocol-generation-v2"]'),
+            ('readbackProvenProtocolGenerations: ["protocol-generation-v1", "protocol-generation-v2"]', 'readbackProvenProtocolGenerations: ["protocol-generation-v1", "protocol-generation-v2", "other"]'),
+            ('codec: "elu-native-wireframe-v2", compression: .gzip)!]', 'codec: "elu-native-wireframe-v2", compression: .gzip)!, EluV1ReplayTransportSelection(codec: "other", compression: .gzip)!]'),
+        ]:
+            self.assertIn(before, source)
+            self.assertTrue(MODULE.scan_replay_storage_source(path, source.replace(before, after, 1)))
+        path = pathlib.Path(MODULE.STANDALONE_FACADE_SOURCE)
+        source = (ROOT / path).read_text()
+        before = "capabilities: EluStandaloneRuntime.readbackProvenReplayCapabilities"
+        for after in ["capabilities: EluNativeReplayCapabilities()", "capabilities: other"]:
+            self.assertTrue(MODULE.scan_outside_source(path, source.replace(before, after, 1)))
+
+    def test_native_composition_exceptions_are_exact(self) -> None:
+        for relative in [MODULE.NATIVE_RUNTIME_SOURCE, MODULE.NATIVE_COMPOSITION_SOURCE]:
+            path = pathlib.Path(relative)
+            self.assertEqual([], MODULE.scan_replay_storage_source(path, (ROOT / path).read_text()))
+        for relative in [MODULE.STACK_SOURCE, MODULE.STANDALONE_FACADE_SOURCE, "Sources/EluAnalytics/Elu.swift", "Sources/EluAnalytics/Internal/Replay/Other.swift"]:
+            for token in ["EluNativeReplayComposition()", "EluV2ReplayDeliveryCoordinator()", "authority.requiringCurrent {}", "authority.ownsPrepared(value)"]:
+                self.assertTrue(MODULE.scan_replay_storage_source(pathlib.Path(relative), token), (relative, token))
+
+    def test_native_composition_cannot_acquire_storage_capture_or_transport_issuers(self) -> None:
+        for relative in [MODULE.NATIVE_COMPOSITION_SOURCE, MODULE.NATIVE_RUNTIME_SOURCE]:
+            for token in ["EluV2ReplayPreparedRequest", "EluNativeReplayCapturePhysicalUse", "EluNativeReplayCaptureRun", "EluNativeReplayCaptureEnrollment", "queue.appendNativeReplay()", "queue.ensureNativeReplayAuthoritySchema()", "EluUIKitReplayCollector()", "EluNativeReplaySealer()"]:
+                self.assertTrue(MODULE.scan_replay_storage_source(pathlib.Path(relative), token), (relative, token))
+        self.assertTrue(MODULE.scan_replay_storage_source(pathlib.Path(MODULE.NATIVE_COMPOSITION_SOURCE), "EluV2URLSessionReplayTransport()"))
+
+    def test_native_runtime_keeps_empty_default_and_exact_original_guards(self) -> None:
+        path = pathlib.Path(MODULE.NATIVE_RUNTIME_SOURCE)
+        source = (ROOT / path).read_text()
+        for before in ["capabilities: EluNativeReplayCapabilities = EluNativeReplayCapabilities()", "nativeAuthority.ownsPrepared(prepared)", "prepared.supportedProtocolGeneration != nil", "value?.requiringCurrent", "configurationWitness == source", "readZone() == zone"]:
+            self.assertIn(before, source)
+            changed = source.replace(before, "removed_original_guard")
+            self.assertTrue(MODULE.scan_replay_storage_source(path, changed), before)
+        for added in ["EluV2URLSessionReplayTransport()", "EluNativeReplayCaptureOwner()"]:
+            self.assertTrue(MODULE.scan_replay_storage_source(path, source + "\n" + added))
+
+    def test_native_composition_cannot_skip_qualification_or_construct_capture_directly(self) -> None:
+        path = pathlib.Path(MODULE.NATIVE_COMPOSITION_SOURCE)
+        source = (ROOT / path).read_text()
+        for before in ["!capabilities.transports.isEmpty", "!capabilities.readbackProvenProtocolGenerations.isEmpty"]:
+            self.assertIn(before, source)
+            self.assertTrue(MODULE.scan_replay_storage_source(path, source.replace(before, "true")))
+        self.assertTrue(MODULE.scan_replay_storage_source(path, source + "\nEluNativeReplayCaptureOwner()"))
+
+    def test_native_composition_cannot_expand_platform_or_provider_access(self) -> None:
+        path = pathlib.Path(MODULE.NATIVE_COMPOSITION_SOURCE)
+        for token in ["import UIKit", "URLSession", "URLRequest", "import Network", "class Other: EluV2ReplayHTTPTransport {}"]:
+            self.assertTrue(MODULE.scan_replay_storage_source(path, token), token)
+
+    def test_native_capture_owner_can_join_values_and_ui_only_in_exact_file(self) -> None:
+        path = pathlib.Path(MODULE.NATIVE_CAPTURE_SOURCE)
+        text = "import UIKit\nEluNativeReplayCaptureOwner EluNativeReplayCapturePhysicalUse EluUIKitReplayCollector EluNativeReplaySealer EluV2ReplayPreparedRequest"
+        self.assertEqual([], MODULE.scan_replay_storage_source(path, text))
+        for token in ["URLSession", "URLRequest", "import Network", "EluV2URLSessionReplayTransport()"]:
+            self.assertTrue(MODULE.scan_replay_storage_source(path, token), token)
+
+    def test_native_capture_cannot_escape_to_public_stack_or_sibling_paths(self) -> None:
+        for path in [MODULE.STACK_SOURCE, "Sources/EluAnalytics/Elu.swift",
+                     "Sources/EluAnalytics/Internal/Replay/Other.swift", "Other/EluNativeReplayCaptureOwner.swift"]:
+            for token in ["EluNativeReplayCaptureOwner()", "EluNativeReplayCapturePhysicalUse", "EluUIKitReplayCollector()"]:
+                self.assertTrue(MODULE.scan_replay_storage_source(pathlib.Path(path), token), (path, token))
+        for path in [MODULE.NATIVE_AUTHORITY_SOURCE, "Sources/EluAnalytics/Internal/Runtime/EluSQLiteRuntimeQueue.swift"]:
+            self.assertTrue(MODULE.scan_replay_storage_source(pathlib.Path(path), "EluNativeReplayCaptureOwner()"))
+            self.assertTrue(MODULE.scan_replay_storage_source(pathlib.Path(path), "EluUIKitReplayCollector()"))
+
+    def test_pure_native_sealer_cannot_consume_capture_ownership(self) -> None:
+        for token in ["EluNativeReplayCaptureEnrollment", "EluNativeReplayCapturePhysicalUse", "EluNativeReplayCaptureAdmission"]:
+            self.assertTrue(MODULE.scan_replay_storage_source(pathlib.Path(MODULE.NATIVE_SEALER_SOURCE), token))
+
+    def test_native_sealer_can_only_prepare_values(self) -> None:
+        exact = pathlib.Path(MODULE.NATIVE_SEALER_SOURCE)
+        self.assertEqual([], MODULE.scan_replay_storage_source(exact, "struct EluNativeReplaySealer { let value: EluV2ReplayPreparedRequest }"))
+        for token in ["URLSession", "URLRequest", "import UIKit", "import Network",
+                      "EluV2ReplayDeliveryCoordinator", "EluV2ReplayStoredChunk", "ensureReplaySchema()", "ensureReplayDeliverySchema()",
+                      "let queue: EluSQLiteRuntimeQueue", "queue.appendReplay(value)", "queue.reconcileReplay()",
+                      "EluNativeReplayAuthority()", "EluNativeReplayScope()", "let permit: EluNativeReplayPermit",
+                      "EluNativeReplaySynchronousGuard {}", "let prepared: EluNativeReplayPreparedAuthority",
+                      "let input: EluNativeReplayProjectionInput", "queue.ensureNativeReplayAuthoritySchema()",
+                      "queue.nativeReplayProjection()", "queue.installNativeReplayPrivacy()",
+                      "queue.beginNativeReplayStartAccounting()", "queue.stopNativeReplayAccounting()",
+                      "queue.nativeReplayPermitGuard()", "queue.persistNativeReplayClockDenial()"]:
+            self.assertTrue(MODULE.scan_replay_storage_source(exact, token), token)
+
+    def test_native_sealer_cannot_be_constructed_or_referenced_elsewhere(self) -> None:
+        for path in [MODULE.STACK_SOURCE, "Sources/EluAnalytics/Elu.swift", "Sources/EluAnalytics/Internal/Replay/Other.swift"]:
+            for token in ["EluNativeReplaySealer()", "let value: EluNativeReplaySealer"]:
+                self.assertTrue(MODULE.scan_replay_storage_source(pathlib.Path(path), token))
+
+    def test_raster_sealer_reuses_only_exact_static_helpers_without_authority(self) -> None:
+        exact = pathlib.Path(MODULE.NATIVE_RASTER_SEALER_SOURCE)
+        source = (ROOT / exact).read_text()
+        self.assertEqual([], MODULE.scan_replay_storage_source(exact, source))
+        for helper in ["timestamp", "gzip"]:
+            self.assertEqual([], MODULE.scan_replay_storage_source(exact, f"EluNativeReplaySealer.{helper}(value)"))
+        for token in ["EluNativeReplaySealer()", "EluNativeReplaySealer.init(value)",
+                      "EluNativeReplaySealer.seal(value)", "let alias = EluNativeReplaySealer.self",
+                      "let closure = EluNativeReplaySealer.gzip", "typealias Alias = EluNativeReplaySealer",
+                      "EluSQLiteRuntimeQueue", "queue.appendNativeReplay(value)", "queue.appendReplay(value)",
+                      "queue.reconcileReplay()", "queue.ensureReplaySchema()", "queue.ensureReplayDeliverySchema()",
+                      "EluNativeReplayAuthority", "EluNativeReplayPermit", "EluNativeReplayCapabilities",
+                      "EluNativeReplayCapturePhysicalUse", "EluV2ReplayPreparedRequest", "EluV2ReplayDeliveryCoordinator",
+                      "URLSession", "URLRequest", "import UIKit", "import Network", "Task { work() }"]:
+            self.assertTrue(MODULE.scan_replay_storage_source(exact, source + "\n" + token), token)
+
+    def test_raster_helper_exception_does_not_escape_to_siblings_or_runtime(self) -> None:
+        for path in [MODULE.STACK_SOURCE, MODULE.NATIVE_RUNTIME_SOURCE, "Sources/EluAnalytics/Elu.swift",
+                     "Sources/EluAnalytics/Internal/Replay/Other.swift", "Other/EluNativeRasterSealer.swift"]:
+            for token in ["EluNativeReplaySealer.timestamp(value)", "EluNativeReplaySealer.gzip(value)",
+                          "EluNativeRasterSealer()", "EluNativeRasterPreparedRequest", "EluNativeRasterPolicyBinding"]:
+                self.assertTrue(MODULE.scan_replay_storage_source(pathlib.Path(path), token), (path, token))
+
+    def test_raster_response_reads_original_request_and_only_static_text_retry_helpers(self) -> None:
+        exact = pathlib.Path(MODULE.NATIVE_RASTER_RESPONSE_SOURCE)
+        source = (ROOT / exact).read_text()
+        self.assertEqual([], MODULE.scan_replay_storage_source(exact, source))
+        for token in ["EluNativeRasterPreparedRequest()", "EluNativeRasterPreparedRequest.init(data)",
+                      "typealias Request = EluNativeRasterPreparedRequest", "EluNativeRasterSealer()",
+                      "EluNativeRasterPolicyBinding", "EluV2ReplayText.other(value)", "EluV2ReplayPreparedRequest",
+                      "EluV2ReplayDeliveryCoordinator", "EluV1BatchDeliveryCoordinator()",
+                      "let retry = EluV1BatchDeliveryCoordinator.parseRetryAfter",
+                      "EluSQLiteRuntimeQueue", "EluStandaloneRuntime", "EluNativeReplayAuthority",
+                      "EluSwiftUIReplayRegistry", "EluSwiftUIReplayFrame", "queue.appendReplay(value)",
+                      "queue.ensureReplaySchema()", "URLSession", "URLRequest", "import Network",
+                      "import UIKit", "Task { work() }"]:
+            self.assertTrue(MODULE.scan_replay_storage_source(exact, source + "\n" + token), token)
+
+    def test_raster_response_allowance_never_installs_in_runtime_or_siblings(self) -> None:
+        for path in [MODULE.NATIVE_RUNTIME_SOURCE, MODULE.STACK_SOURCE, "Sources/EluAnalytics/Elu.swift",
+                     "Sources/EluAnalytics/Internal/Replay/Other.swift", "Other/EluNativeRasterResponse.swift"]:
+            for token in ["request: EluNativeRasterPreparedRequest", "EluNativeRasterResponse.classify(value)",
+                          "EluNativeRasterResponseOutcome", "EluNativeRasterConflictScope"]:
+                self.assertTrue(MODULE.scan_replay_storage_source(pathlib.Path(path), token), (path, token))
+
+    def test_raster_durable_allowance_is_only_original_queue_and_authority(self) -> None:
+        for path in [MODULE.NATIVE_RASTER_QUEUE_SOURCE, MODULE.NATIVE_AUTHORITY_SOURCE]:
+            source = (ROOT / path).read_text()
+            self.assertEqual([], MODULE.scan_replay_storage_source(pathlib.Path(path), source))
+            self.assertEqual([], MODULE.scan_native_v3_source(pathlib.Path(path), source))
+            for token in ["EluNativeRasterSealer()", "EluNativeRasterPreparedRequest(body)",
+                          "EluNativeRasterPreparedRequest.init(body)", "EluSwiftUIReplayFrame",
+                          "EluSwiftUIReplayRegistry", "EluNativeRasterResponse.classify(value)"]:
+                self.assertTrue(MODULE.scan_replay_storage_source(pathlib.Path(path), source + "\n" + token), token)
+        for path in [MODULE.STACK_SOURCE, MODULE.NATIVE_RUNTIME_SOURCE, MODULE.NATIVE_CAPTURE_SOURCE,
+                     "Sources/EluAnalytics/Elu.swift", "Sources/EluAnalytics/Internal/Replay/Other.swift"]:
+            for token in ["EluStoredReplayRecord", "EluNativeRasterStoredRequest", "EluNativeRasterSourceLedger",
+                          "EluNativeRasterPermit", "EluNativeRasterCaptureAdmission"]:
+                if path == MODULE.NATIVE_CAPTURE_SOURCE and token in {"EluNativeRasterPermit", "EluNativeRasterCaptureAdmission"}:
+                    self.assertEqual([], MODULE.scan_replay_storage_source(pathlib.Path(path), token))
+                else:
+                    self.assertTrue(MODULE.scan_replay_storage_source(pathlib.Path(path), token), (path, token))
+            self.assertTrue(MODULE.scan_native_v3_source(pathlib.Path(path), "source.nativeV3"))
+
+    def test_raster_delivery_only_extends_original_dispatch_and_keeps_default_dormant(self) -> None:
+        for path in [MODULE.NATIVE_RASTER_QUEUE_SOURCE, MODULE.NATIVE_RASTER_DELIVERY_SOURCE,
+                     MODULE.NATIVE_RASTER_RESPONSE_SOURCE, MODULE.NATIVE_RASTER_DELIVERY_STATE,
+                     MODULE.REPLAY_TRANSPORT_SOURCE]:
+            source = (ROOT / path).read_text()
+            self.assertEqual([], MODULE.scan_replay_storage_source(pathlib.Path(path), source))
+        for path in [MODULE.STACK_SOURCE, MODULE.NATIVE_RUNTIME_SOURCE, MODULE.NATIVE_CAPTURE_SOURCE,
+                     "Sources/EluAnalytics/Elu.swift", "Sources/EluAnalytics/Internal/Replay/Other.swift"]:
+            for token in ["EluReplayDeliverySupport", "support: .includingRaster", "EluNativeRasterResponse.classify(value)"]:
+                self.assertTrue(MODULE.scan_replay_storage_source(pathlib.Path(path), token), (path, token))
+        path = pathlib.Path(MODULE.NATIVE_RASTER_DELIVERY_SOURCE)
+        source = (ROOT / path).read_text()
+        for token in ["let classify = EluNativeRasterResponse.classify", "EluNativeRasterResponse()",
+                      "EluNativeRasterStoredRequest(restoring: data)", "EluNativeRasterSealer()"]:
+            self.assertTrue(MODULE.scan_replay_storage_source(path, source + "\n" + token), token)
+        path = pathlib.Path(MODULE.NATIVE_RASTER_QUEUE_SOURCE)
+        source = (ROOT / path).read_text()
+        self.assertTrue(MODULE.scan_replay_storage_source(path, source.replace(
+            "support: EluReplayDeliverySupport = .wireframeOnly", "support: EluReplayDeliverySupport = .includingRaster")))
+
+    def test_raster_restore_cannot_construct_live_requests_or_install_capture(self) -> None:
+        path = pathlib.Path(MODULE.NATIVE_RASTER_STORAGE_SOURCE)
+        source = (ROOT / path).read_text()
+        self.assertEqual([], MODULE.scan_replay_storage_source(path, source))
+        for token in ["EluNativeRasterPreparedRequest", "EluNativeRasterSealer", "EluSwiftUIReplayFrame",
+                      "EluSQLiteRuntimeQueue", "EluNativeReplayAuthority", "URLSession", "import UIKit",
+                      "EluV2ReplayDeliveryCoordinator", "Task { work() }"]:
+            self.assertTrue(MODULE.scan_replay_storage_source(path, source + "\n" + token), token)
+
+    def test_native_authority_has_only_one_explicit_activation_per_schema(self) -> None:
+        for call in ["ensureReplaySchema", "ensureReplayDeliverySchema"]:
+            with verification_root() as root:
+                path = root / MODULE.NATIVE_AUTHORITY_SOURCE
+                path.write_text(path.read_text() + f"\n// duplicate: {call}()\n")
+                self.assertTrue(any("schema activation" in error for error in MODULE.verify(root)))
+
+    def test_native_activation_cannot_move_to_lifecycle_or_gain_networking(self) -> None:
+        path = pathlib.Path("Sources/EluAnalytics/Internal/Replay/EluNativeReplayLifecycle.swift")
+        self.assertTrue(MODULE.scan_replay_storage_source(path, "queue.ensureReplaySchema()"))
+        exact = pathlib.Path(MODULE.NATIVE_AUTHORITY_SOURCE)
+        for token in ["URLSession", "URLRequest", "import UIKit", "EluV2URLSessionReplayTransport()"]:
+            self.assertTrue(MODULE.scan_replay_storage_source(exact, token))
+
+    def test_exact_replay_transport_seam_cannot_expand_to_other_files_or_construction(self) -> None:
+        for path in [MODULE.STACK_SOURCE, "Sources/EluAnalytics/Internal/Replay/Other.swift"]:
+            self.assertTrue(MODULE.scan_replay_storage_source(pathlib.Path(path), "EluV2URLSessionReplayTransport()"))
+        exact = pathlib.Path(MODULE.REPLAY_TRANSPORT_SOURCE)
+        self.assertEqual(MODULE.scan_replay_storage_source(exact, "final class EluV2URLSessionReplayTransport: EluV2ReplayHTTPTransport, @unchecked Sendable { let request: URLRequest }"), [])
+        for text in ["EluV2URLSessionReplayTransport()", "import UIKit", "import Network", "class Other: EluV2ReplayHTTPTransport {}"]:
+            self.assertTrue(MODULE.scan_replay_storage_source(exact, text))
+
+    def test_replay_delivery_schema_cannot_be_activated_by_factory(self) -> None:
+        with verification_root() as root:
+            path = root / MODULE.STACK_SOURCE
+            path.write_text(path.read_text() + "\n// try await queue.ensureReplayDeliverySchema()\n")
+            self.assertTrue(any("replay delivery schema activation" in error for error in MODULE.verify(root)))
+
+    def test_replay_delivery_helpers_cannot_gain_networking(self) -> None:
+        path = pathlib.Path("Sources/EluAnalytics/Internal/Replay/EluV2ReplayDeliveryCoordinator.swift")
+        self.assertTrue(MODULE.scan_replay_storage_source(path, "let session = URLSession.shared"))
+        self.assertTrue(MODULE.scan_replay_storage_source(path, "struct Sender: EluV2ReplayHTTPTransport {}"))
+
+    def test_replay_storage_cannot_escape_to_public_factory_or_a_sibling_file(self) -> None:
+        for path in ["Sources/EluAnalytics/Elu.swift", MODULE.STACK_SOURCE,
+                     "Sources/EluAnalytics/Internal/Replay/Other.swift"]:
+            self.assertTrue(MODULE.scan_replay_storage_source(pathlib.Path(path), "EluV2ReplayPreparedRequest(data)"))
+            self.assertTrue(MODULE.scan_replay_storage_source(pathlib.Path(path), "runtime.ensureReplaySchema()"))
+
+    def test_exact_replay_storage_files_cannot_construct_network_provider_or_ui(self) -> None:
+        path = pathlib.Path("Sources/EluAnalytics/Internal/Replay/EluV2ReplayPreparedRequest.swift")
+        self.assertEqual(MODULE.scan_replay_storage_source(path, "struct EluV2ReplayPreparedRequest {}"), [])
+        for token in ["URLSession", "URLRequest", "import UIKit"]:
+            self.assertTrue(MODULE.scan_replay_storage_source(path, token))
+
+    def test_replay_schema_definition_cannot_gain_an_eager_call(self) -> None:
+        with verification_root() as root:
+            path = root / "Sources/EluAnalytics/Internal/Runtime/EluSQLiteRuntimeQueue.swift"
+            path.write_text(path.read_text() + "\n// eager: ensureReplaySchema()\n")
+            self.assertTrue(any("replay schema activation" in error for error in MODULE.verify(root)))
+
     def test_rejects_platform_network_construction(self) -> None:
         self.assertTrue(MODULE.scan_flag_source("let request = URLRequest(url: value)"))
 
@@ -52,6 +556,148 @@ class FeatureFlagBoundaryScannerTests(unittest.TestCase):
             "let transport: any EluV1FlagTransport",
         )
         self.assertTrue(errors)
+
+    def test_exact_transport_source_is_allowed(self) -> None:
+        path = pathlib.Path(MODULE.FLAG_TRANSPORT_SOURCE)
+        self.assertEqual(MODULE.scan_flag_source((ROOT / path).read_text(), path), [])
+
+    def test_transport_exception_does_not_follow_basename_or_directory(self) -> None:
+        text = (ROOT / MODULE.FLAG_TRANSPORT_SOURCE).read_text()
+        for path in [
+            pathlib.Path("Sources/EluAnalytics/Internal/Flags/Nested/EluV1URLSessionFlagTransport.swift"),
+            pathlib.Path("Sources/EluAnalytics/Internal/Flags/AnotherTransport.swift"),
+        ]:
+            self.assertTrue(MODULE.scan_flag_source(text, path))
+
+    def test_exact_transport_cannot_add_another_conformer_or_weaken_protocol(self) -> None:
+        path = pathlib.Path(MODULE.FLAG_TRANSPORT_SOURCE)
+        original = (ROOT / path).read_text()
+        for text in [
+            original + "\nfinal class Extra: EluV1FlagTransport {}\n",
+            original + "\nextension Other: EluV1AuthorizedFlagTransport {}\n",
+            original.replace("EluV1AuthorizedFlagTransport, @unchecked Sendable", "EluV1FlagTransport, @unchecked Sendable", 1),
+        ]:
+            self.assertTrue(any("concrete transport" in error for error in MODULE.scan_flag_source(text, path)))
+
+    def test_exact_transport_does_not_allow_other_network_stacks(self) -> None:
+        path = pathlib.Path(MODULE.FLAG_TRANSPORT_SOURCE)
+        for token in ["import Network", "import CFNetwork", "NWConnection"]:
+            self.assertTrue(MODULE.scan_flag_source(token, path))
+
+    def test_authorized_protocol_cannot_bypass_conformer_or_reference_scan(self) -> None:
+        self.assertTrue(MODULE.scan_flag_source("actor Extra: EluV1AuthorizedFlagTransport {}"))
+        self.assertTrue(MODULE.scan_outside_source(
+            pathlib.Path("Sources/EluAnalytics/Other.swift"), "let value: any EluV1AuthorizedFlagTransport"))
+
+    def test_bound_authority_exception_is_exact_and_protocol_only(self) -> None:
+        path = pathlib.Path(MODULE.BOUND_AUTHORITY_SOURCE)
+        original = (ROOT / path).read_text()
+        self.assertEqual(MODULE.scan_outside_source(path, original), [])
+        self.assertTrue(MODULE.scan_outside_source(path.with_name("OtherAuthority.swift"), original))
+        for added in ["let session = URLSession.shared", "let client: EluV1FlagClient", "final class Extra: EluV1AuthorizedFlagTransport {}", "let concrete = EluV1URLSessionFlagTransport(siteKey: key)"]:
+            self.assertTrue(MODULE.scan_outside_source(path, original + "\n" + added))
+
+    def test_existing_callers_cannot_construct_or_define_concrete_transport(self) -> None:
+        for caller in MODULE.FLAG_CLIENT_CALLERS:
+            self.assertTrue(MODULE.scan_outside_source(pathlib.Path(caller), "let transport = EluV1URLSessionFlagTransport(siteKey: key)"))
+            self.assertTrue(MODULE.scan_outside_source(pathlib.Path(caller), "final class Extra: EluV1AuthorizedFlagTransport {}"))
+
+    def test_mutated_tree_cannot_copy_transport_or_add_concrete_activation(self) -> None:
+        with verification_root() as root:
+            source = root / MODULE.FLAG_TRANSPORT_SOURCE
+            duplicate = source.parent / "Nested" / source.name
+            duplicate.parent.mkdir()
+            duplicate.write_text(source.read_text())
+            self.assertTrue(any("forbidden network" in error for error in MODULE.verify(root)))
+        with verification_root() as root:
+            runtime = root / "Sources/EluAnalytics/Internal/Runtime/EluStandaloneRuntime.swift"
+            runtime.write_text(runtime.read_text() + "\nlet accidental = EluV1URLSessionFlagTransport(siteKey: key)\n")
+            self.assertTrue(any("owned concrete" in error for error in MODULE.verify(root)))
+
+    def test_stack_exception_is_exact_and_keeps_platform_networking_in_transports(self) -> None:
+        path = pathlib.Path(MODULE.STACK_SOURCE)
+        original = (ROOT / path).read_text()
+        self.assertEqual(MODULE.scan_outside_source(path, original), [])
+        self.assertTrue(MODULE.scan_outside_source(path.with_name("OtherStack.swift"), original))
+        for added in ["let session = URLSession.shared", "let request: URLRequest", "import Network", "import CFNetwork", "let connection: NWConnection"]:
+            self.assertTrue(MODULE.scan_outside_source(path, original + "\n" + added))
+
+    def test_stack_cannot_add_construction_change_credential_or_bypass_owner_activation(self) -> None:
+        path = pathlib.Path(MODULE.STACK_SOURCE)
+        original = (ROOT / path).read_text()
+        for text in [
+            original + "\nlet another = EluV1URLSessionFlagTransport(siteKey: siteKey)",
+            original.replace("EluV1URLSessionFlagTransport(siteKey: siteKey, endpointPolicy: endpointPolicy)", "EluV1URLSessionFlagTransport(siteKey: otherKey, endpointPolicy: endpointPolicy)"),
+            original.replace("EluV1URLSessionFlagTransport(siteKey: siteKey, endpointPolicy: endpointPolicy)", "EluV1URLSessionFlagTransport(siteKey: siteKey, endpointPolicy: .cloud)"),
+            original + "\nlet client = EluV1FlagClient.make(runtime: queue, transport: transport, versions: versions)",
+            original + "\nfinal class Extra: EluV1AuthorizedFlagTransport {}",
+        ]:
+            self.assertTrue(MODULE.scan_outside_source(path, text))
+
+    def test_copied_stack_and_stack_migration_activation_fail_full_verifier(self) -> None:
+        with verification_root() as root:
+            source = root / MODULE.STACK_SOURCE
+            source.with_name("OtherStack.swift").write_text(source.read_text())
+            self.assertTrue(MODULE.verify(root))
+        with verification_root() as root:
+            source = root / MODULE.STACK_SOURCE
+            source.write_text(source.read_text() + "\ntry await queue.ensureFlagSchema()\n")
+            self.assertTrue(any("lazy flag migration" in error for error in MODULE.verify(root)))
+
+    def test_standalone_bootstrap_preserves_exact_host_and_guarded_callback(self) -> None:
+        path = pathlib.Path(MODULE.STANDALONE_FACADE_SOURCE)
+        source = (ROOT / path).read_text()
+        self.assertEqual(MODULE.scan_outside_source(path, source), [])
+        for mutation in [
+            source.replace("configHost: context.configHost", "configHost: otherHost", 1),
+            source.replace("endpointPolicy: context.endpointPolicy", "endpointPolicy: .cloud", 1),
+            source.replace("performance: context.performance", "performance: otherPerformance", 1),
+            source.replace("diagnostics: context.diagnostics", "diagnostics: otherDiagnostics", 1),
+            source.replace("personProfiles: context.personProfiles", "personProfiles: .always", 1),
+            source.replace(", eventFilter: context.eventFilter", "", 1),
+            source.replace("eventFilter: context.eventFilter", "eventFilter: .init()", 1),
+            source.replace("guardedFlagsDidLoad: context.guardedFlagsDidLoad", "guardedFlagsDidLoad: unchecked", 1),
+            source.replace("try await EluStandaloneStack.make(", "try await EluStandaloneRuntime.make(", 1),
+        ]:
+            self.assertTrue(any("bootstrap host/callback" in error for error in MODULE.scan_outside_source(path, mutation)))
+
+    def test_bootstrap_core_and_context_remain_pinned(self) -> None:
+        for relative in ["Sources/EluAnalytics/EluState.swift", "Sources/EluAnalytics/Internal/Facade/EluRuntimeBackend.swift"]:
+            with verification_root() as root:
+                source = root / relative
+                source.write_text(source.read_text() + "\n// changed bootstrap boundary\n")
+                self.assertTrue(any(relative + " digest" in error for error in MODULE.verify(root)))
+
+    def test_default_selection_and_public_selection_remain_denied(self) -> None:
+        with verification_root() as root:
+            facade = root / "Sources/EluAnalytics/Elu.swift"
+            facade.write_text(facade.read_text().replace(MODULE.DEFAULT_SELECTION, "    public var runtimeSelection: EluRuntimeSelection = .standalone\n"))
+            errors = MODULE.verify(root)
+            self.assertIn("the default runtime selection is no longer standalone", errors)
+            self.assertIn("the runtime selection escaped into the public API", errors)
+
+    def test_provider_free_target_rejects_nested_provider_source(self) -> None:
+        for token in ["import phlibwebp", "import PHPLCrashReporter", "final class EluProviderRuntime {}"]:
+            with verification_root() as root:
+                path = root / "Sources/EluAnalytics/Internal/Other/Nested.swift"
+                path.parent.mkdir(parents=True)
+                path.write_text(token)
+                self.assertTrue(any("removed provider source dependency" in error for error in MODULE.verify(root)), token)
+
+    def test_provider_free_package_rejects_source_and_binary_dependencies(self) -> None:
+        for token in [".package(url: \"https://example.test/vendor\", exact: \"1.0.0\")", ".binaryTarget(name: \"Vendor\", path: \"Vendor.xcframework\")"]:
+            with verification_root() as root:
+                path = root / "Package.swift"
+                path.write_text(path.read_text() + "\n" + token)
+                self.assertIn("standalone package adds an external source or binary dependency", MODULE.verify(root))
+
+    def test_retired_preview_import_surfaces_cannot_return(self) -> None:
+        for token in MODULE.RETIRED_STARTUP_SYMBOLS:
+            with verification_root() as root:
+                path = root / "Sources/EluAnalytics/Internal/Other/PreviewImport.swift"
+                path.parent.mkdir(parents=True)
+                path.write_text("struct " + token + " {}")
+                self.assertTrue(any("retired preview import" in error for error in MODULE.verify(root)))
 
     def test_verifier_recursively_scans_nested_flag_sources(self) -> None:
         with verification_root() as root:

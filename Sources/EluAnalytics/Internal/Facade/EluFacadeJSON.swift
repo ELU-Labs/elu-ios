@@ -19,7 +19,7 @@ enum EluFacadeJSON {
     static let maximumDepth = 16
 
     static func isReservedKey(_ key: String) -> Bool {
-        key.hasPrefix(reservedPropertyPrefix)
+        key.hasPrefix(reservedPropertyPrefix) || ["$device_id", "$is_identified", "$process_person_profile", "$epp"].contains(key)
     }
 
     /// The projected properties plus the number of reserved names removed.
@@ -158,15 +158,4 @@ enum EluFacadeJSON {
         }
     }
 
-    /// The exposure ledger key for one reported flag value. A read that found
-    /// no value and a read that found one are reported separately.
-    static func exposureKey(_ key: String, value: EluV1FlagValue?) -> String {
-        guard let value else { return key + "\u{0}" }
-        switch value {
-        case let .bool(flag): return key + "\u{0}b:\(flag)"
-        case let .string(units): return key + "\u{0}s:" + String(decoding: units, as: UTF16.self)
-        case let .number(number): return key + "\u{0}n:\(number)"
-        case .null: return key + "\u{0}null"
-        }
-    }
 }

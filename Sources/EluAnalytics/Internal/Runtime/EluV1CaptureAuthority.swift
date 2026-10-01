@@ -40,6 +40,7 @@ struct EluV1CaptureAuthoritySnapshot: Equatable, Sendable {
     let monotonicBudget: UInt64
     let idleTimeoutSeconds: Int
     let maximumDurationSeconds: Int
+    let maximumQueueBytes: Int
 }
 
 struct EluV1CaptureAuthorityTerminal: Equatable, Sendable {
@@ -72,6 +73,13 @@ enum EluV1CaptureRejection: Equatable, Sendable {
     case optedOut
     case invalidEvent
     case queueLimit
+    case rateLimited
+    case exposureAlreadyRecorded
+    case exposureLedgerFull
+    case eventFiltered
+    case eventFilterInvalid
+    case eventFilterWithdrawn
+    case eventFilterUnsupportedPersonChanges
     case storageProvenNotCommitted
     case storageOutcomeUnknown
 }

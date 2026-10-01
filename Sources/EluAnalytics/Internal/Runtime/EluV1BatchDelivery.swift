@@ -24,25 +24,17 @@ struct EluV1BatchAuthorizationSnapshot: Equatable, Sendable {
     init(
         siteKey: String,
         eventsEndpoint: URL,
+        endpointPolicy: EluEndpointPolicy = .cloud,
         expiresAt: Date,
         eventBatchCount: Int,
         eventBatchBytes: Int
     ) throws {
-        let components = URLComponents(url: eventsEndpoint, resolvingAgainstBaseURL: false)
         guard !siteKey.isEmpty,
               siteKey.unicodeScalars.count <= 512,
               siteKey.unicodeScalars.allSatisfy({
                   !CharacterSet.controlCharacters.contains($0)
               }),
-              let components,
-              components.scheme?.lowercased() == "https",
-              components.host?.lowercased() == "ingest.elu.dev",
-              components.port == nil || components.port == 443,
-              components.user == nil,
-              components.password == nil,
-              components.fragment == nil,
-              components.percentEncodedPath == "/v1/events",
-              components.queryItems?.contains(where: { $0.name == "site_key" }) != true,
+              endpointPolicy.endpoint(eventsEndpoint.absoluteString, role: .events) != nil,
               expiresAt.timeIntervalSinceReferenceDate.isFinite,
               (1 ... Self.maximumBatchCount).contains(eventBatchCount),
               (Self.minimumBatchBytes ... Self.maximumBatchBytes).contains(eventBatchBytes)
@@ -481,6 +473,14 @@ actor EluV1BatchDeliveryCoordinator {
         } catch {
             return scheduleRetry(records: prepared.records, attempt: attempt + 1, retryAfter: 0)
         }
+        // URLSession stops reading denied responses at their headers. A denial
+        // applies to this authorization even when no error body is available;
+        // adding records must not turn it into another send with the same key.
+        if response.status == 401 || response.status == 403 {
+            let reason = EluV1BatchPreservationReason.permanentHTTP(response.status)
+            authorizationBlock = reason
+            return .preserved(reason)
+        }
         guard response.body.count <= Self.maximumResponseBytes else {
             return blockRequest(prepared.requestId, reason: .protocolFailure)
         }
@@ -591,14 +591,6 @@ actor EluV1BatchDeliveryCoordinator {
         }
 
         switch response.status {
-        case 401, 403:
-            guard retryAfterHeader == nil else {
-                return blockRequest(prepared.requestId, reason: .protocolFailure)
-            }
-            let reason = EluV1BatchPreservationReason.permanentHTTP(response.status)
-            authorizationBlock = reason
-            return .preserved(reason)
-
         case 413:
             guard retryAfterHeader == nil else {
                 return blockRequest(prepared.requestId, reason: .protocolFailure)

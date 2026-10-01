@@ -82,6 +82,44 @@ final class EluV1StrictCanonicalJSONTests: XCTestCase {
         )
     }
 
+    func testRetainedRootValuePreservesWhitespaceEscapesUnicodeAndNumberLexemes() throws {
+        let raw = #"{ "é": "😀 é", "escape":"\u0061", "number": 2.5e-1, "array": [ 1, true ] }"#
+        let bytes = Data((" \n {\"configV2\" : \t" + raw + ",\"tail\":true} \r\n").utf8)
+        let retained = try EluV1StrictCanonicalJSON.parse(bytes, retainingRootProperty: "configV2")
+        XCTAssertEqual(retained.propertyData, Data(raw.utf8))
+        XCTAssertEqual(retained.document.canonicalData, try EluV1StrictCanonicalJSON.parse(bytes).canonicalData)
+        XCTAssertNotEqual(retained.propertyData, try retained.document.canonicalObjectProperty("configV2"))
+    }
+
+    func testRetainedRootValueNeverUsesNestedSameNameOrDecodedDuplicate() throws {
+        let bytes = Data(#"{"other":{"configV2":{"wrong":true}},"config\u00562":{"configV2":1,"right":true}}"#.utf8)
+        let result = try EluV1StrictCanonicalJSON.parse(bytes, retainingRootProperty: "configV2")
+        XCTAssertEqual(result.propertyData, Data(#"{"configV2":1,"right":true}"#.utf8))
+        XCTAssertNil(try EluV1StrictCanonicalJSON.parse(Data(#"{"other":{"configV2":1}}"#.utf8),
+                                                       retainingRootProperty: "configV2").propertyData)
+        for text in [
+            #"{"configV2":{},"config\u00562":{}}"#,
+            #"{"configV2":{"a":1,"\u0061":2}}"#,
+            #"{"configV2":{},"later":{"a":1,"a":2}}"#,
+        ] {
+            XCTAssertThrowsError(try EluV1StrictCanonicalJSON.parse(Data(text.utf8), retainingRootProperty: "configV2"))
+        }
+    }
+
+    func testRetainedRootValueWaitsForCompleteStrictValidation() throws {
+        for data in [
+            Data([0x7B, 0x22, 0x78, 0x22, 0x3A, 0x22, 0xC0, 0xAF, 0x22, 0x7D]),
+            Data(#"{"configV2":{}} trailing"#.utf8),
+            Data(#"{"configV2":{},"later":"\ud800"}"#.utf8),
+            Data(#"{"configV2":{},"later":1e400}"#.utf8),
+            Data("[]".utf8),
+            Data(("{\"configV2\":" + String(repeating: "[", count: 64) + "0"
+                  + String(repeating: "]", count: 64) + "}").utf8),
+        ] {
+            XCTAssertThrowsError(try EluV1StrictCanonicalJSON.parse(data, retainingRootProperty: "configV2"))
+        }
+    }
+
     private func fixture(_ name: String) -> Data {
         let root = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()

@@ -73,6 +73,28 @@ enum EluV1StrictCanonicalJSON {
         return Document(value: value, canonicalData: try canonicalData(for: value))
     }
 
+    /// Opt-in original value extraction for an enclosing configuration receipt.
+    /// The full document is validated before any slice is returned. Whitespace
+    /// outside the JSON value is envelope syntax, not part of the selected value.
+    static func parse(_ data: Data, retainingRootProperty name: String) throws
+        -> (document: Document, propertyData: Data?)
+    {
+        guard let source = String(data: data, encoding: .utf8) else {
+            throw EluV1StrictCanonicalJSONError.invalidUTF8
+        }
+        let units = Array(source.utf16)
+        let parser = Parser(units, retainedRootProperty: Array(name.utf16))
+        let value = try parser.parse()
+        guard case .object = value else { throw EluV1StrictCanonicalJSONError.rootIsNotObject }
+        let canonical = try canonicalData(for: value)
+        // Valid UTF-8 has a unique encoding. Re-encoding this original UTF-16
+        // slice preserves escapes, number lexemes, whitespace and Unicode bytes.
+        let retained = parser.retainedRootRange.map {
+            Data(String(decoding: units[$0], as: UTF16.self).utf8)
+        }
+        return (Document(value: value, canonicalData: canonical), retained)
+    }
+
     static func canonicalData(for value: Value) throws -> Data {
         var output = String()
         try appendCanonical(value, to: &output)
@@ -301,9 +323,12 @@ enum EluV1StrictCanonicalJSON {
     private final class Parser {
         private let source: [UInt16]
         private var index = 0
+        private let retainedRootProperty: [UInt16]?
+        private(set) var retainedRootRange: Range<Int>?
 
-        init(_ source: [UInt16]) {
+        init(_ source: [UInt16], retainedRootProperty: [UInt16]? = nil) {
             self.source = source
+            self.retainedRootProperty = retainedRootProperty
         }
 
         func parse() throws -> Value {
@@ -354,7 +379,12 @@ enum EluV1StrictCanonicalJSON {
                 skipWhitespace()
                 try require(0x3A)
                 skipWhitespace()
-                members.append(Member(name: name, value: try parseValue(depth: depth)))
+                let valueStart = index
+                let value = try parseValue(depth: depth)
+                if depth == 1, let retainedRootProperty, name == retainedRootProperty {
+                    retainedRootRange = valueStart..<index
+                }
+                members.append(Member(name: name, value: value))
                 skipWhitespace()
                 if consume(0x7D) { return .object(members) }
                 try require(0x2C)

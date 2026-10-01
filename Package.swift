@@ -12,16 +12,11 @@ let package = Package(
             targets: ["EluAnalytics"]
         ),
     ],
-    dependencies: [
-        // An exact version keeps dependency resolution reproducible.
-        .package(url: "https://github.com/PostHog/posthog-ios.git", exact: "3.69.0"),
-    ],
+    dependencies: [],
     targets: [
         .target(
             name: "EluAnalytics",
-            dependencies: [
-                .product(name: "PostHog", package: "posthog-ios"),
-            ],
+            dependencies: [],
             resources: [
                 .copy("Resources/PrivacyInfo.xcprivacy"),
             ],

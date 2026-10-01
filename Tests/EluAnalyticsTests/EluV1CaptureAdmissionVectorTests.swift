@@ -540,6 +540,13 @@ final class EluV1CaptureAdmissionVectorTests: XCTestCase {
         case .optedOut: "opted-out"
         case .invalidEvent: "invalid-event"
         case .queueLimit: "queue-limit"
+        case .rateLimited: "rate-limited"
+        case .eventFiltered: "event-filtered"
+        case .eventFilterInvalid: "event-filter-invalid"
+        case .eventFilterWithdrawn: "event-filter-withdrawn"
+        case .eventFilterUnsupportedPersonChanges: "event-filter-unsupported-person-changes"
+        case .exposureAlreadyRecorded: "exposure-already-recorded"
+        case .exposureLedgerFull: "exposure-ledger-full"
         case .storageProvenNotCommitted: "storage-proven-not-committed"
         case .storageOutcomeUnknown: "storage-outcome-unknown"
         }

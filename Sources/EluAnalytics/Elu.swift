@@ -1,38 +1,55 @@
 import Foundation
 
-/// Options for `Elu.setup(siteKey:options:)`. Production apps on ELU Cloud
-/// use the plain `Elu.setup(siteKey:)`; the options serve dev/staging config
-/// hosts and apps that send to a self-hosted ELU instance.
+/// Options for `Elu.setup(siteKey:options:)`. ELU Cloud uses the default host.
 public struct EluSetupOptions {
-    /// ELU config endpoint origin. Default: `https://elu.dev`.
-    ///
-    /// A config host outside `elu.dev` is accepted only when it is exactly
-    /// `apiHost`: HTTPS, the same host, the default port. Any other value
-    /// leaves the SDK idle.
+    /// ELU config base URL. Default: `https://elu.dev`.
     public var configHost: URL
-
-    /// The self-hosted ELU instance this app sends to, or `nil` for ELU Cloud.
-    /// Declaring it is what lets `configHost` name that instance.
+    /// Declared self-hosted HTTPS base, optionally including a path prefix.
+    /// A custom config base must match it exactly.
     public var apiHost: URL?
+    /// Native performance collection is disabled unless explicitly enabled.
+    public var performance = EluPerformanceOptions()
+    /// Delayed numeric OS diagnostics are disabled unless explicitly enabled.
+    public var diagnostics = EluDiagnosticsOptions()
+    /// Opt in to annotated SwiftUI replay through the original native-v3 config.
+    /// Default false. Requires a current compatible declared-region grant and
+    /// a stable `EluSwiftUIReplayScope` with every input/private area wrapped.
+    /// This does not discover inputs or `privacySensitive()` automatically,
+    /// grant capture permission, or enable SwiftUI touch/gesture recording.
+    /// Select before the first setup call; unsupported config has no v2 fallback.
+    /// This candidate requires the supported ELU issuer/replay endpoint pair;
+    /// arbitrary self-hosted raster endpoints are not supported.
+    public var declaredRegionReplayEnabled = false
+    /// New anonymous events do not create a person profile by default.
+    public var personProfiles: EluPersonProfilesMode = .identifiedOnly
+    /// Analytics storage lifetime. Explicit consent is retained separately in both modes.
+    public var persistence: EluPersistenceMode = .persistent
 
-    /// Which analytics runtime this run drives. Not part of the public API:
-    /// a build selects one runtime for its whole fleet, and the selection is
-    /// changed by changing this default, never by customer code.
-    ///
-    /// The two runtimes do not share stored identity, so changing the default
-    /// starts a fresh ELU identity on every device. Carrying an existing
-    /// identity across is a separate, separately reviewed step.
-    var runtimeSelection: EluRuntimeSelection = .provider
+    /// Site-scoped capture token bucket; identity reset does not reset this budget.
+    public var rateLimiting = EluRateLimitingOptions()
+
+    /// Top-level customer property names removed after merging super properties
+    /// and before `beforeSend`. Runtime-owned identity metadata is protected.
+    public var propertyDenylist: [String] = []
+    /// Runs once per event on the SDK event path, outside SDK locks.
+    /// Return a replacement or nil to drop it. Errors/invalid results drop safely.
+    /// Keep this synchronous callback short; replay frames do not pass through it.
+    public var beforeSend: (@Sendable (EluEvent) throws -> EluEvent?)? = nil
+
+    /// Internal construction marker for the owned runtime. Customer code
+    /// cannot select or construct another backend.
+    var runtimeSelection: EluRuntimeSelection = .standalone
 
     public init(configHost: URL = URL(string: "https://elu.dev")!) {
         self.configHost = configHost
     }
 
-    /// Options for an app that sends to a self-hosted ELU instance: pass the
-    /// instance's origin as both `configHost` and `apiHost`.
     public init(configHost: URL, apiHost: URL?) {
-        self.configHost = configHost
-        self.apiHost = apiHost
+        self.configHost = configHost; self.apiHost = apiHost
+    }
+
+    public init(configHost: URL = URL(string: "https://elu.dev")!, performance: EluPerformanceOptions) {
+        self.configHost = configHost; self.performance = performance
     }
 }
 
@@ -41,7 +58,7 @@ public struct EluSetupOptions {
 /// Every method is safe in every lifecycle state: before config arrives,
 /// capture-class calls buffer in memory; when analytics is disabled (kill
 /// switch, EU block) they are silent no-ops; while running they delegate to
-/// the embedded provider. Nothing here throws or blocks the caller on
+/// the ELU-owned runtime. Nothing here throws or blocks the caller on
 /// network. Customer code never touches the underlying provider directly.
 public enum Elu {
     // MARK: - Setup
@@ -53,8 +70,7 @@ public enum Elu {
         setup(siteKey: siteKey, options: EluSetupOptions())
     }
 
-    /// Initialize with explicit options (a dev/staging config host, or a
-    /// self-hosted ELU instance declared as `apiHost`).
+    /// Initialize with explicit options, including a declared self-hosted config origin.
     public static func setup(siteKey: String, options: EluSetupOptions) {
         EluCore.shared.setup(siteKey: siteKey, options: options)
     }
@@ -67,9 +83,18 @@ public enum Elu {
         EluCore.shared.dispatch(.identify(distinctId: distinctId, userProperties: userProperties))
     }
 
-    /// Clear identity and stored ids (call on logout).
+    public static func identify(_ distinctId: String, userProperties: [String: Any]?, userPropertiesOnce: [String: Any]) {
+        EluCore.shared.dispatch(.identify(distinctId: distinctId, userProperties: userProperties, userPropertiesOnce: userPropertiesOnce))
+    }
+
+    /// End the current user/session while retaining the installation device id and consent.
     public static func reset() {
         EluCore.shared.reset()
+    }
+
+    /// Also rotate the installation device id when explicitly requested.
+    public static func reset(resetDeviceId: Bool) {
+        EluCore.shared.reset(resetDeviceId: resetDeviceId)
     }
 
     public static func alias(_ alias: String) {
@@ -85,14 +110,38 @@ public enum Elu {
         EluCore.shared.dispatch(.setPersonProperties(properties))
     }
 
+    public static func setPersonProperties(_ properties: [String: Any], propertiesOnce: [String: Any]) {
+        EluCore.shared.dispatch(.setPersonProperties(properties, propertiesOnce: propertiesOnce))
+    }
+
+    public static func getGroups() -> [String: String] { EluCore.shared.getGroups() }
+    public static func resetGroups() { EluCore.shared.dispatch(.resetGroups) }
+    public static func resetPersonPropertiesForFlags() { EluCore.shared.dispatch(.resetPersonPropertiesForFlags) }
+    public static func resetGroupPropertiesForFlags(_ type: String? = nil) {
+        EluCore.shared.dispatch(.resetGroupPropertiesForFlags(type))
+    }
+
     // MARK: - Events
 
     public static func capture(_ event: String, properties: [String: Any]? = nil) {
         EluCore.shared.dispatch(.capture(event: event, properties: properties))
     }
 
-    /// Record a screen view (`$screen`). UIKit view controllers are captured
-    /// automatically; SwiftUI navigation needs manual calls — see README.
+    /// Record an explicit event time. Times before persisted activity, or
+    /// outside the supported date range, are discarded with the event.
+    public static func capture(_ event: String, properties: [String: Any]? = nil, timestamp: Date) {
+        EluCore.shared.dispatch(.capture(event: event, properties: properties, timestamp: timestamp))
+    }
+
+    /// Person changes run only after event acceptance, under the same current
+    /// identity and consent. They are not part of the event's transaction.
+    public static func capture(_ event: String, properties: [String: Any]? = nil, options: EluCaptureOptions) {
+        EluCore.shared.dispatch(.capture(event: event, properties: properties, timestamp: options.timestamp,
+            set: options.set, setOnce: options.setOnce))
+    }
+
+    /// Record a logical screen view. Call explicitly from UIKit and SwiftUI
+    /// when the application presents a screen — see README.
     public static func screen(_ name: String, properties: [String: Any]? = nil) {
         EluCore.shared.dispatch(.screen(name: name, properties: properties))
     }
@@ -107,6 +156,12 @@ public enum Elu {
     /// `unregister` or `reset`).
     public static func register(_ properties: [String: Any]) {
         EluCore.shared.dispatch(.register(properties))
+    }
+
+    /// Set each super property only when absent, or equal to `defaultValue`.
+    /// Explicit null values count as present unless `defaultValue` is `NSNull()`.
+    public static func registerOnce(_ properties: [String: Any], defaultValue: Any? = "None") {
+        EluCore.shared.dispatch(.registerOnce(properties, defaultValue: defaultValue))
     }
 
     public static func unregister(_ key: String) {
@@ -125,12 +180,32 @@ public enum Elu {
         EluCore.shared.getFeatureFlag(key)
     }
 
+    public static func getFeatureFlag(_ key: String, options: EluFeatureFlagOptions) -> Any? {
+        EluCore.shared.getFeatureFlag(key, options: options)
+    }
+
     public static func getFeatureFlagPayload(_ key: String) -> Any? {
         EluCore.shared.getFeatureFlagPayload(key)
     }
 
+    /// Read one identity-bound flag snapshot, including its variant and payload.
+    /// Returns nil while unavailable or when the key is absent.
+    public static func getFeatureFlagResult(_ key: String) -> EluFeatureFlagResult? {
+        EluCore.shared.getFeatureFlagResult(key)
+    }
+
+    public static func getFeatureFlagResult(_ key: String, options: EluFeatureFlagOptions) -> EluFeatureFlagResult? {
+        EluCore.shared.getFeatureFlagResult(key, options: options)
+    }
+
     public static func isFeatureEnabled(_ key: String) -> Bool {
         EluCore.shared.isFeatureEnabled(key)
+    }
+
+    /// Returns nil for an unavailable or absent flag unless a default is supplied.
+    /// A present false value is never replaced by the default.
+    public static func isFeatureEnabled(_ key: String, options: EluFeatureFlagOptions, defaultValue: Bool? = nil) -> Bool? {
+        EluCore.shared.isFeatureEnabled(key, options: options) ?? defaultValue
     }
 
     public static func reloadFeatureFlags(_ completion: (() -> Void)? = nil) {
@@ -142,6 +217,18 @@ public enum Elu {
         EluCore.shared.onFeatureFlagsLoaded(callback)
     }
 
+    /// Quiet current snapshot; nil means unavailable, while an empty snapshot
+    /// is a valid evaluation. Reading does not emit flag exposure events.
+    public static func featureFlagSnapshot() -> EluFeatureFlagSnapshot? {
+        EluCore.shared.featureFlagSnapshot()
+    }
+
+    /// Main-queue snapshots from the original load path. Retain the returned
+    /// token; cancellation or token deinit stops callbacks not yet admitted.
+    public static func subscribeToFeatureFlags(_ callback: @escaping (EluFeatureFlagSnapshot) -> Void) -> EluFeatureFlagSubscription {
+        EluCore.shared.subscribeToFeatureFlags(callback)
+    }
+
     public static func setPersonPropertiesForFlags(_ properties: [String: Any]) {
         EluCore.shared.dispatch(.setPersonPropertiesForFlags(properties))
     }
@@ -150,9 +237,42 @@ public enum Elu {
         EluCore.shared.dispatch(.setGroupPropertiesForFlags(type: type, properties: properties))
     }
 
+    // MARK: - Consent
+
+    /// Persistently stop capture, replay, and delivery for this installation.
+    /// Calls made while opted out are not backfilled when consent is restored.
+    public static func optOut() { EluCore.shared.setConsent(optedOut: true) }
+
+    /// Restore capture when current remote privacy policy also permits it.
+    /// Pass nil to suppress the optional opt-in event.
+    public static func optIn(captureEventName: String? = "$opt_in", properties: [String: Any]? = nil) {
+        EluCore.shared.setConsent(optedOut: false, event: captureEventName, properties: properties)
+    }
+
+    public static func isOptedOut() -> Bool { EluCore.shared.isOptedOut() }
+
+    // MARK: - Replay controls
+
+    /// Clear this runtime's local replay stop and reevaluate all current
+    /// configuration, consent, privacy, audience, root and budget requirements.
+    /// This cannot force recording or override sampling. Call after setup.
+    public static func startSessionRecording() { EluCore.shared.setSessionRecordingEnabled(true) }
+
+    /// Freeze new replay collection immediately. An already captured authorized
+    /// prefix can finish sealing asynchronously; sealed delivery remains enabled.
+    /// The first chunk still requires its configured minimum observed duration.
+    /// This is a local runtime choice, not persistent consent withdrawal.
+    public static func stopSessionRecording() { EluCore.shared.setSessionRecordingEnabled(false) }
+
+    /// True only while the original UIKit collector is installed and current.
+    /// False during setup, local stop, withdrawal or failed/unavailable capture.
+    public static func sessionRecordingStarted() -> Bool { EluCore.shared.sessionRecordingStarted() }
+
     // MARK: - Delivery
 
-    /// Force-send queued events now (e.g. right before expected termination).
+    /// Request a delivery attempt for queued events. This does not wait for a
+    /// server acknowledgment or guarantee delivery before process termination.
+    /// Unacknowledged durable events are retried on a later eligible launch.
     public static func flush() {
         EluCore.shared.flush()
     }

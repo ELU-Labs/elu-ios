@@ -13,6 +13,285 @@ final class EluStandaloneFacadeRuntimeTests: XCTestCase {
         var errorDescription: String? { "checkout failed" }
     }
 
+    func testOriginalFacadeFactoryDefaultsToOneV2Request() async throws {
+        try await assertBootstrapRequest(optIn: false, body: Data("{}".utf8), expected: .v2)
+    }
+
+    func testOriginalFacadeFactoryOptsIntoV3WithoutFallbackOnInvalidResponse() async throws {
+        try await assertBootstrapRequest(optIn: true, body: Data("{}".utf8), expected: .nativeV3)
+    }
+
+    func testOriginalFacadeFactoryBaseOnlyV3DoesNotGrantRaster() async throws {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let now = Date()
+        let base: [String: Any] = ["schemaVersion": 2, "revision": "bootstrap-closed",
+            "status": "disabled", "reason": "policy",
+            "issuedAt": formatter.string(from: now.addingTimeInterval(-1)),
+            "expiresAt": formatter.string(from: now.addingTimeInterval(300))]
+        let body = try JSONSerialization.data(withJSONObject: ["schemaVersion": 3, "configV2": base], options: [.sortedKeys])
+        XCTAssertNil(try EluNativeV3ConfigParser.parse(body).raster)
+        try await assertBootstrapRequest(optIn: true, body: body, expected: .nativeV3)
+    }
+
+    private func assertBootstrapRequest(optIn: Bool, body: Data, expected: EluV2ConfigRequest.Format) async throws {
+        try await withTemporaryDirectory { root in
+            let siteKey = "elu_pk_test_" + String(repeating: "b", count: 22)
+            let context = EluRuntimeBackendContext(siteKey: siteKey, isNewUser: true,
+                flagsDidLoad: {}, declaredRegionReplayEnabled: optIn)
+            let transport = BootstrapConfigTransport(body: body)
+            let stack = try await EluStandaloneFacadeRuntime.makeStack(context: context,
+                rootDirectoryURL: root, configTransport: transport)
+            do {
+                stack.start(); stack.setForeground(true)
+                for _ in 0..<250 {
+                    if await transport.requests.count == 1 { break }
+                    try await Task.sleep(nanoseconds: 20_000_000)
+                }
+                let requests = await transport.requests
+                XCTAssertEqual(requests.count, 1)
+                let request = try XCTUnwrap(requests.first)
+                XCTAssertEqual(request.format, expected)
+                XCTAssertEqual(request.url.absoluteString,
+                    "https://elu.dev/sdk/\(expected == .v2 ? "v2" : "v3")/\(siteKey)/config")
+                XCTAssertFalse(stack.runtime.nativeReplayIsRecording())
+                let capture = await stack.runtime.capture("without-permission")
+                guard case .rejected = capture else {
+                    XCTFail("The implementation option granted capture permission")
+                    stack.close(); await stack.settled(); return
+                }
+                stack.close(); await stack.settled()
+                let finalRequests = await transport.requests
+                XCTAssertEqual(finalRequests.count, 1, "No second configuration owner or fallback request")
+                XCTAssertEqual(finalRequests.map(\.format), [expected])
+            } catch {
+                stack.close(); await stack.settled(); throw error
+            }
+        }
+    }
+
+    func testNeverModeRejectsPersonIntentBeforeOptimisticGettersAndKeepsForFlagsLocal() async throws {
+        try await withTemporaryDirectory { root in
+            let harness = try await makeHarness(root: root, personProfiles: .never)
+            let original = harness.backend.distinctId()
+            let before = try await harness.runtime.queueSnapshot()
+            harness.backend.execute(.identify(distinctId: "forbidden-user", userProperties: ["tier": "paid"]))
+            XCTAssertEqual(harness.backend.distinctId(), original, "No optimistic forbidden identity")
+            harness.backend.execute(.alias("forbidden-alias"))
+            harness.backend.execute(.setPersonProperties(["tier": "paid"]))
+            await harness.backend.settled()
+            let unchanged = try await harness.runtime.queueSnapshot()
+            XCTAssertEqual(unchanged, before)
+            harness.backend.execute(.setPersonPropertiesForFlags(["tier": "evaluation-only"]))
+            harness.backend.execute(.capture(event: "anonymous", properties: ["$device_id": "forged", "$epp": true,
+                "$is_identified": true, "$process_person_profile": true]))
+            await harness.backend.settled()
+            let changed = try await harness.runtime.queueSnapshot()
+            XCTAssertEqual(changed.flagContext.personProperties["tier"], .string("evaluation-only"))
+            XCTAssertNil(changed.identity.userId)
+            _ = await harness.runtime.flush()
+            let events = try await harness.transport.recordedEvents()
+            let event = try XCTUnwrap(events.first), properties = try XCTUnwrap(event["properties"] as? [String: Any])
+            XCTAssertEqual(properties["$device_id"] as? String, before.identity.anonymousId)
+            XCTAssertEqual(properties["$is_identified"] as? Bool, false)
+            XCTAssertEqual(properties["$process_person_profile"] as? Bool, false)
+            XCTAssertNil(properties["$epp"])
+            await harness.close()
+        }
+    }
+
+    func testFacadeResetVariantKeepsOrRotatesIndependentDeviceIdentity() async throws {
+        try await withTemporaryDirectory { root in
+            let harness = try await makeHarness(root: root)
+            harness.backend.execute(.capture(event: "before", properties: nil))
+            await harness.backend.settled()
+            harness.backend.execute(.reset)
+            harness.backend.execute(.capture(event: "ordinary-reset", properties: nil))
+            await harness.backend.settled()
+            harness.backend.execute(.resetDeviceIdentity)
+            harness.backend.execute(.capture(event: "device-reset", properties: nil))
+            await harness.backend.settled()
+            _ = await harness.runtime.flush()
+            let events = try await harness.transport.recordedEvents()
+            XCTAssertEqual(events.compactMap { $0["name"] as? String }, ["before", "ordinary-reset", "device-reset"])
+            let devices = events.compactMap { ($0["properties"] as? [String: Any])?["$device_id"] as? String }
+            XCTAssertEqual(devices.count, 3)
+            guard devices.count == 3 else { await harness.close(); return }
+            XCTAssertEqual(devices[0], devices[1]); XCTAssertNotEqual(devices[1], devices[2])
+            await harness.close()
+        }
+    }
+
+    func testRegisterOncePreservesValuesAndUsesExplicitDefaultAtomically() async throws {
+        try await withTemporaryDirectory { root in
+            let harness = try await makeHarness(root: root)
+            harness.backend.execute(.register(["tier": "gold", "empty": NSNull(), "sentinel": "None"]))
+            harness.backend.execute(.registerOnce(["tier": "silver", "empty": "changed", "new": 42,
+                                                  "sentinel": "filled"], defaultValue: "None"))
+            await harness.backend.settled()
+            var snapshot = try await harness.runtime.queueSnapshot()
+            XCTAssertEqual(snapshot.identity.superProperties["tier"], .string("gold"))
+            XCTAssertEqual(snapshot.identity.superProperties["empty"], .null)
+            XCTAssertEqual(snapshot.identity.superProperties["sentinel"], .string("filled"))
+            XCTAssertEqual(snapshot.identity.superProperties["new"], .integer(42))
+            harness.backend.execute(.registerOnce(["empty": "present"], defaultValue: NSNull()))
+            await harness.backend.settled()
+            snapshot = try await harness.runtime.queueSnapshot()
+            XCTAssertEqual(snapshot.identity.superProperties["empty"], .string("present"))
+            await harness.close()
+            let reopened = try await makeHarness(root: root)
+            let restored = try await reopened.runtime.queueSnapshot()
+            XCTAssertEqual(restored.identity.superProperties, snapshot.identity.superProperties)
+            await reopened.close()
+        }
+    }
+
+    func testFlagResultUsesOneCurrentSnapshotAndClearsOnIdentityIntent() async throws {
+        try await withTemporaryDirectory { root in
+            let harness = try await makeHarness(root: root, flagTransport: FacadeFlagTransport())
+            XCTAssertNil(harness.backend.featureFlagResult("variant"))
+            harness.backend.activate()
+            await harness.backend.settled()
+            let result = try XCTUnwrap(harness.backend.featureFlagResult("variant"))
+            XCTAssertEqual(result.key, "variant")
+            XCTAssertTrue(result.enabled)
+            XCTAssertEqual(result.variant, "variant-a")
+            XCTAssertEqual((result.payload as? [String: Any])?["color"] as? String, "violet")
+            XCTAssertFalse(try XCTUnwrap(harness.backend.featureFlagResult("enabled")).enabled)
+            XCTAssertNil(harness.backend.featureFlagResult("absent"))
+            let finish = harness.backend.beginPendingOperation(.reset)
+            XCTAssertNil(harness.backend.featureFlagResult("variant"))
+            finish?()
+            await harness.close()
+        }
+    }
+
+    func testConsentPersistsAcrossResetAndRestartAndRestoresCaptureExplicitly() async throws {
+        try await withTemporaryDirectory { root in
+            let harness = try await makeHarness(root: root)
+            harness.backend.execute(.consent(EluConsentOperation(optedOut: true)))
+            XCTAssertTrue(harness.backend.isOptedOut())
+            harness.backend.execute(.capture(event: "private", properties: nil))
+            harness.backend.execute(.reset)
+            await harness.backend.settled()
+            let beforeRestart = try await harness.runtime.queueSnapshot()
+            XCTAssertTrue(beforeRestart.identity.optedOut)
+            XCTAssertNil(beforeRestart.identity.session)
+            XCTAssertEqual(beforeRestart.queuedCount, 0)
+            await harness.close()
+            let reopened = try await makeHarness(root: root)
+            XCTAssertTrue(reopened.backend.isOptedOut())
+            reopened.backend.execute(.consent(EluConsentOperation(optedOut: false, event: "$opt_in")))
+            reopened.backend.execute(.capture(event: "allowed", properties: nil))
+            await reopened.backend.settled()
+            XCTAssertFalse(reopened.backend.isOptedOut())
+            _ = await reopened.runtime.flush()
+            let events = try await reopened.transport.recordedEvents()
+            XCTAssertEqual(events.compactMap { $0["name"] as? String }, ["$opt_in", "allowed"])
+            await reopened.close()
+        }
+    }
+
+    func testInitialConsentPrecedesInjectedConfigurationAndPreservesSavedChoiceWhenAbsent() async throws {
+        try await withTemporaryDirectory { root in
+            let denied = try await makeHarness(root: root, initialConsent: EluConsentOperation(optedOut: true))
+            denied.backend.execute(.capture(event: "private", properties: nil))
+            await denied.backend.settled()
+            let saved = try await denied.runtime.queueSnapshot()
+            XCTAssertTrue(saved.identity.optedOut)
+            XCTAssertEqual(saved.queuedCount, 0)
+            await denied.close()
+            let reopened = try await makeHarness(root: root)
+            XCTAssertTrue(reopened.backend.isOptedOut(), "No pre-setup choice must preserve durable denial")
+            await reopened.close()
+            let granted = try await makeHarness(root: root, initialConsent: EluConsentOperation(optedOut: false))
+            granted.backend.execute(.capture(event: "allowed", properties: nil))
+            await granted.backend.settled()
+            let allowed = try await granted.runtime.queueSnapshot()
+            XCTAssertFalse(allowed.identity.optedOut)
+            XCTAssertEqual(allowed.queuedCount, 1)
+            await granted.close()
+        }
+    }
+
+    func testNewOptOutIntentCannotBeReopenedByAnOlderOptInOrConfigRefresh() async throws {
+        try await withTemporaryDirectory { root in
+            let harness = try await makeHarness(root: root)
+            let oldOptIn = UUID(), newOptOut = UUID()
+            harness.runtime.acceptConsentIntent(oldOptIn, optedOut: false)
+            harness.runtime.acceptConsentIntent(newOptOut, optedOut: true)
+            _ = await harness.runtime.setOptedOut(true, intent: newOptOut)
+            // Simulate a grant accepted before denial but dispatched after it.
+            let stale = await harness.runtime.setOptedOut(false, intent: oldOptIn)
+            XCTAssertNil(stale)
+            let result = await harness.runtime.capture("must-not-capture")
+            guard case .rejected = result else { return XCTFail("newer opt-out must fence admission") }
+            guard case .unavailable = await harness.runtime.flush() else { return XCTFail("newer opt-out must fence delivery") }
+            let snapshot = try await harness.runtime.queueSnapshot()
+            XCTAssertTrue(snapshot.identity.optedOut)
+            XCTAssertEqual(snapshot.queuedCount, 0)
+            await harness.close()
+            let reopened = try await makeHarness(root: root)
+            XCTAssertTrue(reopened.backend.isOptedOut(), "latest denial must survive process restart")
+            await reopened.close()
+        }
+    }
+
+    func testSetOnceOverloadsGroupsAndLocalFlagContextResetsPersist() async throws {
+        try await withTemporaryDirectory { root in
+            let harness = try await makeHarness(root: root)
+            harness.backend.execute(.identify(distinctId: "member", userProperties: ["plan": "pro"], userPropertiesOnce: ["joined": "first"]))
+            harness.backend.execute(.setPersonProperties([:], propertiesOnce: ["joined": "second", "source": "native"]))
+            harness.backend.execute(.group(type: "company", key: "acme", properties: nil))
+            await harness.backend.settled()
+            XCTAssertEqual(harness.backend.groups(), ["company": "acme"])
+            let before = try await harness.runtime.queueSnapshot()
+            XCTAssertEqual(before.flagContext.personProperties["joined"], .string("first"))
+            XCTAssertEqual(before.flagContext.personProperties["source"], .string("native"))
+            harness.backend.execute(.setPersonPropertiesForFlags(["beta": true]))
+            harness.backend.execute(.setGroupPropertiesForFlags(type: "company", properties: ["tier": "test"]))
+            harness.backend.execute(.setGroupPropertiesForFlags(type: "project", properties: ["tier": "preview"]))
+            harness.backend.execute(.resetPersonPropertiesForFlags)
+            harness.backend.execute(.resetGroupPropertiesForFlags("company"))
+            await harness.backend.settled()
+            let reset = try await harness.runtime.queueSnapshot()
+            XCTAssertTrue(reset.flagContext.personProperties.isEmpty)
+            XCTAssertNil(reset.flagContext.groupProperties["company"])
+            XCTAssertEqual(reset.flagContext.groupProperties["project"], ["tier": .string("preview")])
+            XCTAssertEqual(reset.queuedCount, before.queuedCount, "flag context changes must remain local")
+            harness.backend.execute(.resetGroupPropertiesForFlags(nil))
+            await harness.backend.settled()
+            let allGroupsReset = try await harness.runtime.queueSnapshot()
+            XCTAssertTrue(allGroupsReset.flagContext.groupProperties.isEmpty)
+            XCTAssertEqual(allGroupsReset.identity.groups, ["company": "acme"])
+            XCTAssertEqual(allGroupsReset.queuedCount, before.queuedCount)
+            harness.backend.execute(.resetGroups)
+            await harness.backend.settled()
+            XCTAssertTrue(harness.backend.groups().isEmpty)
+            await harness.close()
+            let reopened = try await makeHarness(root: root)
+            let restored = try await reopened.runtime.queueSnapshot()
+            XCTAssertTrue(restored.identity.groups.isEmpty)
+            XCTAssertTrue(restored.flagContext.personProperties.isEmpty)
+            XCTAssertTrue(restored.flagContext.groupProperties.isEmpty)
+            await reopened.close()
+        }
+    }
+
+    func testRegisterOnceDefaultsUseScalarNumericEqualityWithoutDeepObjectComparison() async throws {
+        try await withTemporaryDirectory { root in
+            let harness = try await makeHarness(root: root)
+            harness.backend.execute(.register(["numeric": 1, "object": ["a": 1]]))
+            harness.backend.execute(.registerOnce(["numeric": 2], defaultValue: 1.0))
+            harness.backend.execute(.registerOnce(["object": "wrong"], defaultValue: ["a": 1]))
+            await harness.backend.settled()
+            let snapshot = try await harness.runtime.queueSnapshot()
+            XCTAssertEqual(snapshot.identity.superProperties["numeric"], .integer(2))
+            XCTAssertEqual(snapshot.identity.superProperties["object"], .object(["a": .integer(1)]))
+            await harness.close()
+        }
+    }
+
     func testEveryFacadeMethodRecordsThroughTheOwnedRuntimeInCallOrder() async throws {
         try await withTemporaryDirectory { root in
             let harness = try await makeHarness(root: root)
@@ -64,8 +343,6 @@ final class EluStandaloneFacadeRuntimeTests: XCTestCase {
                     "associateGroup",
                     "setGroupProperties",
                     "setPersonProperties",
-                    "setPersonProperties",
-                    "setGroupProperties",
                 ]
             )
             await harness.close()
@@ -146,7 +423,169 @@ final class EluStandaloneFacadeRuntimeTests: XCTestCase {
         }
     }
 
-    func testExposureIsReportedOncePerKeyAndValueForEachIdentityRevision() async throws {
+    func testFullFlagPublicationIsQuietAndOriginalIntentRevokesIt() async throws {
+        try await withTemporaryDirectory { root in
+            let publications = FacadePublications()
+            let harness = try await makeHarness(root: root, flagTransport: FacadeFlagTransport(), snapshotObserver: { publications.append($0) })
+            XCTAssertNil(harness.backend.featureFlagPublication())
+            harness.backend.activate(); await harness.backend.settled()
+            let publication = try XCTUnwrap(harness.backend.featureFlagPublication())
+            XCTAssertTrue(publication.isCurrent())
+            XCTAssertEqual(publication.snapshot.source, .remote)
+            XCTAssertEqual(publication.snapshot.entries.count, 3)
+            XCTAssertNil(publication.snapshot.error)
+            XCTAssertEqual(publications.values().count, 1)
+            for _ in 0 ..< 3 { _ = harness.backend.featureFlagPublication() }
+            _ = await harness.runtime.flush()
+            let exposures = try await harness.transport.recordedEvents().filter { $0["name"] as? String == "$feature_flag_called" }
+            XCTAssertTrue(exposures.isEmpty)
+            let finish = harness.backend.beginPendingOperation(.reset)
+            XCTAssertFalse(publication.isCurrent())
+            XCTAssertNil(harness.backend.featureFlagPublication())
+            finish?()
+            XCTAssertFalse(publication.isCurrent(), "Released intent cannot revive an old publication")
+            XCTAssertEqual(publication.snapshot.entries.count, 3, "Detached historical data stays immutable")
+            await harness.close()
+        }
+    }
+
+    func testCachePublicationCarriesOnlyActualReloadFailureAndSuccessClearsIt() async throws {
+        try await withTemporaryDirectory { root in
+            let transport = FacadeFlagTransport()
+            let first = try await makeHarness(root: root, flagTransport: transport)
+            first.backend.activate(); await first.backend.settled(); await first.close()
+            await transport.setFailing(true)
+            let publications = FacadePublications()
+            let reopened = try await makeHarness(root: root, flagTransport: transport, snapshotObserver: { publications.append($0) })
+            reopened.backend.activate(); await reopened.backend.settled()
+            let observed = publications.values()
+            XCTAssertEqual(observed.count, 2)
+            XCTAssertEqual(observed.first?.snapshot.source, .cache)
+            XCTAssertNil(observed.first?.snapshot.error, "Startup cache is not a failed reload")
+            XCTAssertEqual(observed.last?.snapshot.error, .transport)
+            XCTAssertEqual(observed.last?.snapshot.source, .cache)
+            XCTAssertFalse(observed[0].isCurrent(), "Later publication retires queued earlier metadata")
+            XCTAssertTrue(observed[1].isCurrent())
+            await transport.setFailing(false); await transport.setMalformed(true)
+            reopened.backend.reloadFeatureFlags(nil); await reopened.backend.settled()
+            XCTAssertEqual(reopened.backend.featureFlagPublication()?.snapshot.error, .invalidResponse)
+            XCTAssertEqual(reopened.backend.featureFlagPublication()?.snapshot.source, .cache)
+            await transport.setMalformed(false)
+            reopened.backend.reloadFeatureFlags(nil); await reopened.backend.settled()
+            XCTAssertEqual(reopened.backend.featureFlagPublication()?.snapshot.source, .remote)
+            XCTAssertNil(reopened.backend.featureFlagPublication()?.snapshot.error)
+            XCTAssertFalse(observed[1].isCurrent())
+            await reopened.close()
+        }
+    }
+
+    func testSupersededPhysicalFailureCannotPublishErrorForNewIdentity() async throws {
+        try await withTemporaryDirectory { root in
+            let sent = expectation(description: "original send")
+            let transport = SnapshotHeldFailureTransport { sent.fulfill() }
+            let publications = FacadePublications()
+            let harness = try await makeHarness(root: root, flagTransport: transport, snapshotObserver: { publications.append($0) })
+            harness.backend.activate()
+            await fulfillment(of: [sent], timeout: 5)
+            let finish = harness.backend.beginPendingOperation(.reset)
+            await transport.release()
+            await harness.backend.settled()
+            XCTAssertTrue(publications.values().isEmpty)
+            XCTAssertNil(harness.backend.featureFlagPublication())
+            finish?()
+            XCTAssertNil(harness.backend.featureFlagPublication())
+            await harness.close()
+        }
+    }
+
+    func testFailedReloadWithoutCachePublishesUnavailableMetadataOnly() async throws {
+        try await withTemporaryDirectory { root in
+            let transport = FacadeFlagTransport()
+            await transport.setFailing(true)
+            let harness = try await makeHarness(root: root, flagTransport: transport)
+            harness.backend.activate(); await harness.backend.settled()
+            let transportFailure = try XCTUnwrap(harness.backend.featureFlagPublication())
+            XCTAssertTrue(transportFailure.isCurrent())
+            XCTAssertEqual(transportFailure.snapshot.source, .unavailable)
+            XCTAssertEqual(transportFailure.snapshot.error, .transport)
+            XCTAssertTrue(transportFailure.snapshot.entries.isEmpty)
+            XCTAssertNil(transportFailure.snapshot.requestId)
+            await transport.setFailing(false); await transport.setMalformed(true)
+            harness.backend.reloadFeatureFlags(nil); await harness.backend.settled()
+            XCTAssertEqual(harness.backend.featureFlagPublication()?.snapshot.error, .invalidResponse)
+            XCTAssertFalse(transportFailure.isCurrent())
+            await harness.close()
+        }
+    }
+
+    func testFlagReadOptionsSuppressExposureWithoutConsumingItsDurableEntry() async throws {
+        try await withTemporaryDirectory { root in
+            let harness = try await makeHarness(root: root, flagTransport: FacadeFlagTransport())
+            harness.backend.activate()
+            await harness.backend.settled()
+            let quiet = EluFeatureFlagOptions(sendEvent: false, fresh: true)
+            XCTAssertEqual(harness.backend.featureFlag("variant", options: quiet) as? String, "variant-a")
+            XCTAssertEqual(harness.backend.featureFlagResult("variant", options: quiet)?.variant, "variant-a")
+            XCTAssertEqual(harness.backend.isFeatureEnabled("enabled", options: quiet), false)
+            XCTAssertNil(harness.backend.isFeatureEnabled("absent", options: quiet))
+            await harness.backend.settled()
+            _ = await harness.runtime.flush()
+            var exposures = try await harness.transport.recordedEvents().filter { $0["name"] as? String == "$feature_flag_called" }
+            XCTAssertTrue(exposures.isEmpty)
+
+            // A quiet read cannot consume the first later requested exposure.
+            _ = harness.backend.featureFlagResult("variant", options: .init(fresh: true))
+            _ = harness.backend.featureFlag("variant")
+            await harness.backend.settled()
+            _ = await harness.runtime.flush()
+            exposures = try await harness.transport.recordedEvents().filter { $0["name"] as? String == "$feature_flag_called" }
+            XCTAssertEqual(exposures.count, 1)
+            XCTAssertEqual((exposures.first?["properties"] as? [String: Any])?["$feature_flag"] as? String, "variant")
+            await harness.close()
+        }
+    }
+
+    func testFreshFlagReadRejectsRestoredCacheUntilCurrentRemoteResponse() async throws {
+        try await withTemporaryDirectory { root in
+            let transport = FacadeFlagTransport()
+            let first = try await makeHarness(root: root, flagTransport: transport)
+            first.backend.activate()
+            await first.backend.settled()
+            await first.close()
+            await transport.setFailing(true)
+            let reopened = try await makeHarness(root: root, flagTransport: transport)
+            reopened.backend.activate()
+            await reopened.backend.settled()
+            XCTAssertEqual(reopened.backend.featureFlag("variant", options: .init(sendEvent: false)) as? String, "variant-a")
+            XCTAssertNil(reopened.backend.featureFlag("variant", options: .init(fresh: true)))
+            XCTAssertNil(reopened.backend.featureFlagResult("variant", options: .init(fresh: true)))
+            XCTAssertNil(reopened.backend.isFeatureEnabled("enabled", options: .init(fresh: true)))
+            await reopened.backend.settled()
+            _ = await reopened.runtime.flush()
+            let rejected = try await reopened.transport.recordedEvents().filter { $0["name"] as? String == "$feature_flag_called" }
+            XCTAssertTrue(rejected.isEmpty, "Rejected fresh reads must not consume or emit exposure")
+
+            await transport.setFailing(false)
+            let loaded = expectation(description: "remote flags")
+            reopened.backend.reloadFeatureFlags { loaded.fulfill() }
+            await reopened.backend.settled()
+            await fulfillment(of: [loaded], timeout: 5)
+            XCTAssertEqual(reopened.backend.featureFlag("variant", options: .init(fresh: true)) as? String, "variant-a")
+            XCTAssertEqual(reopened.backend.isFeatureEnabled("enabled", options: .init(sendEvent: false, fresh: true)), false)
+            await reopened.backend.settled()
+            _ = await reopened.runtime.flush()
+            let remote = try await reopened.transport.recordedEvents().filter { $0["name"] as? String == "$feature_flag_called" }
+            XCTAssertEqual(remote.count, 1)
+
+            let finish = reopened.backend.beginPendingOperation(.reset)
+            XCTAssertNil(reopened.backend.featureFlag("variant", options: .init(sendEvent: false, fresh: true)))
+            XCTAssertNil(reopened.backend.featureFlagResult("variant", options: .init(sendEvent: false)))
+            finish?()
+            await reopened.close()
+        }
+    }
+
+    func testExposureIsReportedOncePerVisitorKeyAndTypedValueAcrossIdentifyAndReload() async throws {
         try await withTemporaryDirectory { root in
             let harness = try await makeHarness(root: root, flagTransport: FacadeFlagTransport())
             harness.backend.activate()
@@ -169,6 +608,11 @@ final class EluStandaloneFacadeRuntimeTests: XCTestCase {
             let reported = try XCTUnwrap(exposures.first?["properties"] as? [String: Any])
             XCTAssertEqual(reported["$feature_flag"] as? String, "variant")
             XCTAssertEqual(reported["$feature_flag_response"] as? String, "variant-a")
+            XCTAssertFalse((reported["$feature_flag_request_id"] as? String ?? "").isEmpty)
+            XCTAssertEqual(reported["$feature_flag_evaluated_at"] as? Int64, 1_785_801_661_000)
+            XCTAssertEqual(reported["$used_bootstrap_value"] as? Bool, false)
+            XCTAssertTrue(reported["$feature_flag_bootstrapped_response"] is NSNull)
+            XCTAssertTrue(reported["$feature_flag_bootstrapped_payload"] is NSNull)
             XCTAssertEqual(
                 (reported["$feature_flag_payload"] as? [String: Any])?["color"] as? String,
                 "violet"
@@ -178,7 +622,7 @@ final class EluStandaloneFacadeRuntimeTests: XCTestCase {
             XCTAssertEqual(missing["$feature_flag_error"] as? String, "flag_missing")
             XCTAssertNil(missing["$feature_flag_response"])
 
-            // A new identity is a new ledger: the same value is reported again.
+            // Identifying this visitor preserves the durable ledger.
             harness.backend.execute(.identify(distinctId: "user-1", userProperties: nil))
             await harness.backend.settled()
             _ = harness.backend.featureFlag("variant")
@@ -187,8 +631,93 @@ final class EluStandaloneFacadeRuntimeTests: XCTestCase {
 
             exposures = try await harness.transport.recordedEvents()
                 .filter { $0["name"] as? String == "$feature_flag_called" }
+            XCTAssertEqual(exposures.count, 2)
+            let reloaded = expectation(description: "reload")
+            harness.backend.reloadFeatureFlags { reloaded.fulfill() }
+            await harness.backend.settled(); await fulfillment(of: [reloaded], timeout: 5)
+            _ = harness.backend.featureFlag("variant")
+            await harness.backend.settled(); _ = await harness.runtime.flush()
+            exposures = try await harness.transport.recordedEvents().filter { $0["name"] as? String == "$feature_flag_called" }
+            XCTAssertEqual(exposures.count, 2)
+            harness.backend.execute(.reset)
+            await harness.backend.settled()
+            _ = harness.backend.featureFlag("variant")
+            await harness.backend.settled(); _ = await harness.runtime.flush()
+            exposures = try await harness.transport.recordedEvents().filter { $0["name"] as? String == "$feature_flag_called" }
             XCTAssertEqual(exposures.count, 3)
             await harness.close()
+        }
+    }
+
+    func testExposureFloorsExactEvaluationMillisecondsFromRemoteAndReopenedCache() async throws {
+        try await withTemporaryDirectory { root in
+            let transport = FacadeFlagTransport(evaluatedAt: "2026-08-04T00:01:01.123999999Z")
+            let first = try await makeHarness(root: root, flagTransport: transport)
+            first.backend.activate()
+            await first.backend.settled()
+            XCTAssertEqual(first.backend.featureFlag("variant") as? String, "variant-a")
+            await first.backend.settled()
+            _ = await first.runtime.flush()
+            let remoteEvents = try await first.transport.recordedEvents()
+                .filter { $0["name"] as? String == "$feature_flag_called" }
+            XCTAssertEqual(remoteEvents.count, 1)
+            let remote = try XCTUnwrap(remoteEvents.first?["properties"] as? [String: Any])
+            XCTAssertEqual(remote["$feature_flag_evaluated_at"] as? Int64, 1_785_801_661_123)
+            XCTAssertEqual(remote["$used_bootstrap_value"] as? Bool, false)
+            await first.close()
+
+            await transport.setFailing(true)
+            let reopened = try await makeHarness(root: root, flagTransport: transport)
+            reopened.backend.activate()
+            await reopened.backend.settled()
+            XCTAssertEqual(reopened.backend.featureFlag("variant") as? String, "variant-a")
+            XCTAssertEqual(reopened.backend.featureFlag("enabled") as? Bool, false)
+            await reopened.backend.settled()
+            _ = await reopened.runtime.flush()
+            let cachedEvents = try await reopened.transport.recordedEvents()
+                .filter { $0["name"] as? String == "$feature_flag_called" }
+            XCTAssertEqual(cachedEvents.count, 1, "The accepted variant exposure stays deduplicated")
+            let cached = try XCTUnwrap(cachedEvents.first?["properties"] as? [String: Any])
+            XCTAssertEqual(cached["$feature_flag"] as? String, "enabled")
+            XCTAssertEqual(cached["$feature_flag_evaluated_at"] as? Int64, 1_785_801_661_123)
+            XCTAssertEqual(cached["$used_bootstrap_value"] as? Bool, true)
+            await reopened.close()
+        }
+    }
+
+    func testReopenedRemoteCacheKeepsVisitorLedgerAndReportsExplicitCacheProvenance() async throws {
+        try await withTemporaryDirectory { root in
+            let first = try await makeHarness(root: root, flagTransport: FacadeFlagTransport())
+            first.backend.activate(); await first.backend.settled()
+            _ = first.backend.featureFlag("variant")
+            await first.backend.settled(); _ = await first.runtime.flush()
+            await first.close()
+            let transport = FacadeFlagTransport(); await transport.setFailing(true)
+            let reopened = try await makeHarness(root: root, flagTransport: transport)
+            reopened.backend.activate(); await reopened.backend.settled()
+            XCTAssertEqual(reopened.backend.featureFlag("variant") as? String, "variant-a")
+            _ = reopened.backend.featureFlag("zero")
+            await reopened.backend.settled(); _ = await reopened.runtime.flush()
+            var exposures = try await reopened.transport.recordedEvents().filter { $0["name"] as? String == "$feature_flag_called" }
+            XCTAssertEqual(exposures.count, 1, "Previously accepted variant is not reported after restart")
+            let cached = try XCTUnwrap(exposures.first?["properties"] as? [String: Any])
+            XCTAssertEqual(cached["$feature_flag"] as? String, "zero")
+            XCTAssertEqual(cached["$used_bootstrap_value"] as? Bool, true)
+            XCTAssertEqual(cached["$feature_flag_evaluated_at"] as? Int64, 1_785_801_661_000)
+            XCTAssertFalse((cached["$feature_flag_request_id"] as? String ?? "").isEmpty)
+            XCTAssertTrue(cached["$feature_flag_bootstrapped_response"] is NSNull)
+            await transport.setFailing(false)
+            let reloaded = expectation(description: "remote response")
+            reopened.backend.reloadFeatureFlags { reloaded.fulfill() }
+            await reopened.backend.settled(); await fulfillment(of: [reloaded], timeout: 5)
+            _ = reopened.backend.featureFlag("enabled")
+            await reopened.backend.settled(); _ = await reopened.runtime.flush()
+            exposures = try await reopened.transport.recordedEvents().filter { $0["name"] as? String == "$feature_flag_called" }
+            XCTAssertEqual(exposures.count, 2)
+            let remote = try XCTUnwrap(exposures.last?["properties"] as? [String: Any])
+            XCTAssertEqual(remote["$feature_flag_response"] as? Bool, false)
+            XCTAssertEqual(remote["$used_bootstrap_value"] as? Bool, false)
+            await reopened.close()
         }
     }
 
@@ -248,7 +777,8 @@ final class EluStandaloneFacadeRuntimeTests: XCTestCase {
 
             let snapshot = try await harness.runtime.queueSnapshot()
             XCTAssertEqual(snapshot.queuedCount, 0)
-            XCTAssertNil(snapshot.identity.userId)
+            // Local identity survives without capture authority; no mutation is backfilled.
+            XCTAssertEqual(snapshot.identity.userId, "user-1")
             let flushed = await harness.runtime.flush()
             XCTAssertEqual(flushed, .unavailable)
             let records = try await harness.transport.recordedRecords()
@@ -307,7 +837,8 @@ final class EluStandaloneFacadeRuntimeTests: XCTestCase {
 
             let snapshot = try await harness.runtime.queueSnapshot()
             XCTAssertEqual(snapshot.queuedCount, 0)
-            XCTAssertNil(snapshot.identity.userId)
+            // Local identity survives without capture authority; no mutation is backfilled.
+            XCTAssertEqual(snapshot.identity.userId, "user-1")
             let records = try await harness.transport.recordedRecords()
             XCTAssertTrue(records.isEmpty)
             await harness.close()
@@ -358,6 +889,577 @@ final class EluStandaloneFacadeRuntimeTests: XCTestCase {
 
     // MARK: - Harness
 
+    func testExplicitCaptureTimeIsPersistedAndDeliveredAfterReopen() async throws {
+        try await withTemporaryDirectory { root in
+            let timestamp = baseDate.addingTimeInterval(1.125)
+            let harness = try await makeHarness(root: root)
+            harness.backend.execute(.capture(event: "explicit-time", properties: ["amount": 42], timestamp: timestamp))
+            await harness.backend.settled()
+            let saved = try await harness.runtime.queueSnapshot()
+            XCTAssertEqual(saved.queuedCount, 1)
+            XCTAssertEqual(saved.identity.updatedAt, timestamp)
+            XCTAssertEqual(saved.identity.session?.lastActivityAt, timestamp)
+            let beforeSend = try await harness.transport.recordedEvents()
+            XCTAssertTrue(beforeSend.isEmpty)
+            await harness.close()
+
+            // Configuration can automatically drain a reopened backlog. Hold
+            // its original transport until the durable restoration is observed.
+            let transport = FacadeBatchTransport(held: true)
+            let reopened = try await makeHarness(root: root, batchTransport: transport)
+            do {
+                let restored = try await reopened.runtime.queueSnapshot()
+                XCTAssertEqual(restored.queuedCount, 1)
+                XCTAssertEqual(restored.identity, saved.identity)
+                await transport.release()
+                _ = await reopened.runtime.flush() // May lawfully coalesce with the automatic pass.
+                let deadline = DispatchTime.now().uptimeNanoseconds + 5_000_000_000
+                var drained = false
+                while DispatchTime.now().uptimeNanoseconds < deadline {
+                    if try await reopened.runtime.queueSnapshot().queuedCount == 0 { drained = true; break }
+                    try await Task.sleep(nanoseconds: 10_000_000)
+                }
+                XCTAssertTrue(drained, "Join actual accepted-prefix retirement before examining delivery")
+                let events = try await reopened.transport.recordedEvents()
+                XCTAssertEqual(events.count, 1)
+                let event = try XCTUnwrap(events.first)
+                XCTAssertEqual(event["name"] as? String, "explicit-time")
+                XCTAssertEqual(event["occurredAt"] as? String, EluRFC3339.string(from: timestamp))
+                XCTAssertEqual((event["properties"] as? [String: Any])?["amount"] as? Int, 42)
+                await reopened.close()
+            } catch {
+                await transport.release()
+                await reopened.close()
+                throw error
+            }
+        }
+    }
+
+    func testExplicitCaptureTimeRejectsInvalidAndOlderActivityWithoutReordering() async throws {
+        try await withTemporaryDirectory { root in
+            let harness = try await makeHarness(root: root)
+            for timestamp in [Date(timeIntervalSince1970: .nan),
+                              Date(timeIntervalSince1970: .infinity), baseDate.addingTimeInterval(-1)] {
+                harness.backend.execute(.capture(event: "invalid-time", properties: nil, timestamp: timestamp))
+            }
+            await harness.backend.settled()
+            let before = try await harness.runtime.queueSnapshot()
+            XCTAssertEqual(before.queuedCount, 0)
+            XCTAssertNil(before.identity.session)
+
+            harness.backend.execute(.capture(event: "ordinary-time", properties: nil))
+            harness.backend.execute(.capture(event: "later-time", properties: nil, timestamp: baseDate.addingTimeInterval(2)))
+            harness.backend.execute(.capture(event: "out-of-order", properties: nil, timestamp: baseDate.addingTimeInterval(1)))
+            await harness.backend.settled()
+            let saved = try await harness.runtime.queueSnapshot()
+            XCTAssertEqual(saved.queuedCount, 2)
+            XCTAssertEqual(saved.identity.updatedAt, baseDate.addingTimeInterval(2))
+            _ = await harness.runtime.flush()
+            let events = try await harness.transport.recordedEvents()
+            XCTAssertEqual(events.compactMap { $0["name"] as? String }, ["ordinary-time", "later-time"])
+            XCTAssertEqual(events.compactMap { $0["occurredAt"] as? String },
+                           [EluRFC3339.string(from: baseDate), EluRFC3339.string(from: baseDate.addingTimeInterval(2))])
+            await harness.close()
+        }
+    }
+
+    func testCaptureAssociatedPersonPreservesOrderSetOnceAndNoImplicitFlagReload() async throws {
+        try await withTemporaryDirectory { root in
+            let flags = FacadeFlagTransport()
+            let transport = FacadeBatchTransport(held: true)
+            let h = try await makeHarness(root: root, flagTransport: flags, batchTransport: transport)
+            do {
+                h.backend.reloadFeatureFlags(nil); await h.backend.settled()
+                let reloads = await flags.callCount()
+                h.backend.execute(.capture(event: "first", properties: ["amount": 42], timestamp: baseDate,
+                    set: ["tier": "paid"], setOnce: ["source": "ios"]))
+                XCTAssertFalse(h.backend.flagsAreLoaded, "Person intent immediately withdraws the old flag projection")
+                h.backend.execute(.capture(event: "second", properties: nil,
+                    set: ["tier": "enterprise"], setOnce: ["source": "changed", "firstPlan": "paid"]))
+                await h.backend.settled()
+                let before = try await h.runtime.queueSnapshot()
+                XCTAssertEqual(before.flagContext.personProperties["tier"], .string("enterprise"))
+                XCTAssertEqual(before.flagContext.personProperties["source"], .string("ios"))
+                XCTAssertEqual(before.flagContext.personProperties["firstPlan"], .string("paid"))
+                let afterReloads = await flags.callCount()
+                XCTAssertEqual(afterReloads, reloads, "Capture-associated properties do not schedule another reload")
+                try await drainCaptureRecords(h)
+                let records = try await transport.recordedRecords()
+                XCTAssertEqual(records.compactMap { $0["kind"] as? String }, ["event", "mutation", "event", "mutation"])
+                let event = try XCTUnwrap(records.first?["event"] as? [String: Any])
+                XCTAssertEqual(event["occurredAt"] as? String, "2026-08-04T00:01:00.000Z")
+                let properties = try XCTUnwrap(event["properties"] as? [String: Any])
+                XCTAssertEqual(properties["amount"] as? Int, 42)
+                XCTAssertNil(properties["tier"]); XCTAssertNil(properties["$set"])
+                let mutation = try XCTUnwrap(records[1]["mutation"] as? [String: Any])
+                let change = try XCTUnwrap(mutation["change"] as? [String: Any])
+                XCTAssertEqual(change["type"] as? String, "setPersonProperties")
+                XCTAssertEqual((change["set"] as? [String: Any])?["tier"] as? String, "paid")
+                XCTAssertEqual((change["setOnce"] as? [String: Any])?["source"] as? String, "ios")
+                await h.close()
+                let reopened = try await makeHarness(root: root)
+                let restored = try await reopened.runtime.queueSnapshot()
+                XCTAssertEqual(restored.queuedCount, 0, "ACK retirement does not create another mutation on reopen")
+                XCTAssertEqual(restored.flagContext.personProperties, before.flagContext.personProperties)
+                await reopened.close()
+            } catch { await transport.release(); await h.close(); throw error }
+        }
+    }
+
+    func testLaterQuietCaptureInsideHookOrCommitPreservesOriginalOrderedPair() async throws {
+        for stage in ["hook", "commit", "automatic-commit"] {
+            try await withTemporaryDirectory { root in
+                let owner = EventHookFacadeOwner(), fault = CapturePersonFault()
+                let transport = FacadeBatchTransport(held: true), flags = FacadeFlagTransport()
+                let appendSecond: @Sendable () -> Void = {
+                    guard let backend = owner.read() else { XCTFail("Original facade missing"); return }
+                    let op = EluBufferedOp.capture(event: "second", properties: nil,
+                        set: ["tier": "second"], setOnce: ["source": "second"])
+                    let finish = backend.beginPendingOperation(op)
+                    backend.execute(op)
+                    XCTAssertFalse(backend.flagsAreLoaded)
+                    finish?()
+                }
+                let h = try await makeHarness(root: root, flagTransport: flags, batchTransport: transport,
+                    eventFilter: .init(beforeSend: { event in
+                        var event = event
+                        if event.event == "first" || event.event == "$screen" {
+                            if stage == "hook" { appendSecond() }
+                            event.set = ["tier": "first"]; event.setOnce = ["source": "first"]
+                        }
+                        return event
+                    }), faultInjector: fault)
+                owner.bind(h.backend)
+                do {
+                    h.backend.reloadFeatureFlags(nil); await h.backend.settled()
+                    let reloads = await flags.callCount()
+                    if stage != "hook" { fault.arm(.afterCommit, action: appendSecond) }
+                    if stage == "automatic-commit" { h.backend.execute(.screen(name: "first", properties: nil)) }
+                    else { h.backend.execute(.capture(event: "first", properties: nil)) }
+                    await h.backend.settled()
+                    if stage != "hook" { XCTAssertTrue(fault.fired) }
+                    let state = try await h.runtime.queueSnapshot()
+                    XCTAssertEqual(state.queuedCount, 4, stage)
+                    XCTAssertEqual(state.flagContext.personProperties["tier"], .string("second"), stage)
+                    XCTAssertEqual(state.flagContext.personProperties["source"], .string("first"), stage)
+                    XCTAssertNil(h.backend.featureFlagPublication(), "Changed person context cannot revive old flags")
+                    let finalReloads = await flags.callCount(); XCTAssertEqual(finalReloads, reloads)
+                    try await drainCaptureRecords(h)
+                    let records = try await transport.recordedRecords()
+                    XCTAssertEqual(records.compactMap { $0["kind"] as? String }, ["event", "mutation", "event", "mutation"])
+                    XCTAssertEqual(records.compactMap { ($0["event"] as? [String: Any])?["name"] as? String },
+                        ["first", "second"])
+                    await h.close()
+                } catch { await transport.release(); await h.close(); throw error }
+            }
+        }
+    }
+
+    func testQuietHookSettlementRereadsSameFlagCacheWithoutReloadOrExposure() async throws {
+        for mode in ["pass", "drop", "remove"] {
+            try await withTemporaryDirectory { root in
+                let flags = FacadeFlagTransport(), transport = FacadeBatchTransport(held: true)
+                let h = try await makeHarness(root: root, flagTransport: flags, batchTransport: transport,
+                    eventFilter: .init(beforeSend: { event in
+                        if mode == "drop" { return nil }
+                        var event = event; event.set = nil; event.setOnce = nil; return event
+                    }))
+                do {
+                    h.backend.reloadFeatureFlags(nil); await h.backend.settled()
+                    let original = try XCTUnwrap(h.backend.featureFlagPublication())
+                    let reloads = await flags.callCount()
+                    let legacyNotifications = h.loadAnnouncements()
+                    let op = EluBufferedOp.capture(event: "quiet", properties: nil,
+                        set: mode == "remove" ? ["secret": "removed"] : nil)
+                    let finish = h.backend.beginPendingOperation(op)
+                    h.backend.execute(op)
+                    XCTAssertFalse(h.backend.flagsAreLoaded)
+                    XCTAssertFalse(original.isCurrent())
+                    finish?()
+                    await h.backend.settled()
+                    let restored = try XCTUnwrap(h.backend.featureFlagPublication())
+                    XCTAssertTrue(restored.isCurrent())
+                    XCTAssertFalse(original.isCurrent(), "The original guard stays withdrawn")
+                    XCTAssertEqual(restored.snapshot.requestId, original.snapshot.requestId)
+                    XCTAssertEqual(restored.snapshot.flagsJSON, original.snapshot.flagsJSON)
+                    XCTAssertEqual(restored.snapshot.source, .remote)
+                    XCTAssertEqual(h.backend.featureFlag("variant", options: .init(sendEvent: false, fresh: true)) as? String, "variant-a")
+                    let finalReloads = await flags.callCount(); XCTAssertEqual(finalReloads, reloads)
+                    XCTAssertEqual(h.loadAnnouncements(), legacyNotifications)
+                    let state = try await h.runtime.queueSnapshot()
+                    XCTAssertEqual(state.queuedCount, mode == "drop" ? 0 : 1)
+                    XCTAssertTrue(state.flagContext.personProperties.isEmpty)
+                    try await drainCaptureRecords(h)
+                    let records = try await transport.recordedRecords()
+                    XCTAssertEqual(records.compactMap { ($0["event"] as? [String: Any])?["name"] as? String }, mode == "drop" ? [] : ["quiet"])
+                    await h.close()
+                } catch { await transport.release(); await h.close(); throw error }
+            }
+        }
+    }
+
+    func testQuietCacheRereadDoesNotNotifyAListenerThatCaptures() async throws {
+        try await withTemporaryDirectory { root in
+            let owner = EventHookFacadeOwner(), notifications = FacadeCounter()
+            let flags = FacadeFlagTransport(), transport = FacadeBatchTransport(held: true)
+            let h = try await makeHarness(root: root, flagTransport: flags,
+                snapshotObserver: { _ in
+                    // Bound the regression itself: the broken restoration sends
+                    // extra notifications, but cannot make this test run forever.
+                    if notifications.next() <= 3 {
+                        owner.read()?.execute(.capture(event: "listener-analytics", properties: nil))
+                    }
+                }, batchTransport: transport, eventFilter: .init(beforeSend: { _ in nil }))
+            owner.bind(h.backend)
+            do {
+                h.backend.reloadFeatureFlags(nil); await h.backend.settled()
+                XCTAssertEqual(notifications.value(), 1)
+                XCTAssertNotNil(h.backend.featureFlagPublication())
+                let firstLoads = await flags.callCount(); XCTAssertEqual(firstLoads, 1)
+                let state = try await h.runtime.queueSnapshot(); XCTAssertEqual(state.queuedCount, 0)
+                h.backend.reloadFeatureFlags(nil); await h.backend.settled()
+                XCTAssertEqual(notifications.value(), 2, "An actual new load still notifies")
+                let secondLoads = await flags.callCount(); XCTAssertEqual(secondLoads, 2)
+                XCTAssertNotNil(h.backend.featureFlagPublication())
+                await transport.release(); await h.close()
+            } catch { await transport.release(); await h.close(); throw error }
+        }
+    }
+
+    func testQuietHookCannotPromoteRestoredCacheToRemoteOrReviveExpiredCache() async throws {
+        try await withTemporaryDirectory { root in
+            let flags = FacadeFlagTransport()
+            let first = try await makeHarness(root: root, flagTransport: flags)
+            first.backend.activate(); await first.backend.settled(); await first.close()
+            await flags.setFailing(true)
+            let clock = FacadeClock(wall: baseDate), expire = EventFilterCounter()
+            let transport = FacadeBatchTransport(held: true)
+            let h = try await makeHarness(root: root, flagTransport: flags, batchTransport: transport,
+                eventFilter: .init(beforeSend: { event in
+                    if event.event == "expire" { clock.advance(3_600); expire.hit() }
+                    return nil
+                }), clock: clock)
+            do {
+                h.backend.activate(); await h.backend.settled()
+                let cached = try XCTUnwrap(h.backend.featureFlagPublication())
+                XCTAssertEqual(cached.snapshot.source, .cache)
+                XCTAssertEqual(cached.snapshot.error, .transport)
+                let reloads = await flags.callCount()
+                h.backend.execute(.capture(event: "drop", properties: nil)); await h.backend.settled()
+                let restored = try XCTUnwrap(h.backend.featureFlagPublication())
+                XCTAssertEqual(restored.snapshot.source, .cache)
+                XCTAssertEqual(restored.snapshot.error, .transport)
+                XCTAssertNil(h.backend.featureFlag("variant", options: .init(sendEvent: false, fresh: true)))
+                XCTAssertEqual(h.backend.featureFlag("variant", options: .init(sendEvent: false)) as? String, "variant-a")
+                h.backend.execute(.capture(event: "expire", properties: nil)); await h.backend.settled()
+                XCTAssertEqual(expire.count, 1)
+                XCTAssertNil(h.backend.featureFlagPublication())
+                XCTAssertFalse(h.backend.flagsAreLoaded)
+                let finalReloads = await flags.callCount(); XCTAssertEqual(finalReloads, reloads)
+                let state = try await h.runtime.queueSnapshot(); XCTAssertEqual(state.queuedCount, 0)
+                await transport.release(); await h.close()
+            } catch { await transport.release(); await h.close(); throw error }
+        }
+    }
+
+    func testRejectedCaptureNeverAppliesAssociatedPersonFields() async throws {
+        for mode in ["invalid", "disabled", "consent", "timestamp"] {
+            try await withTemporaryDirectory { root in
+                let h = try await makeHarness(root: root,
+                    document: mode == "disabled" ? fixture("config-disabled.json") : nil,
+                    initialConsent: mode == "consent" ? EluConsentOperation(optedOut: true) : nil)
+                let before = try await h.runtime.queueSnapshot()
+                h.backend.execute(.capture(event: mode == "invalid" ? "" : "rejected", properties: nil,
+                    timestamp: mode == "timestamp" ? Date(timeIntervalSince1970: .nan) : nil,
+                    set: ["forbidden": true], setOnce: ["alsoForbidden": true]))
+                await h.backend.settled()
+                let after = try await h.runtime.queueSnapshot()
+                XCTAssertEqual(after.flagContext.personProperties, before.flagContext.personProperties, mode)
+                XCTAssertEqual(after.identity.contextRevision, before.identity.contextRevision, mode)
+                XCTAssertEqual(after.queuedCount, 0, mode)
+                await h.close()
+            }
+        }
+    }
+
+    func testRateLimitedCaptureDoesNotApplyItsPersonFields() async throws {
+        try await withTemporaryDirectory { root in
+            let transport = FacadeBatchTransport(held: true)
+            let h = try await makeHarness(root: root, batchTransport: transport,
+                rateLimiting: .init(eventsPerSecond: 1, eventsBurstLimit: 1))
+            h.backend.execute(.capture(event: "first", properties: nil, set: ["tier": "first"]))
+            h.backend.execute(.capture(event: "limited", properties: nil, set: ["tier": "wrong"]))
+            await h.backend.settled()
+            let state = try await h.runtime.queueSnapshot()
+            XCTAssertEqual(state.flagContext.personProperties["tier"], .string("first"))
+            XCTAssertEqual(h.backend.dropCounts[.rateLimited], 1)
+            await transport.release(); await h.close()
+        }
+    }
+
+    func testExplicitEmptyPersonMapDiffersFromAbsentOptions() async throws {
+        try await withTemporaryDirectory { root in
+            let transport = FacadeBatchTransport(held: true)
+            let h = try await makeHarness(root: root, batchTransport: transport)
+            h.backend.execute(.capture(event: "without-person", properties: nil))
+            h.backend.execute(.capture(event: "empty-person", properties: nil, set: [:]))
+            h.backend.execute(.capture(event: "after-person", properties: nil))
+            await h.backend.settled()
+            do {
+                try await drainCaptureRecords(h)
+                let records = try await transport.recordedRecords()
+                XCTAssertEqual(records.compactMap { $0["kind"] as? String }, ["event", "event", "mutation", "event"])
+                let change = (records[2]["mutation"] as? [String: Any])?["change"] as? [String: Any]
+                XCTAssertEqual(change?["type"] as? String, "setPersonProperties")
+                XCTAssertEqual((change?["set"] as? [String: Any])?.count, 0)
+                let events = records.compactMap { $0["event"] as? [String: Any] }
+                XCTAssertEqual((events[0]["properties"] as? [String: Any])?["$process_person_profile"] as? Bool, false)
+                XCTAssertEqual((events[2]["properties"] as? [String: Any])?["$process_person_profile"] as? Bool, true)
+                await h.close()
+            } catch { await transport.release(); await h.close(); throw error }
+        }
+    }
+
+    func testNeverModeKeepsAcceptedEventWithoutAssociatedMutation() async throws {
+        try await withTemporaryDirectory { root in
+            let transport = FacadeBatchTransport(held: true)
+            let h = try await makeHarness(root: root, personProfiles: .never, batchTransport: transport)
+            h.backend.execute(.capture(event: "allowed", properties: nil,
+                set: ["forbidden": true], setOnce: ["alsoForbidden": true]))
+            await h.backend.settled()
+            let state = try await h.runtime.queueSnapshot()
+            XCTAssertEqual(state.queuedCount, 1)
+            XCTAssertTrue(state.flagContext.personProperties.isEmpty)
+            await transport.release(); await h.close()
+        }
+    }
+
+    func testAssociatedMutationRejectsReplacementIdentityAndEventTime() async throws {
+        for change in ["identify", "reset", "activity"] {
+            try await withTemporaryDirectory { root in
+                let transport = FacadeBatchTransport(held: true)
+                let h = try await makeHarness(root: root, batchTransport: transport)
+                let result = await h.runtime.capture("original")
+                guard case let .accepted(_, accepted) = result else {
+                    XCTFail("Original event must be accepted"); await transport.release(); await h.close(); return
+                }
+                if change == "identify" { _ = await h.runtime.identify("replacement") }
+                else if change == "reset" { _ = await h.runtime.resetIdentity() }
+                else { _ = await h.runtime.capture("later", occurredAt: baseDate.addingTimeInterval(1)) }
+                let before = try await h.runtime.queueSnapshot()
+                let mutation = await h.runtime.setPersonProperties(["wrongIdentity": .bool(true)], propertiesOnce: [:],
+                    afterAcceptedCapture: accepted, admissionGuard: { true })
+                XCTAssertNil(mutation, change)
+                let after = try await h.runtime.queueSnapshot()
+                XCTAssertEqual(after.flagContext.personProperties, before.flagContext.personProperties, change)
+                XCTAssertEqual(after.nextSequence, before.nextSequence, change)
+                await transport.release(); await h.close()
+            }
+        }
+    }
+
+    func testAssociatedMutationRevocationRollsBackAndCannotUseLocalFallback() async throws {
+        try await withTemporaryDirectory { root in
+            let fault = CapturePersonFault(), gate = CapturePersonGate()
+            let h = try await makeHarness(root: root, faultInjector: fault)
+            let result = await h.runtime.capture("accepted")
+            guard case let .accepted(_, accepted) = result else {
+                XCTFail("Expected accepted event"); await h.close(); return
+            }
+            fault.arm(.afterRecordInsert(0)) { gate.revoke() }
+            let mutation = await h.runtime.setPersonProperties(["mustNotPersist": .bool(true)], propertiesOnce: [:],
+                afterAcceptedCapture: accepted, admissionGuard: { gate.current() })
+            XCTAssertTrue(fault.fired)
+            XCTAssertNil(mutation)
+            let state = try await h.runtime.queueSnapshot()
+            XCTAssertNil(state.flagContext.personProperties["mustNotPersist"])
+            XCTAssertEqual(state.nextSequence, accepted.nextSequence, "The rolled-back mutation consumes no sequence")
+            await h.close()
+            let transport = FacadeBatchTransport(held: true)
+            let reopened = try await makeHarness(root: root, batchTransport: transport)
+            let restored = try await reopened.runtime.queueSnapshot()
+            XCTAssertNil(restored.flagContext.personProperties["mustNotPersist"])
+            XCTAssertEqual(restored.nextSequence, accepted.nextSequence)
+            await transport.release(); await reopened.close()
+        }
+    }
+
+    func testFinishingOriginalCaptureHandoffDoesNotWithdrawItsPersonAdmission() async throws {
+        try await withTemporaryDirectory { root in
+            let fault = CapturePersonFault(), completion = CapturePersonCompletion()
+            let transport = FacadeBatchTransport(held: true)
+            let h = try await makeHarness(root: root, batchTransport: transport, faultInjector: fault)
+            let op = EluBufferedOp.capture(event: "accepted", properties: nil, set: ["retained": true])
+            completion.store(h.backend.beginPendingOperation(op))
+            fault.arm(.afterRecordInsert(0)) { completion.finish() }
+            h.backend.execute(op)
+            await h.backend.settled()
+            XCTAssertTrue(fault.fired)
+            let state = try await h.runtime.queueSnapshot()
+            XCTAssertEqual(state.queuedCount, 2)
+            XCTAssertEqual(state.flagContext.personProperties["retained"], .bool(true))
+            completion.finish()
+            await transport.release(); await h.close()
+        }
+    }
+
+    func testNewIdentityIntentBetweenEventCommitAndMutationWithdrawsPersonAdmission() async throws {
+        try await withTemporaryDirectory { root in
+            let fault = CapturePersonFault(), completion = CapturePersonCompletion()
+            let transport = FacadeBatchTransport(held: true)
+            let h = try await makeHarness(root: root, batchTransport: transport, faultInjector: fault)
+            let backend = h.backend
+            fault.arm(.afterCommit) { completion.store(backend.beginPendingOperation(.reset)) }
+            h.backend.execute(.capture(event: "accepted", properties: nil, set: ["mustNotPersist": true]))
+            await h.backend.settled()
+            XCTAssertTrue(fault.fired)
+            let state = try await h.runtime.queueSnapshot()
+            XCTAssertEqual(state.queuedCount, 1, "Accepted original event remains; no associated mutation")
+            XCTAssertNil(state.flagContext.personProperties["mustNotPersist"])
+            XCTAssertNil(h.backend.featureFlagPublication())
+            completion.finish()
+            await transport.release(); await h.close()
+        }
+    }
+
+    func testAmbiguousEventCommitDoesNotInventAssociatedMutationAfterReopen() async throws {
+        try await withTemporaryDirectory { root in
+            let fault = CapturePersonFault()
+            let h = try await makeHarness(root: root, faultInjector: fault)
+            fault.arm(.afterCommit) { throw EluRuntimeQueueError.faultInjected(.afterCommit) }
+            h.backend.execute(.capture(event: "committed-before-loss", properties: nil, set: ["notCommitted": true]))
+            await h.backend.settled()
+            XCTAssertTrue(fault.fired)
+            await h.close()
+            let transport = FacadeBatchTransport(held: true)
+            let reopened = try await makeHarness(root: root, batchTransport: transport)
+            do {
+                let state = try await reopened.runtime.queueSnapshot()
+                XCTAssertEqual(state.queuedCount, 1, "The actual committed event survives the ambiguous result")
+                XCTAssertNil(state.flagContext.personProperties["notCommitted"])
+                try await drainCaptureRecords(reopened)
+                let records = try await transport.recordedRecords()
+                XCTAssertEqual(records.compactMap { $0["kind"] as? String }, ["event"])
+                XCTAssertEqual((records.first?["event"] as? [String: Any])?["name"] as? String, "committed-before-loss")
+                await reopened.close()
+            } catch { await transport.release(); await reopened.close(); throw error }
+        }
+    }
+
+    func testFutureEventTimeDoesNotRewritePersonMutationWallClock() async throws {
+        try await withTemporaryDirectory { root in
+            let transport = FacadeBatchTransport(held: true)
+            let h = try await makeHarness(root: root, batchTransport: transport)
+            h.backend.execute(.capture(event: "future", properties: nil, timestamp: baseDate.addingTimeInterval(2),
+                set: ["notBackdated": true]))
+            await h.backend.settled()
+            let state = try await h.runtime.queueSnapshot()
+            XCTAssertEqual(state.queuedCount, 1)
+            XCTAssertEqual(state.identity.updatedAt, baseDate.addingTimeInterval(2))
+            XCTAssertNil(state.flagContext.personProperties["notBackdated"])
+            await transport.release(); await h.close()
+        }
+    }
+
+    func testHookIntroducesPersonMapsWithoutInitialCaptureOptionsAndDoesNotReloadFlags() async throws {
+        try await withTemporaryDirectory { root in
+            let flags = FacadeFlagTransport(), calls = EventFilterCounter()
+            let transport = FacadeBatchTransport(held: true)
+            let h = try await makeHarness(root: root, flagTransport: flags, batchTransport: transport,
+                eventFilter: .init(beforeSend: { event in
+                    calls.hit(); var event = event
+                    event.set = ["tier": "introduced"]
+                    event.setOnce = ["source": "hook"]
+                    return event
+                }))
+            do {
+                h.backend.reloadFeatureFlags(nil); await h.backend.settled()
+                let reloads = await flags.callCount()
+                h.backend.execute(.capture(event: "plain-options", properties: nil))
+                XCTAssertFalse(h.backend.flagsAreLoaded)
+                await h.backend.settled()
+                let saved = try await h.runtime.queueSnapshot()
+                XCTAssertEqual(saved.queuedCount, 2)
+                XCTAssertEqual(saved.flagContext.personProperties["tier"], .string("introduced"))
+                XCTAssertEqual(saved.flagContext.personProperties["source"], .string("hook"))
+                let finalReloads = await flags.callCount(); XCTAssertEqual(finalReloads, reloads)
+                XCTAssertEqual(calls.count, 1)
+                try await drainCaptureRecords(h)
+                let records = try await transport.recordedRecords()
+                XCTAssertEqual(records.compactMap { $0["kind"] as? String }, ["event", "mutation"])
+                await h.close()
+            } catch { await transport.release(); await h.close(); throw error }
+        }
+    }
+
+    func testHookCanRemoveAssociatedMapsAndDropCannotApplyPersonChanges() async throws {
+        try await withTemporaryDirectory { root in
+            let transport = FacadeBatchTransport(held: true)
+            let h = try await makeHarness(root: root, batchTransport: transport, eventFilter: .init(beforeSend: { event in
+                if event.event == "drop" { return nil }
+                var event = event; event.set = nil; event.setOnce = nil; return event
+            }))
+            h.backend.execute(.capture(event: "scrub", properties: nil, set: ["secret": "x"], setOnce: [:]))
+            h.backend.execute(.capture(event: "drop", properties: nil, set: ["secret": "y"]))
+            await h.backend.settled()
+            let saved = try await h.runtime.queueSnapshot()
+            XCTAssertEqual(saved.queuedCount, 1)
+            XCTAssertNil(saved.flagContext.personProperties["secret"])
+            XCTAssertEqual(h.backend.dropCounts[.filtered], 1)
+            await transport.release(); await h.close()
+        }
+    }
+
+    func testSynchronousHookGetterAndNewIdentityIntentCannotCommitOldEventOrPerson() async throws {
+        try await withTemporaryDirectory { root in
+            let owner = EventHookFacadeOwner(), completion = CapturePersonCompletion()
+            let transport = FacadeBatchTransport(held: true)
+            let h = try await makeHarness(root: root, batchTransport: transport, eventFilter: .init(beforeSend: { event in
+                guard let backend = owner.read() else { XCTFail("Original owner missing"); return nil }
+                XCTAssertNotNil(backend.distinctId())
+                completion.store(backend.beginPendingOperation(.reset))
+                var event = event; event.set = ["mustNotPersist": true]; return event
+            }))
+            owner.bind(h.backend)
+            let before = try await h.runtime.queueSnapshot()
+            h.backend.execute(.capture(event: "withdrawn-in-hook", properties: nil))
+            await h.backend.settled()
+            let after = try await h.runtime.queueSnapshot()
+            XCTAssertEqual(after.nextSequence, before.nextSequence)
+            XCTAssertEqual(after.identity, before.identity)
+            XCTAssertNil(after.flagContext.personProperties["mustNotPersist"])
+            completion.finish()
+            await transport.release(); await h.close()
+        }
+    }
+
+    func testHookRunsOnceAcrossOriginalAuthorityRenewalRetry() async throws {
+        try await withTemporaryDirectory { root in
+            let calls = EventFilterCounter(), fault = CapturePersonFault()
+            let transport = FacadeBatchTransport(held: true)
+            let h = try await makeHarness(root: root, batchTransport: transport,
+                eventFilter: .init(beforeSend: { event in calls.hit(); return event }), faultInjector: fault)
+            fault.arm(.afterStateRead) { throw EluRuntimeQueueError.generationMismatch }
+            h.backend.execute(.capture(event: "one-original-call", properties: nil))
+            await h.backend.settled()
+            XCTAssertTrue(fault.fired)
+            XCTAssertEqual(calls.count, 1)
+            let saved = try await h.runtime.queueSnapshot(); XCTAssertEqual(saved.queuedCount, 1)
+            await transport.release(); await h.close()
+        }
+    }
+
+    private func drainCaptureRecords(_ h: Harness) async throws {
+        await h.transport.release()
+        _ = await h.runtime.flush()
+        let deadline = DispatchTime.now().uptimeNanoseconds + 5_000_000_000
+        while try await h.runtime.queueSnapshot().queuedCount != 0 && DispatchTime.now().uptimeNanoseconds < deadline {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        let final = try await h.runtime.queueSnapshot()
+        XCTAssertEqual(final.queuedCount, 0, "Original ACK must retire the queued prefix")
+    }
+
     private struct Harness {
         let runtime: EluStandaloneRuntime
         let backend: EluStandaloneFacadeRuntime
@@ -376,10 +1478,18 @@ final class EluStandaloneFacadeRuntimeTests: XCTestCase {
     private func makeHarness(
         root: URL,
         document: Data? = nil,
-        flagTransport: (any EluV1FlagTransport)? = nil
+        flagTransport: (any EluV1FlagTransport)? = nil,
+        initialConsent: EluConsentOperation? = nil,
+        personProfiles: EluPersonProfilesMode = .identifiedOnly,
+        snapshotObserver: @escaping @Sendable (EluFeatureFlagPublication) -> Void = { _ in },
+        batchTransport: FacadeBatchTransport? = nil,
+        rateLimiting: EluRateLimitingOptions = .init(),
+        eventFilter: EluEventFilter = .init(),
+        faultInjector: (any EluRuntimeQueueFaultInjecting)? = nil,
+        clock suppliedClock: FacadeClock? = nil
     ) async throws -> Harness {
-        let transport = FacadeBatchTransport()
-        let clock = FacadeClock(wall: baseDate)
+        let transport = batchTransport ?? FacadeBatchTransport()
+        let clock = suppliedClock ?? FacadeClock(wall: baseDate)
         let identifiers = FacadeCounter()
         let runtime = try await EluStandaloneRuntime.make(
             rootDirectoryURL: root,
@@ -401,7 +1511,8 @@ final class EluStandaloneFacadeRuntimeTests: XCTestCase {
             replaySampleDraw: { 0.1 },
             anonymousIdGenerator: { "anon_facade_\(identifiers.next())" },
             streamIdGenerator: { "stream_facade" },
-            sessionIdGenerator: { "session_facade_\(identifiers.next())" }
+            sessionIdGenerator: { "session_facade_\(identifiers.next())" },
+            personProfiles: personProfiles, rateLimiting: rateLimiting, eventFilter: eventFilter, faultInjector: faultInjector
         )
         let announcements = FacadeCounter()
         let context = EluRuntimeBackendContext(
@@ -409,7 +1520,11 @@ final class EluStandaloneFacadeRuntimeTests: XCTestCase {
             config: try TestConfigFactory.make(),
             configDocument: document ?? fixture("config-enabled.json"),
             isNewUser: true,
-            flagsDidLoad: { _ = announcements.next() }
+            flagsDidLoad: { _ = announcements.next() },
+            personProfiles: personProfiles,
+            eventFilter: eventFilter,
+            initialConsent: initialConsent,
+            flagSnapshotDidLoad: snapshotObserver
         )
         let backend = EluStandaloneFacadeRuntime(
             context: context,
@@ -448,11 +1563,26 @@ final class EluStandaloneFacadeRuntimeTests: XCTestCase {
     }
 }
 
+private actor BootstrapConfigTransport: EluV2ConfigTransport {
+    private let body: Data
+    private(set) var requests: [EluV2ConfigRequest] = []
+    init(body: Data) { self.body = body }
+    func fetch(_ request: EluV2ConfigRequest) async throws -> Data {
+        requests.append(request)
+        return body
+    }
+}
+
 /// Accepts every batch and keeps the records it was handed.
 actor FacadeBatchTransport: EluV1BatchHTTPTransport {
     private var requests: [EluV1BatchHTTPRequest] = []
+    private var held: Bool
+    private var waiting: CheckedContinuation<Void, Never>?
+    init(held: Bool = false) { self.held = held }
+    func release() { held = false; let original = waiting; waiting = nil; original?.resume() }
 
     func send(_ request: EluV1BatchHTTPRequest) async throws -> EluV1BatchHTTPResponse {
+        if held { await withCheckedContinuation { waiting = $0 } }
         requests.append(request)
         guard let root = try JSONSerialization.jsonObject(with: request.body) as? [String: Any],
               let requestId = root["requestId"] as? String,
@@ -510,9 +1640,21 @@ actor FacadeBatchTransport: EluV1BatchHTTPTransport {
 /// Answers every flag request from the identity witness it was sent.
 actor FacadeFlagTransport: EluV1FlagTransport {
     private var calls = 0
+    private var failing = false
+    private var malformed = false
+    private let evaluatedAt: String
+
+    init(evaluatedAt: String = "2026-08-04T00:01:01.000Z") {
+        self.evaluatedAt = evaluatedAt
+    }
+
+    func setFailing(_ value: Bool) { failing = value }
+    func setMalformed(_ value: Bool) { malformed = value }
 
     func send(endpoint: URL, requestBody: Data) async throws -> Data {
         calls += 1
+        if failing { throw URLError(.notConnectedToInternet) }
+        if malformed { return Data("not valid JSON".utf8) }
         guard let request = try JSONSerialization.jsonObject(with: requestBody) as? [String: Any],
               let identity = request["identity"] as? [String: Any]
         else {
@@ -525,7 +1667,7 @@ actor FacadeFlagTransport: EluV1FlagTransport {
                 "contextRevision": request["contextRevision"] ?? 0,
                 "identityRevision": identity["revision"] ?? 0,
                 "flagsRevision": "flags-facade-1",
-                "evaluatedAt": "2026-08-04T00:01:01.000Z",
+                "evaluatedAt": evaluatedAt,
                 "expiresAt": "2026-08-04T00:04:00.000Z",
                 "flags": [
                     "variant": "variant-a",
@@ -571,6 +1713,12 @@ final class FacadeClock: @unchecked Sendable {
         return continuousValue
     }
 
+    func advance(_ seconds: TimeInterval) {
+        lock.lock(); defer { lock.unlock() }
+        wallValue.addTimeInterval(seconds)
+        continuousValue += UInt64(seconds * 1_000_000_000)
+    }
+
     var source: EluV1BatchTimeSource {
         EluV1BatchTimeSource(
             wallNow: { [self] in self.wall() },
@@ -598,4 +1746,65 @@ final class FacadeCounter: @unchecked Sendable {
         defer { lock.unlock() }
         return count
     }
+}
+
+private final class FacadePublications: @unchecked Sendable {
+    private let lock = NSLock()
+    private var retained: [EluFeatureFlagPublication] = []
+    func append(_ value: EluFeatureFlagPublication) { lock.lock(); retained.append(value); lock.unlock() }
+    func values() -> [EluFeatureFlagPublication] { lock.lock(); defer { lock.unlock() }; return retained }
+}
+
+private actor SnapshotHeldFailureTransport: EluV1FlagTransport {
+    private let sent: @Sendable () -> Void
+    private var held: CheckedContinuation<Void, Never>?
+    private var released = false
+    init(sent: @escaping @Sendable () -> Void) { self.sent = sent }
+    func send(endpoint: URL, requestBody: Data) async throws -> Data {
+        if !released {
+            await withCheckedContinuation { continuation in
+                held = continuation
+                sent()
+            }
+        }
+        throw URLError(.notConnectedToInternet)
+    }
+    func release() { released = true; let value = held; held = nil; value?.resume() }
+}
+
+/// Existing queue fault points exercise real rollback/ambiguous-commit paths.
+private final class CapturePersonFault: EluRuntimeQueueFaultInjecting, @unchecked Sendable {
+    private let lock = NSLock()
+    private var action: (EluRuntimeQueueFaultPoint, @Sendable () throws -> Void)?
+    private var didFire = false
+    var fired: Bool { lock.lock(); defer { lock.unlock() }; return didFire }
+    func arm(_ point: EluRuntimeQueueFaultPoint, action: @escaping @Sendable () throws -> Void) {
+        lock.lock(); defer { lock.unlock() }; self.action = (point, action); didFire = false
+    }
+    func hit(_ point: EluRuntimeQueueFaultPoint) throws {
+        lock.lock()
+        let selected = action?.0 == point ? action?.1 : nil
+        if selected != nil { action = nil; didFire = true }
+        lock.unlock()
+        try selected?()
+    }
+}
+private final class CapturePersonGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var allowed = true
+    func current() -> Bool { lock.lock(); defer { lock.unlock() }; return allowed }
+    func revoke() { lock.lock(); allowed = false; lock.unlock() }
+}
+private final class CapturePersonCompletion: @unchecked Sendable {
+    private let lock = NSLock()
+    private var pending: (() -> Void)?
+    func store(_ value: (() -> Void)?) { lock.lock(); pending = value; lock.unlock() }
+    func finish() { lock.lock(); let value = pending; pending = nil; lock.unlock(); value?() }
+}
+
+private final class EventHookFacadeOwner: @unchecked Sendable {
+    private let lock = NSLock()
+    private weak var backend: EluStandaloneFacadeRuntime?
+    func bind(_ backend: EluStandaloneFacadeRuntime) { lock.lock(); self.backend = backend; lock.unlock() }
+    func read() -> EluStandaloneFacadeRuntime? { lock.lock(); defer { lock.unlock() }; return backend }
 }

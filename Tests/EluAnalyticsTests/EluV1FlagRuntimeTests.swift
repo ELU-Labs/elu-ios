@@ -959,13 +959,13 @@ final class EluV1FlagRuntimeTests: XCTestCase {
             let initial = try await runtime.snapshot()
             await runtime.close()
             let database = try self.databaseURL(root: root)
-            XCTAssertEqual(try self.userVersion(database), 1)
-            XCTAssertEqual(try self.tableNames(database), ["queue_records", "runtime_state"])
+            XCTAssertEqual(try self.userVersion(database), 41)
+            XCTAssertEqual(try self.tableNames(database), ["capture_session_history", "flag_exposure_state", "native_diagnostics_state", "person_identity_state", "queue_records", "runtime_state"])
 
             runtime = try await self.makeRuntime(root: root, clock: clock)
             await runtime.close()
-            XCTAssertEqual(try self.userVersion(database), 1)
-            XCTAssertEqual(try self.tableNames(database), ["queue_records", "runtime_state"])
+            XCTAssertEqual(try self.userVersion(database), 41)
+            XCTAssertEqual(try self.tableNames(database), ["capture_session_history", "flag_exposure_state", "native_diagnostics_state", "person_identity_state", "queue_records", "runtime_state"])
 
             runtime = try await self.makeRuntime(root: root, clock: clock)
             _ = try await EluV1FlagClient.make(
@@ -976,10 +976,10 @@ final class EluV1FlagRuntimeTests: XCTestCase {
             let migratedSnapshot = try await runtime.snapshot()
             XCTAssertEqual(migratedSnapshot, initial)
             await runtime.close()
-            XCTAssertEqual(try self.userVersion(database), 2)
+            XCTAssertEqual(try self.userVersion(database), 42)
             XCTAssertEqual(
                 try self.tableNames(database),
-                ["flag_cache_records", "queue_records", "runtime_state"]
+                ["capture_session_history", "flag_cache_records", "flag_exposure_state", "native_diagnostics_state", "person_identity_state", "queue_records", "runtime_state"]
             )
             XCTAssertEqual(try self.runtimeRecordSchema(database), 1)
             let before = try self.flagRows(database)
@@ -2287,7 +2287,9 @@ final class EluV1FlagRuntimeTests: XCTestCase {
                 expectedGeneration: initial.generation
             )
             let replacedPending = Task { await client.reload() }
-            await Task.yield()
+            // The old waiter is released only after the denied reload has
+            // actually replaced its logical authority; yielding is not a barrier.
+            let firstResult = await first.value
             _ = try await runtime.setOptedOut(
                 false,
                 expectedGeneration: optedOut.generation
@@ -2295,7 +2297,6 @@ final class EluV1FlagRuntimeTests: XCTestCase {
             let newestPending = Task { await client.reload() }
 
             let replacedResult = await replacedPending.value
-            let firstResult = await first.value
             let beforeReleaseCalls = await transport.callCount()
             let beforeReleaseMax = await transport.maxConcurrentCalls()
             XCTAssertEqual(replacedResult, .stale)
@@ -2360,6 +2361,34 @@ final class EluV1FlagRuntimeTests: XCTestCase {
             }
             let finalMax = await transport.maxConcurrentCalls()
             XCTAssertEqual(finalMax, 1)
+            await runtime.close()
+        }
+    }
+
+    func testCloseReleasesLogicalWaitersWithoutRestartingNonCooperativeTransport() async throws {
+        try await withTemporaryDirectory { root in
+            let clock = FlagTestClock(self.initialWall)
+            let runtime = try await self.makeRuntime(root: root, clock: clock)
+            let transport = GatedFlagTransport()
+            let client = try await EluV1FlagClient.make(runtime: runtime, transport: transport, versions: try self.versions())
+            _ = await client.applyConfig(self.fixture("config-enabled.json"))
+            let active = Task { await client.reload() }
+            while await transport.callCount() != 1 { await Task.yield() }
+            await client.close()
+            let closedResult = await active.value
+            XCTAssertEqual(closedResult, .stale)
+            let reload = await client.reload()
+            XCTAssertEqual(reload, .stale)
+            let apply = await client.applyConfig(self.fixture("config-enabled.json"))
+            XCTAssertEqual(apply, .restricted(.missing))
+            let projection = await client.readProjection()
+            XCTAssertNil(projection)
+            let before = await transport.callCount()
+            XCTAssertEqual(before, 1)
+            await transport.completeCurrent()
+            for _ in 0 ..< 20 { await Task.yield() }
+            let after = await transport.callCount()
+            XCTAssertEqual(after, 1)
             await runtime.close()
         }
     }

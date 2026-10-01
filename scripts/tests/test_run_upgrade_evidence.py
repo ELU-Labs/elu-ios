@@ -119,11 +119,16 @@ class UpgradeEvidenceCaptureTests(unittest.TestCase):
         self.assertEqual(RUNNER.RUN_RESULT_WAIT_SECONDS, 60)
         self.assertGreater(RUNNER.RUN_RESULT_WAIT_SECONDS, 10 + 10 + 20 + 5)
 
-    def test_upgrade_harness_uses_the_supported_simulator_image(self) -> None:
+    def test_current_storage_gate_uses_supported_simulator_and_retires_preview_runner(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")
         upgrade_job = workflow.split("  upgrade-evidence:", 1)[1]
         self.assertIn("    runs-on: macos-15\n", upgrade_job)
         self.assertNotIn("macos-15-intel", upgrade_job)
+        self.assertIn("name: Clean install and owned-store upgrades", upgrade_job)
+        self.assertIn("-only-testing:EluAnalyticsTests/EluSQLiteRuntimeQueueTests", upgrade_job)
+        self.assertIn("-only-testing:EluAnalyticsTests/EluV2ReplayStorageTests", upgrade_job)
+        self.assertNotIn("run-upgrade-evidence.py", upgrade_job)
+        self.assertNotIn("continue-on-error", upgrade_job)
 
     def test_app_delegate_window_can_witness_the_protocol_requirement(self) -> None:
         source = HARNESS_SOURCE.read_text(encoding="utf-8")

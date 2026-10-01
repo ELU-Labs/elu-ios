@@ -16,8 +16,9 @@ struct EluV1AuthorizedEndpointSet: Equatable, Sendable {
     }
 }
 
-/// A platform transport pair that has passed the external replay readback gate.
-/// Merely appearing in server config does not make a codec usable on this runtime.
+/// A locally supported platform transport pair. Construction alone does not
+/// certify readback; usable pairs must be selected by the owned composition and
+/// separately authorized by current server configuration and privacy state.
 struct EluV1ReplayTransportSelection: Equatable, Hashable, Sendable {
     let codec: String
     let compression: EluV1Compression
@@ -104,6 +105,32 @@ struct EluV1ConfigResolution: Equatable, Sendable {
     let replayAuthorization: EluV1ReplayAuthorization
 }
 
+/// Current policy permission for lawful sealed bytes. It is not fresh capture authority.
+struct EluV2SealedReplayDeliverySnapshot: Equatable, Sendable {
+    let configWitness: EluV2ReplayConfigWitness
+    let siteId: String
+    let expiresAt: EluV1Timestamp
+    let endpoint: URL
+    let transport: EluV1ReplayTransportSelection
+    let protocolGeneration: String
+    let maximumRequestBytes: Int
+    fileprivate init(configWitness: EluV2ReplayConfigWitness, siteId: String, expiresAt: EluV1Timestamp,
+        endpoint: URL, transport: EluV1ReplayTransportSelection, generation: String, maximumRequestBytes: Int) {
+        self.configWitness = configWitness; self.siteId = siteId; self.expiresAt = expiresAt
+        self.endpoint = endpoint; self.transport = transport; protocolGeneration = generation
+        self.maximumRequestBytes = maximumRequestBytes
+    }
+    fileprivate init(_ value: EluV1ConfigResolution, endpoint: URL, transport: EluV1ReplayTransportSelection, generation: String) {
+        configWitness = EluV2ReplayConfigWitness(issuedAt: value.exactIssuedAt, semanticHash: value.configSemanticHash)
+        siteId = value.siteId
+        expiresAt = value.exactExpiresAt
+        self.endpoint = endpoint
+        self.transport = transport
+        protocolGeneration = generation
+        maximumRequestBytes = value.limits.replayChunkBytes
+    }
+}
+
 enum EluV1ConfigUpdateResult: Equatable, Sendable {
     case enabled(revision: String, expiresAt: Date)
     case disabled(revision: String)
@@ -187,7 +214,7 @@ final class EluV1ConfigManager: @unchecked Sendable {
     static let maximumConfigBytes = 65_536
     static let maximumPrivacyStateBytes = 32_768
 
-    private struct PreparedConfig {
+    struct PreparedConfig {
         let document: EluV1ConfigDocument
         let canonicalData: Data
         let semanticHash: String
@@ -359,6 +386,7 @@ final class EluV1ConfigManager: @unchecked Sendable {
     // replay authorization always requires recorded fallback proof.
     private static let recognizedIOSMaskingRuleDialects: Set<String> = []
 
+    private let endpointPolicy: EluEndpointPolicy
     private let lock = NSLock()
     private let readbackProvenReplayTransports: Set<EluV1ReplayTransportSelection>
     private let flagOwner: (siteKey: String, namespaceDigest: String)?
@@ -370,8 +398,10 @@ final class EluV1ConfigManager: @unchecked Sendable {
     private var flagActivationCounter: EluV1FlagActivationCounter
 
     init(
+        endpointPolicy: EluEndpointPolicy = .cloud,
         readbackProvenReplayTransports: Set<EluV1ReplayTransportSelection> = []
     ) {
+        self.endpointPolicy = endpointPolicy
         self.readbackProvenReplayTransports = readbackProvenReplayTransports
         flagOwner = nil
         flagActivationCounter = EluV1FlagActivationCounter()
@@ -379,9 +409,11 @@ final class EluV1ConfigManager: @unchecked Sendable {
 
     init(
         exactConstructorSiteKey: String,
+        endpointPolicy: EluEndpointPolicy = .cloud,
         readbackProvenReplayTransports: Set<EluV1ReplayTransportSelection> = [],
         flagActivationCounter: EluV1FlagActivationCounter = EluV1FlagActivationCounter()
     ) throws {
+        self.endpointPolicy = endpointPolicy
         self.readbackProvenReplayTransports = readbackProvenReplayTransports
         flagOwner = (
             exactConstructorSiteKey,
@@ -410,7 +442,7 @@ final class EluV1ConfigManager: @unchecked Sendable {
 
         do {
             try Self.validateClock(now)
-            let prepared = try Self.prepareFlagProjection(configData)
+            let prepared = try Self.prepareFlagProjection(configData, endpointPolicy: endpointPolicy)
             let restriction: EluV1FlagRestriction?
             switch prepared.status {
             case .disabled:
@@ -530,7 +562,7 @@ final class EluV1ConfigManager: @unchecked Sendable {
         do {
             lastValidatedCandidateIdentity = nil
             try Self.validateClock(now)
-            let prepared = try Self.prepareConfig(configData)
+            let prepared = try Self.prepareConfig(configData, endpointPolicy: endpointPolicy)
             lastValidatedCandidateIdentity = ValidatedCandidateIdentity(
                 issuedAt: prepared.document.issuedAt,
                 semanticHash: prepared.semanticHash,
@@ -625,6 +657,65 @@ final class EluV1ConfigManager: @unchecked Sendable {
         effectivePrivacyStateData: Data?,
         identity: EluIdentitySnapshot,
         now: Date
+    ) throws -> EluV1ConfigResolution {
+        try authorize(effectivePrivacyStateData: effectivePrivacyStateData, identity: identity, now: now, sealedDelivery: false)
+    }
+
+    func authorizeSealedReplayDelivery(
+        effectivePrivacyStateData: Data?, identity: EluIdentitySnapshot, now: Date
+    ) throws -> EluV2SealedReplayDeliverySnapshot? {
+        let value = try authorize(effectivePrivacyStateData: effectivePrivacyStateData, identity: identity, now: now, sealedDelivery: true)
+        guard value.configSchemaVersion == 2,
+              case let .authorized(pair) = value.replayAuthorization,
+              let endpoint = value.endpoints[.replay], let generation = value.replayProtocolGeneration else { return nil }
+        return EluV2SealedReplayDeliverySnapshot(value, endpoint: endpoint, transport: pair, generation: generation)
+    }
+
+    /// Sealed-only permission from current observed local policy. This never
+    /// constructs effective privacy bytes, a hash, or fresh capture authority.
+    func authorizeSealedReplayDelivery(policyObservation: EluProjectedSealedReplayPolicy,
+        identity: EluIdentitySnapshot, now: Date
+    ) throws -> EluV2SealedReplayDeliverySnapshot? {
+        lock.lock(); defer { lock.unlock() }
+        try Self.validateClock(now)
+        expireActiveConfigIfNeeded(now: now)
+        guard let active = activeConfig, active.document.schemaVersion == 2,
+              let policy = active.document.privacy, let features = active.document.features,
+              let capabilities = active.document.capabilities, let site = active.document.site,
+              let limit = active.document.limits, let endpoint = active.trustedEndpoints?[.replay],
+              let generation = capabilities.replay.replayProtocolGeneration,
+              policyObservation.configWitness == ValidatedCandidateIdentity(issuedAt: active.document.issuedAt,
+                  semanticHash: active.semanticHash, policySourceHash: active.policySourceHash),
+              policyObservation.policyRevision == policy.revision,
+              policyObservation.contextRevision == identity.identity.contextRevision,
+              policyObservation.identityOptedOut == identity.identity.optedOut else { return nil }
+        let decision = EluPrivacyStateProjector.onDeviceDecision(regionPolicy: policy.regionPolicy,
+            timeZoneIdentifier: policyObservation.timeZoneIdentifier, identityOptedOut: identity.identity.optedOut)
+        guard policyObservation.onDeviceDecision == decision,
+              policyObservation.profileCompatibility == .compatible,
+              policyObservation.profile.compatibility(with: policy.masking, platform: .ios) == .compatible else { return nil }
+        let selected = readbackProvenReplayTransports.first {
+            EluNativeReplayProtocol.matching(codec: $0.codec, compression: $0.compression.rawValue,
+                generation: generation) != nil &&
+                capabilities.replay.advertises(codec: $0.codec, compression: $0.compression)
+        }
+        guard Self.sealedPolicyAllows(features: features, policy: policy, decision: decision.decision,
+            optedOut: identity.identity.optedOut, maskingValidated: true, transportAdvertised: selected != nil),
+              let selected else { return nil }
+        return EluV2SealedReplayDeliverySnapshot(
+            configWitness: EluV2ReplayConfigWitness(issuedAt: active.document.issuedAt, semanticHash: active.semanticHash),
+            siteId: site.id, expiresAt: active.document.expiresAt, endpoint: endpoint,
+            transport: selected, generation: generation, maximumRequestBytes: limit.replayChunkBytes)
+    }
+
+    private static func sealedPolicyAllows(features: EluV1Features, policy: EluV1PrivacyPolicy,
+        decision: EluV1Decision, optedOut: Bool, maskingValidated: Bool, transportAdvertised: Bool) -> Bool {
+        features.capture && policy.capture.enabled && decision == .allow && !optedOut &&
+            features.replay && policy.replay.enabled && maskingValidated && transportAdvertised
+    }
+
+    private func authorize(
+        effectivePrivacyStateData: Data?, identity: EluIdentitySnapshot, now: Date, sealedDelivery: Bool
     ) throws -> EluV1ConfigResolution {
         lock.lock()
         defer { lock.unlock() }
@@ -816,7 +907,11 @@ final class EluV1ConfigManager: @unchecked Sendable {
             replayAuthorization = .invalid(.claimedAuthorizationMismatch)
         } else if captureAuthorization != .authorized {
             replayAuthorization = .restricted(.captureUnavailable)
-        } else if !serverReplayAllowed {
+        } else if !(sealedDelivery
+            ? Self.sealedPolicyAllows(features: features, policy: privacyPolicy,
+                decision: effectivePrivacy.onDeviceDecision.decision, optedOut: identity.identity.optedOut,
+                maskingValidated: effectivePrivacy.maskingValidated, transportAdvertised: replayTransportAdvertised)
+            : serverReplayAllowed) {
             replayAuthorization = .restricted(
                 Self.replayRestrictionReason(
                     features: features,
@@ -952,7 +1047,7 @@ final class EluV1ConfigManager: @unchecked Sendable {
         }
     }
 
-    private static func prepareConfig(_ data: Data) throws -> PreparedConfig {
+    static func prepareConfig(_ data: Data, endpointPolicy: EluEndpointPolicy) throws -> PreparedConfig {
         let (document, strictDocument) = try decodeConfig(data)
         guard document.issuedAt < document.expiresAt else {
             throw EluV1ConfigResolutionError.invalidConfigValidityWindow
@@ -964,7 +1059,7 @@ final class EluV1ConfigManager: @unchecked Sendable {
             }
             trustedEndpoints = try validateAllEndpoints(
                 endpoints,
-                schemaVersion: document.schemaVersion
+                schemaVersion: document.schemaVersion, endpointPolicy: endpointPolicy
             )
         } else {
             trustedEndpoints = nil
@@ -983,13 +1078,13 @@ final class EluV1ConfigManager: @unchecked Sendable {
     /// Flags consume only their own endpoint role. Known unrelated channel
     /// values remain part of the semantic document when present, but are not
     /// required or interpreted and cannot grant or deny flag authority.
-    private static func prepareFlagProjection(_ data: Data) throws -> PreparedFlagProjection {
+    private static func prepareFlagProjection(_ data: Data, endpointPolicy: EluEndpointPolicy) throws -> PreparedFlagProjection {
         let (projection, strictDocument) = try decodeFlagProjection(data)
         guard projection.issuedAt < projection.expiresAt else {
             throw EluV1ConfigResolutionError.invalidConfigValidityWindow
         }
         let endpoint = try projection.flagsEndpoint.map {
-            try validateEndpoint($0, role: .flags, schemaVersion: projection.schemaVersion)
+            try validateEndpoint($0, role: .flags, schemaVersion: projection.schemaVersion, endpointPolicy: endpointPolicy)
         }
         return PreparedFlagProjection(
             schemaVersion: projection.schemaVersion,
@@ -1081,17 +1176,17 @@ final class EluV1ConfigManager: @unchecked Sendable {
 
     private static func validateAllEndpoints(
         _ endpoints: EluV1RawEndpoints,
-        schemaVersion: Int
+        schemaVersion: Int, endpointPolicy: EluEndpointPolicy
     ) throws -> [EluV1EndpointRole: URL] {
         var validated: [EluV1EndpointRole: URL] = [
-            .events: try validateEndpoint(endpoints.events, role: .events, schemaVersion: schemaVersion),
-            .flags: try validateEndpoint(endpoints.flags, role: .flags, schemaVersion: schemaVersion),
+            .events: try validateEndpoint(endpoints.events, role: .events, schemaVersion: schemaVersion, endpointPolicy: endpointPolicy),
+            .flags: try validateEndpoint(endpoints.flags, role: .flags, schemaVersion: schemaVersion, endpointPolicy: endpointPolicy),
         ]
         if let replay = endpoints.replay {
-            validated[.replay] = try validateEndpoint(replay, role: .replay, schemaVersion: schemaVersion)
+            validated[.replay] = try validateEndpoint(replay, role: .replay, schemaVersion: schemaVersion, endpointPolicy: endpointPolicy)
         }
         if let assets = endpoints.assets {
-            validated[.assets] = try validateEndpoint(assets, role: .assets, schemaVersion: schemaVersion)
+            validated[.assets] = try validateEndpoint(assets, role: .assets, schemaVersion: schemaVersion, endpointPolicy: endpointPolicy)
         }
         return validated
     }
@@ -1100,41 +1195,10 @@ final class EluV1ConfigManager: @unchecked Sendable {
     /// standalone replay endpoint accepts replay v2 only, so a v2 document must
     /// never advertise the v1 path and a v1 document must never advertise v2.
     private static func validateEndpoint(
-        _ value: String,
-        role: EluV1EndpointRole,
-        schemaVersion: Int
+        _ value: String, role: EluV1EndpointRole, schemaVersion: Int,
+        endpointPolicy: EluEndpointPolicy
     ) throws -> URL {
-        let expectedHost: String
-        let expectedPath: String
-        switch role {
-        case .events:
-            expectedHost = "ingest.elu.dev"
-            expectedPath = "/v1/events"
-        case .replay:
-            expectedHost = "ingest.elu.dev"
-            expectedPath = schemaVersion == EluV1ConfigDocument.v2SchemaVersion
-                ? "/v2/replay"
-                : "/v1/replay"
-        case .flags:
-            expectedHost = "ingest.elu.dev"
-            expectedPath = "/v1/flags"
-        case .assets:
-            expectedHost = "assets.elu.dev"
-            expectedPath = "/sdk/"
-        }
-
-        guard EluV1Validation.isAbsoluteHTTPSURI(value),
-              let components = URLComponents(string: value),
-              components.scheme == "https",
-              components.host?.lowercased() == expectedHost,
-              components.port == nil || components.port == 443,
-              components.user == nil,
-              components.password == nil,
-              components.fragment == nil,
-              components.percentEncodedPath == expectedPath,
-              components.queryItems?.contains(where: { $0.name == "site_key" }) != true,
-              let url = components.url
-        else {
+        guard let url = endpointPolicy.endpoint(value, role: role, schemaVersion: schemaVersion) else {
             throw EluV1ConfigResolutionError.untrustedEndpoint(role)
         }
         return url

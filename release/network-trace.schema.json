@@ -3,9 +3,17 @@
   "$id": "https://elu.dev/schemas/ios-sdk-network-trace-v1.json",
   "title": "ELU iOS SDK normalized network trace",
   "type": "object",
-  "required": ["schemaVersion", "scenarios", "requests"],
+  "required": [
+    "schemaVersion",
+    "scenarios",
+    "requests",
+    "evidenceKind",
+    "runtimeEvidence"
+  ],
   "properties": {
-    "schemaVersion": { "const": 1 },
+    "schemaVersion": {
+      "const": 1
+    },
     "scenarios": {
       "type": "array",
       "minItems": 9,
@@ -30,7 +38,10 @@
       "minItems": 1,
       "items": {
         "type": "object",
-        "required": ["scenario", "url"],
+        "required": [
+          "scenario",
+          "url"
+        ],
         "properties": {
           "scenario": {
             "enum": [
@@ -45,15 +56,31 @@
               "offline-recovery"
             ]
           },
-          "url": { "type": "string", "format": "uri", "pattern": "^https://" },
-          "method": { "type": "string" },
-          "requestHeaders": { "type": "object" },
+          "url": {
+            "type": "string",
+            "format": "uri",
+            "pattern": "^https://"
+          },
+          "method": {
+            "type": "string"
+          },
+          "requestHeaders": {
+            "type": "object"
+          },
           "requestBody": {},
-          "responseHeaders": { "type": "object" },
+          "responseHeaders": {
+            "type": "object"
+          },
           "responseBody": {}
         },
         "additionalProperties": true
       }
+    },
+    "evidenceKind": {
+      "const": "ios-runtime-network-capture"
+    },
+    "runtimeEvidence": {
+      "const": true
     }
   },
   "additionalProperties": true

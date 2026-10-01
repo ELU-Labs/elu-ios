@@ -1,0 +1,556 @@
+{
+  "snapshotVersion": 1,
+  "module": "EluAnalytics",
+  "baseline": "Baselines/0.1.0/public-symbols.json",
+  "description": "Additive source API for the native runtime candidate; this ledger is not release or migration qualification.",
+  "symbols": [
+    {
+      "kind": "swift.type.method",
+      "name": "Elu.capture(_:properties:timestamp:)"
+    },
+    {
+      "kind": "swift.type.method",
+      "name": "Elu.blockView(_:)"
+    },
+    {
+      "kind": "swift.type.method",
+      "name": "Elu.getFeatureFlagResult(_:)"
+    },
+    {
+      "kind": "swift.type.method",
+      "name": "Elu.getGroups()"
+    },
+    {
+      "kind": "swift.type.method",
+      "name": "Elu.identify(_:userProperties:userPropertiesOnce:)"
+    },
+    {
+      "kind": "swift.type.method",
+      "name": "Elu.isOptedOut()"
+    },
+    {
+      "kind": "swift.type.method",
+      "name": "Elu.maskView(_:)"
+    },
+    {
+      "kind": "swift.type.method",
+      "name": "Elu.optIn(captureEventName:properties:)"
+    },
+    {
+      "kind": "swift.type.method",
+      "name": "Elu.optOut()"
+    },
+    {
+      "kind": "swift.type.method",
+      "name": "Elu.registerOnce(_:defaultValue:)"
+    },
+    {
+      "kind": "swift.type.method",
+      "name": "Elu.resetGroupPropertiesForFlags(_:)"
+    },
+    {
+      "kind": "swift.type.method",
+      "name": "Elu.resetGroups()"
+    },
+    {
+      "kind": "swift.type.method",
+      "name": "Elu.resetPersonPropertiesForFlags()"
+    },
+    {
+      "kind": "swift.type.method",
+      "name": "Elu.setPersonProperties(_:propertiesOnce:)"
+    },
+    {
+      "kind": "swift.struct",
+      "name": "EluFeatureFlagResult"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluFeatureFlagResult.enabled"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluFeatureFlagResult.key"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluFeatureFlagResult.payload"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluFeatureFlagResult.variant"
+    },
+    {
+      "kind": "swift.struct",
+      "name": "EluPerformanceOptions"
+    },
+    {
+      "kind": "swift.func.op",
+      "name": "EluPerformanceOptions.!=(_:_:)"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluPerformanceOptions.enabled"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluPerformanceOptions.frameCadence"
+    },
+    {
+      "kind": "swift.init",
+      "name": "EluPerformanceOptions.init(enabled:memory:mainThreadStalls:sampleIntervalMilliseconds:mainThreadStallThresholdMilliseconds:)"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluPerformanceOptions.mainThreadStallThresholdMilliseconds"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluPerformanceOptions.mainThreadStalls"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluPerformanceOptions.memory"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluPerformanceOptions.sampleIntervalMilliseconds"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluSetupOptions.apiHost"
+    },
+    {
+      "kind": "swift.init",
+      "name": "EluSetupOptions.init(configHost:apiHost:)"
+    },
+    {
+      "kind": "swift.init",
+      "name": "EluSetupOptions.init(configHost:performance:)"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluSetupOptions.performance"
+    },
+    {
+      "kind": "swift.class",
+      "name": "EluURLSession"
+    },
+    {
+      "kind": "swift.method",
+      "name": "EluURLSession.data(for:delegate:)"
+    },
+    {
+      "kind": "swift.init",
+      "name": "EluURLSession.init(session:)"
+    },
+    {
+      "kind": "swift.method",
+      "name": "EluURLSession.perform(_:completionHandler:)"
+    },
+    {
+      "kind": "swift.struct",
+      "name": "EluDiagnosticsOptions"
+    },
+    {
+      "kind": "swift.func.op",
+      "name": "EluDiagnosticsOptions.!=(_:_:)"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluDiagnosticsOptions.enabled"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluDiagnosticsOptions.launchSummaries"
+    },
+    {
+      "kind": "swift.init",
+      "name": "EluDiagnosticsOptions.init(enabled:launchSummaries:)"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluSetupOptions.diagnostics"
+    },
+    {
+      "kind": "swift.type.method",
+      "name": "Elu.reset(resetDeviceId:)"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluSetupOptions.personProfiles"
+    },
+    {
+      "kind": "swift.enum",
+      "name": "EluPersonProfilesMode"
+    },
+    {
+      "kind": "swift.enum.case",
+      "name": "EluPersonProfilesMode.identifiedOnly"
+    },
+    {
+      "kind": "swift.enum.case",
+      "name": "EluPersonProfilesMode.always"
+    },
+    {
+      "kind": "swift.enum.case",
+      "name": "EluPersonProfilesMode.never"
+    },
+    {
+      "kind": "swift.func.op",
+      "name": "EluPersonProfilesMode.!=(_:_:)"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluSetupOptions.persistence"
+    },
+    {
+      "kind": "swift.enum",
+      "name": "EluPersistenceMode"
+    },
+    {
+      "kind": "swift.enum.case",
+      "name": "EluPersistenceMode.persistent"
+    },
+    {
+      "kind": "swift.enum.case",
+      "name": "EluPersistenceMode.memory"
+    },
+    {
+      "kind": "swift.func.op",
+      "name": "EluPersistenceMode.!=(_:_:)"
+    },
+    {
+      "kind": "swift.struct",
+      "name": "EluRateLimitingOptions"
+    },
+    {
+      "kind": "swift.func.op",
+      "name": "EluRateLimitingOptions.!=(_:_:)"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluRateLimitingOptions.eventsPerSecond"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluRateLimitingOptions.eventsBurstLimit"
+    },
+    {
+      "kind": "swift.init",
+      "name": "EluRateLimitingOptions.init(eventsPerSecond:eventsBurstLimit:)"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluSetupOptions.rateLimiting"
+    },
+    {
+      "kind": "swift.type.method",
+      "name": "Elu.startSessionRecording()"
+    },
+    {
+      "kind": "swift.type.method",
+      "name": "Elu.stopSessionRecording()"
+    },
+    {
+      "kind": "swift.type.method",
+      "name": "Elu.sessionRecordingStarted()"
+    },
+    {
+      "kind": "swift.class",
+      "name": "EluReplayWindow"
+    },
+    {
+      "kind": "swift.method",
+      "name": "EluReplayWindow.sendEvent(_:)"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluDiagnosticsOptions.crashReportDetails"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluDiagnosticsOptions.crashReports"
+    },
+    {
+      "kind": "swift.init",
+      "name": "EluDiagnosticsOptions.init(enabled:launchSummaries:crashReports:crashReportDetails:)"
+    },
+    {
+      "kind": "swift.class",
+      "name": "EluSwiftUIReplayScope"
+    },
+    {
+      "kind": "swift.init",
+      "name": "EluSwiftUIReplayScope.init(requiredRegions:)"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluSwiftUIReplayScope.objectWillChange"
+    },
+    {
+      "kind": "swift.method",
+      "name": "View.eluBlock(_:region:)"
+    },
+    {
+      "kind": "swift.method",
+      "name": "View.eluMask(_:region:)"
+    },
+    {
+      "kind": "swift.method",
+      "name": "View.eluReplayRoot(_:)"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluSetupOptions.declaredRegionReplayEnabled"
+    },
+    {
+      "kind": "swift.type.method",
+      "name": "Elu.getFeatureFlag(_:options:)"
+    },
+    {
+      "kind": "swift.type.method",
+      "name": "Elu.getFeatureFlagResult(_:options:)"
+    },
+    {
+      "kind": "swift.type.method",
+      "name": "Elu.isFeatureEnabled(_:options:defaultValue:)"
+    },
+    {
+      "kind": "swift.struct",
+      "name": "EluFeatureFlagOptions"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluFeatureFlagOptions.sendEvent"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluFeatureFlagOptions.fresh"
+    },
+    {
+      "kind": "swift.init",
+      "name": "EluFeatureFlagOptions.init(sendEvent:fresh:)"
+    },
+    {
+      "kind": "swift.type.method",
+      "name": "Elu.featureFlagSnapshot()"
+    },
+    {
+      "kind": "swift.type.method",
+      "name": "Elu.subscribeToFeatureFlags(_:)"
+    },
+    {
+      "kind": "swift.struct",
+      "name": "EluFeatureFlagSnapshot"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluFeatureFlagSnapshot.source"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluFeatureFlagSnapshot.error"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluFeatureFlagSnapshot.entries"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluFeatureFlagSnapshot.flagsJSON"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluFeatureFlagSnapshot.payloadsJSON"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluFeatureFlagSnapshot.requestId"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluFeatureFlagSnapshot.flagsRevision"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluFeatureFlagSnapshot.evaluatedAt"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluFeatureFlagSnapshot.expiresAt"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluFeatureFlagSnapshot.isAvailable"
+    },
+    {
+      "kind": "swift.method",
+      "name": "EluFeatureFlagSnapshot.entry(forKey:)"
+    },
+    {
+      "kind": "swift.enum",
+      "name": "EluFeatureFlagSnapshot.Source"
+    },
+    {
+      "kind": "swift.enum.case",
+      "name": "EluFeatureFlagSnapshot.Source.remote"
+    },
+    {
+      "kind": "swift.enum.case",
+      "name": "EluFeatureFlagSnapshot.Source.cache"
+    },
+    {
+      "kind": "swift.enum.case",
+      "name": "EluFeatureFlagSnapshot.Source.unavailable"
+    },
+    {
+      "kind": "swift.init",
+      "name": "EluFeatureFlagSnapshot.Source.init(rawValue:)"
+    },
+    {
+      "kind": "swift.func.op",
+      "name": "EluFeatureFlagSnapshot.Source.!=(_:_:)"
+    },
+    {
+      "kind": "swift.enum",
+      "name": "EluFeatureFlagSnapshot.LoadError"
+    },
+    {
+      "kind": "swift.enum.case",
+      "name": "EluFeatureFlagSnapshot.LoadError.transport"
+    },
+    {
+      "kind": "swift.enum.case",
+      "name": "EluFeatureFlagSnapshot.LoadError.invalidResponse"
+    },
+    {
+      "kind": "swift.init",
+      "name": "EluFeatureFlagSnapshot.LoadError.init(rawValue:)"
+    },
+    {
+      "kind": "swift.func.op",
+      "name": "EluFeatureFlagSnapshot.LoadError.!=(_:_:)"
+    },
+    {
+      "kind": "swift.struct",
+      "name": "EluFeatureFlagSnapshot.Entry"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluFeatureFlagSnapshot.Entry.key"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluFeatureFlagSnapshot.Entry.value"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluFeatureFlagSnapshot.Entry.payloadJSON"
+    },
+    {
+      "kind": "swift.enum",
+      "name": "EluFeatureFlagSnapshot.Entry.Value"
+    },
+    {
+      "kind": "swift.enum.case",
+      "name": "EluFeatureFlagSnapshot.Entry.Value.bool(_:)"
+    },
+    {
+      "kind": "swift.enum.case",
+      "name": "EluFeatureFlagSnapshot.Entry.Value.string(_:)"
+    },
+    {
+      "kind": "swift.enum.case",
+      "name": "EluFeatureFlagSnapshot.Entry.Value.number(_:)"
+    },
+    {
+      "kind": "swift.enum.case",
+      "name": "EluFeatureFlagSnapshot.Entry.Value.null"
+    },
+    {
+      "kind": "swift.class",
+      "name": "EluFeatureFlagSubscription"
+    },
+    {
+      "kind": "swift.method",
+      "name": "EluFeatureFlagSubscription.cancel()"
+    },
+    {
+      "kind": "swift.type.method",
+      "name": "Elu.capture(_:properties:options:)"
+    },
+    {
+      "kind": "swift.struct",
+      "name": "EluCaptureOptions"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluCaptureOptions.set"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluCaptureOptions.setOnce"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluCaptureOptions.timestamp"
+    },
+    {
+      "kind": "swift.init",
+      "name": "EluCaptureOptions.init(set:setOnce:timestamp:)"
+    },
+    {
+      "kind": "swift.method",
+      "name": "EluFeatureFlagSnapshot.Source.hash(into:)"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluFeatureFlagSnapshot.Source.hashValue"
+    },
+    {
+      "kind": "swift.method",
+      "name": "EluFeatureFlagSnapshot.LoadError.hash(into:)"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluFeatureFlagSnapshot.LoadError.hashValue"
+    },
+    {
+      "kind": "swift.struct",
+      "name": "EluEvent"
+    },
+    {
+      "kind": "swift.init",
+      "name": "EluEvent.init(event:properties:timestamp:set:setOnce:)"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluEvent.event"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluEvent.properties"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluEvent.timestamp"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluEvent.set"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluEvent.setOnce"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluSetupOptions.propertyDenylist"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluSetupOptions.beforeSend"
+    }
+  ]
+}
