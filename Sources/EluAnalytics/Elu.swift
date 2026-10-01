@@ -125,6 +125,13 @@ public enum Elu {
         EluCore.shared.dispatch(.capture(event: event, properties: properties, timestamp: timestamp))
     }
 
+    /// Person changes run only after event acceptance, under the same current
+    /// identity and consent. They are not part of the event's transaction.
+    public static func capture(_ event: String, properties: [String: Any]? = nil, options: EluCaptureOptions) {
+        EluCore.shared.dispatch(.capture(event: event, properties: properties, timestamp: options.timestamp,
+            set: options.set, setOnce: options.setOnce))
+    }
+
     /// Record a logical screen view. Call explicitly from UIKit and SwiftUI
     /// when the application presents a screen — see README.
     public static func screen(_ name: String, properties: [String: Any]? = nil) {

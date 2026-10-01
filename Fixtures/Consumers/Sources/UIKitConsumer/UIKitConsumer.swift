@@ -66,7 +66,8 @@ public final class FixtureCheckoutViewController: UIViewController {
     public func completeCheckout(userID: String) {
         Elu.identify(userID, userProperties: ["plan": "pro"])
         Elu.group("company", key: "fixture-company", properties: ["tier": "test"])
-        Elu.capture("checkout completed", properties: ["source": "uikit"])
+        Elu.capture("checkout completed", properties: ["source": "uikit"],
+            options: EluCaptureOptions(set: ["plan": "pro"], setOnce: ["firstChannel": "ios"], timestamp: Date()))
     }
 }
 #endif

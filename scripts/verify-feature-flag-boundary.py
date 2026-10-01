@@ -12,10 +12,10 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 PINNED = {
-    "Sources/EluAnalytics/Elu.swift": "7e546c2edeccca4288be90ad08dcbcd9c88ac5baa14bf2d19c87c61221cda195",
+    "Sources/EluAnalytics/Elu.swift": "2e882b564a1480adde8d3b0d378cece4ce2b35cb56a7606dde8e7738a3ce06f2",
     "Sources/EluAnalytics/EluState.swift": "47794ca453e603e3faa7f501b9591a0a61629a8e82d96923b670f8722c84782d",
     "Sources/EluAnalytics/EluConfigClient.swift": "152abfb01a6d0aa81e470d3185ecd4db3aeeef26d8626e67bab8f0a41e20d43d",
-    "Sources/EluAnalytics/Internal/Facade/EluRuntimeBackend.swift": "a78455201838f970c624cc5a956aaf3eb7f26f499655a6845632c579d88ba23c",
+    "Sources/EluAnalytics/Internal/Facade/EluRuntimeBackend.swift": "7ff4cab047a7ae5f81bdaae1afda51939825d00c92d79bb89c70ec98f3dbd926",
     "Package.swift": "86701aa42833ddfff4b928e8ed59608cfe46f54e2765656f8166a75633219398",
     "Conformance/V1/manifest.json": "98152d8725c286f29402ba3e420bda8dd364200fb6fdf1cfe49b2da9b8f63e54",
 }

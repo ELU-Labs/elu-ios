@@ -477,6 +477,30 @@
       "name": "EluFeatureFlagSubscription.cancel()"
     },
     {
+      "kind": "swift.type.method",
+      "name": "Elu.capture(_:properties:options:)"
+    },
+    {
+      "kind": "swift.struct",
+      "name": "EluCaptureOptions"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluCaptureOptions.set"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluCaptureOptions.setOnce"
+    },
+    {
+      "kind": "swift.property",
+      "name": "EluCaptureOptions.timestamp"
+    },
+    {
+      "kind": "swift.init",
+      "name": "EluCaptureOptions.init(set:setOnce:timestamp:)"
+    },
+    {
       "kind": "swift.method",
       "name": "EluFeatureFlagSnapshot.Source.hash(into:)"
     },

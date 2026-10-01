@@ -8493,8 +8493,11 @@ actor EluSQLiteRuntimeQueue {
         versions: EluVersionContext,
         expectedGeneration: Int64,
         allowWire: Bool = true,
-        wireGuard: @escaping @Sendable () -> Bool = { true }
+        wireGuard: @escaping @Sendable () -> Bool = { true },
+        admissionGuard: (@Sendable () -> Bool)? = nil,
+        minimumOccurredAt: Date? = nil
     ) throws -> EluRuntimeQueueSnapshot {
+        guard admissionGuard?() ?? true else { throw EluRuntimeQueueError.sourceAuthorityUnavailable }
         guard ownerNamespaceHash != nil else {
             throw EluRuntimeQueueError.invalidState
         }
@@ -8508,9 +8511,16 @@ actor EluSQLiteRuntimeQueue {
             personIdentity: EluPersonIdentityState
         )
         do {
+            let occurredAt = clock()
+            // A capture-associated mutation cannot precede its accepted event.
+            // Keep the actual wall reading; never adjust it to make admission pass.
+            if let minimumOccurredAt {
+                guard occurredAt.timeIntervalSinceReferenceDate.isFinite,
+                      occurredAt >= minimumOccurredAt else { throw EluRuntimeQueueError.invalidState }
+            }
             prepared = try prepareMutationTransition(
                 transition,
-                occurredAt: clock(),
+                occurredAt: occurredAt,
                 versions: versions
             )
         } catch {
@@ -8530,6 +8540,7 @@ actor EluSQLiteRuntimeQueue {
                 maximumQueueBytes: maximumQueueBytes,
                 personIdentityUpdate: prepared.personIdentity,
                 prewriteValidation: { diskState in
+                    guard admissionGuard?() ?? true else { throw EluRuntimeQueueError.sourceAuthorityUnavailable }
                     if admitsWire && !prepared.drafts.isEmpty &&
                         (!wireGuard() || (self.configurationGate != nil &&
                         !self.freshMutationSourceIsCurrent(witness, diskState: diskState))) {
@@ -8537,17 +8548,24 @@ actor EluSQLiteRuntimeQueue {
                     }
                 },
                 precommitValidation: {
+                    guard admissionGuard?() ?? true else { throw EluRuntimeQueueError.sourceAuthorityUnavailable }
                     if admitsWire && !prepared.drafts.isEmpty && (!wireGuard() || !self.sourceIsCurrent(witness)) {
                         throw EluRuntimeQueueError.sourceAuthorityUnavailable
                     }
                 }
             ).snapshot
         } catch EluRuntimeQueueError.sourceAuthorityUnavailable {
-            // The attempted wire transaction rolled back before COMMIT. Preserve
-            // the local identity/context transition without emitting stale activity.
+            // Ordinary person calls retain their existing local fallback. An
+            // associated capture's superseded admission cannot use that fallback.
+            guard admissionGuard?() ?? true else { throw EluRuntimeQueueError.sourceAuthorityUnavailable }
             return try commitPrepared(expectedGeneration: expectedGeneration,
                 identity: prepared.identity, flagContext: prepared.flagContext, drafts: [],
-                personIdentityUpdate: prepared.personIdentity).snapshot
+                personIdentityUpdate: prepared.personIdentity,
+                prewriteValidation: { _ in
+                    guard admissionGuard?() ?? true else { throw EluRuntimeQueueError.sourceAuthorityUnavailable }
+                }, precommitValidation: {
+                    guard admissionGuard?() ?? true else { throw EluRuntimeQueueError.sourceAuthorityUnavailable }
+                }).snapshot
         }
     }
 

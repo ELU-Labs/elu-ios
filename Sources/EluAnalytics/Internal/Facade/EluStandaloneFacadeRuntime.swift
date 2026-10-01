@@ -41,6 +41,8 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
     private var foregroundIntent = false
     private var foregroundGeneration = UUID()
     private var flagGeneration = UUID()
+    // New intent invalidates capture admission; finishing its own handoff does not.
+    private var capturePersonGeneration = UUID()
     private var pendingFlagIntents: [UUID: EluStandaloneFacadePendingIntent] = [:]
     private let flagTransport: (any EluV1FlagTransport)?
     private let lock = NSLock()
@@ -324,6 +326,7 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
         let pending = withLock { () -> EluStandaloneFacadePendingIntent? in
             guard !isShutDown else { return nil }
             flagGeneration = UUID()
+            capturePersonGeneration = UUID()
             clearFlagsLocked()
             let pending = EluStandaloneFacadePendingIntent()
             if let runtime = started?.runtime { pending.bind(runtime) }
@@ -353,13 +356,23 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
 
     func execute(_ op: EluBufferedOp) {
         switch op {
-        case let .capture(event, properties, timestamp):
-            // Canonical rejection happens after rate admission in the queue.
-            // Bound and detach customer values here before the actor handoff.
+        case let .capture(event, properties, timestamp, set, setOnce):
+            // Detach event and person maps separately before the actor handoff.
+            // Person changes never enter the event's properties or transaction.
             let name = event
             let projected = project(properties)
-            enqueue { runtime, owner in
-                owner.record(await runtime.capture(name, properties: projected, occurredAt: timestamp))
+            let person = project(set), personOnce = project(setOnce)
+            let hasPersonIntent = set != nil || setOnce != nil
+            let permitsPerson = personProfiles != .never && hasPersonIntent
+            enqueue(affectsFlags: hasPersonIntent) { runtime, owner in
+                let current = hasPersonIntent ? owner.capturePersonAdmission() : nil
+                let result = await runtime.capture(name, properties: projected, occurredAt: timestamp,
+                    admissionGuard: current)
+                owner.record(result)
+                guard permitsPerson, let current, current(), case let .accepted(_, accepted) = result else { return }
+                owner.apply(await runtime.setPersonProperties(person, propertiesOnce: personOnce,
+                    afterAcceptedCapture: accepted, admissionGuard: current))
+                // Match capture-associated mutation semantics: no extra flag reload.
             }
 
         case let .screen(name, properties):
@@ -861,7 +874,7 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
     }
 
     private func configurationIntent() {
-        withLock { flagGeneration = UUID(); clearFlagsLocked() }
+        withLock { flagGeneration = UUID(); capturePersonGeneration = UUID(); clearFlagsLocked() }
     }
 
     private func clearFlags() {
@@ -918,6 +931,16 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
         lock.unlock()
     }
 
+    private func capturePersonAdmission() -> (@Sendable () -> Bool) {
+        let generation = withLock { capturePersonGeneration }
+        return { [weak self] in
+            self?.withLock {
+                self?.isShutDown == false && self?.capturePersonGeneration == generation &&
+                    self?.consentProjection?.optedOut != true
+            } ?? false
+        }
+    }
+
     private func record(_ result: EluV1CaptureResult) {
         switch result {
         case let .accepted(_, snapshot):
@@ -960,6 +983,7 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
         let pending: EluStandaloneFacadePendingIntent?
         if affectsFlags {
             flagGeneration = UUID()
+            capturePersonGeneration = UUID()
             clearFlagsLocked()
             let value = EluStandaloneFacadePendingIntent()
             if let runtime = started?.runtime { value.bind(runtime) }

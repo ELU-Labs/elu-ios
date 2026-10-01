@@ -2,7 +2,8 @@ import Foundation
 
 /// A facade operation held while the SDK is `pending` (no usable config yet).
 enum EluBufferedOp {
-    case capture(event: String, properties: [String: Any]?, timestamp: Date? = nil)
+    case capture(event: String, properties: [String: Any]?, timestamp: Date? = nil,
+                 set: [String: Any]? = nil, setOnce: [String: Any]? = nil)
     case identify(distinctId: String, userProperties: [String: Any]?, userPropertiesOnce: [String: Any] = [:])
     case screen(name: String, properties: [String: Any]?)
     case alias(String)

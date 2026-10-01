@@ -812,6 +812,31 @@ actor EluStandaloneRuntime {
         return await mutate(.setPersonProperties(set: properties, setOnce: propertiesOnce, unset: []))
     }
 
+    /// The original capture's identity, context and event-time state must still
+    /// be current. Unrelated delivery may advance storage generation; take that
+    /// generation only after checking the accepted predecessor, then use the
+    /// existing queue transaction's generation and admission fences.
+    @discardableResult
+    func setPersonProperties(
+        _ properties: [String: EluJSONValue], propertiesOnce: [String: EluJSONValue],
+        afterAcceptedCapture accepted: EluRuntimeQueueSnapshot,
+        admissionGuard: @escaping @Sendable () -> Bool
+    ) async -> EluRuntimeQueueSnapshot? {
+        guard phase != .closed, admissionGuard() else { return nil }
+        let fence = deliveryFence, decision = fence.token()
+        let current: @Sendable () -> Bool = { fence.isCurrent(decision) && admissionGuard() }
+        guard let snapshot = try? await queue.snapshot(),
+              snapshot.streamId == accepted.streamId, snapshot.identity == accepted.identity,
+              !snapshot.identity.optedOut, current(),
+              let next = try? await queue.applyOwnedMutation(
+                .setPersonProperties(set: properties, setOnce: propertiesOnce, unset: []),
+                versions: versions, expectedGeneration: snapshot.generation,
+                allowWire: phase == .capturing, wireGuard: current, admissionGuard: current,
+                minimumOccurredAt: accepted.identity.updatedAt)
+        else { return nil }
+        return await commit(next)
+    }
+
     /// Associates a group, and describes it in the same transition when
     /// properties are supplied.
     @discardableResult

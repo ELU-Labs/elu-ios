@@ -963,6 +963,259 @@ final class EluStandaloneFacadeRuntimeTests: XCTestCase {
         }
     }
 
+    func testCaptureAssociatedPersonPreservesOrderSetOnceAndNoImplicitFlagReload() async throws {
+        try await withTemporaryDirectory { root in
+            let flags = FacadeFlagTransport()
+            let transport = FacadeBatchTransport(held: true)
+            let h = try await makeHarness(root: root, flagTransport: flags, batchTransport: transport)
+            do {
+                h.backend.reloadFeatureFlags(); await h.backend.settled()
+                let reloads = await flags.callCount()
+                h.backend.execute(.capture(event: "first", properties: ["amount": 42], timestamp: baseDate,
+                    set: ["tier": "paid"], setOnce: ["source": "ios"]))
+                XCTAssertFalse(h.backend.flagsAreLoaded, "Person intent immediately withdraws the old flag projection")
+                h.backend.execute(.capture(event: "second", properties: nil,
+                    set: ["tier": "enterprise"], setOnce: ["source": "changed", "firstPlan": "paid"]))
+                await h.backend.settled()
+                let before = try await h.runtime.queueSnapshot()
+                XCTAssertEqual(before.flagContext.personProperties["tier"], .string("enterprise"))
+                XCTAssertEqual(before.flagContext.personProperties["source"], .string("ios"))
+                XCTAssertEqual(before.flagContext.personProperties["firstPlan"], .string("paid"))
+                let afterReloads = await flags.callCount()
+                XCTAssertEqual(afterReloads, reloads, "Capture-associated properties do not schedule another reload")
+                try await drainCaptureRecords(h)
+                let records = try await transport.recordedRecords()
+                XCTAssertEqual(records.compactMap { $0["kind"] as? String }, ["event", "mutation", "event", "mutation"])
+                let event = try XCTUnwrap(records.first?["event"] as? [String: Any])
+                XCTAssertEqual(event["occurredAt"] as? String, "2026-08-04T00:01:00.000Z")
+                let properties = try XCTUnwrap(event["properties"] as? [String: Any])
+                XCTAssertEqual(properties["amount"] as? Int, 42)
+                XCTAssertNil(properties["tier"]); XCTAssertNil(properties["$set"])
+                let mutation = try XCTUnwrap(records[1]["mutation"] as? [String: Any])
+                let change = try XCTUnwrap(mutation["change"] as? [String: Any])
+                XCTAssertEqual(change["type"] as? String, "setPersonProperties")
+                XCTAssertEqual((change["set"] as? [String: Any])?["tier"] as? String, "paid")
+                XCTAssertEqual((change["setOnce"] as? [String: Any])?["source"] as? String, "ios")
+                await h.close()
+                let reopened = try await makeHarness(root: root)
+                let restored = try await reopened.runtime.queueSnapshot()
+                XCTAssertEqual(restored.queuedCount, 0, "ACK retirement does not create another mutation on reopen")
+                XCTAssertEqual(restored.flagContext.personProperties, before.flagContext.personProperties)
+                await reopened.close()
+            } catch { await transport.release(); await h.close(); throw error }
+        }
+    }
+
+    func testRejectedCaptureNeverAppliesAssociatedPersonFields() async throws {
+        for mode in ["invalid", "disabled", "consent", "timestamp"] {
+            try await withTemporaryDirectory { root in
+                let h = try await makeHarness(root: root,
+                    document: mode == "disabled" ? fixture("config-disabled.json") : nil,
+                    initialConsent: mode == "consent" ? EluConsentOperation(optedOut: true) : nil)
+                let before = try await h.runtime.queueSnapshot()
+                h.backend.execute(.capture(event: mode == "invalid" ? "" : "rejected", properties: nil,
+                    timestamp: mode == "timestamp" ? Date(timeIntervalSince1970: .nan) : nil,
+                    set: ["forbidden": true], setOnce: ["alsoForbidden": true]))
+                await h.backend.settled()
+                let after = try await h.runtime.queueSnapshot()
+                XCTAssertEqual(after.flagContext.personProperties, before.flagContext.personProperties, mode)
+                XCTAssertEqual(after.identity.contextRevision, before.identity.contextRevision, mode)
+                XCTAssertEqual(after.queuedCount, 0, mode)
+                await h.close()
+            }
+        }
+    }
+
+    func testRateLimitedCaptureDoesNotApplyItsPersonFields() async throws {
+        try await withTemporaryDirectory { root in
+            let transport = FacadeBatchTransport(held: true)
+            let h = try await makeHarness(root: root, batchTransport: transport,
+                rateLimiting: .init(eventsPerSecond: 1, eventsBurstLimit: 1))
+            h.backend.execute(.capture(event: "first", properties: nil, set: ["tier": "first"]))
+            h.backend.execute(.capture(event: "limited", properties: nil, set: ["tier": "wrong"]))
+            await h.backend.settled()
+            let state = try await h.runtime.queueSnapshot()
+            XCTAssertEqual(state.flagContext.personProperties["tier"], .string("first"))
+            XCTAssertEqual(h.backend.dropCounts[.rateLimited], 1)
+            await transport.release(); await h.close()
+        }
+    }
+
+    func testExplicitEmptyPersonMapDiffersFromAbsentOptions() async throws {
+        try await withTemporaryDirectory { root in
+            let transport = FacadeBatchTransport(held: true)
+            let h = try await makeHarness(root: root, batchTransport: transport)
+            h.backend.execute(.capture(event: "without-person", properties: nil))
+            h.backend.execute(.capture(event: "empty-person", properties: nil, set: [:]))
+            h.backend.execute(.capture(event: "after-person", properties: nil))
+            await h.backend.settled()
+            do {
+                try await drainCaptureRecords(h)
+                let records = try await transport.recordedRecords()
+                XCTAssertEqual(records.compactMap { $0["kind"] as? String }, ["event", "event", "mutation", "event"])
+                let change = (records[2]["mutation"] as? [String: Any])?["change"] as? [String: Any]
+                XCTAssertEqual(change?["type"] as? String, "setPersonProperties")
+                XCTAssertEqual((change?["set"] as? [String: Any])?.count, 0)
+                let events = records.compactMap { $0["event"] as? [String: Any] }
+                XCTAssertEqual((events[0]["properties"] as? [String: Any])?["$process_person_profile"] as? Bool, false)
+                XCTAssertEqual((events[2]["properties"] as? [String: Any])?["$process_person_profile"] as? Bool, true)
+                await h.close()
+            } catch { await transport.release(); await h.close(); throw error }
+        }
+    }
+
+    func testNeverModeKeepsAcceptedEventWithoutAssociatedMutation() async throws {
+        try await withTemporaryDirectory { root in
+            let transport = FacadeBatchTransport(held: true)
+            let h = try await makeHarness(root: root, personProfiles: .never, batchTransport: transport)
+            h.backend.execute(.capture(event: "allowed", properties: nil,
+                set: ["forbidden": true], setOnce: ["alsoForbidden": true]))
+            await h.backend.settled()
+            let state = try await h.runtime.queueSnapshot()
+            XCTAssertEqual(state.queuedCount, 1)
+            XCTAssertTrue(state.flagContext.personProperties.isEmpty)
+            await transport.release(); await h.close()
+        }
+    }
+
+    func testAssociatedMutationRejectsReplacementIdentityAndEventTime() async throws {
+        for change in ["identify", "reset", "activity"] {
+            try await withTemporaryDirectory { root in
+                let transport = FacadeBatchTransport(held: true)
+                let h = try await makeHarness(root: root, batchTransport: transport)
+                let result = await h.runtime.capture("original")
+                guard case let .accepted(_, accepted) = result else {
+                    XCTFail("Original event must be accepted"); await transport.release(); await h.close(); return
+                }
+                if change == "identify" { _ = await h.runtime.identify("replacement") }
+                else if change == "reset" { _ = await h.runtime.resetIdentity() }
+                else { _ = await h.runtime.capture("later", occurredAt: baseDate.addingTimeInterval(1)) }
+                let before = try await h.runtime.queueSnapshot()
+                let mutation = await h.runtime.setPersonProperties(["wrongIdentity": .bool(true)], propertiesOnce: [:],
+                    afterAcceptedCapture: accepted, admissionGuard: { true })
+                XCTAssertNil(mutation, change)
+                let after = try await h.runtime.queueSnapshot()
+                XCTAssertEqual(after.flagContext.personProperties, before.flagContext.personProperties, change)
+                XCTAssertEqual(after.nextSequence, before.nextSequence, change)
+                await transport.release(); await h.close()
+            }
+        }
+    }
+
+    func testAssociatedMutationRevocationRollsBackAndCannotUseLocalFallback() async throws {
+        try await withTemporaryDirectory { root in
+            let fault = CapturePersonFault(), gate = CapturePersonGate()
+            let h = try await makeHarness(root: root, faultInjector: fault)
+            let result = await h.runtime.capture("accepted")
+            guard case let .accepted(_, accepted) = result else {
+                XCTFail("Expected accepted event"); await h.close(); return
+            }
+            fault.arm(.afterRecordInsert(0)) { gate.revoke() }
+            let mutation = await h.runtime.setPersonProperties(["mustNotPersist": .bool(true)], propertiesOnce: [:],
+                afterAcceptedCapture: accepted, admissionGuard: { gate.current() })
+            XCTAssertTrue(fault.fired)
+            XCTAssertNil(mutation)
+            let state = try await h.runtime.queueSnapshot()
+            XCTAssertNil(state.flagContext.personProperties["mustNotPersist"])
+            XCTAssertEqual(state.nextSequence, accepted.nextSequence, "The rolled-back mutation consumes no sequence")
+            await h.close()
+            let transport = FacadeBatchTransport(held: true)
+            let reopened = try await makeHarness(root: root, batchTransport: transport)
+            let restored = try await reopened.runtime.queueSnapshot()
+            XCTAssertNil(restored.flagContext.personProperties["mustNotPersist"])
+            XCTAssertEqual(restored.nextSequence, accepted.nextSequence)
+            await transport.release(); await reopened.close()
+        }
+    }
+
+    func testFinishingOriginalCaptureHandoffDoesNotWithdrawItsPersonAdmission() async throws {
+        try await withTemporaryDirectory { root in
+            let fault = CapturePersonFault(), completion = CapturePersonCompletion()
+            let transport = FacadeBatchTransport(held: true)
+            let h = try await makeHarness(root: root, batchTransport: transport, faultInjector: fault)
+            let op = EluBufferedOp.capture(event: "accepted", properties: nil, set: ["retained": true])
+            completion.store(h.backend.beginPendingOperation(op))
+            fault.arm(.afterRecordInsert(0)) { completion.finish() }
+            h.backend.execute(op)
+            await h.backend.settled()
+            XCTAssertTrue(fault.fired)
+            let state = try await h.runtime.queueSnapshot()
+            XCTAssertEqual(state.queuedCount, 2)
+            XCTAssertEqual(state.flagContext.personProperties["retained"], .bool(true))
+            completion.finish()
+            await transport.release(); await h.close()
+        }
+    }
+
+    func testNewIdentityIntentBetweenEventCommitAndMutationWithdrawsPersonAdmission() async throws {
+        try await withTemporaryDirectory { root in
+            let fault = CapturePersonFault(), completion = CapturePersonCompletion()
+            let transport = FacadeBatchTransport(held: true)
+            let h = try await makeHarness(root: root, batchTransport: transport, faultInjector: fault)
+            let backend = h.backend
+            fault.arm(.afterCommit) { completion.store(backend.beginPendingOperation(.reset)) }
+            h.backend.execute(.capture(event: "accepted", properties: nil, set: ["mustNotPersist": true]))
+            await h.backend.settled()
+            XCTAssertTrue(fault.fired)
+            let state = try await h.runtime.queueSnapshot()
+            XCTAssertEqual(state.queuedCount, 1, "Accepted original event remains; no associated mutation")
+            XCTAssertNil(state.flagContext.personProperties["mustNotPersist"])
+            XCTAssertNil(h.backend.featureFlagPublication())
+            completion.finish()
+            await transport.release(); await h.close()
+        }
+    }
+
+    func testAmbiguousEventCommitDoesNotInventAssociatedMutationAfterReopen() async throws {
+        try await withTemporaryDirectory { root in
+            let fault = CapturePersonFault()
+            let h = try await makeHarness(root: root, faultInjector: fault)
+            fault.arm(.afterCommit) { throw EluRuntimeQueueError.faultInjected(.afterCommit) }
+            h.backend.execute(.capture(event: "committed-before-loss", properties: nil, set: ["notCommitted": true]))
+            await h.backend.settled()
+            XCTAssertTrue(fault.fired)
+            await h.close()
+            let transport = FacadeBatchTransport(held: true)
+            let reopened = try await makeHarness(root: root, batchTransport: transport)
+            do {
+                let state = try await reopened.runtime.queueSnapshot()
+                XCTAssertEqual(state.queuedCount, 1, "The actual committed event survives the ambiguous result")
+                XCTAssertNil(state.flagContext.personProperties["notCommitted"])
+                try await drainCaptureRecords(reopened)
+                let records = try await transport.recordedRecords()
+                XCTAssertEqual(records.compactMap { $0["kind"] as? String }, ["event"])
+                XCTAssertEqual((records.first?["event"] as? [String: Any])?["name"] as? String, "committed-before-loss")
+                await reopened.close()
+            } catch { await transport.release(); await reopened.close(); throw error }
+        }
+    }
+
+    func testFutureEventTimeDoesNotRewritePersonMutationWallClock() async throws {
+        try await withTemporaryDirectory { root in
+            let transport = FacadeBatchTransport(held: true)
+            let h = try await makeHarness(root: root, batchTransport: transport)
+            h.backend.execute(.capture(event: "future", properties: nil, timestamp: baseDate.addingTimeInterval(2),
+                set: ["notBackdated": true]))
+            await h.backend.settled()
+            let state = try await h.runtime.queueSnapshot()
+            XCTAssertEqual(state.queuedCount, 1)
+            XCTAssertEqual(state.identity.updatedAt, baseDate.addingTimeInterval(2))
+            XCTAssertNil(state.flagContext.personProperties["notBackdated"])
+            await transport.release(); await h.close()
+        }
+    }
+
+    private func drainCaptureRecords(_ h: Harness) async throws {
+        await h.transport.release()
+        _ = await h.runtime.flush()
+        let deadline = DispatchTime.now().uptimeNanoseconds + 5_000_000_000
+        while try await h.runtime.queueSnapshot().queuedCount != 0 && DispatchTime.now().uptimeNanoseconds < deadline {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        let final = try await h.runtime.queueSnapshot()
+        XCTAssertEqual(final.queuedCount, 0, "Original ACK must retire the queued prefix")
+    }
+
     private struct Harness {
         let runtime: EluStandaloneRuntime
         let backend: EluStandaloneFacadeRuntime
@@ -985,7 +1238,9 @@ final class EluStandaloneFacadeRuntimeTests: XCTestCase {
         initialConsent: EluConsentOperation? = nil,
         personProfiles: EluPersonProfilesMode = .identifiedOnly,
         snapshotObserver: @escaping @Sendable (EluFeatureFlagPublication) -> Void = { _ in },
-        batchTransport: FacadeBatchTransport? = nil
+        batchTransport: FacadeBatchTransport? = nil,
+        rateLimiting: EluRateLimitingOptions = .init(),
+        faultInjector: (any EluRuntimeQueueFaultInjecting)? = nil
     ) async throws -> Harness {
         let transport = batchTransport ?? FacadeBatchTransport()
         let clock = FacadeClock(wall: baseDate)
@@ -1011,7 +1266,7 @@ final class EluStandaloneFacadeRuntimeTests: XCTestCase {
             anonymousIdGenerator: { "anon_facade_\(identifiers.next())" },
             streamIdGenerator: { "stream_facade" },
             sessionIdGenerator: { "session_facade_\(identifiers.next())" },
-            personProfiles: personProfiles
+            personProfiles: personProfiles, rateLimiting: rateLimiting, faultInjector: faultInjector
         )
         let announcements = FacadeCounter()
         let context = EluRuntimeBackendContext(
@@ -1262,4 +1517,34 @@ private actor SnapshotHeldFailureTransport: EluV1FlagTransport {
         throw URLError(.notConnectedToInternet)
     }
     func release() { released = true; let value = held; held = nil; value?.resume() }
+}
+
+/// Existing queue fault points exercise real rollback/ambiguous-commit paths.
+private final class CapturePersonFault: EluRuntimeQueueFaultInjecting, @unchecked Sendable {
+    private let lock = NSLock()
+    private var action: (EluRuntimeQueueFaultPoint, @Sendable () throws -> Void)?
+    private var didFire = false
+    var fired: Bool { lock.lock(); defer { lock.unlock() }; return didFire }
+    func arm(_ point: EluRuntimeQueueFaultPoint, action: @escaping @Sendable () throws -> Void) {
+        lock.lock(); defer { lock.unlock() }; self.action = (point, action); didFire = false
+    }
+    func hit(_ point: EluRuntimeQueueFaultPoint) throws {
+        lock.lock()
+        let selected = action?.0 == point ? action?.1 : nil
+        if selected != nil { action = nil; didFire = true }
+        lock.unlock()
+        try selected?()
+    }
+}
+private final class CapturePersonGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var allowed = true
+    func current() -> Bool { lock.lock(); defer { lock.unlock() }; return allowed }
+    func revoke() { lock.lock(); allowed = false; lock.unlock() }
+}
+private final class CapturePersonCompletion: @unchecked Sendable {
+    private let lock = NSLock()
+    private var pending: (() -> Void)?
+    func store(_ value: (() -> Void)?) { lock.lock(); pending = value; lock.unlock() }
+    func finish() { lock.lock(); let value = pending; pending = nil; lock.unlock(); value?() }
 }

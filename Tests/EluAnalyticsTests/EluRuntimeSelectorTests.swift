@@ -628,7 +628,7 @@ final class SelectorBackend: EluRuntimeBackend, @unchecked Sendable {
 
     func execute(_ op: EluBufferedOp) {
         switch op {
-        case let .capture(event, _, _): record("capture(\(event))")
+        case let .capture(event, _, _, _, _): record("capture(\(event))")
         case let .screen(name, _): record("screen(\(name))")
         case .captureException: record("captureException")
         case let .identify(distinctId, _, _): record("identify(\(distinctId))")

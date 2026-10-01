@@ -171,6 +171,19 @@ session activity; invalid or older times discard the entire event. Events keep
 call order, so backdating an event after newer activity does not reorder it.
 The overload without `timestamp` uses the runtime clock when it processes the call.
 
+To update a person after an accepted event, use
+`Elu.capture("Checkout completed", properties: ["amount": 42], options:
+EluCaptureOptions(set: ["plan": "pro"], setOnce: ["firstChannel": "ios"], timestamp: completedAt))`.
+`set` replaces existing person values; `setOnce` fills missing values. These maps
+are separate from event properties. Rejected events do not apply them, and
+`personProfiles: .never` ignores them while retaining otherwise eligible events.
+The same ordered call admits the event first, then applies the person change
+under the original identity and current consent. It does not reload feature flags.
+These are separate durable writes: a crash, storage failure, or superseding
+identity/privacy intent can leave the event without its person change. Person
+changes use the runtime wall clock, not the event timestamp; a future event time
+can make the following person change inadmissible. No automatic backfill occurs.
+
 Pass `EluFeatureFlagOptions` to control one read:
 
 ```swift

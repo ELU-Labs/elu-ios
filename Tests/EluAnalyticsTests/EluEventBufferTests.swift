@@ -37,7 +37,7 @@ final class EluEventBufferTests: XCTestCase {
         var buffer = EluEventBuffer()
         buffer.push(.capture(event: "delayed", properties: ["amount": 42], timestamp: timestamp))
         guard let operation = buffer.drain().first,
-              case let .capture(event, properties, observed) = operation else {
+              case let .capture(event, properties, observed, _, _) = operation else {
             return XCTFail("Expected the pending capture")
         }
         XCTAssertEqual(event, "delayed")
@@ -47,10 +47,29 @@ final class EluEventBufferTests: XCTestCase {
         _ = publicCapture
     }
 
+    func testCaptureOptionsStaySeparateAndPreservePendingFlagIntent() {
+        let time = Date(timeIntervalSince1970: 123)
+        let options = EluCaptureOptions(set: ["tier": "paid"], setOnce: ["source": "ios"], timestamp: time)
+        let publicCapture: (String, [String: Any]?, EluCaptureOptions) -> Void = Elu.capture(_:properties:options:)
+        _ = publicCapture
+        var buffer = EluEventBuffer()
+        buffer.push(.capture(event: "checkout", properties: ["amount": 42], timestamp: options.timestamp,
+            set: options.set, setOnce: options.setOnce))
+        let op = buffer.drain()[0]
+        guard case let .capture(event, properties, timestamp, set, setOnce) = op else { return XCTFail() }
+        XCTAssertEqual(event, "checkout"); XCTAssertEqual(timestamp, time)
+        XCTAssertEqual(properties?["amount"] as? Int, 42)
+        XCTAssertNil(properties?["tier"])
+        XCTAssertEqual(set?["tier"] as? String, "paid")
+        XCTAssertEqual(setOnce?["source"] as? String, "ios")
+        XCTAssertTrue(op.changesFlagContext)
+        XCTAssertFalse(EluBufferedOp.capture(event: "ordinary", properties: nil).changesFlagContext)
+    }
+
     private func labels(_ operations: [EluBufferedOp]) -> [String] {
         operations.map { operation in
             switch operation {
-            case let .capture(event, _, _): "capture:\(event)"
+            case let .capture(event, _, _, _, _): "capture:\(event)"
             case .reset: "reset"
             case .resetDeviceIdentity: "resetDeviceIdentity"
             case .resetGroups: "resetGroups"

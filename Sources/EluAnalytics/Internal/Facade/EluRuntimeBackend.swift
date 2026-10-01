@@ -184,7 +184,8 @@ extension EluRuntimeBackend {
 extension EluBufferedOp {
     var changesFlagContext: Bool {
         switch self {
-        case .capture, .screen, .captureException: return false
+        case let .capture(_, _, _, set, setOnce): return set != nil || setOnce != nil
+        case .screen, .captureException: return false
         default: return true
         }
     }
