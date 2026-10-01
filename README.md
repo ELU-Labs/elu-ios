@@ -28,10 +28,9 @@ dependencies: [
 ]
 ```
 
-Then add `EluAnalytics` to your target's dependencies. Version 0.2.0 is an
-unreleased candidate; install it only after its reviewed release and matching
-tag are available at the link above. Use unpublished source as a local Swift
-package for development.
+Then add `EluAnalytics` to your target's dependencies. Install a version only
+after its reviewed release and matching tag are available at the link above.
+Use unpublished source as a local Swift package for development.
 
 ## Setup
 
