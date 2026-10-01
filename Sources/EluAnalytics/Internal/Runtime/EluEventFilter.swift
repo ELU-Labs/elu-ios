@@ -3,7 +3,7 @@ import Foundation
 struct EluEventPersonChanges: Equatable, Sendable {
     let set: [String: EluJSONValue]?
     let setOnce: [String: EluJSONValue]?
-    var hasIntent: Bool { set != nil || setOnce != nil }
+    var hasIntent: Bool { self.set != nil || setOnce != nil }
 }
 
 enum EluEventFilterFailure: Error, Equatable, Sendable {
