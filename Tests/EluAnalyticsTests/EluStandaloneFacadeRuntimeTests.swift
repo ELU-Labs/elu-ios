@@ -969,7 +969,7 @@ final class EluStandaloneFacadeRuntimeTests: XCTestCase {
             let transport = FacadeBatchTransport(held: true)
             let h = try await makeHarness(root: root, flagTransport: flags, batchTransport: transport)
             do {
-                h.backend.reloadFeatureFlags(); await h.backend.settled()
+                h.backend.reloadFeatureFlags(nil); await h.backend.settled()
                 let reloads = await flags.callCount()
                 h.backend.execute(.capture(event: "first", properties: ["amount": 42], timestamp: baseDate,
                     set: ["tier": "paid"], setOnce: ["source": "ios"]))
