@@ -4,14 +4,18 @@ Implementation evidence is separate from published release status. Consult the
 [reviewed releases](https://github.com/ELU-Labs/elu-ios/releases) for customer
 artifacts, and the [README](../README.md) for the current public API and limits.
 
-The current publication target is `0.2.0-beta.1`, a nonproduction evaluation
-prerelease for test apps and synthetic data only. Production customer activation
-remains disabled, and stable `0.2.0` remains unreleased. The beta requires its own
-exact-source hosted CI and reviewed, signed tag; historical results below do not
-establish those checks. Its installed SDK, public-origin network, replay/privacy,
-performance, engine/player and Lab qualification is deferred only under the
-[evaluation beta exception](../release/README.md). See the
-[README](../README.md#evaluation-beta-020-beta1) for installation and limitations.
+The current source is the unreleased `0.2.0` production candidate. Production
+customer activation remains disabled. Its exact source and artifact still require
+hosted CI, installed SDK and upgrade checks, public-origin network, replay/privacy,
+performance, engine/player and Lab qualification, and the
+[full release qualification](../release/README.md#full-release-qualification).
+Historical results below do not establish those checks for this candidate.
+
+The [published `0.2.0-beta.1`](https://github.com/ELU-Labs/elu-ios/releases/tag/0.2.0-beta.1)
+remains available for nonproduction test apps and synthetic data only. Its
+[evaluation exception](../release/README.md#evaluation-exception-020-beta1-only)
+does not apply to `0.2.0`; no beta result is relabelled as stable qualification.
+See the [README](../README.md#production-candidate-020-unreleased) for current status.
 
 The current source includes durable analytics and consent, independent device
 identity and person-profile modes, prefixed HTTPS self-hosting, durable flag
