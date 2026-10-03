@@ -6,7 +6,7 @@ ELU dashboard and delivered as remote config. Optional native integrations,
 including annotated SwiftUI replay, require the explicit setup below.
 
 This package uses the ELU-owned analytics runtime and has no external Swift
-package dependencies. Customer installation and support apply to the exact
+package dependencies. Production installation and support apply to the exact
 version and artifacts listed in a reviewed [GitHub release](https://github.com/ELU-Labs/elu-ios/releases)
 after its required release checks have passed. A source checkout alone does not
 establish release qualification. Application code uses `Elu.*` with an ELU site key.
@@ -15,7 +15,22 @@ establish release qualification. Application code uses `Elu.*` with an ELU site 
 - Events, identity, feature flags, screen tracking, and lifecycle events
 - Remote configuration controls whether analytics may run
 - Bounded UIKit replay, gated by current server qualification, configuration,
-  and on-device privacy, with package and service qualification required for release
+  and on-device privacy, with package and service qualification required for production release
+
+## Evaluation beta: 0.2.0-beta.1
+
+This prerelease is for nonproduction evaluation in test apps using synthetic data
+only. Do not use it with real customer data or live production traffic. Production
+customer activation remains disabled; installing the beta does not enable capture
+or bypass configuration, consent, or privacy controls. Collection requires an
+eligible evaluation configuration supplied by ELU.
+
+Installed SDK behavior, public-origin network traffic, replay and privacy,
+performance, engine readback, and customer-player playback remain unqualified.
+Their required Lab checks are deferred only for this evaluation beta and remain
+mandatory before a production release. Passing hosted CI alone does not establish
+these results. Install the beta only after its exact source passes the required
+hosted checks and its reviewed, signed tag and GitHub prerelease are available.
 
 ## Install (Swift Package Manager)
 
@@ -24,12 +39,13 @@ add to your `Package.swift`:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/ELU-Labs/elu-ios.git", exact: "0.2.0"),
+    .package(url: "https://github.com/ELU-Labs/elu-ios.git", exact: "0.2.0-beta.1"),
 ]
 ```
 
-Then add `EluAnalytics` to your target's dependencies. Install a version only
-after its reviewed release and matching tag are available at the link above.
+Then add `EluAnalytics` to your test app's target dependencies. This exact version
+selects the evaluation beta; it is not a production SDK release. Install only
+after its reviewed prerelease and matching signed tag are available at the link above.
 Use unpublished source as a local Swift package for development.
 
 ## Setup
@@ -114,7 +130,7 @@ Every new event, including native numeric telemetry, carries SDK-owned
 properties cannot override them, and `$epp` is never sent as an event property.
 
 The owned runtime uses separate storage. The unused 0.1.0 release is not a
-supported persisted-data import source: version 0.2.0 starts a fresh owned
+supported persisted-data import source: version 0.2.0-beta.1 starts a fresh owned
 installation and leaves its old files untouched. Unpublished preview databases
 with import receipts are refused without deleting their database, WAL, or SHM
 files. Existing supported owned-store schemas retain identity, consent, queued
@@ -480,9 +496,9 @@ Elu.blockView(paymentContainer) // Excludes content and descendants.
 
 Restrictions last for the view's lifetime and cannot weaken remote policy.
 Unknown native blocking rules disable replay. Exact-artifact local simulator,
-engine, player and privacy qualification remain required before release.
+engine, player and privacy qualification remain required before production release.
 
-### Annotated SwiftUI replay (unreleased candidate)
+### Annotated SwiftUI replay (evaluation only)
 
 The candidate can capture the original displayed SwiftUI root, including its
 current state and scroll position, using explicit privacy declarations. It is
@@ -544,9 +560,9 @@ or prefixes are not supported. Leaving the option false preserves v2 setup.
 Capture uses one eligible original window/root, at most one frame per second,
 with bounded image dimensions and request size. It adds no SwiftUI interaction
 markers or automatic screen tracking; continue explicit `Elu.screen` calls.
-The API remains an unreleased candidate pending exact package, engine, privacy
+The API is available only for evaluation pending exact package, engine, privacy
 and customer-player qualification. The compiled consumer example and isolated
-rendering checks are not release approval.
+rendering checks are not production release approval.
 
 ### Local replay controls
 
@@ -618,7 +634,7 @@ cannot enable v2, consent, recording or a public capability override. The
 v2 path requires the exact locally supported tuple and original
 configuration, then a known durable initial-frame commit satisfying the minimum
 duration before observing coordinates. This source integration and authored tests
-are not a released or end-to-end-qualified interaction feature.
+do not establish a production-ready or end-to-end-qualified interaction feature.
 
 The bounded primary direct-finger stream records start, at most ten movement
 samples per second, and end/cancel; it does not infer clicks, recognize gestures,
