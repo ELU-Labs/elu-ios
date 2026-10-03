@@ -158,8 +158,8 @@ rejects all restrictive writes. Reset never erases this consent record.
 
 ## Replay and privacy
 
-Replay uses bounded UIKit wireframes, not screenshots. The binary supports
-`elu-native-wireframe-v1` with gzip and `protocol-generation-v1`; current server
+The default automatic replay mode uses bounded UIKit wireframes. The binary
+supports `elu-native-wireframe-v1` with gzip and `protocol-generation-v1`; current server
 qualification and configuration must authorize that exact support. Sampling,
 session budgets, lifecycle, identity, consent, and local privacy still apply.
 When optional configuration-v2 `replayAudience` is `"new-devices"`, replay is
@@ -202,7 +202,16 @@ Truncated text, unsupported attributed
 content, attachments, links, transparent text, and custom subclasses remain
 masked or opaque. All input values, including `UITextField` and `UITextView`,
 stay hidden. Images, web views, custom drawing, and SwiftUI content use
-content-free placeholders. SwiftUI replay is not supported.
+content-free placeholders in this automatic wireframe mode.
+
+The separate [annotated SwiftUI replay](README.md#annotated-swiftui-replay-evaluation-only)
+path is an explicit evaluation-only opt-in. It requires
+`declaredRegionReplayEnabled = true`, a retained `EluSwiftUIReplayScope`, and the
+linked setup and privacy declarations for every input and private region. It
+does not discover inputs or `.privacySensitive()` automatically; unannotated
+content may be visible. Compatible server authorization and all existing consent,
+privacy and runtime gates still apply. Exact package, engine, privacy and
+customer-player qualification remain required before production use.
 
 Apply `Elu.maskView` or `Elu.blockView` on the main thread before presenting
 private UIKit content. Masking hides subtree text; blocking excludes content
