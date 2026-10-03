@@ -17,36 +17,45 @@ establish release qualification. Application code uses `Elu.*` with an ELU site 
 - Bounded UIKit replay, gated by current server qualification, configuration,
   and on-device privacy, with package and service qualification required for production release
 
-## Evaluation beta: 0.2.0-beta.1
+## Production candidate: 0.2.0 (unreleased)
 
-This prerelease is for nonproduction evaluation in test apps using synthetic data
-only. Do not use it with real customer data or live production traffic. Production
-customer activation remains disabled; installing the beta does not enable capture
-or bypass configuration, consent, or privacy controls. Collection requires an
-eligible evaluation configuration supplied by ELU.
+This source reports `0.2.0` for exact-artifact qualification. It is not a published
+or production-qualified release. Production customer activation remains disabled.
 
 Installed SDK behavior, public-origin network traffic, replay and privacy,
 performance, engine readback, and customer-player playback remain unqualified.
-Their required Lab checks are deferred only for this evaluation beta and remain
-mandatory before a production release. Passing hosted CI alone does not establish
-these results. Install the beta only after its exact source passes the required
-hosted checks and its reviewed, signed tag and GitHub prerelease are available.
+The exact candidate must pass required hosted CI, installed Lab and upgrade
+checks, and the [full release qualification](release/README.md#full-release-qualification)
+before production publication and activation. Passing source, mock, or hosted CI
+checks alone does not establish runtime qualification. The evaluation beta's
+exception does not apply to this candidate.
+
+## Evaluation beta: 0.2.0-beta.1
+
+The [published evaluation beta](https://github.com/ELU-Labs/elu-ios/releases/tag/0.2.0-beta.1)
+remains available for nonproduction test apps using synthetic data only. Its
+[version-specific installation instructions](https://github.com/ELU-Labs/elu-ios/blob/0.2.0-beta.1/README.md#install-swift-package-manager)
+select that beta exactly. Do not use it with real customer data or live production
+traffic. Its deferred runtime checks apply only to the beta and do not qualify
+`0.2.0`. Collection still requires an eligible evaluation configuration supplied
+by ELU; installing the beta does not bypass configuration, consent or privacy.
 
 ## Install (Swift Package Manager)
 
-In Xcode: **File → Add Package Dependencies…** and enter the package URL, or
-add to your `Package.swift`:
+`0.2.0` is not available as a release yet. Qualification must use the exact
+reviewed candidate source and artifact. After its required checks pass and its
+reviewed, signed tag and GitHub release are published, use **File → Add Package
+Dependencies…** in Xcode or add to your `Package.swift`:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/ELU-Labs/elu-ios.git", exact: "0.2.0-beta.1"),
+    .package(url: "https://github.com/ELU-Labs/elu-ios.git", exact: "0.2.0"),
 ]
 ```
 
-Then add `EluAnalytics` to your test app's target dependencies. This exact version
-selects the evaluation beta; it is not a production SDK release. Install only
-after its reviewed prerelease and matching signed tag are available at the link above.
-Use unpublished source as a local Swift package for development.
+Then add `EluAnalytics` to your app's target dependencies. These production
+installation instructions apply only after that exact release is available.
+Use unpublished source as a local Swift package for development and qualification.
 
 ## Setup
 
@@ -130,7 +139,7 @@ Every new event, including native numeric telemetry, carries SDK-owned
 properties cannot override them, and `$epp` is never sent as an event property.
 
 The owned runtime uses separate storage. The unused 0.1.0 release is not a
-supported persisted-data import source: version 0.2.0-beta.1 starts a fresh owned
+supported persisted-data import source: version 0.2.0 starts a fresh owned
 installation and leaves its old files untouched. Unpublished preview databases
 with import receipts are refused without deleting their database, WAL, or SHM
 files. Existing supported owned-store schemas retain identity, consent, queued
