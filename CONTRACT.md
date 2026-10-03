@@ -1,9 +1,23 @@
 # EluAnalytics for iOS — runtime contract
 
 This describes the ELU-owned iOS runtime and public `Elu.*` API. See the
-[README](README.md) for installation and code examples. Customer support applies
+[README](README.md) for installation and code examples. Production support applies
 to the exact artifacts in a reviewed release after its required checks pass;
 source implementation alone does not establish package or service qualification.
+
+Version `0.2.0-beta.1` is a nonproduction evaluation prerelease for test apps and
+synthetic data only. Production customer activation remains disabled. The beta
+does not authorize capture; an eligible evaluation configuration and the existing
+consent, privacy, and runtime authority checks still apply. Install only after the
+exact beta source passes required hosted CI and its reviewed, signed tag and
+GitHub prerelease are available, using the exact Swift Package version in the
+README.
+
+Installed SDK behavior, public-origin network traffic, replay and privacy,
+performance, engine readback, and customer-player playback remain unqualified.
+The corresponding installed and Lab checks are deferred only for this beta;
+they remain required for production release and customer activation. Source,
+contract, mock, and hosted CI checks do not establish those runtime results.
 
 ## Setup and configuration
 
@@ -308,14 +322,14 @@ execution and actual OS report delivery remain separate validation gates.
 ## Storage upgrades and release evidence
 
 Supported owned-store schemas preserve identity, consent, queued records, and
-ordinary schema upgrades. Version 0.2.0 does not import persisted data from the
+ordinary schema upgrades. Version 0.2.0-beta.1 does not import persisted data from the
 unused 0.1.0 runtime and leaves its files untouched. Unsupported transition or
 unknown schemas fail closed without destructive recovery. Reset does not grant
 permission to erase an unsupported store. Exact supported schema and owned-file
 import boundaries are documented in [storage compatibility](docs/storage-compatibility.md).
 
 The bundled privacy manifest describes the SDK's data categories and API use;
-review the complete app's disclosures as explained in the README. Release
+review the complete app's disclosures as explained in the README. Production release
 qualification separately requires exact distribution checks, supported upgrades,
 device testing, Lab engine readback and customer-player rendering, privacy and
 resource measurements. Compilation or stored replay bytes alone are not those

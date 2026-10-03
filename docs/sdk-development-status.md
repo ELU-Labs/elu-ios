@@ -4,6 +4,15 @@ Implementation evidence is separate from published release status. Consult the
 [reviewed releases](https://github.com/ELU-Labs/elu-ios/releases) for customer
 artifacts, and the [README](../README.md) for the current public API and limits.
 
+The current publication target is `0.2.0-beta.1`, a nonproduction evaluation
+prerelease for test apps and synthetic data only. Production customer activation
+remains disabled, and stable `0.2.0` remains unreleased. The beta requires its own
+exact-source hosted CI and reviewed, signed tag; historical results below do not
+establish those checks. Its installed SDK, public-origin network, replay/privacy,
+performance, engine/player and Lab qualification is deferred only under the
+[evaluation beta exception](../release/README.md). See the
+[README](../README.md#evaluation-beta-020-beta1) for installation and limitations.
+
 The current source includes durable analytics and consent, independent device
 identity and person-profile modes, prefixed HTTPS self-hosting, durable flag
 exposures, memory-only analytics persistence with separate explicit consent, and
@@ -73,7 +82,7 @@ success is inferred from that historical run or API-ledger additions.
 
 Exact distribution installation, owned upgrades, real Lab engine readback,
 customer-player rendering, privacy/fault cohorts and bounded resource checks
-remain release gates. Final qualification on a local simulator using the exact
+remain production release gates. Final qualification on a local simulator using the exact
 artifacts is still pending; hosted CI does not replace it. Physical-device
 behavior, performance and OS diagnostic availability remain unverified. A source
 or consumer compile is not final artifact or end-to-end qualification. Keep
