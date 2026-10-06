@@ -42,6 +42,38 @@ final class EluNativeV3ConfigParserTests: XCTestCase {
                           EluV1StrictCanonicalJSON.hash(try encode(envelope())))
     }
 
+    func testExplicitIosOnlyRasterRetainsOriginalEnvelopeAndInheritedPolicy() throws {
+        let legacy = try parse(envelope())
+        var value = try envelope()
+        set(&value, ["raster", "platforms"], ["ios"])
+        let bytes = try encode(value)
+        let result = try EluNativeV3ConfigParser.parse(bytes)
+        XCTAssertNotNil(result.raster)
+        XCTAssertEqual(result.data, bytes)
+        XCTAssertEqual(result.baseCanonicalData, legacy.baseCanonicalData)
+        XCTAssertEqual(result.baseSemanticHash, legacy.baseSemanticHash)
+        XCTAssertEqual(result.raster?.effectivePolicyHash, expectedHash)
+        XCTAssertEqual(result.raster?.maximumRequestBytes, legacy.raster?.maximumRequestBytes)
+        XCTAssertNotEqual(result.semanticHash, legacy.semanticHash)
+        set(&value, ["raster", "privacy", "effectivePolicyHash"], "sha256:" + String(repeating: "0", count: 64))
+        XCTAssertThrowsError(try parse(value))
+    }
+
+    func testRasterPlatformSelectionRequiresCanonicalIosMembership() throws {
+        let invalid: [Any] = [
+            [String](), ["android"], ["ios", "android"], ["ios", "ios"],
+            ["android", "android", "ios"], ["browser", "ios"], ["IOS"],
+            "ios", NSNull(), [1], [["ios"]],
+        ]
+        for platforms in invalid {
+            var value = try envelope()
+            set(&value, ["raster", "platforms"], platforms)
+            XCTAssertThrowsError(try parse(value), String(describing: platforms)) { error in
+                XCTAssertEqual(error as? EluNativeV3ConfigParser.Failure, .mismatchedRaster)
+            }
+        }
+    }
+
     func testOriginalParserStillRejectsOuterV3AndAcceptsExtractedV2() throws {
         let bytes = try encode(envelope())
         XCTAssertThrowsError(try EluV1ConfigManager.prepareConfig(bytes, endpointPolicy: .cloud))
