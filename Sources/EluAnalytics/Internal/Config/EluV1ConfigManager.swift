@@ -261,6 +261,11 @@ final class EluV1ConfigManager: @unchecked Sendable {
             case session
             case limits
             case reason
+            // Optional members the main config contract validates. Flags only
+            // need to tolerate them; rejecting one disables flags for the revision.
+            case capturePerformance
+            case captureExceptions
+            case replayAudience
         }
 
         init(from decoder: Decoder) throws {

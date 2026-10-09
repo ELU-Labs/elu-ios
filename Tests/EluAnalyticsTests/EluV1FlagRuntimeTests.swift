@@ -1210,6 +1210,25 @@ final class EluV1FlagRuntimeTests: XCTestCase {
         }
     }
 
+    func testOptionalConfigMembersDoNotRestrictFlags() throws {
+        // Served configs carry capturePerformance on some revisions; the flag
+        // projection must accept every member the main contract accepts.
+        var value = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: fixture("config-enabled.json")) as? [String: Any]
+        )
+        value["capturePerformance"] = ["memory": true, "long_tasks": true, "sample_interval_ms": 30000]
+        value["replayAudience"] = "new-devices"
+        let data = try JSONSerialization.data(withJSONObject: value, options: [.sortedKeys])
+        let manager = try EluV1ConfigManager(exactConstructorSiteKey: siteKey)
+        let candidate = try manager.prepareFlagConfig(configData: data, now: initialWall)
+        XCTAssertNil(candidate.restriction)
+        XCTAssertNotNil(candidate.siteId)
+        XCTAssertNotNil(candidate.endpoint)
+        guard case .allowed = manager.commitFlagConfig(candidate, barrierGeneration: 1) else {
+            return XCTFail("optional config members must not restrict flags")
+        }
+    }
+
     func testOwnerLocalActivationGenerationExhaustionNeverReusesSaturatedAuthority() throws {
         let manager = try EluV1ConfigManager(
             exactConstructorSiteKey: siteKey,
