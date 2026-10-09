@@ -7,6 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		AA9F89F526539977CA1872DF /* EluEventContextTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = ADC851961B0DDB5758AE4776 /* EluEventContextTests.swift */; };
 		09542CD3BA2B0414E6441DF2 /* EluEventFilterTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 91EB52FDCF618FF879943968 /* EluEventFilterTests.swift */; };
 		5ED9B6C29AB373976FC8BE45 /* EluEventFilterQueueTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = CC4A6D8B6BB2DC28F70F26D6 /* EluEventFilterQueueTests.swift */; };
 		722D3E41A9B1747E46641F89 /* EluNativeRasterCompositionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 11524264DB71986AB9D8C26A /* EluNativeRasterCompositionTests.swift */; };
@@ -108,6 +109,7 @@
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
+		ADC851961B0DDB5758AE4776 /* EluEventContextTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluEventContextTests.swift; sourceTree = "<group>"; };
 		91EB52FDCF618FF879943968 /* EluEventFilterTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluEventFilterTests.swift; sourceTree = "<group>"; };
 		CC4A6D8B6BB2DC28F70F26D6 /* EluEventFilterQueueTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluEventFilterQueueTests.swift; sourceTree = "<group>"; };
 		11524264DB71986AB9D8C26A /* EluNativeRasterCompositionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluNativeRasterCompositionTests.swift; sourceTree = "<group>"; };
@@ -240,6 +242,7 @@
 		A0928195822C53907FA0C692 /* EluAnalyticsTests */ = {
 			isa = PBXGroup;
 			children = (
+				ADC851961B0DDB5758AE4776 /* EluEventContextTests.swift */,
 				91EB52FDCF618FF879943968 /* EluEventFilterTests.swift */,
 				CC4A6D8B6BB2DC28F70F26D6 /* EluEventFilterQueueTests.swift */,
 				11524264DB71986AB9D8C26A /* EluNativeRasterCompositionTests.swift */,
@@ -428,6 +431,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				AA9F89F526539977CA1872DF /* EluEventContextTests.swift in Sources */,
 				09542CD3BA2B0414E6441DF2 /* EluEventFilterTests.swift in Sources */,
 				5ED9B6C29AB373976FC8BE45 /* EluEventFilterQueueTests.swift in Sources */,
 				722D3E41A9B1747E46641F89 /* EluNativeRasterCompositionTests.swift in Sources */,

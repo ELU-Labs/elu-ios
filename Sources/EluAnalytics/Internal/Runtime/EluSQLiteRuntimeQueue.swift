@@ -3839,6 +3839,8 @@ actor EluSQLiteRuntimeQueue {
     private var rateLimiter: EluCaptureRateLimiter?
     private let rateLimitOwner = UUID()
     private let eventFilter: EluEventFilter
+    /// SDK-owned library/OS/device/app properties under every new event.
+    private let eventContext: [String: EluJSONValue]
 
     static func open(
         directoryURL: URL,
@@ -3897,6 +3899,7 @@ actor EluSQLiteRuntimeQueue {
         persistence: EluPersistenceMode = .persistent,
         rateLimiting: EluRateLimitingOptions? = nil,
         eventFilter: EluEventFilter = .init(),
+        eventContext: [String: EluJSONValue] = [:],
         limits: EluRuntimeQueueLimits,
         clock: @escaping @Sendable () -> Date = { Date() },
         continuousClock: @escaping @Sendable () -> UInt64 = EluMachContinuousClock.now,
@@ -3962,7 +3965,8 @@ actor EluSQLiteRuntimeQueue {
             nativeContinuousNanoseconds: nativeContinuousNanoseconds,
             flagStoreEpochGenerator: flagStoreEpochGenerator,
             configurationGate: configurationGate,
-            eventFilter: eventFilter
+            eventFilter: eventFilter,
+            eventContext: eventContext
         )
         try await queue.reconcileStoredConsent()
         if let rateLimiting {
@@ -4069,10 +4073,12 @@ actor EluSQLiteRuntimeQueue {
             "flag_store_\(EluRuntimeIdentifier.compactUUID())"
         },
         configurationGate: EluV2ConfigAuthorityGate? = nil,
-        eventFilter: EluEventFilter = .init()
+        eventFilter: EluEventFilter = .init(),
+        eventContext: [String: EluJSONValue] = [:]
     ) {
         self.configurationGate = configurationGate
         self.eventFilter = eventFilter
+        self.eventContext = eventContext
         self.resources = resources
         self.state = state
         self.limits = limits
@@ -8226,7 +8232,10 @@ actor EluSQLiteRuntimeQueue {
                 scope.unchangedRestriction(token) && (gate?.isCurrent(sourceWitness) ?? true) && (admissionGuard?() ?? true)
             }
             filterCurrent = current
-            var merged = diagnosticSummary == nil && crashReport == nil ? state.identity.superProperties : [:]
+            var merged = eventContext
+            if diagnosticSummary == nil && crashReport == nil {
+                for (key, value) in state.identity.superProperties { merged[key] = value }
+            }
             for (key, value) in command.properties { merged[key] = value }
             let attempt = filterAttempt ?? EluEventFilterAttempt()
             do {
@@ -9561,7 +9570,10 @@ actor EluSQLiteRuntimeQueue {
         includeContext: Bool = true,
         mergedProperties: [String: EluJSONValue]? = nil
     ) throws -> (identity: EluIdentityState, draft: EluEventDraft) {
-        var properties = mergedProperties ?? (includeContext ? state.identity.superProperties : [:])
+        var properties = mergedProperties ?? eventContext
+        if mergedProperties == nil, includeContext {
+            for (key, value) in state.identity.superProperties { properties[key] = value }
+        }
         if mergedProperties == nil { for (key, value) in command.properties { properties[key] = value } }
         properties["$elu_contract_version"] = .string(command.versions.contractVersion)
         properties["$elu_sdk_version"] = .string(command.versions.runtime.version)
