@@ -110,13 +110,23 @@ enum EluNativeV3ConfigParser {
         ])
         let hash = EluV1StrictCanonicalJSON.hash(Data(policyDomain.utf8)
             + (try EluV1StrictCanonicalJSON.canonicalData(for: material)))
+        guard case let .object(rasterMembers) = candidate,
+              let platforms = rasterMembers.first(where: { $0.name == Array("platforms".utf16) })?.value else {
+            throw Failure.mismatchedRaster
+        }
+        let platformBytes = try EluV1StrictCanonicalJSON.canonicalData(for: platforms)
+        // The original issuer may qualify iOS independently. Only its canonical
+        // iOS-containing sets are valid here; a foreign-only grant never enables
+        // this recorder. The complete original envelope remains hash-bound.
+        guard platformBytes == Data(#"["ios"]"#.utf8)
+            || platformBytes == Data(#"["android","ios"]"#.utf8) else { throw Failure.mismatchedRaster }
         let expected = object([
             ("schemaVersion", integer(1)), ("endpoint", string(endpoint.absoluteString)),
             ("replayContractVersion", string("3.0.0")), ("replaySchemaVersion", integer(3)),
             ("ackSchemaVersion", integer(3)),
             ("replayProtocolGeneration", string("native-raster-generation-v1")),
             ("codec", string("elu-native-raster-v1")), ("compression", string("gzip")),
-            ("platforms", .array([string("android"), string("ios")])),
+            ("platforms", platforms),
             ("privacy", object([
                 ("schemaVersion", integer(1)), ("revision", string(privacy.revision)),
                 ("effectivePolicyHash", string(hash)), ("maskingProfileHash", string(profileHash)),

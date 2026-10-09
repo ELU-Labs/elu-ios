@@ -44,6 +44,37 @@ preflight passed. No synthetic network fixture may be presented as observed
 runtime evidence. A stable release still requires the complete procedure and
 Lab qualification below.
 
+## Owner decision: 0.2.0 ships with native replay dormant
+
+On 2026-10-09 the repository owner chose to release stable `0.2.0` for analytics
+and feature flags before native replay is qualified. This decision applies to
+`0.2.0` only and does not qualify replay, the player, privacy rendering of
+replay, Android, or native activation.
+
+What was observed against the real engine (ELU Test sandbox project, ring 0,
+iOS 26.3 simulator, a small consumer app built from this source):
+
+- configuration fetch and refresh, custom events, screens, exceptions, identify
+  and person updates, super properties and session continuity, all read back
+  from the engine's event store;
+- durable queue delivery after a server-side authorization outage and an app
+  relaunch;
+- feature flags, after the flag projection fix in this release;
+- replay stays off: no native replay grant is served, so no replay is recorded
+  or sent.
+
+Native replay cannot start for any customer until the cloud activation switch
+is enabled, and the release configuration refuses that switch without a
+reviewed native replay registry entry carrying qualified iOS and Android
+artifacts. Because of that, the replay requirements of the full preflight
+below (observed `/v2/replay` and `/v3/replay` requests, engine replay readback
+and player rendering) are deferred for `0.2.0` only. Every other step still
+applies: hosted CI on the exact release commit, the retained `ios-tested-source`
+archive verified against that commit and version, the strict artifact scan, and
+an owner-signed annotated OpenPGP tag verified with
+`scripts/verify-release-tag.py` under trusted fingerprints. Release notes must
+state that replay is not yet available.
+
 ## Full release qualification
 
 Run `scripts/release-preflight.sh <exact-semver-tag> <network-trace.json>` only
