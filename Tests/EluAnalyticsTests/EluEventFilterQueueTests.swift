@@ -3,13 +3,14 @@ import XCTest
 @testable import EluAnalytics
 
 final class EluEventFilterQueueTests: XCTestCase {
-    private func make(_ filter: EluEventFilter, fault: DeliveryFault? = nil) async throws -> NativeSessionHarness {
+    private func make(_ filter: EluEventFilter, fault: DeliveryFault? = nil,
+                      eventContext: [String: EluJSONValue] = [:]) async throws -> NativeSessionHarness {
         let h = NativeSessionHarness(try await DeliveryHarness.make(fault: fault))
         await h.queue.close()
         let clock = h.base.testClock
         h.base.queue = try await EluSQLiteRuntimeQueue.openCaptureRuntime(rootDirectoryURL: h.base.root,
             exactConstructorSiteKey: "elu_pk_test_aaaaaaaaaaaaaaaaaaaaaa", endpointPolicy: h.base.endpointPolicy,
-            eventFilter: filter, limits: h.base.limits, clock: { clock.read() }, continuousClock: { clock.ticks() },
+            eventFilter: filter, eventContext: eventContext, limits: h.base.limits, clock: { clock.read() }, continuousClock: { clock.ticks() },
             continuousBudgetConverter: { clock.convert($0) }, configurationGate: h.base.gate, faultInjector: h.base.fault)
         try await h.publish()
         return h
@@ -45,6 +46,35 @@ final class EluEventFilterQueueTests: XCTestCase {
         XCTAssertNil(event.properties["secret"]); XCTAssertNil(event.properties["onlySuper"])
         XCTAssertNotEqual(event.properties["$device_id"], .string("forged"))
         XCTAssertEqual(event.properties["$elu_sdk_version"], .string("0.2.0"))
+        await h.queue.close()
+    }
+
+    func testEventContextSitsUnderSuperAndCallPropertiesWithOrWithoutAFilter() async throws {
+        let context: [String: EluJSONValue] = ["$os": .string("iOS"), "$app_version": .string("1.0"), "$lib": .string("elu-ios")]
+        for filter in [EluEventFilter(), EluEventFilter(beforeSend: { event in
+            XCTAssertEqual(event.properties["$os"] as? String, "iOS"); return event
+        })] {
+            let h = try await make(filter, eventContext: context); defer { h.base.remove() }
+            _ = try await h.queue.registerStandaloneSuperProperties(["$app_version": .string("super")])
+            try await h.publish()
+            let result = try await h.queue.capture(command(h, properties: ["$lib": .string("call")]))
+            let event = try XCTUnwrap(accepted(result))
+            XCTAssertEqual(event.properties["$os"], .string("iOS"))
+            XCTAssertEqual(event.properties["$app_version"], .string("super"))
+            XCTAssertEqual(event.properties["$lib"], .string("call"))
+            await h.queue.close()
+        }
+    }
+
+    func testEventFilterCanRemoveEventContext() async throws {
+        let h = try await make(.init(propertyDenylist: ["$timezone"], beforeSend: { event in
+            var event = event; event.properties.removeValue(forKey: "$locale"); return event
+        }), eventContext: ["$timezone": .string("UTC"), "$locale": .string("en-US"), "$os": .string("iOS")])
+        defer { h.base.remove() }
+        let result = try await h.queue.capture(command(h))
+        let event = try XCTUnwrap(accepted(result))
+        XCTAssertNil(event.properties["$timezone"]); XCTAssertNil(event.properties["$locale"])
+        XCTAssertEqual(event.properties["$os"], .string("iOS"))
         await h.queue.close()
     }
 

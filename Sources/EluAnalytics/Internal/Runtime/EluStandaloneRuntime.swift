@@ -289,6 +289,9 @@ actor EluStandaloneRuntime {
         #else
         resolvedHandoff = backgroundHandoff
         #endif
+        let eventContext = await MainActor.run {
+            EluEventContext.current(lib: resolvedVersions.runtime).properties
+        }
 
         let queue = try await EluSQLiteRuntimeQueue.openCaptureRuntime(
             rootDirectoryURL: rootDirectoryURL,
@@ -298,6 +301,7 @@ actor EluStandaloneRuntime {
             persistence: persistence,
             rateLimiting: rateLimiting,
             eventFilter: eventFilter,
+            eventContext: eventContext,
             limits: resolvedLimits,
             clock: clock,
             continuousClock: continuousClock,

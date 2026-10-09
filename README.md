@@ -138,6 +138,16 @@ Every new event, including native numeric telemetry, carries SDK-owned
 `$device_id`, `$is_identified`, and `$process_person_profile` values. Customer
 properties cannot override them, and `$epp` is never sent as an event property.
 
+New events also carry library, OS, device, and app context read once at setup:
+`$lib` (`elu-ios`), `$lib_version`, `$os` and `$os_name`, `$os_version`,
+`$device_type`, `$device_model` (a hardware identifier such as `iPhone17,1`),
+`$device_manufacturer`, `$is_emulator`, `$app_name`, `$app_version`,
+`$app_build`, `$app_namespace` (the bundle identifier), `$screen_width` and
+`$screen_height` (portrait points), `$locale`, and `$timezone`. Super properties
+and event properties override these values, and `propertyDenylist` or
+`beforeSend` can remove them. The SDK reads no advertising or vendor
+identifier and no user-assigned device name.
+
 The owned runtime uses separate storage. The unused 0.1.0 release is not a
 supported persisted-data import source: version 0.2.0 starts a fresh owned
 installation and leaves its old files untouched. Unpublished preview databases

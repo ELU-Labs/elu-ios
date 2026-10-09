@@ -97,6 +97,7 @@ final class EluStandaloneRuntimeTests: XCTestCase {
             let sample = try XCTUnwrap(events.first { $0["name"] as? String == "$performance_sample" })
             let properties = try XCTUnwrap(sample["properties"] as? [String: Any])
             XCTAssertEqual(properties["$performance_platform"] as? String, "ios")
+            XCTAssertEqual(properties["$lib"] as? String, "elu-ios", "passive events carry the event context")
             XCTAssertEqual(properties["$performance_sample_interval_ms"] as? Int, 5_000)
             XCTAssertEqual(properties["$app_foreground"] as? Bool, true)
             XCTAssertNotNil(properties["$device_id"] as? String)
@@ -830,6 +831,52 @@ final class EluStandaloneRuntimeTests: XCTestCase {
             let local = await runtime.setFlagPersonProperties(["local": .bool(true)])
             XCTAssertEqual(local?.flagContext.personProperties["local"], .bool(true)); XCTAssertEqual(calls.count, 2)
             XCTAssertEqual(local?.queuedCount, 0)
+            await runtime.close()
+        }
+    }
+
+    func testDeliveredEventsCarryLibraryOSDeviceAndAppContext() async throws {
+        try await withTemporaryDirectory { root in
+            let transport = RecordingBatchTransport(), clock = TestRuntimeClock(wall: baseDate)
+            let runtime = try await makeRuntime(root: root, transport: transport, clock: clock)
+            guard case .capturing = await runtime.applyConfiguration(fixture("config-enabled.json")) else {
+                await runtime.close(); return XCTFail("expected capture authority")
+            }
+            guard case .accepted = await runtime.capture("checkout", properties: ["$app_build": .string("customer")]) else {
+                await runtime.close(); return XCTFail("expected an accepted capture")
+            }
+            _ = await runtime.flush()
+            let requests = await transport.recordedRequests()
+            let request = try XCTUnwrap(requests.first)
+            let properties = try XCTUnwrap(batchEvents(request).first?["properties"] as? [String: Any])
+            XCTAssertEqual(properties["$lib"] as? String, "elu-ios")
+            XCTAssertEqual(properties["$lib_version"] as? String, EluCore.sdkVersion)
+            XCTAssertEqual(properties["$device_manufacturer"] as? String, "Apple")
+            XCTAssertFalse(try XCTUnwrap(properties["$device_model"] as? String).isEmpty)
+            #if targetEnvironment(simulator)
+            XCTAssertEqual(properties["$is_emulator"] as? Bool, true)
+            #endif
+            XCTAssertEqual(properties["$app_name"] as? String,
+                           (Bundle.main.infoDictionary?["CFBundleDisplayName"] ?? Bundle.main.infoDictionary?["CFBundleName"]) as? String)
+            XCTAssertEqual(properties["$app_version"] as? String,
+                           Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String)
+            XCTAssertEqual(properties["$app_namespace"] as? String, Bundle.main.bundleIdentifier)
+            XCTAssertEqual(properties["$app_build"] as? String, "customer", "the call's own value wins")
+            XCTAssertEqual(properties["$timezone"] as? String, TimeZone.current.identifier)
+            XCTAssertEqual(properties["$locale"] as? String, Locale.preferredLanguages.first)
+            #if canImport(UIKit)
+            let (os, osVersion, idiom, screen) = await MainActor.run {
+                (UIDevice.current.systemName, UIDevice.current.systemVersion, UIDevice.current.userInterfaceIdiom,
+                 UIScreen.main.fixedCoordinateSpace.bounds.size)
+            }
+            XCTAssertEqual(properties["$os"] as? String, os)
+            XCTAssertEqual(properties["$os_name"] as? String, os)
+            XCTAssertEqual(properties["$os_version"] as? String, osVersion)
+            XCTAssertEqual(properties["$device_type"] as? String, idiom == .pad ? "Tablet" : "Mobile")
+            XCTAssertEqual(properties["$screen_width"] as? Int, Int(screen.width.rounded()))
+            XCTAssertEqual(properties["$screen_height"] as? Int, Int(screen.height.rounded()))
+            #endif
+            for identifying in ["$device_name", "$idfa", "$idfv", "$user_name"] { XCTAssertNil(properties[identifying]) }
             await runtime.close()
         }
     }
