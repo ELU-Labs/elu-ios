@@ -4,18 +4,18 @@ Implementation evidence is separate from published release status. Consult the
 [reviewed releases](https://github.com/ELU-Labs/elu-ios/releases) for customer
 artifacts, and the [README](../README.md) for the current public API and limits.
 
-The current source is the unreleased `0.2.0` production candidate. Production
-customer activation remains disabled. Its exact source and artifact still require
-hosted CI, installed SDK and upgrade checks, public-origin network, replay/privacy,
-performance, engine/player and Lab qualification, and the
-[full release qualification](../release/README.md#full-release-qualification).
-Historical results below do not establish those checks for this candidate.
+The current release is `0.2.1` (after `0.2.0`), published under the owner decisions
+in [release/README.md](../release/README.md). The
+[full release qualification](../release/README.md#full-release-qualification)
+(installed SDK and upgrade checks, public-origin network, replay/privacy,
+performance, engine/player and Lab qualification) has not been completed for it.
+Historical results below do not establish those checks.
 
 The [published `0.2.0-beta.1`](https://github.com/ELU-Labs/elu-ios/releases/tag/0.2.0-beta.1)
 remains available for nonproduction test apps and synthetic data only. Its
 [evaluation exception](../release/README.md#evaluation-exception-020-beta1-only)
-does not apply to `0.2.0`; no beta result is relabelled as stable qualification.
-See the [README](../README.md#production-candidate-020-unreleased) for current status.
+does not apply to `0.2.0` or later; no beta result is relabelled as stable qualification.
+See the [README](../README.md#current-release-021) for current status.
 
 The current source includes durable analytics and consent, independent device
 identity and person-profile modes, prefixed HTTPS self-hosting, durable flag
@@ -60,7 +60,7 @@ includes the corrected lost-ACK and root-source fixtures and the public
 declared-region setup option. The tested archive belongs to PR merge `c71640e9`;
 its packaged file contents and executable modes match reviewed `0a0c438`.
 These are source-validation results, not installed-package or release
-qualification; version 0.2.0 remains an unreleased candidate.
+qualification.
 
 Customer request metrics require the explicit `EluURLSession` wrapper; URLs,
 headers and bodies are omitted. Opt-in native performance includes process

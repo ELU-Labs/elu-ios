@@ -75,6 +75,27 @@ an owner-signed annotated OpenPGP tag verified with
 `scripts/verify-release-tag.py` under trusted fingerprints. Release notes must
 state that replay is not yet available.
 
+## Owner decision: 0.2.1 and iOS native replay activation
+
+On 2026-10-09 the repository owner directed a `0.2.1` release: `0.2.0` plus
+automatic device and app context on every event (`$lib`, `$os`, `$device_model`,
+`$app_version` and related properties; pull request #22). The `0.2.0` decision
+above applies to `0.2.1` unchanged: the same deferrals, and the same required
+steps (hosted CI on the exact release commit, the retained `ios-tested-source`
+archive verified against that commit and version, the strict artifact scan, and
+an owner-signed annotated OpenPGP tag verified with `scripts/verify-release-tag.py`
+under trusted fingerprints).
+
+The same day the owner directed that native replay be activated for iOS without
+the Lab qualification or a sandbox check, stating that no customer uses the iOS
+SDK. The ELU release configuration now accepts a single-platform native entry, so
+the statement above that it requires qualified iOS and Android artifacts no longer
+holds. The iOS entry declares the blanket and sensitive profile pair the SDK selects
+from policy, with an owner-waiver verification record kept in ELU
+`docs/sdk-ownership/native-replay-records/` (ELU pull request #363). The SDK's replay code is unchanged
+from `0.2.0`. Release notes must say that replay depends on ELU's service
+configuration and that its full qualification has not been run.
+
 ## Full release qualification
 
 Run `scripts/release-preflight.sh <exact-semver-tag> <network-trace.json>` only

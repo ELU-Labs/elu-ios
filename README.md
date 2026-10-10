@@ -17,18 +17,22 @@ establish release qualification. Application code uses `Elu.*` with an ELU site 
 - Bounded UIKit replay, gated by current server qualification, configuration,
   and on-device privacy, with package and service qualification required for production release
 
-## Production candidate: 0.2.0 (unreleased)
+## Current release: 0.2.1
 
-This source reports `0.2.0` for exact-artifact qualification. It is not a published
-or production-qualified release. Production customer activation remains disabled.
+`0.2.1` is the current release. It adds automatic device and app context to every
+event (see the event context section below) to the analytics, identity, sessions,
+durable delivery and feature flags released in `0.2.0`. Both releases were verified
+against the real ELU engine for those features and ship under the owner decisions
+recorded in [release/README.md](release/README.md), which defer parts of the
+[full release qualification](release/README.md#full-release-qualification):
+installed Lab and upgrade checks, replay privacy rendering, customer-player playback
+and performance.
 
-Installed SDK behavior, public-origin network traffic, replay and privacy,
-performance, engine readback, and customer-player playback remain unqualified.
-The exact candidate must pass required hosted CI, installed Lab and upgrade
-checks, and the [full release qualification](release/README.md#full-release-qualification)
-before production publication and activation. Passing source, mock, or hosted CI
-checks alone does not establish runtime qualification. The evaluation beta's
-exception does not apply to this candidate.
+Native session replay is turned on by ELU's service configuration, not by the SDK
+version. Recordings follow your project's masking policy: by default readable UIKit
+text (labels, buttons) is recorded while text inputs stay masked and images, opaque
+views and web views stay blocked; with "mask all text" every text element is masked.
+Its full qualification has not been run.
 
 ## Evaluation beta: 0.2.0-beta.1
 
@@ -37,25 +41,20 @@ remains available for nonproduction test apps using synthetic data only. Its
 [version-specific installation instructions](https://github.com/ELU-Labs/elu-ios/blob/0.2.0-beta.1/README.md#install-swift-package-manager)
 select that beta exactly. Do not use it with real customer data or live production
 traffic. Its deferred runtime checks apply only to the beta and do not qualify
-`0.2.0`. Collection still requires an eligible evaluation configuration supplied
+`0.2.0` or later. Collection still requires an eligible evaluation configuration supplied
 by ELU; installing the beta does not bypass configuration, consent or privacy.
 
 ## Install (Swift Package Manager)
 
-`0.2.0` is not available as a release yet. Qualification must use the exact
-reviewed candidate source and artifact. After its required checks pass and its
-reviewed, signed tag and GitHub release are published, use **File → Add Package
-Dependencies…** in Xcode or add to your `Package.swift`:
+Use **File → Add Package Dependencies…** in Xcode, or add to your `Package.swift`:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/ELU-Labs/elu-ios.git", exact: "0.2.0"),
+    .package(url: "https://github.com/ELU-Labs/elu-ios.git", exact: "0.2.1"),
 ]
 ```
 
-Then add `EluAnalytics` to your app's target dependencies. These production
-installation instructions apply only after that exact release is available.
-Use unpublished source as a local Swift package for development and qualification.
+Then add `EluAnalytics` to your app's target dependencies.
 
 ## Setup
 
@@ -149,7 +148,7 @@ and event properties override these values, and `propertyDenylist` or
 identifier and no user-assigned device name.
 
 The owned runtime uses separate storage. The unused 0.1.0 release is not a
-supported persisted-data import source: version 0.2.0 starts a fresh owned
+supported persisted-data import source: versions 0.2.0 and later start a fresh owned
 installation and leaves its old files untouched. Unpublished preview databases
 with import receipts are refused without deleting their database, WAL, or SHM
 files. Existing supported owned-store schemas retain identity, consent, queued

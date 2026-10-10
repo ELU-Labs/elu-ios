@@ -5,22 +5,21 @@ This describes the ELU-owned iOS runtime and public `Elu.*` API. See the
 to the exact artifacts in a reviewed release after its required checks pass;
 source implementation alone does not establish package or service qualification.
 
-Version `0.2.0` is an unreleased production candidate. Production customer
-activation remains disabled. Source availability does not authorize capture;
-eligible configuration and the existing consent, privacy, and runtime authority
-checks still apply.
+Version `0.2.1` is the current release. Releases ship under the owner decisions in
+[release/README.md](release/README.md). Source availability does not authorize
+capture; eligible configuration and the existing consent, privacy, and runtime
+authority checks still apply.
 
-Installed SDK behavior, public-origin network traffic, replay and privacy,
-performance, engine readback, and customer-player playback remain unqualified.
-Required hosted CI, installed Lab and upgrade checks, and the
-[full release qualification](release/README.md#full-release-qualification) apply
-to the exact candidate before production publication and customer activation.
-Source, contract, mock, and hosted CI checks do not establish runtime results.
+The [full release qualification](release/README.md#full-release-qualification)
+(installed Lab and upgrade checks, public-origin network traces, replay privacy and
+customer-player playback, performance) has not been completed for any `0.2.x`
+release; the owner decisions record what was verified instead. Source, contract,
+mock, and hosted CI checks do not establish runtime results.
 
 The separately [published `0.2.0-beta.1`](https://github.com/ELU-Labs/elu-ios/releases/tag/0.2.0-beta.1)
 remains a nonproduction evaluation prerelease for test apps and synthetic data
 only. Its evaluation exception and deferred checks apply only to that version;
-they do not qualify or waive any requirement for `0.2.0`.
+they do not qualify or waive any requirement for `0.2.0` or later.
 
 ## Setup and configuration
 
@@ -334,7 +333,7 @@ execution and actual OS report delivery remain separate validation gates.
 ## Storage upgrades and release evidence
 
 Supported owned-store schemas preserve identity, consent, queued records, and
-ordinary schema upgrades. Version 0.2.0 does not import persisted data from the
+ordinary schema upgrades. Versions 0.2.0 and later do not import persisted data from the
 unused 0.1.0 runtime and leaves its files untouched. Unsupported transition or
 unknown schemas fail closed without destructive recovery. Reset does not grant
 permission to erase an unsupported store. Exact supported schema and owned-file
