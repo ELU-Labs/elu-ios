@@ -1,0 +1,46 @@
+{
+  "snapshotVersion": 3,
+  "manifestProvenance": {
+    "path": "Package.swift",
+    "sha256": "86701aa42833ddfff4b928e8ed59608cfe46f54e2765656f8166a75633219398"
+  },
+  "package": {
+    "toolsVersion": "5.9.0",
+    "name": "EluAnalytics",
+    "platforms": [
+      {
+        "name": "ios",
+        "minimumVersion": "13.0"
+      }
+    ],
+    "products": [
+      {
+        "name": "EluAnalytics",
+        "type": "library",
+        "targets": [
+          "EluAnalytics"
+        ]
+      }
+    ],
+    "targets": [
+      {
+        "name": "EluAnalytics",
+        "type": "regular"
+      },
+      {
+        "name": "EluAnalyticsTests",
+        "type": "test"
+      }
+    ],
+    "targetSettings": {
+      "EluAnalytics": [
+        {
+          "tool": "linker",
+          "linkedLibrary": "sqlite3"
+        }
+      ],
+      "EluAnalyticsTests": []
+    }
+  },
+  "dependencies": []
+}

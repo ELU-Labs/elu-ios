@@ -1,0 +1,15 @@
+.build/
+.swiftpm/
+DerivedData/
+Package.resolved
+__pycache__/
+
+# Xcode user state and local test results
+xcuserdata/
+*.xcuserstate
+*.xcresult
+
+# Editor and macOS metadata
+.idea/
+.vscode/
+.DS_Store

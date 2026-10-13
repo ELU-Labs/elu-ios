@@ -1,0 +1,50 @@
+{
+    "contractVersion": "2.0.0",
+    "verificationStatus": "pending-external-verification",
+    "blocking": true,
+    "reason": "Repository conformance alone is insufficient; exact replay attribution, privacy evidence, and playback must be verified before capability advertisement.",
+    "orderedInput": {
+        "configFixture": "fixtures/config-enabled.json",
+        "replayFixture": "fixtures/replay.json",
+        "requestFixture": "fixtures/replay-request.json",
+        "ackFixture": "fixtures/replay-ack.json"
+    },
+    "expectedReadback": {
+        "protocol": {
+            "configSchemaVersion": 2,
+            "replayContractVersion": "2.0.0",
+            "replaySchemaVersion": 2,
+            "replayV1Accepted": false
+        },
+        "attribution": {
+            "anonymousId": "anon_018fcb7cff80721387a19b859e7c53a6",
+            "userId": "user_123",
+            "identityRevision": 1,
+            "contextRevision": 7,
+            "sessionId": "session_018fcb7cff80721387a19b859e7c53a6"
+        },
+        "replay": {
+            "replayId": "replay_018fcb7cff80721387a19b859e7c53a6",
+            "chunkId": "chunk_000001",
+            "sequence": 1,
+            "codec": "elu-browser-dom-v1",
+            "compression": "gzip",
+            "accepted": true,
+            "playable": true,
+            "appliedBeforeSerialization": true,
+            "secureInputsMasked": true,
+            "maskingProfileHash": "sha256:410f116852d0c302486d6c81595582aa87a396eac32a4044039deb3b9c548cc6"
+        },
+        "privacyEvidence": {
+            "plantedSecretMarker": "elu_fixture_secret_must_never_serialize",
+            "expectedOccurrencesInAcceptedRequest": 0,
+            "expectedOccurrencesInStoredPayload": 0,
+            "expectedOccurrencesInRenderedReplay": 0,
+            "clientAssertionsAloneAreSufficient": false
+        },
+        "request": {
+            "requestId": "request_20363e543df61890ceb221a6d99aec555295b35e48ef2eb48c7ebeab6756c231",
+            "canonicalRequestSha256": "sha256:f285072873b007a2e63691401a3a3dce703315e51edf93b895a4c1a73dc4af7e"
+        }
+    }
+}
