@@ -129,6 +129,21 @@ on a later eligible launch; lost acknowledgments do not justify treating a
 request as delivered. Offline storage does not bypass current configuration,
 consent, or privacy authority.
 
+For a `429` or `5xx` response, the SDK retries the unchanged request with
+backoff, whatever the response body. When the body is ELU's error object, its
+`Retry-After` is honoured (up to one day for replay), and a `429` pauses that
+upload endpoint. For any other body, one valid `Retry-After` is honoured up to
+five minutes, and a missing, repeated or invalid one is ignored. After a
+temporary failure, replay uploads wait up to a minute before the next recording
+is tried. `401` and `403` stop delivery of that request. In annotated SwiftUI
+replay, a validated `409` conflict or `413` size refusal stops that recording
+permanently. Other unexpected responses, including a wireframe `409`, hold a
+replay chunk: the same bytes are offered again after one hour to one day, until
+the chunk expires seven days after capture. While the first undelivered chunk
+of a recording is held or refused, new chunks for that recording are not stored,
+and a new recording starts only once the configuration is refreshed, the
+identity or analytics session changes, or the app is opened again.
+
 Explicit consent has a separate bounded pending/settled record under the same
 canonical site/API-base namespace in both modes. Only a settled explicit choice can
 establish a grant across modes; pending choices deny. Existing denied persistent
@@ -180,6 +195,16 @@ one cancellable root-only observer waits for an available foreground root under
 the same unexpired authorization; it performs no text collection, SQL polling
 or configuration renewal. A pending restart is ignored once a later local start
 or stop supersedes it. Snapshot changes do not represent native touch or scroll events.
+
+When the app is ended, killed or updated and opened again inside the same
+analytics session, the new process starts a new replay ID under that session's
+original sample decision, first start and remaining budget; it never continues an
+earlier replay ID. The time the app was closed is charged to the budget by the
+device wall clock, which must not read earlier than the last recorded replay time;
+otherwise replay stays off for the rest of that session. Sealed chunks from the
+earlier process keep their delivery permission, and unsealed frames are discarded.
+Local stop does not carry over to the next launch; it must be requested again after
+setup, and opt-out is the persistent control.
 
 The blanket profile masks text. When current policy authorizes ordinary text,
 supported fully visible `UILabel` and `UIButton` text can remain

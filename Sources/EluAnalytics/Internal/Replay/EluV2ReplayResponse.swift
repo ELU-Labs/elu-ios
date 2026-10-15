@@ -28,6 +28,16 @@ enum EluV2ReplayResponse {
     static func classify(_ response: EluV1BatchHTTPResponse, request: EluV2ReplayPreparedRequest, now: Date) -> EluV2ReplayResponseOutcome {
         // Refusal status survives unreadable, oversized, or malformed error bodies.
         if response.status == 401 || response.status == 403 { return .credentialBlocked(status: response.status) }
+        let closed = classifyClosed(response, request: request, now: now)
+        // A validated error object keeps its exact semantics. Any other 429/5xx
+        // (plain text, HTML, empty, oversized, or with an unreadable
+        // Retry-After) retries this row only and never pauses the endpoint.
+        guard closed == .protocolBlocked, EluV1BatchDeliveryCoordinator.isRetryableStatus(response.status) else { return closed }
+        return .retry(afterSeconds: EluV1BatchDeliveryCoordinator.foreignRetryAfter(response.headers, now: now))
+    }
+
+    private static func classifyClosed(_ response: EluV1BatchHTTPResponse, request: EluV2ReplayPreparedRequest, now: Date) -> EluV2ReplayResponseOutcome {
+        if response.status == 401 || response.status == 403 { return .credentialBlocked(status: response.status) }
         guard response.body.count <= maximumBytes else { return .protocolBlocked }
         let retries = response.headers.filter { $0.key.lowercased() == "retry-after" }
         guard retries.count <= 1 else { return .protocolBlocked }
@@ -44,8 +54,10 @@ enum EluV2ReplayResponse {
                       ReplayResponseJSON.string(object["result"]) == "accepted" else { return .protocolBlocked }
                 return .accepted
             }
-            // The v2 identity-conflict schema is a permanent protocol refusal;
-            // no deletion or special retry follows even a valid conflict body.
+            // A wireframe 409, even with a valid identity-conflict body, is a
+            // protocol hold: nothing is deleted, and the queue offers the same
+            // bytes again after the hold until the row expires. Only a validated
+            // raster 409 or 413 refusal is permanent.
             guard response.status == 413 || response.status == 429 || (500...599).contains(response.status) else { return .protocolBlocked }
             let object = try ReplayResponseJSON.object(document.value, required: ["schemaVersion", "status", "code", "disposition", "message"], optional: ["requestId"])
             guard try ReplayResponseJSON.integer(object["schemaVersion"]) == 1,

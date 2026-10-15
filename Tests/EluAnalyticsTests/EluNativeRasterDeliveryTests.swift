@@ -115,6 +115,8 @@ final class EluNativeRasterDeliveryTests: XCTestCase {
             let metadata = try h.native.bytes("SELECT metadata FROM replay_delivery WHERE ordinal=0")
             XCTAssertEqual(try EluV2ReplayDeliveryState.decode(metadata).rasterBlock?.reason, reason)
             await h.close(); try await h.native.reopen(); try await h.publish(branch: true, advance: true)
+            // Unlike a protocol hold, a validated conflict or size refusal is never offered again.
+            h.native.base.testClock.advance(90_000); try await h.publish(branch: true, advance: true)
             let value = try await h.permission(), authority = try XCTUnwrap(value)
             guard case .idle = try await h.queue.claimNextReplay(authority) else { return XCTFail("renewal revived permanent block") }
             XCTAssertEqual(try h.native.bytes("SELECT metadata FROM replay_delivery WHERE ordinal=0"), metadata)
@@ -169,6 +171,28 @@ final class EluNativeRasterDeliveryTests: XCTestCase {
             else { XCTAssertEqual(metadata.rasterBlock?.reason, reason); XCTAssertNil(metadata.blocked) }
             _ = await coordinator.closeAndWait(); await h.close()
         }
+    }
+
+    func testCoordinatorRetriesPlainText503AndDeliversSameRequest() async throws {
+        let h = try await Rig.make(); defer { h.remove() }
+        _ = try await h.append(h.request()); await h.stop()
+        let transport = RasterDeliveryTransport { request, index in
+            if index == 0 { return .init(status: 503, headers: ["Retry-After": "1"], body: Data("503 Service Unavailable".utf8)) }
+            return try Self.ack(EluNativeRasterStoredRequest(restoring: request.body))
+        }
+        let clock = h.native.base.testClock
+        let coordinator = EluV2ReplayDeliveryCoordinator(queue: h.queue, transport: transport, wallNow: { clock.read() },
+            sleep: { _ in throw CancellationError() }, randomUnit: { 0 })
+        let value = try await h.permission(), authority = try XCTUnwrap(value)
+        let first = await coordinator.trigger(authority)
+        XCTAssertEqual(first.attempted, 1); XCTAssertEqual(first.retried, 1); XCTAssertEqual(first.blocked, 0)
+        let metadata = try EluV2ReplayDeliveryState.decode(h.native.bytes("SELECT metadata FROM replay_delivery WHERE ordinal=0"))
+        XCTAssertNil(metadata.blocked); XCTAssertNil(metadata.rasterBlock); XCTAssertNotNil(metadata.retry)
+        clock.advance(1)
+        let second = await coordinator.trigger(authority); XCTAssertEqual(second.accepted, 1); XCTAssertEqual(second.blocked, 0)
+        let sent = await transport.bodies; XCTAssertEqual(sent.count, 2); XCTAssertEqual(sent.first, sent.last)
+        let remaining = try await h.queue.storedReplayRecords(); XCTAssertTrue(remaining.isEmpty)
+        _ = await coordinator.closeAndWait(); await h.close()
     }
 
     func testStaleSourceAckCannotDeleteButOriginalRefusalStillPersists() async throws {

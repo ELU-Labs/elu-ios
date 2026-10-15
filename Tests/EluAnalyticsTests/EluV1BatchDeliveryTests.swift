@@ -650,6 +650,10 @@ final class EluV1BatchDeliveryTests: XCTestCase {
                 XCTAssertEqual(result, .preserved(.permanentHTTP(401)))
             case .http(403, _):
                 XCTAssertEqual(result, .preserved(.permanentHTTP(403)))
+            case .http(429, _), .http(500, _):
+                // HTTP status is authoritative: an unusable Retry-After falls
+                // back to ordinary backoff for the same request.
+                XCTAssertEqual(result, .deferred(untilMonotonicNanoseconds: 750_000_000))
             default:
                 XCTAssertEqual(result, .preserved(.protocolFailure))
             }
@@ -661,6 +665,39 @@ final class EluV1BatchDeliveryTests: XCTestCase {
             XCTAssertEqual(calls, 1)
             await queue.close()
         }
+    }
+
+    func testForeignServerFailureRetriesSameRequestWithCappedRetryAfter() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let queue = try await makeQueue(directory: directory)
+        _ = try await appendRecords(queue, count: 1)
+        let transport = TestBatchTransport(replies: [
+            .raw(503, ["Retry-After": "99999999"], Data("503 Service Unavailable".utf8)),
+            .raw(502, [:], Data()),
+            .accept,
+        ])
+        let clock = TestBatchClock(wall: capturedAt, monotonic: 0)
+        let coordinator = try self.coordinator(queue: queue, transport: transport, clock: clock, randomUnit: 0)
+        guard case let .deferred(capped) = await coordinator.trigger() else {
+            return XCTFail("Expected a retry for a plain-text 503")
+        }
+        XCTAssertEqual(capped, 300_000_000_000)
+        clock.setMonotonic(capped)
+        guard case let .deferred(backoff) = await coordinator.trigger() else {
+            return XCTFail("Expected a retry for an empty 502")
+        }
+        XCTAssertEqual(backoff, capped + 1_000_000_000)
+        clock.setMonotonic(backoff)
+        let result = await coordinator.trigger()
+        XCTAssertEqual(result, .resolved(delivered: 1, terminallyDiscarded: 0))
+        let ids = await transport.requestIds()
+        XCTAssertEqual(ids.count, 3)
+        XCTAssertEqual(Set(ids).count, 1)
+        let snapshot = try await queue.snapshot()
+        XCTAssertEqual(snapshot.queuedCount, 0)
+        await coordinator.cancel()
+        await queue.close()
     }
 
     func testURLSessionDenialPreservesOldAndNewRowsWithoutReusingAuthorization() async throws {
@@ -694,23 +731,30 @@ final class EluV1BatchDeliveryTests: XCTestCase {
         }
     }
 
-    func testTransportErrorBodyLimitAcceptsExactBoundaryAndBlocksOneByteOver() async throws {
-        for (size, expected) in [
+    func testTransportErrorBodyLimitAcceptsExactBoundaryAndOneByteOverRetriesOnlyServerFailures() async throws {
+        for (status, retryAfter, size, expected) in [
             (
+                503, "30",
                 EluV1BatchDeliveryCoordinator.maximumErrorResponseBytes,
                 EluV1BatchDeliveryTriggerResult.deferred(untilMonotonicNanoseconds: 30_000_000_000)
             ),
             (
+                503, "30",
+                EluV1BatchDeliveryCoordinator.maximumErrorResponseBytes + 1,
+                EluV1BatchDeliveryTriggerResult.deferred(untilMonotonicNanoseconds: 30_000_000_000)
+            ),
+            (
+                413, nil,
                 EluV1BatchDeliveryCoordinator.maximumErrorResponseBytes + 1,
                 EluV1BatchDeliveryTriggerResult.preserved(.protocolFailure)
             ),
-        ] {
+        ] as [(Int, String?, Int, EluV1BatchDeliveryTriggerResult)] {
             let directory = try temporaryDirectory()
             defer { try? FileManager.default.removeItem(at: directory) }
             let queue = try await makeQueue(directory: directory)
             _ = try await appendRecords(queue, count: 1)
             let transport = TestBatchTransport(
-                replies: [.httpWithBodySize(503, "30", size)]
+                replies: [.httpWithBodySize(status, retryAfter, size)]
             )
             let coordinator = try self.coordinator(queue: queue, transport: transport)
 
@@ -1115,6 +1159,7 @@ private enum TestBatchReply: Sendable {
     case http(Int, String?)
     case httpAndSetWall(Int, String?, TestBatchClock, Date)
     case httpWithBodySize(Int, String?, Int)
+    case raw(Int, [String: String], Data)
     case network
     case mismatchedAcknowledgement
     case duplicateAcknowledgementKey
@@ -1202,6 +1247,8 @@ private actor TestBatchTransport: EluV1BatchHTTPTransport {
                 headers: response.headers,
                 body: body
             )
+        case let .raw(status, headers, body):
+            return EluV1BatchHTTPResponse(status: status, headers: headers, body: body)
         case .network:
             throw TestBatchTransportError.network
         case .mismatchedAcknowledgement:

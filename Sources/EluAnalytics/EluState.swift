@@ -21,7 +21,7 @@ enum EluDisabledReason: Equatable {
 final class EluCore {
     static let shared = EluCore()
 
-    static let sdkVersion = "0.2.2"
+    static let sdkVersion = "0.2.3"
     static let facadeVersion = 1
 
     /// Constructs the owned runtime once for this core's original setup.

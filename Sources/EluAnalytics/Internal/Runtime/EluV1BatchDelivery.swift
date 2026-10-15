@@ -482,7 +482,7 @@ actor EluV1BatchDeliveryCoordinator {
             return .preserved(reason)
         }
         guard response.body.count <= Self.maximumResponseBytes else {
-            return blockRequest(prepared.requestId, reason: .protocolFailure)
+            return failClosed(response, prepared, attempt: attempt)
         }
         if (200 ... 299).contains(response.status) {
             let result = await applyAcknowledgement(response, to: prepared, attempt: attempt)
@@ -574,20 +574,20 @@ actor EluV1BatchDeliveryCoordinator {
         attempt: Int
     ) async -> EluV1SegmentResult {
         guard response.body.count <= Self.maximumErrorResponseBytes else {
-            return blockRequest(prepared.requestId, reason: .protocolFailure)
+            return failClosed(response, prepared, attempt: attempt)
         }
         let retryAfterHeader: String?
         do {
             retryAfterHeader = try Self.header(named: "Retry-After", in: response.headers)
         } catch {
-            return blockRequest(prepared.requestId, reason: .protocolFailure)
+            return failClosed(response, prepared, attempt: attempt)
         }
         guard Self.validateErrorResponse(
             response.body,
             status: response.status,
             requestId: prepared.requestId
         ) else {
-            return blockRequest(prepared.requestId, reason: .protocolFailure)
+            return failClosed(response, prepared, attempt: attempt)
         }
 
         switch response.status {
@@ -617,7 +617,7 @@ actor EluV1BatchDeliveryCoordinator {
             guard let retryAfterHeader,
                   let delay = Self.parseRetryAfter(retryAfterHeader, now: time.wallNow())
             else {
-                return blockRequest(prepared.requestId, reason: .protocolFailure)
+                return failClosed(response, prepared, attempt: attempt)
             }
             return scheduleRetry(
                 records: prepared.records,
@@ -629,7 +629,7 @@ actor EluV1BatchDeliveryCoordinator {
             let delay: TimeInterval
             if let retryAfterHeader {
                 guard let parsed = Self.parseRetryAfter(retryAfterHeader, now: time.wallNow()) else {
-                    return blockRequest(prepared.requestId, reason: .protocolFailure)
+                    return failClosed(response, prepared, attempt: attempt)
                 }
                 delay = parsed
             } else {
@@ -647,6 +647,25 @@ actor EluV1BatchDeliveryCoordinator {
                 reason: .permanentHTTP(response.status)
             )
         }
+    }
+
+    /// HTTP status is authoritative for 429 and 5xx. When the response is not
+    /// the validated error object (for example an intermediary's plain-text,
+    /// HTML, empty or oversized body, or an unreadable Retry-After), the same
+    /// request is retried with backoff. Every other status still fails closed.
+    private func failClosed(
+        _ response: EluV1BatchHTTPResponse,
+        _ prepared: EluV1PreparedBatch,
+        attempt: Int
+    ) -> EluV1SegmentResult {
+        guard Self.isRetryableStatus(response.status) else {
+            return blockRequest(prepared.requestId, reason: .protocolFailure)
+        }
+        return scheduleRetry(
+            records: prepared.records,
+            attempt: attempt + 1,
+            retryAfter: Self.foreignRetryAfter(response.headers, now: time.wallNow())
+        )
     }
 
     private func blockRequest(
@@ -1271,6 +1290,23 @@ extension EluV1BatchDeliveryCoordinator {
             throw EluV1BatchDeliveryError.malformedResponse
         }
         return matches.first?.value
+    }
+
+    /// Longest pause honoured from a 429/5xx that is not the validated error
+    /// object. Such a response never sets a longer, endpoint-wide pause.
+    static let foreignMaximumRetryAfterSeconds: TimeInterval = 300
+
+    static func isRetryableStatus(_ status: Int) -> Bool {
+        status == 429 || (500 ... 599).contains(status)
+    }
+
+    /// Exactly one readable Retry-After is honoured, capped at five minutes.
+    /// A missing, repeated or unreadable value yields 0 so backoff applies.
+    static func foreignRetryAfter(_ headers: [String: String], now: Date) -> TimeInterval {
+        let values = headers.filter { $0.key.caseInsensitiveCompare("Retry-After") == .orderedSame }
+        guard values.count == 1, let value = values.first?.value,
+              let parsed = parseRetryAfter(value, now: now) else { return 0 }
+        return min(max(0, parsed), foreignMaximumRetryAfterSeconds)
     }
 
     static func parseRetryAfter(_ value: String, now: Date) -> TimeInterval? {

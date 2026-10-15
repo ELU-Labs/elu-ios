@@ -121,6 +121,105 @@ final class EluNativeReplaySessionStateTests: XCTestCase {
         XCTAssertNil(value.session?.firstStartAt)
     }
 
+    /// A recording that started at `start` and stopped at `stoppedAt` with a continuous-clock floor.
+    private func stopped(cap: Int = 60, floor: Int64, stoppedAt: String? = nil) throws -> State {
+        var value = try observed(cap: cap)
+        XCTAssertTrue(try value.begin(epoch: epoch, wall: EluV1Timestamp(start), currentRate: 1))
+        XCTAssertTrue(try value.stop(key: key, firstStartAt: start, epoch: epoch,
+            wall: EluV1Timestamp(stoppedAt ?? start), elapsedMicroseconds: floor))
+        return value
+    }
+
+    func testOwnerGapChargesWallGapOnTopOfRetainedFloorWithoutRebasing() throws {
+        var value = try stopped(floor: 400_000)
+        let before = try XCTUnwrap(value.session), ordinal = value.nextReplayOrdinal
+        XCTAssertEqual(try value.settleOwnerGap(wall: EluV1Timestamp("2026-09-09T12:00:10.000Z"), highWater: nil), .resumed)
+        let after = try XCTUnwrap(value.session)
+        XCTAssertEqual(after.elapsedFloorMicroseconds, 10_400_000)
+        XCTAssertEqual(after.firstStartAt, before.firstStartAt); XCTAssertEqual(after.samplingHash, before.samplingHash)
+        XCTAssertEqual(after.originalSampleRate, before.originalSampleRate); XCTAssertEqual(after.originalSelected, before.originalSelected)
+        XCTAssertEqual(after.maximumDurationSeconds, before.maximumDurationSeconds); XCTAssertEqual(value.nextReplayOrdinal, ordinal)
+        XCTAssertEqual(after.observedWallAt, "2026-09-09T12:00:10.000Z")
+        XCTAssertNil(after.activeEpoch); XCTAssertFalse(after.interrupted); XCTAssertFalse(after.clockDenied)
+        XCTAssertTrue(try value.begin(epoch: UUID().uuidString, wall: EluV1Timestamp("2026-09-09T12:00:10.000Z"), currentRate: 1))
+        XCTAssertEqual(value.session?.firstStartAt, start); XCTAssertEqual(value.session?.elapsedFloorMicroseconds, 10_400_000)
+
+        // A recording the previous owner never stopped is settled the same way.
+        var orphan = try observed()
+        XCTAssertTrue(try orphan.begin(epoch: epoch, wall: EluV1Timestamp(start), currentRate: 1))
+        XCTAssertEqual(try orphan.settleOwnerGap(wall: EluV1Timestamp("2026-09-09T12:00:03.000Z"), highWater: EluV1Timestamp("2026-09-09T12:00:02.000Z")), .resumed)
+        XCTAssertNil(orphan.session?.activeEpoch); XCTAssertEqual(orphan.session?.elapsedFloorMicroseconds, 3_000_000)
+    }
+
+    func testOwnerGapAdditiveTermChargesStalledWallRecording() throws {
+        var value = try stopped(floor: 30_000_000, stoppedAt: "2026-09-09T12:00:10.000Z")
+        XCTAssertEqual(value.session?.elapsedFloorMicroseconds, 30_000_000)
+        XCTAssertEqual(try value.settleOwnerGap(wall: EluV1Timestamp("2026-09-09T12:00:15.000Z"), highWater: nil), .resumed)
+        XCTAssertEqual(value.session?.elapsedFloorMicroseconds, 35_000_000, "the gap is added to the floor, not max(30 s, 15 s)")
+    }
+
+    func testOwnerGapDeniesBelowEitherMarkAndNeverClearsDenial() throws {
+        let stoppedAt = "2026-09-09T12:00:10.000Z"
+        let cases: [(String?, String?)] = [("2026-09-09T12:00:09.999Z", nil),
+            ("2026-09-09T12:00:11.000Z", "2026-09-09T12:00:12.000Z"), (nil, nil)]
+        for (wall, mark) in cases {
+            var value = try stopped(floor: 400_000, stoppedAt: stoppedAt)
+            let before = try XCTUnwrap(value.session)
+            XCTAssertEqual(try value.settleOwnerGap(wall: wall.map { try EluV1Timestamp($0) },
+                highWater: mark.map { try EluV1Timestamp($0) }), .denied)
+            let denied = try XCTUnwrap(value.session)
+            XCTAssertTrue(denied.clockDenied); XCTAssertTrue(denied.interrupted)
+            XCTAssertEqual(denied.elapsedFloorMicroseconds, before.elapsedFloorMicroseconds)
+            XCTAssertEqual(denied.observedWallAt, stoppedAt)
+            XCTAssertEqual(try value.settleOwnerGap(wall: EluV1Timestamp("2026-09-09T12:01:00.000Z"), highWater: nil), .denied)
+            XCTAssertEqual(value.session?.clockDenied, true)
+            XCTAssertFalse(try value.begin(epoch: UUID().uuidString, wall: EluV1Timestamp("2026-09-09T12:01:00.000Z"), currentRate: 1))
+        }
+        // Denial leaves an orphaned recording exactly as fail-closed as before.
+        var orphan = try observed()
+        XCTAssertTrue(try orphan.begin(epoch: epoch, wall: EluV1Timestamp("2026-09-09T12:00:05.000Z"), currentRate: 1))
+        XCTAssertEqual(try orphan.settleOwnerGap(wall: EluV1Timestamp("2026-09-09T12:00:04.000Z"), highWater: nil), .denied)
+        XCTAssertEqual(orphan.session?.activeEpoch, epoch); XCTAssertEqual(orphan.session?.elapsedFloorMicroseconds, 0)
+    }
+
+    func testOwnerGapUnmovedWallIsUnprovenNotDenied() throws {
+        var value = try stopped(floor: 400_000, stoppedAt: "2026-09-09T12:00:10.000Z")
+        let before = try XCTUnwrap(value.session)
+        XCTAssertEqual(try value.settleOwnerGap(wall: EluV1Timestamp("2026-09-09T12:00:10.0009Z"),
+            highWater: EluV1Timestamp("2026-09-09T12:00:10.000Z")), .unproven)
+        let unproven = try XCTUnwrap(value.session)
+        XCTAssertTrue(unproven.interrupted); XCTAssertFalse(unproven.clockDenied)
+        XCTAssertEqual(unproven.elapsedFloorMicroseconds, before.elapsedFloorMicroseconds)
+        XCTAssertEqual(unproven.observedWallAt, before.observedWallAt)
+        XCTAssertFalse(try value.begin(epoch: UUID().uuidString, wall: EluV1Timestamp("2026-09-09T12:00:10.0009Z"), currentRate: 1))
+        XCTAssertEqual(try value.settleOwnerGap(wall: EluV1Timestamp("2026-09-09T12:00:10.001Z"), highWater: nil), .resumed)
+        XCTAssertEqual(value.session?.interrupted, false); XCTAssertEqual(value.session?.elapsedFloorMicroseconds, 10_001_000)
+    }
+
+    func testOwnerGapNoOpForUnstartedOrUnselected() throws {
+        var none = try empty(); let emptyBytes = try none.encoded()
+        XCTAssertEqual(try none.settleOwnerGap(wall: nil, highWater: nil), .none)
+        XCTAssertEqual(try none.encoded(), emptyBytes)
+        for rate in [1.0, 0.0] {
+            var value = try observed(rate: rate); let bytes = try value.encoded()
+            XCTAssertEqual(value.session?.originalSelected, rate == 1)
+            XCTAssertEqual(try value.settleOwnerGap(wall: nil, highWater: EluV1Timestamp("2026-09-09T13:00:00Z")), .none)
+            XCTAssertEqual(try value.settleOwnerGap(wall: EluV1Timestamp("2026-09-09T12:30:00Z"), highWater: nil), .none)
+            XCTAssertEqual(try value.encoded(), bytes)
+        }
+    }
+
+    func testOwnerGapExhaustsBudgetWithoutRefill() throws {
+        var value = try stopped(floor: 40_000_000, stoppedAt: "2026-09-09T12:00:40.000Z")
+        XCTAssertEqual(try value.settleOwnerGap(wall: EluV1Timestamp("2026-09-09T12:01:10.000Z"), highWater: nil), .resumed)
+        XCTAssertEqual(value.session?.remainingMicroseconds, 0)
+        XCTAssertFalse(try value.begin(epoch: UUID().uuidString, wall: EluV1Timestamp("2026-09-09T12:01:10.000Z"), currentRate: 1))
+        try value.observe(key: key, sampleRate: 1, maximumDurationSeconds: 120,
+            wall: EluV1Timestamp("2026-09-09T12:01:11.000Z"), ownedEpoch: nil, continuousElapsed: nil)
+        XCTAssertEqual(value.session?.maximumDurationSeconds, 60); XCTAssertEqual(value.session?.remainingMicroseconds, 0)
+        XCTAssertFalse(try value.begin(epoch: UUID().uuidString, wall: EluV1Timestamp("2026-09-09T12:01:11.000Z"), currentRate: 1))
+    }
+
     func testClosedCanonicalMetadataRejectsMissingExtraFutureAndImpossibleFields() throws {
         let value = try observed()
         let data = try value.encoded()

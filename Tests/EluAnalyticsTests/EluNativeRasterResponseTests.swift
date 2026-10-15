@@ -18,8 +18,11 @@ final class EluNativeRasterResponseTests: XCTestCase {
             .replacingOccurrences(of: "\"schemaVersion\":3", with: "\"schemaVersion\":3.0")
             .replacingOccurrences(of: "\"sequence\":0", with: "\"sequence\":0e0")
         XCTAssertEqual(classify(200, Data(equivalent.utf8), request), .accepted)
-        for status in [201, 202, 204, 206, 299, 400, 409, 413, 429, 500] {
+        for status in [201, 202, 204, 206, 299, 400, 409, 413] {
             XCTAssertEqual(classify(status, body, request), .protocolBlocked, "HTTP \(status)")
+        }
+        for status in [429, 500] {
+            XCTAssertEqual(classify(status, body, request), .retry(afterSeconds: 0), "HTTP \(status)")
         }
         for schema in [1, 2, 4] {
             var wrong = ack(request); wrong["schemaVersion"] = schema
@@ -88,8 +91,11 @@ final class EluNativeRasterResponseTests: XCTestCase {
         for scope in [EluNativeRasterConflictScope.request, .chunk, .sequence] {
             let body = try encoded(conflict(request, scope.rawValue))
             XCTAssertEqual(classify(409, body, request), .identityConflict(scope: scope))
-            for status in [200, 201, 400, 413, 429, 500] {
+            for status in [200, 201, 400, 413] {
                 XCTAssertEqual(classify(status, body, request), .protocolBlocked)
+            }
+            for status in [429, 500] {
+                XCTAssertEqual(classify(status, body, request), .retry(afterSeconds: 0))
             }
         }
     }
@@ -131,22 +137,22 @@ final class EluNativeRasterResponseTests: XCTestCase {
 
     func testOriginalRetryAfterRulesIncludeDatesClampAndCaseInsensitiveDuplicates() throws {
         let request = try prepared(), limited = try encoded(error(429, request))
-        XCTAssertEqual(classify(429, limited, request), .protocolBlocked)
+        XCTAssertEqual(classify(429, limited, request), .retry(afterSeconds: 0))
         XCTAssertEqual(classify(429, limited, request, headers: ["rEtRy-AfTeR": "2"]), .endpointCooldown(seconds: 2))
         XCTAssertEqual(classify(429, limited, request, headers: ["Retry-After": "999999"]), .endpointCooldown(seconds: 86_400))
         XCTAssertEqual(classify(429, limited, request, headers: ["Retry-After": "Thu, 01 Jan 1970 00:00:03 GMT"]), .endpointCooldown(seconds: 3))
         for bad in ["invalid", "-1", "1.5"] {
-            XCTAssertEqual(classify(429, limited, request, headers: ["Retry-After": bad]), .protocolBlocked)
+            XCTAssertEqual(classify(429, limited, request, headers: ["Retry-After": bad]), .retry(afterSeconds: 0))
         }
         for status in [200, 409, 413, 429, 503] {
             let value = status == 200 ? ack(request) : status == 409 ? conflict(request) : error(status, request)
             XCTAssertEqual(classify(status, try encoded(value), request,
-                headers: ["Retry-After": "1", "retry-after": "1"]), .protocolBlocked)
+                headers: ["Retry-After": "1", "retry-after": "1"]), [429, 503].contains(status) ? .retry(afterSeconds: 0) : .protocolBlocked)
         }
         XCTAssertEqual(classify(200, try encoded(ack(request)), request, headers: ["Retry-After": "0"]), .protocolBlocked)
     }
 
-    func testServerFailuresRetainBoundedStructuredTransportSemantics() throws {
+    func testServerFailuresRetryWhetherOrNotTheErrorBodyValidates() throws {
         let request = try prepared()
         for status in [500, 503, 599] {
             let body = try encoded(error(status, request))
@@ -158,9 +164,37 @@ final class EluNativeRasterResponseTests: XCTestCase {
             ("status", 500), ("schemaVersion", 3), ("disposition", "permanent"), ("extra", true)]
         for (key, value) in mutations {
             var wrong = error(503, request); wrong[key] = value
-            XCTAssertEqual(classify(503, try encoded(wrong), request), .protocolBlocked, key)
+            XCTAssertEqual(classify(503, try encoded(wrong), request), .retry(afterSeconds: 0), key)
         }
-        XCTAssertEqual(classify(503, Data(), request), .protocolBlocked)
+        XCTAssertEqual(classify(503, Data(), request), .retry(afterSeconds: 0))
+    }
+
+    func testForeignRetryableStatusRetriesPerRow() throws {
+        let request = try prepared(), html = Data("<html>busy</html>".utf8)
+        XCTAssertEqual(classify(503, Data("503 Service Unavailable".utf8), request, headers: ["Retry-After": "5"]), .retry(afterSeconds: 5))
+        XCTAssertEqual(classify(502, Data(), request), .retry(afterSeconds: 0))
+        XCTAssertEqual(classify(504, html, request, headers: ["retry-after": "120"]), .retry(afterSeconds: 120))
+        XCTAssertEqual(classify(503, html, request, headers: ["Retry-After": "86400"]), .retry(afterSeconds: 300))
+        XCTAssertEqual(classify(503, html, request, headers: ["Retry-After": "Sat, 01 Jan 2050 00:00:00 GMT"]), .retry(afterSeconds: 300))
+        for headers in [["Retry-After": "5, 5"], ["Retry-After": "5", "retry-after": "9"], ["Retry-After": "-1"],
+                        ["Retry-After": "99999999999999999999999"]] {
+            XCTAssertEqual(classify(503, html, request, headers: headers), .retry(afterSeconds: 0), "\(headers)")
+        }
+        XCTAssertEqual(classify(500, try encoded(ack(request)), request), .retry(afterSeconds: 0))
+        XCTAssertEqual(classify(503, Data(repeating: 0x20, count: 65_537), request), .retry(afterSeconds: 0))
+        XCTAssertEqual(classify(501, Data(), request), .retry(afterSeconds: 0))
+        // A foreign 429 never becomes an endpoint-wide pause.
+        XCTAssertEqual(classify(429, html, request, headers: ["Retry-After": "86400"]), .retry(afterSeconds: 300))
+        XCTAssertEqual(classify(429, Data(), request), .retry(afterSeconds: 0))
+        // Validated bodies keep their exact meaning.
+        XCTAssertEqual(classify(429, try encoded(error(429, request)), request, headers: ["Retry-After": "30"]), .endpointCooldown(seconds: 30))
+        XCTAssertEqual(classify(503, try encoded(error(503, request)), request, headers: ["Retry-After": "5"]), .retry(afterSeconds: 5))
+        XCTAssertEqual(classify(409, try encoded(conflict(request, "chunk")), request), .identityConflict(scope: .chunk))
+        XCTAssertEqual(classify(409, Data("{}".utf8), request), .protocolBlocked)
+        XCTAssertEqual(classify(409, try encoded(conflict(request)), request, headers: ["Retry-After": "1"]), .protocolBlocked)
+        XCTAssertEqual(classify(201, try encoded(ack(request)), request), .protocolBlocked)
+        XCTAssertEqual(classify(413, Data(), request), .protocolBlocked)
+        XCTAssertEqual(classify(200, html, request), .protocolBlocked)
     }
 
     private func ack(_ request: EluNativeRasterPreparedRequest) -> [String: Any] {

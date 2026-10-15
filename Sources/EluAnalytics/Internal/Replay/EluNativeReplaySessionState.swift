@@ -223,6 +223,32 @@ struct EluNativeReplaySessionState: Codable, Equatable, Sendable {
         s.activeEpoch = nil; session = s; try validate(); return true
     }
 
+    enum OwnerGapOutcome: Equatable, Sendable { case none, resumed, unproven, denied }
+
+    /// Only a new exclusive store owner calls this, for the stored session. Here
+    /// `interrupted` means elapsed time across an owner gap is not yet proven.
+    /// The wall-clock gap since the last observation is charged on top of the
+    /// retained floor; the draw, cap, first start and ordinal never change and
+    /// a denial is never cleared. A wall below either durable mark denies the
+    /// session; a wall that did not move proves nothing and is retried later.
+    mutating func settleOwnerGap(wall: EluV1Timestamp?, highWater: EluV1Timestamp?) throws -> OwnerGapOutcome {
+        guard var s = session, let firstStartAt = s.firstStartAt else { return .none }
+        let observed = try EluV1Timestamp(s.observedWallAt), first = try EluV1Timestamp(firstStartAt)
+        guard !s.clockDenied, let wall, !wall.storageIsLeapSecond, wall >= observed, highWater.map({ wall >= $0 }) ?? true,
+              let gap = Self.elapsedCeilMicroseconds(from: observed, to: wall),
+              let sinceFirst = Self.elapsedCeilMicroseconds(from: first, to: wall) else {
+            s.clockDenied = true; s.interrupted = true; session = s; try validate(); return .denied
+        }
+        // Compare the native wire's millisecond buckets; neither value is a leap second here.
+        guard wall.floorUnixMilliseconds > observed.floorUnixMilliseconds else {
+            s.interrupted = true; session = s; try validate(); return .unproven
+        }
+        let (charged, overflow) = s.elapsedFloorMicroseconds.addingReportingOverflow(gap)
+        s.elapsedFloorMicroseconds = min(Self.maximumMicroseconds, max(overflow ? Self.maximumMicroseconds : charged, sinceFirst))
+        s.observedWallAt = wall.source; s.activeEpoch = nil; s.interrupted = false
+        session = s; try validate(); return .resumed
+    }
+
     /// Ceil the single exact original-window delta, never separately rounded refresh deltas.
     static func elapsedCeilMicroseconds(from start: EluV1Timestamp, to end: EluV1Timestamp) -> Int64? {
         guard !start.storageIsLeapSecond, !end.storageIsLeapSecond, end >= start else { return nil }

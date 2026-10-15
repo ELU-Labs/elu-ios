@@ -25,6 +25,7 @@ enum EluRuntimeQueueError: Error, Equatable, Sendable {
     case standaloneLegacyEntryPointUnavailable
     case nativeCaptureWorkPending
     case nativeRasterEpochBlocked(replayId: String, reason: String)
+    case replayStreamBlocked(replayId: String, reason: String)
     case flagAuthorityTerminal
     case faultInjected(EluRuntimeQueueFaultPoint)
 }
@@ -453,7 +454,9 @@ private final class EluRuntimeResources: @unchecked Sendable {
     }
 
     /// A failed restrictive native denial write must not release the original
-    /// installation to a second owner before that denial is durable.
+    /// installation to a second owner in this process. A denial that never
+    /// became durable is not carried to a later process, which judges the gap
+    /// against the stored ledger and replay marks instead.
     func quarantineNativeClockDenial() {
         lock.lock()
         guard !isClosed, !replayQuarantined else { lock.unlock(); return }
@@ -3672,6 +3675,8 @@ struct EluNativeReplayStartReceipt: Sendable {
     fileprivate let key: EluNativeReplaySessionState.Key
     fileprivate let epoch: String
     fileprivate let anchor: EluNativeReplayClockAnchor
+    /// In memory only: this recording's begin wall. No chunk may start earlier.
+    fileprivate let epochStartedAt: String
 }
 
 fileprivate struct EluNativeReplayClockAnchor: Sendable {
@@ -3705,7 +3710,8 @@ actor EluSQLiteRuntimeQueue {
         nativeScope.invalidate(terminal: true)
         let held = resources ?? replayReceiptResources ?? nativeCaptureResources
         // No database work or task may run here. An unresolved original denial
-        // retains resources only; exported guards must never keep this owner alive.
+        // retains resources for this process only; exported guards must never
+        // keep this owner alive.
         if nativeScope.retainedClockDenial() != nil { held?.quarantineNativeClockDenial() }
         if configurationGate?.pendingDenial() != nil { held?.quarantineNativeClockDenial() }
         if replayDispatch != nil { held?.quarantineReplay() }
@@ -4212,23 +4218,33 @@ actor EluSQLiteRuntimeQueue {
         } else {
             try EluRuntimeDatabase.verifySchema(try requireResources().connection, databaseVersion: databaseSchemaVersion)
         }
+        var settled = nativeClockAnchor
         try replayStorageTransaction { connection, disk in
             var metadata = try nativeMetadata(connection, disk: disk)
-            if var session = metadata.session, let first = session.firstStartAt {
-                let retainsOriginalClock = nativeClockAnchor.map {
-                    $0.key == session.key && EluNativeReplaySessionState.same($0.firstStartAt, first)
-                } ?? false
-                let retainsOriginalEpoch = session.activeEpoch.map { epoch in
-                    nativeOwnedEpoch.map { EluNativeReplaySessionState.same($0, epoch) } ?? false
-                } ?? true
-                // Even a clean stop cannot prove time across a new owner's gap.
-                // Only this still-live owner may retain the original clock anchor.
-                if !retainsOriginalClock || !retainsOriginalEpoch {
-                    session.interrupted = true; metadata.session = session
-                    try EluRuntimeDatabase.writeNativeReplayAuthority(connection, value: metadata)
-                }
+            guard var session = metadata.session, let first = session.firstStartAt else { return }
+            let retainsOriginalClock = settled.map {
+                $0.key == session.key && EluNativeReplaySessionState.same($0.firstStartAt, first)
+            } ?? false
+            let retainsOriginalEpoch = session.activeEpoch.map { epoch in
+                nativeOwnedEpoch.map { EluNativeReplaySessionState.same($0, epoch) } ?? false
+            } ?? true
+            if retainsOriginalClock && retainsOriginalEpoch { return }
+            let original = metadata
+            if !retainsOriginalClock && nativeOwnedEpoch == nil {
+                // A new exclusive owner settles the previous owner's gap by wall clock
+                // against the durable ledger and replay marks; a new clock origin starts
+                // only at the charged floor; an unprovable gap stays interrupted.
+                let continuous = nativeContinuousSample()
+                let wall = continuous == nil ? nil : try? EluV1Timestamp.exactClock(clock())
+                try settleNativeOwnerGap(&metadata, connection: connection, anchor: &settled, wall: wall, continuous: continuous)
+            } else {
+                // A live owner never holds an epoch without its anchor, or an anchor
+                // beside another owner's epoch. Fail closed.
+                session.interrupted = true; metadata.session = session
             }
+            if metadata != original { try EluRuntimeDatabase.writeNativeReplayAuthority(connection, value: metadata) }
         }
+        nativeClockAnchor = settled
     }
 
     /// Lazy, original-queue migration. Older writable openers reject the outer
@@ -4458,8 +4474,26 @@ actor EluSQLiteRuntimeQueue {
         nativeContinuousNanoseconds(continuousClock()).map { $0 / 1_000 }
     }
 
+    /// The exclusive store lock and owner registry mean a stored epoch without
+    /// this owner's anchor belongs to a closed or dead owner. The gap is proven
+    /// only by the wall clock at or after the ledger's observed wall and the
+    /// replay store's observed wall, which every sealed chunk's end precedes.
+    /// This writes nothing itself and never throws for clock reasons.
+    private func settleNativeOwnerGap(_ value: inout EluNativeReplaySessionState, connection: EluSQLiteConnection,
+                                      anchor: inout EluNativeReplayClockAnchor?,
+                                      wall: EluV1Timestamp?, continuous: UInt64?) throws {
+        guard let session = value.session, let first = session.firstStartAt, nativeOwnedEpoch == nil,
+              anchor?.key != session.key || anchor.map({ !EluNativeReplaySessionState.same($0.firstStartAt, first) }) == true
+        else { return }
+        let mark = try EluRuntimeDatabase.readReplayState(connection).observedWall
+        guard try value.settleOwnerGap(wall: continuous == nil ? nil : wall, highWater: mark) == .resumed,
+              let continuous, let settled = value.session else { return }
+        anchor = EluNativeReplayClockAnchor(key: settled.key, firstStartAt: first,
+            continuousMicroseconds: continuous, consumedMicroseconds: settled.elapsedFloorMicroseconds)
+    }
+
     /// Accounting clocks are session-local. This does not call the replay-age clock transaction.
-    private func accountNative(_ value: inout EluNativeReplaySessionState,
+    private func accountNative(_ value: inout EluNativeReplaySessionState, connection: EluSQLiteConnection,
                                key: EluNativeReplaySessionState.Key, policy: EluV1ReplayPolicy,
                                ownedEpoch: String?, anchor: inout EluNativeReplayClockAnchor?) throws {
         let wall = try? EluV1Timestamp.exactClock(clock())
@@ -4469,6 +4503,10 @@ actor EluSQLiteRuntimeQueue {
             // that ledger; otherwise its delayed stop would lose its target.
             guard nativeOwnedEpoch == nil else { throw EluRuntimeQueueError.sourceAuthorityUnavailable }
             anchor = nil
+        } else {
+            // Settle with these same samples before observing, whichever of
+            // observation and schema setup touches the ledger first.
+            try settleNativeOwnerGap(&value, connection: connection, anchor: &anchor, wall: wall, continuous: continuous)
         }
         if let wall {
             try value.observe(key: key, sampleRate: policy.sampleRate, maximumDurationSeconds: policy.maximumDurationSeconds,
@@ -4478,8 +4516,7 @@ actor EluSQLiteRuntimeQueue {
         if wall == nil || continuous == nil { nativeClockDeniedKey = key }
         if let first = session.firstStartAt, let continuous {
             if anchor?.key != key || anchor.map({ !EluNativeReplaySessionState.same($0.firstStartAt, first) }) == true {
-                // Observation may be called without repeating optional schema setup.
-                // Never manufacture a new clock origin for an already-started session.
+                // Never manufacture a clock origin except from a settled, charged owner gap.
                 session.interrupted = true
             } else if let elapsed = anchor?.observe(continuous, floor: session.elapsedFloorMicroseconds) {
                 session.elapsedFloorMicroseconds = max(session.elapsedFloorMicroseconds, elapsed)
@@ -4496,12 +4533,12 @@ actor EluSQLiteRuntimeQueue {
         try replayStorageTransaction(validate: { _ = try self.nativeCurrentSource(source, disk: self.state, expected: initial.0) },
             beforeCommit: { connection in
                 var current = try self.nativeMetadata(connection, disk: self.state)
-                try self.accountNative(&current, key: initial.2, policy: initial.1, ownedEpoch: self.nativeOwnedEpoch, anchor: &anchor)
+                try self.accountNative(&current, connection: connection, key: initial.2, policy: initial.1, ownedEpoch: self.nativeOwnedEpoch, anchor: &anchor)
                 try EluRuntimeDatabase.writeNativeReplayAuthority(connection, value: current)
             }) { connection, disk in
                 _ = try nativeCurrentSource(source, disk: disk, expected: initial.0)
                 var current = try nativeMetadata(connection, disk: disk)
-                try accountNative(&current, key: initial.2, policy: initial.1, ownedEpoch: nativeOwnedEpoch, anchor: &anchor)
+                try accountNative(&current, connection: connection, key: initial.2, policy: initial.1, ownedEpoch: nativeOwnedEpoch, anchor: &anchor)
                 try EluRuntimeDatabase.writeNativeReplayAuthority(connection, value: current)
             }
         nativeClockAnchor = anchor
@@ -4615,14 +4652,14 @@ actor EluSQLiteRuntimeQueue {
             _ = try self.nativeCurrentSource(observation.source, disk: self.state, expected: observation.capture)
         }, beforeCommit: { connection in
             var value = try self.nativeMetadata(connection, disk: self.state)
-            try self.accountNative(&value, key: currentSource.2, policy: currentSource.1,
+            try self.accountNative(&value, connection: connection, key: currentSource.2, policy: currentSource.1,
                 ownedEpoch: started ? epoch : self.nativeOwnedEpoch, anchor: &anchor)
             try EluRuntimeDatabase.writeNativeReplayAuthority(connection, value: value)
         }) { connection, disk in
             _ = try nativeCurrentSource(observation.source, disk: disk, expected: observation.capture)
             var value = try nativeMetadata(connection, disk: disk)
             guard value.session?.key == observation.accounting.key else { return nil }
-            try accountNative(&value, key: currentSource.2, policy: currentSource.1, ownedEpoch: nativeOwnedEpoch, anchor: &anchor)
+            try accountNative(&value, connection: connection, key: currentSource.2, policy: currentSource.1, ownedEpoch: nativeOwnedEpoch, anchor: &anchor)
             let wall = try EluV1Timestamp.exactClock(clock())
             guard let continuous = nativeContinuousSample(), try value.begin(epoch: epoch, wall: wall, currentRate: currentSource.1.sampleRate) else {
                 try EluRuntimeDatabase.writeNativeReplayAuthority(connection, value: value); return nil
@@ -4642,7 +4679,8 @@ actor EluSQLiteRuntimeQueue {
             }
             guard let receiptAnchor = anchor else { throw EluRuntimeQueueError.sourceAuthorityUnavailable }
             let candidate = EluNativeReplayStartReceipt(replayId: replayId, firstStartAt: first, owner: nativeAccountingOwner,
-                namespace: value.namespaceHash, stream: disk.streamId, key: session.key, epoch: epoch, anchor: receiptAnchor)
+                namespace: value.namespaceHash, stream: disk.streamId, key: session.key, epoch: epoch, anchor: receiptAnchor,
+                epochStartedAt: wall.source)
             // Bind the only original candidate before the first write/commit.
             if physicalUse != nil { nativeCaptureReceipt = candidate }
             try EluRuntimeDatabase.writeNativeReplayAuthority(connection, value: value)
@@ -4750,8 +4788,9 @@ actor EluSQLiteRuntimeQueue {
             }
             if matched { nativeScope.resolveClockDenial(denied) }
         } catch {
-            // This includes proven rollback: losing the only retained denial
-            // would let a new local owner reopen a previously denied session.
+            // This includes proven rollback. Keep the installation from a second
+            // owner in this process; a later process cannot see this denial and
+            // settles the gap against the stored marks instead.
             held.quarantineNativeClockDenial()
             poisonAndRelease()
             throw error
@@ -4889,7 +4928,7 @@ actor EluSQLiteRuntimeQueue {
                       restored.effectivePolicyHash == admission.permit.policy.effectivePolicyHash,
                       EluV2ReplayText.equal(restored.policyRevision, admission.permit.policy.revision),
                       try EluNativeReplayCaptureClock.admits(startedAt: restored.time, endedAt: restored.time,
-                          after: EluV1Timestamp(receipt.firstStartAt)),
+                          after: EluV1Timestamp(receipt.epochStartedAt)),
                       prepared.body.count <= admission.permit.policy.maximumRequestBytes,
                       prepared.sourceIdentity === admission.permit.sourceIdentity, admission.isCurrent()
                 else { throw EluNativeReplayAuthorityError.stale }
@@ -5088,7 +5127,7 @@ actor EluSQLiteRuntimeQueue {
               EluV2ReplayText.equal(receipt.replayId, prepared.replayId),
               EluV2ReplayText.equal(receipt.stream, disk.streamId),
               try EluNativeReplayCaptureClock.admits(startedAt: prepared.startedAt, endedAt: prepared.endedAt,
-                  after: EluV1Timestamp(receipt.firstStartAt)),
+                  after: EluV1Timestamp(receipt.epochStartedAt)),
               prepared.maskingProfileHash == admission.permit.profile.hash,
               prepared.effectivePolicyHash == admission.permit.privacy.effectivePolicyHash,
               admission.originalSourceData == admission.input.source.data,
@@ -5169,6 +5208,8 @@ actor EluSQLiteRuntimeQueue {
             guard now.floorNanoseconds(since: prepared.startedAt) != nil, !Self.replayExpired(row, now: now), prepared.endedAt <= now,
                   prepared.body.count <= min(authorization.limits.replayChunkBytes, EluV2ReplayPreparedRequest.maximumBytes) else { throw EluRuntimeQueueError.invalidRecord }
             var duplicate: EluV2ReplayStoredChunk?
+            var blocked: String?
+            let delivery = EluSQLiteRuntimeSchema.hasReplayDelivery(databaseSchemaVersion)
             try EluRuntimeDatabase.visitReplayChunks(connection) { existing in
                 if EluV2ReplayText.equal(existing.siteId, row.siteId) && (EluV2ReplayText.equal(existing.prepared.requestId, prepared.requestId)
                     || (EluV2ReplayText.equal(existing.prepared.replayId, prepared.replayId) && (EluV2ReplayText.equal(existing.prepared.chunkId, prepared.chunkId) || existing.prepared.sequence == prepared.sequence))) {
@@ -5176,8 +5217,15 @@ actor EluSQLiteRuntimeQueue {
                           EluV2ReplayText.equal(existing.captureProtocolGeneration, generation) else { throw EluRuntimeQueueError.acknowledgementMismatch }
                     duplicate = existing
                 }
+                if delivery, blocked == nil, EluV2ReplayText.equal(existing.siteId, row.siteId),
+                   EluV2ReplayText.equal(existing.prepared.replayId, prepared.replayId) {
+                    blocked = try EluRuntimeDatabase.readReplayDelivery(connection, ordinal: existing.ordinal).blocked?.reason
+                }
             }
             if let duplicate { return .duplicate(duplicate) }
+            // A held or refused head stops its recording: never store a suffix
+            // behind it. A pending transient retry does not stop the recording.
+            if let blocked { throw EluRuntimeQueueError.replayStreamBlocked(replayId: prepared.replayId, reason: blocked) }
             let totals = try EluRuntimeDatabase.replayTotals(connection)
             guard disk.liveCount + totals.count + 1 <= Int64(limits.maximumCount) else { throw EluRuntimeQueueError.queueCountLimitExceeded }
             guard disk.liveBytes + totals.bytes + Int64(prepared.body.count) <= Int64(min(limits.maximumBytes, authorization.limits.queueBytes)) else { throw EluRuntimeQueueError.queueByteLimitExceeded }
@@ -5332,6 +5380,8 @@ actor EluSQLiteRuntimeQueue {
                 try validateReplaySelection(authority, format: format, connection: connection, ledger: ledger)
                 // Only the lowest retained sequence is considered. Its refusal
                 // blocks every suffix; do not rescan the full queue per epoch.
+                // A credential refusal is permanent. A protocol hold offers the
+                // same bytes again after a bounded wait until the row expires.
                 let endpointKey: Int64 = format == .wireframe ? -1 : -2
                 let endpointRetry = endpoint.endpointRetry(for: format)
                 if try replayRetryIsPending(endpointRetry, key: endpointKey, authorizationWitness: authority.endpointWitness(for: format)), let retry = endpointRetry {
@@ -5339,6 +5389,12 @@ actor EluSQLiteRuntimeQueue {
                     deferred = min(deferred ?? delay, delay); continue
                 }
                 var metadata = try EluRuntimeDatabase.readReplayDelivery(connection, ordinal: row.ordinal)
+                if let block = metadata.blocked, block.reason == "protocol" {
+                    let wait = Self.protocolHoldRemaining(block, startedAt: row.startedAt, now: now)
+                    if wait > 0 { deferred = min(deferred ?? wait, wait); continue }
+                    // The attempt write below persists the cleared hold in this transaction.
+                    metadata.blocked = nil
+                }
                 if metadata.blocked != nil || metadata.rasterBlock != nil { continue }
                 if try replayRetryIsPending(metadata.retry, key: row.ordinal, authorizationWitness: authority.endpointWitness(for: format)), let retry = metadata.retry {
                     let delay = UInt64(retry.delayMillis) * 1_000_000
@@ -5560,6 +5616,19 @@ actor EluSQLiteRuntimeQueue {
         guard delay.isFinite, delay >= 0 else { throw EluRuntimeQueueError.invalidState }
         return .init(recordedAt: now.source, delayMillis: Int64(min(86_400_000, ceil(delay * 1_000))),
             ownerEpoch: replayDeliveryOwner.uuidString, authorizationWitness: claim.authority.endpointWitness(for: claim.format))
+    }
+    /// Nanoseconds until a protocol-held row may be offered again with its exact
+    /// bytes. The hold is the row's age when it was held, bounded to 1...24 h.
+    /// Never throws: an unreadable stored time waits the full day, an age that
+    /// cannot be measured uses the one-hour bound, and a hold that starts in the
+    /// future keeps its full length.
+    static func protocolHoldRemaining(_ block: EluV2ReplayDeliveryState.Block,
+        startedAt: EluV1Timestamp, now: EluV1Timestamp) -> UInt64 {
+        let minimum: UInt64 = 3_600_000_000_000, maximum: UInt64 = 86_400_000_000_000
+        guard let recorded = try? EluV1Timestamp(block.recordedAt) else { return maximum }
+        let hold = min(max(minimum, recorded.floorNanoseconds(since: startedAt) ?? 0), maximum)
+        guard let elapsed = now.floorNanoseconds(since: recorded) else { return hold }
+        return elapsed >= hold ? 0 : hold - elapsed
     }
     private func replayBlock(_ reason: String, claim: EluV2ReplayClaim, now: EluV1Timestamp) -> EluV2ReplayDeliveryState.Block {
         .init(reason: reason, recordedAt: now.source, credentialWitness: claim.authority.credentialWitness,

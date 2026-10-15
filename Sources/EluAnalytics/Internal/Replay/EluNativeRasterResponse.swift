@@ -51,6 +51,18 @@ enum EluNativeRasterResponse {
         if response.status == 401 || response.status == 403 {
             return .credentialBlocked(status: response.status)
         }
+        let closed = classifyClosed(response, request: request, now: now)
+        // A validated body keeps its exact semantics. Any other 429/5xx retries
+        // this row only, with a bounded hint, and never pauses the endpoint.
+        guard closed == .protocolBlocked, EluV1BatchDeliveryCoordinator.isRetryableStatus(response.status) else { return closed }
+        return .retry(afterSeconds: EluV1BatchDeliveryCoordinator.foreignRetryAfter(response.headers, now: now))
+    }
+
+    private static func classifyClosed(_ response: EluV1BatchHTTPResponse, request: Binding,
+                                       now: Date) -> EluNativeRasterResponseOutcome {
+        if response.status == 401 || response.status == 403 {
+            return .credentialBlocked(status: response.status)
+        }
         guard response.body.count <= maximumBytes else { return .protocolBlocked }
         let retries = response.headers.filter { $0.key.lowercased() == "retry-after" }
         guard retries.count <= 1 else { return .protocolBlocked }

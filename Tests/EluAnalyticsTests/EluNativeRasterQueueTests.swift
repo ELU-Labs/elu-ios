@@ -253,6 +253,19 @@ final class EluNativeRasterQueueTests: XCTestCase {
         await h.close()
     }
 
+    func testRasterChunkStartingBeforeItsRecordingBeginsIsRefused() async throws {
+        let h = try await Rig.make(start: false); defer { h.remove() }
+        // An earlier recording fixes the session's first start; this recording begins later.
+        let earlier = try await h.native.start(); h.native.base.testClock.advance(2); _ = try await h.native.stop(earlier)
+        let firstStart = try EluV1Timestamp(earlier.firstStartAt).floorUnixMilliseconds
+        try await h.begin()
+        // Refused at durable admission; the same admission then stores a chunk at its begin.
+        do { _ = try await h.append(h.request(at: firstStart)); XCTFail("raster chunk before its recording began") } catch {}
+        let none = try await h.queue.storedReplayRecords(); XCTAssertTrue(none.isEmpty)
+        guard case .committed(.inserted) = try await h.append(h.request(attempt: 2)) else { return XCTFail("chunk at the recording's begin") }
+        await h.close()
+    }
+
     func testMigrationRollbackPreservesExistingSchemaAndWireframeBytes() async throws {
         let fault = DeliveryFault()
         let h = try await Rig.make(fault: fault, start: false, seedReplay: true); defer { h.remove() }
@@ -356,17 +369,18 @@ final class EluNativeRasterQueueTests: XCTestCase {
             let h = try Rig(native)
             h.originalWireframe = try await h.queue.storedReplayChunks()
             try await h.publish(branch: true, advance: true)
-            if start {
-                let selection = try XCTUnwrap(h.lifecycle.select(root: h.root, window: h.window))
-                let prepared = try await h.owner.prepareRaster(source: XCTUnwrap(h.native.base.witness),
-                    sourceIdentity: h.registry.sourceIdentity(), timeZoneIdentifier: "America/Los_Angeles")
-                h.enrollment = try await h.queue.enrollNativeReplayCapture()
-                h.use = try XCTUnwrap(h.enrollment?.takePhysicalUse())
-                let permit = try await h.owner.startRaster(prepared, selection: selection, physicalUse: h.use)
-                h.permit = try XCTUnwrap(permit)
-                h.admission = try await h.owner.captureAdmission(for: h.permit, physicalUse: h.use)
-            }
+            if start { try await h.begin() }
             return h
+        }
+        func begin() async throws {
+            let selection = try XCTUnwrap(lifecycle.select(root: root, window: window))
+            let prepared = try await owner.prepareRaster(source: XCTUnwrap(native.base.witness),
+                sourceIdentity: registry.sourceIdentity(), timeZoneIdentifier: "America/Los_Angeles")
+            enrollment = try await queue.enrollNativeReplayCapture()
+            use = try XCTUnwrap(enrollment?.takePhysicalUse())
+            let started = try await owner.startRaster(prepared, selection: selection, physicalUse: use)
+            permit = try XCTUnwrap(started)
+            admission = try await owner.captureAdmission(for: permit, physicalUse: use)
         }
         func publish(branch: Bool, advance: Bool, installCapture: Bool = true) async throws {
             var base = try JSONSerialization.jsonObject(with: native.base.config) as! [String: Any]
@@ -408,11 +422,11 @@ final class EluNativeRasterQueueTests: XCTestCase {
                 versions: .init(runtime: .init(name: "elu-ios", version: "1.0.0"), facade: .init(name: "EluAnalytics", version: "1.0.0")),
                 sourceIdentity: sourceIdentity ?? registry.sourceIdentity(), sourceIsCurrent: { original.isCurrent() })
         }
-        func request() throws -> EluNativeRasterPreparedRequest {
+        func request(at time: Int64? = nil, attempt: TimeInterval = 0) throws -> EluNativeRasterPreparedRequest {
             var value = try sealer()
-            return try value.seal(registry.capture(deadline: 1, clock: { 0 }, draw: { _, _, context in
+            return try value.seal(registry.capture(deadline: attempt + 1, clock: { attempt }, draw: { _, _, context in
                 context.setFillColor(UIColor.green.cgColor); context.fill(CGRect(x: 0, y: 0, width: 32, height: 32)); return true
-            }), timestamp: timestamp)
+            }), timestamp: time ?? timestamp)
         }
         func append(_ request: EluNativeRasterPreparedRequest) async throws -> EluNativeRasterCaptureAppendResult {
             try await queue.appendNativeRaster(request, admission: admission, physicalUse: use)

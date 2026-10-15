@@ -81,9 +81,10 @@ final class EluSealedReplayPolicyQueueTests: XCTestCase {
     }
 
     func testFalseZeroAndInterruptedLedgerRemainExactWhileSealedPolicyIsAvailable() async throws {
-        for mode in ["false", "zero", "interrupted"] {
-            let h = try await SealedPolicyTestHarness.make(clearSession: false), n = NativeSessionHarness(h.base)
-            defer { n.base.remove() }
+        for mode in ["false", "zero", "interrupted", "denied"] {
+            let h = try await SealedPolicyTestHarness.make(clearSession: false)
+            var n = NativeSessionHarness(h.base)
+            defer { h.base.remove() }
             try await n.queue.ensureNativeReplayAuthoritySchema()
             try await n.update(rate: mode == "false" ? 0 : 1, cap: mode == "zero" ? 0 : 60)
             _ = try await n.observe()
@@ -92,13 +93,23 @@ final class EluSealedReplayPolicyQueueTests: XCTestCase {
                 await n.queue.close(); try await n.reopen(); try await n.publish()
                 _ = try await n.observe()
             }
+            if mode == "denied" {
+                // After relaunch the device clock reads earlier than the ledger's last observation.
+                let receipt = try await n.start(); let begun = n.base.now
+                n.base.testClock.advance(1); _ = try await n.observe(); _ = try await n.stop(receipt)
+                await n.queue.close(); n.base.testClock.set(begun.addingTimeInterval(0.5))
+                n = try await n.relaunched()
+                _ = try await n.observe()
+            }
             let ledger = try await n.queue.nativeReplaySessionState()
             if mode == "false" { XCTAssertFalse(try XCTUnwrap(ledger.session).originalSelected) }
             if mode == "zero" { XCTAssertEqual(ledger.session?.maximumDurationSeconds, 0) }
-            if mode == "interrupted" { XCTAssertEqual(ledger.session?.interrupted, true) }
+            if mode == "interrupted" { XCTAssertEqual(ledger.session?.interrupted, true); XCTAssertEqual(ledger.session?.clockDenied, false) }
+            if mode == "denied" { XCTAssertEqual(ledger.session?.clockDenied, true) }
             let bytes = try n.bytes("SELECT metadata FROM native_replay_authority")
             let rows = try await n.queue.storedReplayChunks(); XCTAssertEqual(rows.count, 1)
-            let value = try await h.authority(), current = try XCTUnwrap(value)
+            let value = try await n.queue.currentSealedReplayDelivery(source: XCTUnwrap(n.base.witness),
+                capabilities: h.proof, timeZoneIdentifier: h.zone), current = try XCTUnwrap(value)
             XCTAssertEqual(try n.bytes("SELECT metadata FROM native_replay_authority"), bytes)
             guard case let .claimed(claim) = try await n.queue.claimNextReplay(current) else { return XCTFail("original sealed row despite capture-only restriction") }
             XCTAssertEqual(claim.row, .wireframe(rows[0]))
