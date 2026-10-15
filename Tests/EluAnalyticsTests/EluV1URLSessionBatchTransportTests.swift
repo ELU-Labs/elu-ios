@@ -48,6 +48,31 @@ final class EluV1URLSessionBatchTransportTests: XCTestCase {
         }
     }
 
+    func testRetryableStatusSurvivesOversizedBody() async throws {
+        for (status, streamed) in [(429, false), (503, false), (500, true), (502, true)] {
+            BatchURLProtocol.hooks.set { request, client, instance in
+                let headers = streamed ? ["Retry-After": "5"] : ["Retry-After": "5", "Content-Length": "99999999"]
+                client.urlProtocol(instance, didReceive: Self.response(request, status: status, headers: headers), cacheStoragePolicy: .notAllowed)
+                client.urlProtocol(instance, didLoad: Data(repeating: 0x20, count: streamed ? 1025 : 1))
+                client.urlProtocolDidFinishLoading(instance)
+            }
+            let result = try await transport().send(request())
+            XCTAssertEqual(result.status, status)
+            XCTAssertTrue(result.body.isEmpty)
+            XCTAssertEqual(result.headers.first { $0.key.lowercased() == "retry-after" }?.value, "5")
+        }
+        for streamed in [false, true] {
+            BatchURLProtocol.hooks.set { request, client, instance in
+                client.urlProtocol(instance, didReceive: Self.response(request, status: 200,
+                    headers: streamed ? [:] : ["Content-Length": "99999999"]), cacheStoragePolicy: .notAllowed)
+                client.urlProtocol(instance, didLoad: Data(repeating: 0x20, count: streamed ? 1025 : 1))
+                client.urlProtocolDidFinishLoading(instance)
+            }
+            do { _ = try await transport().send(request()); XCTFail("Oversized acknowledgement returned") }
+            catch { XCTAssertEqual(error as? EluV1BatchDeliveryError, .responseTooLarge) }
+        }
+    }
+
     func testGenerationWrappersShareOnePhysicalSlotAndReuseAfterCancellationCleanup() async throws {
         let started = expectation(description: "request started")
         let concrete = EluV1URLSessionBatchTransport(protocolClasses: [BatchCleanupURLProtocol.self])

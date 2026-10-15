@@ -15,19 +15,31 @@ each release has its notes. Application code uses `Elu.*` with an ELU site key.
 - Bounded UIKit session replay, controlled by remote configuration and on-device
   privacy rules
 
-## Current release: 0.2.2
+## Current release: 0.2.3
 
-`0.2.2` is the current release. It includes analytics, identity, sessions,
-durable delivery, feature flags, and automatic device and app context on every
-event (see [Identity: you own it](#identity-you-own-it)). A custom `configHost`
-must now be a self-hosted instance that you also declare as `apiHost` (see
+`0.2.3` is the current release. It fixes two native session replay issues:
+
+- A recording no longer stops uploading when the service, or a proxy in front of
+  it, briefly answers with an error page that is not ELU's error format, for
+  example during maintenance. Those uploads now retry with backoff, and
+  recordings that earlier versions held back on the device upload again within
+  a day of the app updating, as long as they are less than seven days old.
+- Replay now resumes when the app is relaunched or updated during a session. The
+  new launch starts a new recording in the same session, under the same sampling
+  decision and the same recording-length limit. A local `stopSessionRecording()`
+  still lasts only until the app is relaunched.
+
+It includes analytics, identity, sessions, durable delivery, feature flags, and
+automatic device and app context on every event (see
+[Identity: you own it](#identity-you-own-it)). Since 0.2.2, a custom `configHost`
+must be a self-hosted instance that you also declare as `apiHost` (see
 [Self-hosted instances](#self-hosted-instances)); ELU Cloud apps keep the default
 host and need no change.
 
-The SDK no longer writes the unused `elu.firstLaunchAt` UserDefaults key, and its
-privacy manifest no longer declares UserDefaults access. The privacy manifest now
-declares file timestamp access (`C617.1`): the SDK checks metadata only on its own
-files inside the app container. Your app's aggregated privacy report changes
+Since 0.2.2, the SDK no longer writes the unused `elu.firstLaunchAt` UserDefaults
+key, and its privacy manifest no longer declares UserDefaults access. The privacy
+manifest declares file timestamp access (`C617.1`): the SDK checks metadata only on
+its own files inside the app container. Your app's aggregated privacy report changes
 accordingly.
 
 Native session replay on iOS is in preview. ELU turns it on per project through
@@ -39,12 +51,12 @@ web views stay blocked; with "mask all text" every text element is masked.
 ## Install (Swift Package Manager)
 
 In Xcode, use **File → Add Package Dependencies…**, enter
-`https://github.com/ELU-Labs/elu-ios`, choose 0.2.2 or later, and add the
+`https://github.com/ELU-Labs/elu-ios`, choose 0.2.3 or later, and add the
 `EluAnalytics` library to your app target. Or add to your `Package.swift`:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/ELU-Labs/elu-ios.git", from: "0.2.2"),
+    .package(url: "https://github.com/ELU-Labs/elu-ios.git", from: "0.2.3"),
 ],
 targets: [
     .target(
@@ -626,6 +638,15 @@ frames. A missing or presented root is observed without reading view text; recov
 stops on local stop, withdrawal or expiry and never renews configuration itself.
 In automatic wireframe mode, opaque framework/custom content remains opaque. Scroll and navigation can change
 visual snapshots; they do not produce touch or scroll interaction markers.
+
+If the app is closed, ended by the system or updated and then opened again while
+its analytics session is still active, replay continues under a new replay ID in
+the same session, with the same sample decision and the remaining budget. The time
+the app was closed counts toward the session's replay limit. If the device clock
+reads earlier than the last recorded replay time, replay stays off for the rest of
+that session. A local `stopSessionRecording()` does not carry over to the next launch:
+call it again after setup on each launch where recording must stay off, or use
+`optOut()` to stop recording persistently.
 
 ### UIKit touch recording with EluReplayWindow (preview)
 

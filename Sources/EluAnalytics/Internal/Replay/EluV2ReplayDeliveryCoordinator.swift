@@ -29,11 +29,15 @@ private final class EluReplayPassFence: @unchecked Sendable {
 actor EluV2ReplayDeliveryCoordinator {
     enum CloseOutcome: Equatable, Sendable { case settled, quarantined }
     static let maximumRequestsPerPass = 16
+    static let maximumTransientPauseSeconds: TimeInterval = 60
     private let queue: EluSQLiteRuntimeQueue
     private let transport: any EluV2ReplayHTTPTransport
     private let wallNow: @Sendable () -> Date
     private let sleep: @Sendable (UInt64) async throws -> Void
+    private let randomUnit: @Sendable () -> Double
     private var retryTimer: Task<Void, Never>?
+    private var transientStreak = 0
+    private var transientUntil: Date?
     private var running = false
     private var credentialRefusedAuthority: EluV2ReplayDeliveryAuthority?
     private var closed = false
@@ -46,8 +50,10 @@ actor EluV2ReplayDeliveryCoordinator {
 
     init(queue: EluSQLiteRuntimeQueue, transport: any EluV2ReplayHTTPTransport,
          wallNow: @escaping @Sendable () -> Date = { Date() },
-         sleep: @escaping @Sendable (UInt64) async throws -> Void = { try await Task.sleep(nanoseconds: $0) }) {
+         sleep: @escaping @Sendable (UInt64) async throws -> Void = { try await Task.sleep(nanoseconds: $0) },
+         randomUnit: @escaping @Sendable () -> Double = { Double.random(in: 0 ... 1) }) {
         self.queue = queue; self.transport = transport; self.wallNow = wallNow; self.sleep = sleep
+        self.randomUnit = randomUnit
     }
 
     /// Logical withdrawal cancels work but never releases a physical slot early.
@@ -71,6 +77,9 @@ actor EluV2ReplayDeliveryCoordinator {
     /// Read-only test observation; callers cannot create or settle a waiter.
     func registeredCloseWaiterCountForTesting() -> Int { closeWaiters.count }
 
+    /// Read-only test observation of consecutive transient failures.
+    func transientStreakForTesting() -> Int { transientStreak }
+
     private func finishPass() {
         running = false
         requestTask = nil
@@ -88,11 +97,26 @@ actor EluV2ReplayDeliveryCoordinator {
     }
 
     func trigger(_ authority: EluV2ReplayDeliveryAuthority) async -> EluV2ReplayDeliverySummary {
+        await run(authority, afterTransientPause: false)
+    }
+
+    private func run(_ authority: EluV2ReplayDeliveryAuthority, afterTransientPause: Bool) async -> EluV2ReplayDeliverySummary {
         var summary = EluV2ReplayDeliverySummary()
         guard !closed else { summary.stopped = .closed; return summary }
         guard !receiptQuarantined else { summary.stopped = .storageFailure; return summary }
         guard !running else { summary.stopped = .occupied; return summary }
         guard credentialRefusedAuthority?.hasSameSource(as: authority) != true else { summary.stopped = .withdrawn; return summary }
+        // After a transient failure, external triggers fold into the pending
+        // pause instead of sending again. A wall clock that moved backwards
+        // past the bound, or an elapsed pause, ends the pause.
+        if let until = transientUntil, !afterTransientPause {
+            let remaining = until.timeIntervalSince(wallNow())
+            if remaining > 0, remaining <= Self.maximumTransientPauseSeconds {
+                scheduleRetry(authority, after: UInt64((remaining * 1_000_000_000).rounded(.up)), pass: generation, transient: true)
+                summary.stopped = .deferred; return summary
+            }
+        }
+        transientUntil = nil
         retryTimerID = nil; retryTimer?.cancel(); retryTimer = nil
         running = true
         defer { finishPass() }
@@ -162,6 +186,9 @@ actor EluV2ReplayDeliveryCoordinator {
                 completion = .released
                 if error == .occupied { summary.stopped = .occupied }
             } catch let error as EluV1BatchDeliveryError {
+                // Malformed transport results and oversized responses whose
+                // status is not 429/5xx stay protocol holds; an oversized
+                // 429/5xx reaches the classifier with its status and headers.
                 if error == .malformedResponse || error == .responseTooLarge {
                     outcome = .protocolBlocked
                     completion = claim.format == .wireframe ? .response(.protocolBlocked) : .rasterResponse(.protocolBlocked)
@@ -185,6 +212,22 @@ actor EluV2ReplayDeliveryCoordinator {
                 credentialRefusedAuthority = authority
                 summary.stopped = .withdrawn; return summary
             }
+            switch (completion, outcome) {
+            case (.networkFailure, _), (_, .retry?):
+                // A transient failure ends the pass. The next pass waits a
+                // jittered, growing pause and then takes the next eligible head,
+                // so queued recordings take turns instead of all being resent.
+                transientStreak = min(transientStreak + 1, 7)
+                let base = min(Self.maximumTransientPauseSeconds, pow(2, Double(transientStreak - 1)))
+                let sample = randomUnit()
+                let unit = sample.isFinite ? min(max(sample, 0), 1) : 0.5
+                let pause = base * (0.5 + 0.5 * unit)
+                transientUntil = wallNow().addingTimeInterval(pause)
+                scheduleRetry(authority, after: UInt64((pause * 1_000_000_000).rounded(.up)), pass: pass, transient: true)
+                summary.stopped = .deferred; return summary
+            case (_, .accepted?), (_, .rejectedTooLarge?): transientStreak = 0
+            default: break
+            }
             // Reenter the same bounded claim loop: the refused endpoint is
             // cooling down, while the other original endpoint may still progress.
             // The queue returns deferred when no eligible endpoint remains.
@@ -195,7 +238,7 @@ actor EluV2ReplayDeliveryCoordinator {
         summary.stopped = .bounded
         return summary
     }
-    private func scheduleRetry(_ authority: EluV2ReplayDeliveryAuthority, after delay: UInt64, pass: UUID) {
+    private func scheduleRetry(_ authority: EluV2ReplayDeliveryAuthority, after delay: UInt64, pass: UUID, transient: Bool = false) {
         guard !closed, pass == generation, authority.isCurrent() else { return }
         retryTimer?.cancel()
         let timerID = UUID(), sleep = self.sleep
@@ -203,14 +246,15 @@ actor EluV2ReplayDeliveryCoordinator {
         retryTimer = Task { [weak self] in
             do { try await sleep(max(1, delay)) } catch { return }
             guard !Task.isCancelled else { return }
-            await self?.retryFired(authority, pass: pass, timerID: timerID)
+            await self?.retryFired(authority, pass: pass, timerID: timerID, transient: transient)
         }
     }
-    private func retryFired(_ authority: EluV2ReplayDeliveryAuthority, pass: UUID, timerID: UUID) async {
+    private func retryFired(_ authority: EluV2ReplayDeliveryAuthority, pass: UUID, timerID: UUID, transient: Bool) async {
         guard !closed, generation == pass, retryTimerID == timerID else { return }
         retryTimerID = nil
         retryTimer = nil
-        _ = await trigger(authority)
+        // The pause timer itself marks the end of the transient pause.
+        _ = await run(authority, afterTransientPause: transient)
     }
 
 }

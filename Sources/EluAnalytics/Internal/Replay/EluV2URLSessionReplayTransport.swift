@@ -151,7 +151,13 @@ private final class EluV2BoundedReplayURLSessionOperation: NSObject,
         }
         if response.expectedContentLength > Int64(maximumResponseBytes) {
             completionHandler(.cancel)
-            finish(.failure(EluV1BatchDeliveryError.responseTooLarge))
+            // A retryable status stays retryable even when its body is too
+            // large to buffer; only its status and headers are kept.
+            if EluV1BatchDeliveryCoordinator.isRetryableStatus(http.statusCode) {
+                finish(.success(Self.response(http, body: Data())))
+            } else {
+                finish(.failure(EluV1BatchDeliveryError.responseTooLarge))
+            }
             return
         }
         lock.lock()
@@ -168,10 +174,15 @@ private final class EluV2BoundedReplayURLSessionOperation: NSObject,
             body.append(data)
         }
         let task = task
+        let retained = response
         lock.unlock()
         if exceedsLimit {
             task?.cancel()
-            finish(.failure(EluV1BatchDeliveryError.responseTooLarge))
+            if let retained, EluV1BatchDeliveryCoordinator.isRetryableStatus(retained.statusCode) {
+                finish(.success(Self.response(retained, body: Data())))
+            } else {
+                finish(.failure(EluV1BatchDeliveryError.responseTooLarge))
+            }
         }
     }
 

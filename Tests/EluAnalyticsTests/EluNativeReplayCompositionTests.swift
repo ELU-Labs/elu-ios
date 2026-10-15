@@ -473,17 +473,172 @@ final class EluNativeReplayCompositionTests: XCTestCase {
         } catch { fault.action = nil; _ = await f.close(); throw error }
     }
 
-    @MainActor private func makeUIKitFixture(fault: DeliveryFault? = nil) async throws -> CompositionUIKitFixture {
-        let h = try await SealedPolicyTestHarness.make(seed: false, fault: fault)
-        try h.changeConfig { root in
-            var privacy = root["privacy"] as! [String: Any], replay = privacy["replay"] as! [String: Any]
-            replay["sampleRate"] = 1; replay["minimumDurationSeconds"] = 0; replay["maximumDurationSeconds"] = 60
-            privacy["replay"] = replay; root["privacy"] = privacy
+    @MainActor func testRefusedRecordingSettlesAndDoesNotLoopNewRecordingsUntilSourceRenews() async throws {
+        let f = try await makeUIKitFixture(transport: CompositionTransport(refuse: true) {})
+        do {
+            try await waitUIKit("initial frame reaches delivery", diagnostics: { await f.captureDiagnostics() }) { await f.transport.count() == 1 }
+            await f.composition.waitForCurrentDelivery()
+            let first = try await f.transport.requests()[0]
+            // The refused head is held, so the next chunk of that recording is not
+            // stored. The run settles without quarantining capture.
+            f.h.base.testClock.advance(10)
+            try await waitUIKit("held recording stops capture", diagnostics: { await f.captureDiagnostics() }) {
+                guard !f.runtime.nativeReplayIsRecording() else { return false }
+                return !(await f.composition.hasCaptureAfterEvaluationForTesting())
+            }
+            let stored = try await f.queue.storedReplayChunks()
+            XCTAssertEqual(stored.map(\.prepared.replayId), [first.replayId]); XCTAssertEqual(stored.map(\.prepared.sequence), [0])
+            // Events and reevaluations in the same source, identity and session
+            // never start a new recording behind an endpoint that refuses.
+            for index in 0 ..< 3 {
+                guard case .accepted = await f.runtime.capture("after-refusal-\(index)") else { return XCTFail("event capture") }
+                await f.composition.reevaluate()
+                let started = await f.composition.hasCaptureAfterEvaluationForTesting()
+                XCTAssertFalse(started, "reevaluation \(index) started a new recording")
+            }
+            await f.composition.waitForCurrentDelivery()
+            let sends = await f.transport.count(); XCTAssertEqual(sends, 1)
+            XCTAssertFalse(f.runtime.nativeReplayIsRecording())
+            let unchanged = try await f.queue.storedReplayChunks(); XCTAssertEqual(unchanged, stored)
+            // A renewed source is a new capture context, so one new recording starts.
+            try f.h.publish()
+            _ = await f.runtime.applyConfiguration(f.h.base.config, sourceWitness: f.h.base.witness)
+            await f.composition.reevaluate()
+            try await waitUIKit("renewed source starts one recording", diagnostics: { await f.captureDiagnostics() }) { await f.transport.count() >= 2 }
+            let next = try await f.transport.requests()[1]
+            XCTAssertNotEqual(next.replayId, first.replayId)
+            XCTAssertEqual(next.sessionId, first.sessionId); XCTAssertEqual(next.sequence, 0)
+            let result = await f.close(); XCTAssertEqual(result, .settled)
+        } catch { _ = await f.close(); throw error }
+    }
+
+    @MainActor func testBackgroundTerminateRelaunchInsideIdleTimeoutRecordsNewReplay() async throws {
+        let f = try await makeUIKitFixture()
+        var relaunched: CompositionUIKitFixture?
+        do {
+            try await waitUIKit("initial frame reaches delivery", diagnostics: { await f.captureDiagnostics() }) { await f.transport.count() == 1 }
+            f.h.base.testClock.advance(10)
+            try await waitUIKit("second chunk reaches delivery", diagnostics: { await f.captureDiagnostics() }) { await f.transport.count() >= 2 }
+            let old = try await f.transport.requests()
+            XCTAssertEqual(Set(old.map(\.replayId)).count, 1); XCTAssertEqual(old.map(\.sequence).prefix(2), [0, 1])
+            _ = await f.runtime.markBackgrounded(at: f.h.base.now)
+            try await waitUIKit("background settles capture", diagnostics: { await f.captureDiagnostics() }) {
+                guard !f.runtime.nativeReplayIsRecording() else { return false }
+                return try await f.queue.nativeReplaySessionState().session?.activeEpoch == nil
+            }
+            let delivered = try await f.transport.requests()
+            let closed = await f.close(keepingStore: true); XCTAssertEqual(closed, .settled)
+            // The system ends the suspended app; it is opened again inside the idle timeout.
+            // The closed time counts toward the 60 s budget, so keep the gap short.
+            f.h.base.testClock.advance(5)
+            let next = try await makeUIKitFixture(relaunching: f.h); relaunched = next
+            try await waitUIKit("relaunched recording reaches delivery", diagnostics: { await next.captureDiagnostics() }) { await next.transport.count() >= 1 }
+            let first = try await next.transport.requests()[0]
+            XCTAssertFalse(delivered.contains { $0.replayId == first.replayId })
+            XCTAssertEqual(first.sessionId, old[0].sessionId); XCTAssertEqual(first.sequence, 0)
+            let lastEnd = try delivered.map { try EluNativeReplayCaptureClock.milliseconds($0.endedAt) }.max() ?? 0
+            XCTAssertGreaterThan(try EluNativeReplayCaptureClock.milliseconds(first.startedAt), lastEnd)
+            XCTAssertTrue(next.runtime.nativeReplayIsRecording())
+            let ledger = try await next.queue.nativeReplaySessionState().session
+            XCTAssertEqual(ledger?.sessionId, old[0].sessionId); XCTAssertEqual(ledger?.interrupted, false)
+            let result = await next.close(); XCTAssertEqual(result, .settled)
+        } catch {
+            if let relaunched { _ = await relaunched.close() }
+            _ = await f.close(); throw error
+        }
+    }
+
+    @MainActor func testAppUpdateRelaunchBindsNewVersionsToNewReplayOnly() async throws {
+        let f = try await makeUIKitFixture(transport: CompositionTransport(unsent: true) {})
+        var relaunched: CompositionUIKitFixture?
+        do {
+            try await waitUIKit("initial chunk is stored", diagnostics: { await f.captureDiagnostics() }) {
+                try await f.queue.storedReplayChunks().count == 1
+            }
+            _ = await f.runtime.markBackgrounded(at: f.h.base.now)
+            try await waitUIKit("background settles capture", diagnostics: { await f.captureDiagnostics() }) {
+                guard !f.runtime.nativeReplayIsRecording() else { return false }
+                return try await f.queue.nativeReplaySessionState().session?.activeEpoch == nil
+            }
+            let stored = try await f.queue.storedReplayChunks()
+            let closed = await f.close(keepingStore: true); XCTAssertEqual(closed, .settled)
+            f.h.base.testClock.advance(5)
+            let updated = try EluVersionContext(runtime: .init(name: "elu-ios", version: "9.0.0"), facade: .init(name: "elu-ios", version: "9.0.0"))
+            let next = try await makeUIKitFixture(relaunching: f.h, versions: updated); relaunched = next
+            let oldIds = Set(stored.map(\.prepared.replayId))
+            try await waitUIKit("stored chunks and the new recording reach delivery", diagnostics: { await next.captureDiagnostics() }) {
+                let requests = try await next.transport.requests()
+                return oldIds.isSubset(of: Set(requests.map(\.replayId))) && requests.contains { !oldIds.contains($0.replayId) }
+            }
+            let bodies = await next.transport.allBodies()
+            for row in stored {
+                XCTAssertTrue(bodies.contains(row.prepared.body), "stored chunk delivered with its exact bytes")
+                XCTAssertNotEqual(try runtimeVersion(row.prepared.body), "9.0.0")
+            }
+            let fresh = try bodies.map { try EluV2ReplayPreparedRequest($0, captureProtocolGeneration: "replay-v2-1") }
+                .filter { !oldIds.contains($0.replayId) }
+            XCTAssertEqual(Set(fresh.map(\.replayId)).count, 1); XCTAssertEqual(fresh.first?.sequence, 0)
+            XCTAssertEqual(fresh.first?.sessionId, stored.first?.prepared.sessionId)
+            for request in fresh { XCTAssertEqual(try runtimeVersion(request.body), "9.0.0") }
+            let result = await next.close(); XCTAssertEqual(result, .settled)
+        } catch {
+            if let relaunched { _ = await relaunched.close() }
+            _ = await f.close(); throw error
+        }
+    }
+
+    @MainActor func testLocalStopDoesNotPersistAcrossRelaunch() async throws {
+        let f = try await makeUIKitFixture()
+        var relaunched: CompositionUIKitFixture?
+        do {
+            try await waitUIKit("initial frame reaches delivery", diagnostics: { await f.captureDiagnostics() }) { await f.transport.count() == 1 }
+            let first = try await f.transport.requests()[0]
+            f.runtime.setNativeReplayRecordingEnabled(false)
+            await f.composition.reevaluate()
+            try await waitUIKit("local stop settles capture", diagnostics: { await f.captureDiagnostics() }) {
+                guard !f.runtime.nativeReplayIsRecording() else { return false }
+                return try await f.queue.nativeReplaySessionState().session?.activeEpoch == nil
+            }
+            let closed = await f.close(keepingStore: true); XCTAssertEqual(closed, .settled)
+            f.h.base.testClock.advance(5)
+            // No start call: the local stop belonged only to the ended runtime.
+            let next = try await makeUIKitFixture(relaunching: f.h); relaunched = next
+            try await waitUIKit("relaunched recording reaches delivery", diagnostics: { await next.captureDiagnostics() }) { await next.transport.count() >= 1 }
+            let request = try await next.transport.requests()[0]
+            XCTAssertNotEqual(request.replayId, first.replayId)
+            XCTAssertEqual(request.sessionId, first.sessionId); XCTAssertEqual(request.sequence, 0)
+            XCTAssertTrue(next.runtime.nativeReplayIsRecording())
+            let result = await next.close(); XCTAssertEqual(result, .settled)
+        } catch {
+            if let relaunched { _ = await relaunched.close() }
+            _ = await f.close(); throw error
+        }
+    }
+
+    private func runtimeVersion(_ body: Data) throws -> String? {
+        let root = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+        let versions = (root["chunk"] as? [String: Any])?["versions"] as? [String: Any]
+        return (versions?["runtime"] as? [String: Any])?["version"] as? String
+    }
+
+    /// `relaunching` opens a new runtime on that fixture's kept store, as the app does after it was ended.
+    @MainActor private func makeUIKitFixture(fault: DeliveryFault? = nil,
+                                             transport: CompositionTransport = CompositionTransport {},
+                                             relaunching store: SealedPolicyTestHarness? = nil,
+                                             versions: EluVersionContext? = nil) async throws -> CompositionUIKitFixture {
+        let h: SealedPolicyTestHarness
+        if let store { h = store } else {
+            h = try await SealedPolicyTestHarness.make(seed: false, fault: fault)
+            try h.changeConfig { root in
+                var privacy = root["privacy"] as! [String: Any], replay = privacy["replay"] as! [String: Any]
+                replay["sampleRate"] = 1; replay["minimumDurationSeconds"] = 0; replay["maximumDurationSeconds"] = 60
+                privacy["replay"] = replay; root["privacy"] = privacy
+            }
         }
         try h.publish()
         let window = try EluUIKitTestHost.window(), previous = window.rootViewController, controller = UIViewController()
         controller.view = UIView(frame: window.bounds); window.rootViewController = controller
-        let runtime = try await open(h)
+        let runtime = try await open(h, versions: versions)
         guard case .accepted = await runtime.capture("continuity-anchor") else {
             await runtime.close(); window.rootViewController = previous
             throw EluRuntimeQueueError.invalidState
@@ -491,7 +646,6 @@ final class EluNativeReplayCompositionTests: XCTestCase {
         let queue = try XCTUnwrap(Mirror(reflecting: runtime).children.first { $0.label == "queue" }?.value as? EluSQLiteRuntimeQueue)
         let lifecycle = EluNativeReplayLifecycle(windowInventoryForTesting: EluUIKitTestHost.inventory(for: window))
         lifecycle.attached(UUID()); runtime.bindNativeLifecycle(lifecycle)
-        let transport = CompositionTransport {}
         let installed = await runtime.installNativeReplayComposition(lifecycle: lifecycle, capabilities: h.proof,
             deferredUntilActivation: true, transport: transport)
         let composition = try XCTUnwrap(installed)
@@ -533,10 +687,11 @@ final class EluNativeReplayCompositionTests: XCTestCase {
     }
     #endif
 
-    private func open(_ h: SealedPolicyTestHarness, zone: CompositionZone = CompositionZone()) async throws -> EluStandaloneRuntime {
+    private func open(_ h: SealedPolicyTestHarness, zone: CompositionZone = CompositionZone(),
+                      versions: EluVersionContext? = nil) async throws -> EluStandaloneRuntime {
         await h.base.queue.close()
         let runtime = try await EluStandaloneRuntime.make(rootDirectoryURL: h.base.root,
-            siteKey: "elu_pk_test_aaaaaaaaaaaaaaaaaaaaaa", limits: h.base.limits,
+            siteKey: "elu_pk_test_aaaaaaaaaaaaaaaaaaaaaa", versions: versions, limits: h.base.limits,
             transport: CompositionEventTransport(), configurationGate: h.base.gate,
             clock: { h.base.now }, continuousClock: { h.base.testClock.ticks() },
             continuousBudgetConverter: { $0 }, nativeContinuousNanoseconds: { $0 },
@@ -575,11 +730,18 @@ private final class CompositionZone: @unchecked Sendable {
 private actor CompositionTransport: EluV2ReplayHTTPTransport {
     private var bodies: [Data] = []
     private let held: Bool
+    /// Every send gets a non-retryable refusal, so each recording's head is held.
+    private let refuse: Bool
+    /// Every send ends without a response, so each chunk stays stored and pending.
+    private let unsent: Bool
     private let entered: @Sendable () -> Void
     private var waiter: CheckedContinuation<Void, Never>?
-    init(held: Bool = false, entered: @escaping @Sendable () -> Void) { self.held = held; self.entered = entered }
+    init(held: Bool = false, refuse: Bool = false, unsent: Bool = false, entered: @escaping @Sendable () -> Void) {
+        self.held = held; self.refuse = refuse; self.unsent = unsent; self.entered = entered
+    }
     func count() -> Int { bodies.count }
     func firstBody() -> Data? { bodies.first }
+    func allBodies() -> [Data] { bodies }
     func requests() throws -> [EluV2ReplayPreparedRequest] {
         try bodies.map { try EluV2ReplayPreparedRequest($0, captureProtocolGeneration: "replay-v2-1") }
     }
@@ -593,6 +755,10 @@ private actor CompositionTransport: EluV2ReplayHTTPTransport {
             await withCheckedContinuation { waiter = $0; entered() }
             return EluV1BatchHTTPResponse(status: 401, headers: [:], body: Data())
         }
+        if refuse {
+            entered(); return EluV1BatchHTTPResponse(status: 400, headers: [:], body: Data("{}".utf8))
+        }
+        if unsent { entered(); throw CancellationError() }
         let request = try EluV2ReplayPreparedRequest(use.request.body, captureProtocolGeneration: "replay-v2-1")
         let response = EluV1BatchHTTPResponse(status: 200, headers: [:], body: Data("{\"schemaVersion\":2,\"requestId\":\"\(request.requestId)\",\"replayId\":\"\(request.replayId)\",\"chunkId\":\"\(request.chunkId)\",\"sequence\":\(request.sequence),\"result\":\"accepted\"}".utf8))
         entered(); return response
@@ -688,10 +854,11 @@ private struct CompositionUIKitWaitFailure: Error, CustomStringConvertible {
         ].joined(separator: ";")
     }
 
-    func close() async -> EluNativeReplayComposition.CloseOutcome {
+    /// `keepingStore` leaves the store on disk for a relaunch on the same root.
+    func close(keepingStore: Bool = false) async -> EluNativeReplayComposition.CloseOutcome {
         let outcome = await composition.closeAndWait()
         await runtime.close(); lifecycle.close(); window.rootViewController = previous
-        if outcome == .settled { h.base.remove() }
+        if outcome == .settled, !keepingStore { h.base.remove() }
         return outcome
     }
 }

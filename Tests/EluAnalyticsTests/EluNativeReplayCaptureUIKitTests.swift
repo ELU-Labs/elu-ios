@@ -459,6 +459,33 @@ final class EluNativeReplayCaptureUIKitTests: XCTestCase {
         await h.queue.close()
     }
 
+    @MainActor func testUIKitHeldHeadEndsRunSettledWithoutStoringSuffix() async throws {
+        let h = try await make(), setup = try await selected(h)
+        var settled = false
+        defer { setup.root.removeFromSuperview(); if settled { h.base.remove() } }
+        let owner = try start(h, setup)
+        do {
+            try await wait { try await h.queue.storedReplayChunks().count == 1 }
+            let proof = EluNativeReplayCapabilities(readbackProvenTransports: [EluNativeReplayProtocol.v1.transport],
+                readbackProvenProtocolGenerations: [h.base.generation])
+            let value = try await h.queue.currentSealedReplayDelivery(source: XCTUnwrap(h.base.witness),
+                capabilities: proof, timeZoneIdentifier: "America/Los_Angeles")
+            guard case let .claimed(claim) = try await h.queue.claimNextReplay(XCTUnwrap(value)) else { return XCTFail("head not claimable") }
+            _ = try await h.queue.finishReplayClaim(claim, completion: .response(.protocolBlocked))
+            h.base.testClock.advance(10)
+            try await wait { !owner.isRecording() }
+            // The run settles and reports the refusal; capture is not quarantined.
+            guard case let .epochBlocked(replayId, reason) = await owner.finished() else { return XCTFail("held head quarantined capture") }
+            let rows = try await h.queue.storedReplayChunks(); XCTAssertEqual(rows.count, 1)
+            XCTAssertEqual(replayId, rows[0].prepared.replayId); XCTAssertEqual(reason, "protocol")
+            let state = try await h.queue.nativeReplaySessionState(); XCTAssertNil(state.session?.activeEpoch)
+            let enrolled = try await h.queue.enrollNativeReplayCapture()
+            let replacement = try XCTUnwrap(enrolled); replacement.cancelUnused()
+            let finished = try await h.queue.finishNativeReplayCapture(replacement); XCTAssertEqual(finished, .settled)
+            await h.queue.close(); settled = true
+        } catch { _ = await owner.stop(); await h.queue.close(); throw error }
+    }
+
     @MainActor func testUIKitUnknownStopRetainsInstallationUntilProcessExit() async throws {
         let fault = DeliveryFault(), h = try await make(fault: fault), setup = try await selected(h)
         defer { setup.root.removeFromSuperview() }
@@ -636,6 +663,99 @@ final class EluNativeReplayCaptureUIKitTests: XCTestCase {
         let finished = try await h.queue.finishNativeReplayCapture(enrollment); XCTAssertEqual(finished, .accountingPending)
         do { try await h.reopen(); XCTFail("unknown append released installation") }
         catch { XCTAssertEqual(error as? EluRuntimeQueueError, .ownershipConflict) }
+    }
+
+    @MainActor func testUIKitChunkStartingBeforeItsRecordingBeginsIsRefused() async throws {
+        let h = try await make()
+        // An earlier recording fixes the session's first start; this recording begins later.
+        let earlier = try await h.start(); h.base.testClock.advance(2); _ = try await h.stop(earlier)
+        let firstStart = try EluNativeReplayCaptureClock.milliseconds(EluV1Timestamp(earlier.firstStartAt))
+        let setup = try await selected(h)
+        defer { setup.root.removeFromSuperview(); h.base.remove() }
+        let pending = try await h.queue.enrollNativeReplayCapture()
+        let enrollment = try XCTUnwrap(pending), use = try XCTUnwrap(enrollment.takePhysicalUse())
+        do {
+            let started = try await setup.authority.start(setup.prepared, selection: setup.selection, physicalUse: use)
+            let permit = try XCTUnwrap(started)
+            let admission = try await setup.authority.captureAdmission(for: permit, physicalUse: use)
+            let versions = try EluVersionContext(runtime: .init(name: "elu-ios", version: "0.1.0"), facade: .init(name: "elu-ios", version: "0.1.0"))
+            func request(at timestamp: Int64) throws -> EluV2ReplayPreparedRequest {
+                var sealer = try EluNativeReplaySealer(replayId: permit.replayId, identity: permit.identity,
+                    authorization: permit.resolution, privacy: permit.privacy, profile: permit.profile, versions: versions)
+                return try sealer.seal([EluNativeMaskedSnapshot(ordinal: 0, timestamp: timestamp,
+                    viewport: try .init(width: 320, height: 640), nodes: [])])
+            }
+            // Refused at durable admission; the same admission then stores a chunk at its begin.
+            do { _ = try await h.queue.appendNativeReplay(request(at: firstStart), admission: admission, physicalUse: use)
+                XCTFail("a chunk cannot start before its recording began")
+            } catch {}
+            let none = try await h.queue.storedReplayChunks(); XCTAssertTrue(none.isEmpty)
+            let current = try request(at: EluNativeReplayCaptureClock.milliseconds(h.base.now))
+            _ = try await h.queue.appendNativeReplay(current, admission: admission, physicalUse: use)
+            let rows = try await h.queue.storedReplayChunks(); XCTAssertEqual(rows.map(\.prepared.replayId), [permit.replayId])
+            use.settle(); _ = try await setup.authority.stop()
+            let finished = try await h.queue.finishNativeReplayCapture(enrollment); XCTAssertEqual(finished, .settled)
+            await h.queue.close()
+        } catch {
+            use.settle(); _ = try? await setup.authority.stop()
+            _ = try? await h.queue.finishNativeReplayCapture(enrollment)
+            await h.queue.close(); throw error
+        }
+    }
+
+    @MainActor func testUIKitKillMidCaptureRelaunchDiscardsUnsealedTailAndRecordsNewReplay() async throws {
+        let h = try await make(), setup = try await selected(h)
+        let copy = FileManager.default.temporaryDirectory.appendingPathComponent("elu-replay-storage-\(UUID().uuidString)")
+        defer { setup.root.removeFromSuperview(); h.base.remove(); try? FileManager.default.removeItem(at: copy) }
+        let label = UILabel(frame: CGRect(x: 4, y: 8, width: 120, height: 20))
+        label.text = "First chunk"; setup.root.addSubview(label)
+        let owner = try start(h, setup)
+        let sealed: [EluV2ReplayStoredChunk]
+        do {
+            try await wait { try await h.queue.storedReplayChunks().count == 1 }
+            sealed = try await h.queue.storedReplayChunks()
+            let collected = owner.collectedFrameCountForTesting()
+            label.text = "Unsealed tail"
+            // The capture clock stays put, so the next frame is collected but
+            // cannot seal: it exists only in memory when the process ends.
+            try await wait { owner.collectedFrameCountForTesting() > collected }
+            let beforeKill = try await h.queue.storedReplayChunks(); XCTAssertEqual(beforeKill, sealed)
+            // Ending the process here keeps exactly the committed store, as a
+            // copy of its files does.
+            try FileManager.default.copyItem(at: h.base.root, to: copy)
+            guard case .settled = await owner.stop() else { return XCTFail("original capture did not settle") }
+            await h.queue.close()
+        } catch { _ = await owner.stop(); await h.queue.close(); throw error }
+        setup.root.removeFromSuperview()
+        h.base.testClock.advance(30)
+        let r = try await h.relaunched(root: copy)
+        let killed = try await r.ledger(); XCTAssertNotNil(killed.activeEpoch)
+        let restored = try await r.queue.storedReplayChunks(); XCTAssertEqual(restored, sealed)
+        let setupAgain = try await selected(r)
+        defer { setupAgain.root.removeFromSuperview() }
+        let settled = try await r.ledger()
+        XCTAssertNil(settled.activeEpoch); XCTAssertFalse(settled.interrupted); XCTAssertFalse(settled.clockDenied)
+        let next = try start(r, setupAgain)
+        do {
+            try await wait { try await r.queue.storedReplayChunks().count == 2 }
+            let rows = try await r.queue.storedReplayChunks()
+            XCTAssertEqual(rows[0], sealed[0])
+            let old = sealed[0].prepared, fresh = rows[1].prepared
+            XCTAssertNotEqual(fresh.replayId, old.replayId); XCTAssertEqual(fresh.sessionId, old.sessionId)
+            XCTAssertEqual(fresh.sequence, 0)
+            XCTAssertGreaterThan(try EluNativeReplayCaptureClock.milliseconds(fresh.startedAt),
+                                 try EluNativeReplayCaptureClock.milliseconds(old.endedAt))
+            XCTAssertEqual(rows.filter { $0.prepared.replayId == old.replayId }.count, 1, "the unsealed tail is gone")
+            guard case .settled = await next.stop() else { return XCTFail("relaunched capture did not settle") }
+            let proof = EluNativeReplayCapabilities(readbackProvenTransports: [EluNativeReplayProtocol.v1.transport],
+                readbackProvenProtocolGenerations: [r.base.generation])
+            let value = try await r.queue.currentSealedReplayDelivery(source: XCTUnwrap(r.base.witness),
+                capabilities: proof, timeZoneIdentifier: "America/Los_Angeles")
+            guard case let .claimed(claim) = try await r.queue.claimNextReplay(XCTUnwrap(value)) else { return XCTFail("ended process's sealed row") }
+            XCTAssertEqual(claim.row, .wireframe(sealed[0]))
+            _ = try await r.queue.finishReplayClaim(claim, completion: .released)
+            await r.queue.close()
+        } catch { _ = await next.stop(); await r.queue.close(); throw error }
     }
 
     private struct Selection {

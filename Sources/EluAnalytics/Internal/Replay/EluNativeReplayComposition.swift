@@ -121,6 +121,7 @@ actor EluNativeReplayComposition {
         }
     }
     private var capturePrepared: CapturePreparation?
+    private var blockedWireframe: EluNativeReplayPreparedAuthority?
     #if canImport(SwiftUI)
     private var declaredSelection: EluNativeReplaySelection?
     private var blockedRaster: EluNativeRasterPreparedAuthority?
@@ -301,6 +302,7 @@ actor EluNativeReplayComposition {
                 guard let value = try? await runtime.prepareNativeReplay(capabilities: capabilities),
                       !closed, fence.current(token), localControl.permits(localToken),
                       value.isCurrent(), selected.isCurrent() else { return }
+                if wireframeRefused(value) { return }
                 prepared = .wireframe(value)
                 original = await runtime.makeNativeReplayCapture(prepared: value, selection: selected,
                     mayCollect: { localControl.permits(localToken) },
@@ -310,6 +312,7 @@ actor EluNativeReplayComposition {
             guard let value = try? await runtime.prepareNativeReplay(capabilities: capabilities),
                   !closed, fence.current(token), localControl.permits(localToken),
                   value.isCurrent(), selected.isCurrent() else { return }
+            if wireframeRefused(value) { return }
             prepared = .wireframe(value)
             original = await runtime.makeNativeReplayCapture(prepared: value, selection: selected,
                 mayCollect: { localControl.permits(localToken) },
@@ -319,6 +322,7 @@ actor EluNativeReplayComposition {
         guard let value = try? await runtime.prepareNativeReplay(capabilities: capabilities),
               !closed, fence.current(token), localControl.permits(localToken),
               value.isCurrent(), selected.isCurrent() else { return }
+        if wireframeRefused(value) { return }
         prepared = .wireframe(value)
         original = await runtime.makeNativeReplayCapture(prepared: value, selection: selected,
             mayCollect: { localControl.permits(localToken) },
@@ -339,11 +343,21 @@ actor EluNativeReplayComposition {
         }
     }
     private func retainEpochRefusal(_ outcome: EluNativeReplayCaptureOutcome) {
+        guard case .epochBlocked = outcome else { return }
+        switch capturePrepared {
+        case let .wireframe(prepared)?: blockedWireframe = prepared
         #if canImport(SwiftUI)
-        if case .epochBlocked = outcome, case let .raster(prepared)? = capturePrepared {
-            blockedRaster = prepared
-        }
+        case let .raster(prepared)?: blockedRaster = prepared
         #endif
+        case nil: break
+        }
+    }
+    /// A recording that ended behind its held or refused head is not replaced
+    /// by a new recording until the source, identity or session changes.
+    private func wireframeRefused(_ value: EluNativeReplayPreparedAuthority) -> Bool {
+        if let blockedWireframe, blockedWireframe.sameCaptureContext(as: value) { return true }
+        blockedWireframe = nil
+        return false
     }
 
     private func captureFinished(_ id: UUID, outcome: EluNativeReplayCaptureOutcome) {
@@ -413,6 +427,12 @@ actor EluNativeReplayComposition {
 
     /// Causal observation of the retained original task, never capture authority.
     func isObservingRootForTesting() -> Bool { rootObservationTask != nil }
+    /// Joins any evaluation in progress, then reports whether a capture owner is
+    /// installed. Read-only; it grants no capture authority.
+    func hasCaptureAfterEvaluationForTesting() async -> Bool {
+        if evaluating { await withCheckedContinuation { evaluationWaiters.append($0) } }
+        return capture != nil
+    }
     #endif
 
     /// Joins the retained current trigger and any timer-origin pass it encountered.

@@ -123,7 +123,7 @@ final class EluNativeReplaySessionQueueTests: XCTestCase {
         _ = try await h.stop(current); await h.queue.close()
     }
 
-    func testEveryStartedReopenDeniesWithoutOriginalClockEvenAfterCleanStop() async throws {
+    func testFrozenWallReopenStaysUnprovenThenWallAdvanceResumes() async throws {
         for clean in [false, true] {
             for activate in [false, true] {
                 let h = try await NativeSessionHarness.make(seedReplay: true); defer { h.base.remove() }
@@ -135,15 +135,27 @@ final class EluNativeReplaySessionQueueTests: XCTestCase {
                 h.base.testClock.advance(10); h.base.testClock.set(wall)
                 try await h.reopen(); try await h.publish()
                 if activate { try await h.queue.ensureNativeReplayAuthoritySchema() }
+                // A wall clock that did not move cannot prove the gap: unproven, not denied.
                 let reopened = try await h.observe()
-                XCTAssertTrue(reopened.accounting.interrupted)
+                XCTAssertTrue(reopened.accounting.interrupted); XCTAssertFalse(reopened.accounting.clockDenied)
                 XCTAssertEqual(reopened.accounting.firstStartAt, first.firstStartAt)
                 XCTAssertEqual(reopened.accounting.activeEpoch == nil, clean)
                 let second = try await h.queue.beginNativeReplayStartAccounting(reopened)
                 XCTAssertNil(second)
                 let retained = try await h.queue.storedReplayChunks(); XCTAssertEqual(retained, rows)
                 if clean { XCTAssertEqual(reopened.accounting.elapsedFloorMicroseconds, 400_000) }
-                await h.queue.close()
+                // Once the wall moves, the next touch charges the gap on top of the floor and resumes.
+                let ordinal = try await h.queue.nativeReplaySessionState().nextReplayOrdinal
+                h.base.testClock.set(wall.addingTimeInterval(10))
+                try await h.queue.ensureNativeReplayAuthoritySchema()
+                let settled = try await h.ledger()
+                XCTAssertFalse(settled.interrupted); XCTAssertFalse(settled.clockDenied); XCTAssertNil(settled.activeEpoch)
+                XCTAssertEqual(settled.elapsedFloorMicroseconds, clean ? 10_400_000 : 10_000_000)
+                let next = try await h.start()
+                XCTAssertNotEqual(next.replayId, first.replayId); XCTAssertEqual(next.firstStartAt, first.firstStartAt)
+                let after = try await h.queue.nativeReplaySessionState(); XCTAssertEqual(after.nextReplayOrdinal, ordinal + 1)
+                let unchanged = try await h.queue.storedReplayChunks(); XCTAssertEqual(unchanged, rows)
+                _ = try await h.stop(next); await h.queue.close()
             }
         }
     }
@@ -370,6 +382,320 @@ final class EluNativeReplaySessionQueueTests: XCTestCase {
         await h.queue.close()
     }
 
+    func testNextOwnerSettlesEpochLeftByFailedStopOnceWallAdvances() async throws {
+        let fault = DeliveryFault(); let h = try await NativeSessionHarness.make(fault: fault); defer { h.base.remove() }
+        let receipt = try await h.start()
+        fault.action = { point in
+            if point == .beforeCommit || point == .beforeRollback { throw EluRuntimeQueueError.faultInjected(point) }
+        }
+        do { _ = try await h.stop(receipt); XCTFail("failed rollback accepted") }
+        catch { XCTAssertEqual(error as? EluRuntimeQueueError, .databaseUnavailable) }
+        fault.action = nil
+        h.base.testClock.advance(5)
+        try await h.reopen(); try await h.publish(); try await h.queue.ensureNativeReplayAuthoritySchema()
+        let state = try await h.observe()
+        XCTAssertFalse(state.accounting.interrupted); XCTAssertFalse(state.accounting.clockDenied)
+        XCTAssertNil(state.accounting.activeEpoch)
+        XCTAssertGreaterThanOrEqual(state.accounting.elapsedFloorMicroseconds, 5_000_000)
+        let next = try await h.start(); XCTAssertNotEqual(next.replayId, receipt.replayId)
+        _ = try await h.stop(next); await h.queue.close()
+    }
+
+    func testRelaunchAfterKillMidCaptureSettlesOrphanedEpoch() async throws {
+        let h = try await NativeSessionHarness.make(seedReplay: true); defer { h.base.remove() }
+        let old = try await h.start()
+        h.base.testClock.advance(2); try await h.base.refresh()
+        let end = h.base.now
+        let chunk = try h.base.request(chunkId: "chunk_000002", sequence: 2,
+            startedAt: EluRFC3339.string(from: end.addingTimeInterval(-1)), endedAt: EluRFC3339.string(from: end))
+        guard case .inserted = try await h.base.append(request: chunk) else { return XCTFail("sealed chunk") }
+        let rows = try await h.queue.storedReplayChunks(); XCTAssertEqual(rows.count, 2)
+        let killed = try await h.ledger(); XCTAssertNotNil(killed.activeEpoch)
+        // The process ends mid-capture: no stop, and the unsealed tail never reached storage.
+        await h.queue.close()
+        h.base.testClock.advance(30)
+        try await h.reopen(); try await h.publish()
+        try await h.queue.ensureNativeReplayAuthoritySchema()
+        let settled = try await h.ledger()
+        XCTAssertNil(settled.activeEpoch); XCTAssertFalse(settled.interrupted); XCTAssertFalse(settled.clockDenied)
+        XCTAssertEqual(settled.firstStartAt, old.firstStartAt)
+        let elapsed = try XCTUnwrap(EluNativeReplaySessionState.elapsedCeilMicroseconds(
+            from: EluV1Timestamp(old.firstStartAt), to: EluV1Timestamp.exactClock(h.base.now)))
+        XCTAssertGreaterThanOrEqual(settled.elapsedFloorMicroseconds, elapsed)
+        // The ended owner's receipt cannot act through the new owner.
+        let before = try h.bytes("SELECT metadata FROM native_replay_authority")
+        let ignored = try await h.stop(old); XCTAssertFalse(ignored)
+        XCTAssertEqual(try h.bytes("SELECT metadata FROM native_replay_authority"), before)
+        let next = try await h.start()
+        XCTAssertNotEqual(next.replayId, old.replayId); XCTAssertEqual(next.firstStartAt, old.firstStartAt)
+        let stored = try await h.queue.storedReplayChunks(); XCTAssertEqual(stored, rows)
+        guard case let .claimed(claim) = try await h.queue.claimNextReplay(h.base.deliveryAuthority()) else {
+            return XCTFail("sealed row from the ended process")
+        }
+        XCTAssertEqual(claim.row, .wireframe(rows[0]))
+        _ = try await h.queue.finishReplayClaim(claim, completion: .released)
+        _ = try await h.stop(next); await h.queue.close()
+    }
+
+    func testRelaunchWallBelowReplayHighWaterDenies() async throws {
+        let h = try await NativeSessionHarness.make(seedReplay: true); defer { h.base.remove() }
+        let old = try await h.start(); let begun = h.base.now
+        h.base.testClock.advance(5)
+        // Delivery in the ended process raised the replay store's observed wall past the ledger's.
+        guard case let .claimed(claim) = try await h.queue.claimNextReplay(h.base.deliveryAuthority()) else { return XCTFail("claim") }
+        _ = try await h.queue.finishReplayClaim(claim, completion: .released)
+        await h.queue.close()
+        h.base.testClock.set(begun.addingTimeInterval(2))
+        let r = try await h.relaunched()
+        try await r.queue.ensureNativeReplayAuthoritySchema()
+        let denied = try await r.ledger()
+        XCTAssertTrue(denied.clockDenied); XCTAssertTrue(denied.interrupted); XCTAssertNotNil(denied.activeEpoch)
+        let observation = try await r.observe(); XCTAssertTrue(observation.accounting.clockDenied)
+        let refused = try await r.queue.beginNativeReplayStartAccounting(observation); XCTAssertNil(refused)
+        await r.queue.close()
+        // A later wall well ahead of both marks never clears the session's denial.
+        h.base.testClock.set(begun.addingTimeInterval(60))
+        let later = try await r.relaunched(); try await later.queue.ensureNativeReplayAuthoritySchema()
+        let again = try await later.observe(); XCTAssertTrue(again.accounting.clockDenied)
+        XCTAssertEqual(again.accounting.firstStartAt, old.firstStartAt)
+        let stillRefused = try await later.queue.beginNativeReplayStartAccounting(again); XCTAssertNil(stillRefused)
+        guard case .accepted = await later.base.capture() else { return XCTFail("analytics capture stays available") }
+        await later.queue.close()
+    }
+
+    func testDeliveryClaimInSameMillisecondDoesNotBlockResume() async throws {
+        let h = try await NativeSessionHarness.make(seedReplay: true); defer { h.base.remove() }
+        let old = try await h.start(); h.base.testClock.advance(1); _ = try await h.stop(old)
+        await h.queue.close()
+        h.base.testClock.advance(10)
+        try await h.reopen(); try await h.publish()
+        // The new owner's first delivery raises the replay store mark to this exact wall.
+        guard case let .claimed(claim) = try await h.queue.claimNextReplay(h.base.deliveryAuthority()) else { return XCTFail("claim") }
+        _ = try await h.queue.finishReplayClaim(claim, completion: .released)
+        let mark = try h.bytes("SELECT observed_wall FROM replay_state")
+        XCTAssertEqual(String(decoding: mark, as: UTF8.self), try EluV1Timestamp.exactClock(h.base.now).source)
+        try await h.queue.ensureNativeReplayAuthoritySchema()
+        let settled = try await h.ledger(); XCTAssertFalse(settled.interrupted); XCTAssertFalse(settled.clockDenied)
+        let next = try await h.start(); XCTAssertNotEqual(next.replayId, old.replayId)
+        _ = try await h.stop(next); await h.queue.close()
+    }
+
+    func testRelaunchWallRollbackAcrossCleanGapDeniesSessionButNewSessionStartsClean() async throws {
+        let h = try await NativeSessionHarness.make(); defer { h.base.remove() }
+        let old = try await h.start(); let begun = h.base.now
+        h.base.testClock.advance(1); _ = try await h.stop(old)
+        let stopped = try await h.ledger()
+        await h.queue.close()
+        h.base.testClock.set(begun.addingTimeInterval(0.5))
+        try await h.reopen(); try await h.publish(); try await h.queue.ensureNativeReplayAuthoritySchema()
+        let denied = try await h.observe()
+        XCTAssertTrue(denied.accounting.clockDenied)
+        XCTAssertEqual(denied.accounting.elapsedFloorMicroseconds, stopped.elapsedFloorMicroseconds)
+        let refused = try await h.queue.beginNativeReplayStartAccounting(denied); XCTAssertNil(refused)
+        let snapshot = try await h.queue.snapshot()
+        _ = try await h.queue.reset(expectedGeneration: snapshot.generation)
+        try await h.publish()
+        guard case .accepted = await h.base.capture() else { return XCTFail("real new session") }
+        let fresh = try await h.observe()
+        XCTAssertNotEqual(fresh.accounting.key, denied.accounting.key)
+        XCTAssertNotEqual(fresh.accounting.samplingHash, denied.accounting.samplingHash)
+        XCTAssertFalse(fresh.accounting.clockDenied); XCTAssertFalse(fresh.accounting.interrupted)
+        XCTAssertNil(fresh.accounting.firstStartAt)
+        let next = try await h.start(); XCTAssertNotEqual(next.replayId, old.replayId)
+        _ = try await h.stop(next); await h.queue.close()
+    }
+
+    func testRelaunchClockForwardJumpOnlyShrinksBudget() async throws {
+        let h = try await NativeSessionHarness.make(cap: 60); defer { h.base.remove() }
+        let old = try await h.start(); h.base.testClock.advance(1); _ = try await h.stop(old)
+        await h.queue.close()
+        h.base.testClock.advance(120)
+        try await h.reopen(); try await h.publish(); try await h.queue.ensureNativeReplayAuthoritySchema()
+        let jumped = try await h.observe()
+        XCTAssertFalse(jumped.accounting.clockDenied); XCTAssertFalse(jumped.accounting.interrupted)
+        XCTAssertGreaterThanOrEqual(jumped.accounting.elapsedFloorMicroseconds, 121_000_000)
+        XCTAssertEqual(jumped.accounting.remainingMicroseconds, 0)
+        let refused = try await h.queue.beginNativeReplayStartAccounting(jumped); XCTAssertNil(refused)
+        await h.queue.close()
+    }
+
+    func testRelaunchDoesNotRerollSamplingOrRenewCap() async throws {
+        let unselected = try await NativeSessionHarness.make(rate: 0); defer { unselected.base.remove() }
+        let original = try await unselected.observe(); XCTAssertFalse(original.accounting.originalSelected)
+        await unselected.queue.close(); unselected.base.testClock.advance(10)
+        try await unselected.reopen(); try await unselected.update(rate: 1, cap: 60)
+        try await unselected.queue.ensureNativeReplayAuthoritySchema()
+        let reopened = try await unselected.observe()
+        XCTAssertEqual(reopened.accounting.samplingHash, original.accounting.samplingHash)
+        XCTAssertFalse(reopened.currentSelected)
+        let none = try await unselected.queue.beginNativeReplayStartAccounting(reopened); XCTAssertNil(none)
+        await unselected.queue.close()
+
+        let h = try await NativeSessionHarness.make(rate: 1, cap: 60); defer { h.base.remove() }
+        let old = try await h.start(); h.base.testClock.advance(1); _ = try await h.stop(old)
+        let before = try await h.ledger()
+        await h.queue.close(); h.base.testClock.advance(10)
+        try await h.reopen(); try await h.update(rate: 0, cap: 30)
+        try await h.queue.ensureNativeReplayAuthoritySchema()
+        let restricted = try await h.observe()
+        XCTAssertFalse(restricted.currentSelected); XCTAssertFalse(restricted.accounting.interrupted)
+        let refused = try await h.queue.beginNativeReplayStartAccounting(restricted); XCTAssertNil(refused)
+        try await h.update(rate: 1, cap: 120)
+        let restored = try await h.observe()
+        XCTAssertTrue(restored.currentSelected)
+        XCTAssertEqual(restored.accounting.samplingHash, before.samplingHash)
+        XCTAssertEqual(restored.accounting.originalSampleRate, before.originalSampleRate)
+        XCTAssertEqual(restored.accounting.firstStartAt, before.firstStartAt)
+        XCTAssertEqual(restored.accounting.maximumDurationSeconds, 30)
+        let next = try await h.start(); XCTAssertNotEqual(next.replayId, old.replayId)
+        _ = try await h.stop(next); await h.queue.close()
+    }
+
+    func testObserveBeforeEnsureStillSettlesWithAdditiveCharge() async throws {
+        let h = try await NativeSessionHarness.make(); defer { h.base.remove() }
+        let old = try await h.start(); let wall = h.base.now
+        h.base.testClock.advance(0.4); h.base.testClock.set(wall)
+        _ = try await h.stop(old); await h.queue.close()
+        h.base.testClock.set(wall.addingTimeInterval(10))
+        try await h.reopen(); try await h.publish()
+        // Observation before any schema setup still charges the whole gap on top of the floor.
+        let first = try await h.observe()
+        XCTAssertFalse(first.accounting.interrupted); XCTAssertFalse(first.accounting.clockDenied)
+        XCTAssertEqual(first.accounting.elapsedFloorMicroseconds, 10_400_000)
+        try await h.queue.ensureNativeReplayAuthoritySchema()
+        let after = try await h.ledger()
+        XCTAssertEqual(after.elapsedFloorMicroseconds, 10_400_000); XCTAssertFalse(after.interrupted)
+        let next = try await h.start(); XCTAssertNotEqual(next.replayId, old.replayId)
+        _ = try await h.stop(next); await h.queue.close()
+    }
+
+    func testLegacyInterruptedLedgerResumesUnlessDenied() async throws {
+        for variant in ["clean", "orphan", "denied"] {
+            let h = try await NativeSessionHarness.make(); defer { h.base.remove() }
+            let old = try await h.start(); h.base.testClock.advance(1)
+            if variant != "orphan" { _ = try await h.stop(old) }
+            var legacy = try await h.queue.nativeReplaySessionState()
+            await h.queue.close()
+            // The ledger as an earlier release left it after its own relaunch.
+            legacy.session?.interrupted = true
+            if variant == "denied" { legacy.session?.clockDenied = true }
+            try h.replaceMetadata(legacy.encoded())
+            h.base.testClock.advance(10)
+            try await h.reopen(); try await h.publish(); try await h.queue.ensureNativeReplayAuthoritySchema()
+            let current = try await h.observe()
+            if variant == "denied" {
+                XCTAssertTrue(current.accounting.clockDenied); XCTAssertTrue(current.accounting.interrupted)
+                let refused = try await h.queue.beginNativeReplayStartAccounting(current); XCTAssertNil(refused)
+            } else {
+                XCTAssertFalse(current.accounting.interrupted, variant); XCTAssertFalse(current.accounting.clockDenied, variant)
+                XCTAssertNil(current.accounting.activeEpoch, variant)
+                let next = try await h.start()
+                XCTAssertNotEqual(next.replayId, old.replayId); XCTAssertEqual(next.firstStartAt, old.firstStartAt)
+                _ = try await h.stop(next)
+            }
+            await h.queue.close()
+        }
+    }
+
+    func testResumedLedgerKeepsClosedMetadataShape() async throws {
+        let h = try await NativeSessionHarness.make(); defer { h.base.remove() }
+        let old = try await h.start(); h.base.testClock.advance(1); _ = try await h.stop(old)
+        let version = try h.base.schemaVersion()
+        await h.queue.close(); h.base.testClock.advance(10)
+        try await h.reopen(); try await h.publish(); try await h.queue.ensureNativeReplayAuthoritySchema()
+        let bytes = try h.bytes("SELECT metadata FROM native_replay_authority")
+        let root = try XCTUnwrap(JSONSerialization.jsonObject(with: bytes) as? [String: Any])
+        XCTAssertEqual(Set(root.keys), ["schemaVersion", "namespaceHash", "streamId", "nextReplayOrdinal", "session"])
+        XCTAssertEqual(root["schemaVersion"] as? Int, 1)
+        let session = try XCTUnwrap(root["session"] as? [String: Any])
+        XCTAssertEqual(Set(session.keys), ["siteId", "sessionId", "sessionStartedAt", "samplingHash", "originalSampleRate",
+            "originalSelected", "firstStartAt", "maximumDurationSeconds", "elapsedFloorMicroseconds", "observedWallAt",
+            "clockDenied", "interrupted", "activeEpoch"])
+        XCTAssertEqual(session["interrupted"] as? Bool, false)
+        XCTAssertEqual(try EluNativeReplaySessionState.decode(bytes).session?.interrupted, false)
+        XCTAssertEqual(try h.base.schemaVersion(), version)
+        // A wall pinned across a later relaunch proves nothing, which is also what an older reader concludes.
+        let next = try await h.start(); _ = try await h.stop(next)
+        await h.queue.close()
+        try await h.reopen(); try await h.publish()
+        let pinned = try await h.observe(); XCTAssertTrue(pinned.accounting.interrupted)
+        await h.queue.close()
+    }
+
+    func testRelaunchMissingContinuousClockDenies() async throws {
+        let h = try await NativeSessionHarness.make(); defer { h.base.remove() }
+        let old = try await h.start(); h.base.testClock.advance(1); _ = try await h.stop(old)
+        await h.queue.close(); h.base.testClock.advance(10)
+        try await h.reopen(nanoseconds: { _ in nil }); try await h.publish()
+        try await h.queue.ensureNativeReplayAuthoritySchema()
+        let denied = try await h.ledger(); XCTAssertTrue(denied.clockDenied)
+        let observation = try await h.observe(); XCTAssertTrue(observation.accounting.clockDenied)
+        let refused = try await h.queue.beginNativeReplayStartAccounting(observation); XCTAssertNil(refused)
+        await h.queue.close()
+    }
+
+    func testOptOutDuringGapNeverResumes() async throws {
+        for pending in [false, true] {
+            let fault = DeliveryFault(); let h = try await NativeSessionHarness.make(fault: fault)
+            let copy = FileManager.default.temporaryDirectory.appendingPathComponent("elu-replay-storage-\(UUID().uuidString)")
+            defer { h.base.remove(); try? FileManager.default.removeItem(at: copy) }
+            let before = try await h.observe()
+            let old = try await h.start(); h.base.testClock.advance(1); _ = try await h.stop(old)
+            let r: NativeSessionHarness
+            if pending {
+                // The process ends after the opt-out intent is stored and before it settles.
+                fault.action = { if $0 == .afterConsentIntentWrite { throw EluRuntimeQueueError.faultInjected($0) } }
+                do { _ = try await h.queue.setOptedOut(true, expectedGeneration: h.queue.snapshot().generation); XCTFail("opt-out settled") }
+                catch {}
+                fault.action = nil; await h.queue.close()
+                // That failure keeps this store closed for the rest of this process; the
+                // next process opens the files it left.
+                try FileManager.default.copyItem(at: h.base.root, to: copy)
+                h.base.testClock.advance(10)
+                r = try await h.relaunched(root: copy, publish: false)
+            } else {
+                _ = try await h.queue.setOptedOut(true, expectedGeneration: h.queue.snapshot().generation)
+                await h.queue.close(); h.base.testClock.advance(10)
+                r = try await h.relaunched(publish: false)
+            }
+            try? await r.publish()
+            let snapshot = try await r.queue.snapshot()
+            XCTAssertTrue(snapshot.identity.optedOut, "pending=\(pending)"); XCTAssertNil(snapshot.identity.session)
+            try await r.queue.ensureNativeReplayAuthoritySchema()
+            do { _ = try await r.observe(); XCTFail("opted-out session observed") } catch {}
+            _ = try await r.queue.setOptedOut(false, expectedGeneration: r.queue.snapshot().generation)
+            try await r.publish()
+            guard case .accepted = await r.base.capture() else { return XCTFail("capture after opt-in") }
+            let current = try await r.observe()
+            XCTAssertNotEqual(current.accounting.key, before.accounting.key)
+            XCTAssertNil(current.accounting.firstStartAt)
+            let next = try await r.start(); XCTAssertNotEqual(next.replayId, old.replayId)
+            _ = try await r.stop(next); await r.queue.close()
+        }
+    }
+
+    func testRelaunchAfterIdleTimeoutUsesNewLedger() async throws {
+        let h = try await NativeSessionHarness.make(); defer { h.base.remove() }
+        var root = try JSONSerialization.jsonObject(with: h.base.config) as! [String: Any]
+        var session = root["session"] as! [String: Any]; session["idleTimeoutSeconds"] = 60; root["session"] = session
+        h.base.testClock.advance(0.001); root["issuedAt"] = EluRFC3339.string(from: h.base.now)
+        h.base.config = try JSONSerialization.data(withJSONObject: root); try await h.publish()
+        let old = try await h.start(); h.base.testClock.advance(1); _ = try await h.stop(old)
+        let previous = try await h.queue.nativeReplaySessionState()
+        await h.queue.close(); h.base.testClock.advance(61)
+        try await h.reopen(); try await h.publish()
+        guard case .accepted = await h.base.capture() else { return XCTFail("capture after the idle timeout") }
+        let fresh = try await h.observe()
+        XCTAssertNotEqual(fresh.accounting.sessionId, previous.session?.sessionId)
+        XCTAssertNotEqual(fresh.accounting.samplingHash, previous.session?.samplingHash)
+        XCTAssertNil(fresh.accounting.firstStartAt); XCTAssertFalse(fresh.accounting.interrupted)
+        let next = try await h.start()
+        XCTAssertNotEqual(next.replayId, old.replayId); XCTAssertNotEqual(next.firstStartAt, old.firstStartAt)
+        let after = try await h.queue.nativeReplaySessionState()
+        XCTAssertEqual(after.nextReplayOrdinal, previous.nextReplayOrdinal + 1)
+        _ = try await h.stop(next); await h.queue.close()
+    }
+
     func testActualSessionIdleBoundaryDeniesBeforeSourceExpiry() async throws {
         let h = try await NativeSessionHarness.make(); defer { h.base.remove() }
         var root = try JSONSerialization.jsonObject(with: h.base.config) as! [String: Any]
@@ -442,6 +768,25 @@ final class NativeSessionHarness: @unchecked Sendable {
         return try XCTUnwrap(receipt)
     }
     func stop(_ receipt: EluNativeReplayStartReceipt) async throws -> Bool { try await queue.stopNativeReplayAccounting(receipt) }
+    /// The next process on this store, or on a copy of the files a process left:
+    /// the same clock and configuration, with a new configuration gate and queue owner.
+    func relaunched(root: URL? = nil, publish: Bool = true,
+                    nanoseconds: @escaping @Sendable (UInt64) -> UInt64? = { $0 }) async throws -> NativeSessionHarness {
+        let clock = base.testClock
+        let gate = EluV2ConfigAuthorityGate(siteKey: "elu_pk_test_aaaaaaaaaaaaaaaaaaaaaa", clock: EluV2ConfigClock(
+            wallNow: { clock.read() }, continuousNow: { clock.ticks() }, floorTicks: { clock.convert($0) }, floorNanoseconds: { $0 }))
+        let next = DeliveryHarness(root: root ?? base.root, queue: base.queue, gate: gate, limits: base.limits,
+            config: base.config, testClock: clock, fault: base.fault)
+        next.generation = base.generation; next.authorization = base.authorization
+        let value = NativeSessionHarness(next)
+        try await value.reopen(nanoseconds: nanoseconds)
+        if publish { try await value.publish() }
+        return value
+    }
+    func ledger() async throws -> EluNativeReplaySessionState.Session {
+        let value = try await queue.nativeReplaySessionState()
+        return try XCTUnwrap(value.session)
+    }
     private var path: String {
         get throws { try base.root.appendingPathComponent(EluV1SiteNamespace.directoryComponent(exactConstructorSiteKey: "elu_pk_test_aaaaaaaaaaaaaaaaaaaaaa")).appendingPathComponent("runtime-state-v1.sqlite3").path }
     }

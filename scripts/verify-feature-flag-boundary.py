@@ -307,7 +307,7 @@ def scan_replay_storage_source(path: pathlib.Path, text: str) -> list[str]:
     if exact == NATIVE_RASTER_RESPONSE_SOURCE:
         remaining = re.sub(r"\brequest\s*:\s*EluNativeRaster(?:Prepared|Stored)Request\b", "", text)
         remaining = re.sub(r"\bEluV2ReplayText\.equal\s*\(", "(", remaining)
-        remaining = re.sub(r"\bEluV1BatchDeliveryCoordinator\.parseRetryAfter\s*\(", "(", remaining)
+        remaining = re.sub(r"\bEluV1BatchDeliveryCoordinator\.(?:parseRetryAfter|foreignRetryAfter|isRetryableStatus)\s*\(", "(", remaining)
         forbidden = ("EluSQLiteRuntimeQueue", "EluStandaloneRuntime", "EluNativeReplayAuthority",
             "EluNativeReplayCapabilities", "EluNativeReplayScope", "EluNativeReplayPermit",
             "EluSwiftUIReplayRegistry", "EluSwiftUIReplayFrame", "EluNativeReplaySealer",

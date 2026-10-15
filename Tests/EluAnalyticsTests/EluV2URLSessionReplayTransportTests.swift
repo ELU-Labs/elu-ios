@@ -56,6 +56,34 @@ final class EluV2URLSessionReplayTransportTests: XCTestCase {
             await h.queue.close()
         }
     }
+    func test429And5xxSurviveOversizedBodyWithStatus() async throws {
+        for (status, streamed) in [(429, false), (503, false), (502, true), (504, true)] {
+            let (h,dispatch,claim) = try await enrolled();defer{h.remove()}
+            ReplayTransportURLProtocol.hooks.set { request,client,instance in
+                let headers = streamed ? ["Retry-After":"5"] : ["Retry-After":"5","Content-Length":"99999999"]
+                client.urlProtocol(instance,didReceive:Self.response(request,status:status,headers:headers),cacheStoragePolicy:.notAllowed)
+                client.urlProtocol(instance,didLoad:Data(repeating:0x20,count:streamed ? EluV2ReplayResponse.maximumBytes + 1 : 1))
+                client.urlProtocolDidFinishLoading(instance)
+            }
+            let value = try await transport().send(dispatch)
+            XCTAssertEqual(value.status,status);XCTAssertTrue(value.body.isEmpty)
+            XCTAssertEqual(value.headers.first { $0.key.lowercased() == "retry-after" }?.value,"5")
+            _ = try await h.queue.finishReplayClaim(claim,completion:.released)
+            await h.queue.close()
+        }
+        for streamed in [false, true] {
+            let (h,dispatch,claim) = try await enrolled();defer{h.remove()}
+            ReplayTransportURLProtocol.hooks.set { request,client,instance in
+                client.urlProtocol(instance,didReceive:Self.response(request,status:200,headers:streamed ? [:] : ["Content-Length":"99999999"]),cacheStoragePolicy:.notAllowed)
+                client.urlProtocol(instance,didLoad:Data(repeating:0x20,count:streamed ? EluV2ReplayResponse.maximumBytes + 1 : 1))
+                client.urlProtocolDidFinishLoading(instance)
+            }
+            do{_ = try await transport().send(dispatch);XCTFail("Oversized acknowledgement returned")}
+            catch{XCTAssertEqual(error as? EluV1BatchDeliveryError,.responseTooLarge)}
+            _ = try await h.queue.finishReplayClaim(claim,completion:.released)
+            await h.queue.close()
+        }
+    }
     func testDuplicateDispatchCannotReleaseFirstPhysicalLeaseAfterOwnerClose() async throws {
         let (h,dispatch,claim) = try await enrolled();defer{h.remove()}
         let began=expectation(description:"started"), concrete=transport()

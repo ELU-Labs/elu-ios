@@ -63,9 +63,189 @@ final class EluV2ReplayDeliveryTests: XCTestCase {
         try await h.queue.ensureReplayDeliverySchema(); let permission = try await h.deliveryAuthority()
         let first = try await claim(h.queue, permission); XCTAssertEqual(first.row.sequence, 1)
         _ = try await h.queue.finishReplayClaim(first, completion: .response(.protocolBlocked))
-        guard case .idle = try await h.queue.claimNextReplay(permission) else { return XCTFail("blocked head skipped") }
+        // The held head still blocks its suffix; the hold is bounded instead of permanent.
+        guard case .deferred(afterNanoseconds: 3_600_000_000_000) = try await h.queue.claimNextReplay(permission) else { return XCTFail("blocked head skipped") }
         let count = try await awaitCount(h.queue); XCTAssertEqual(count, 2)
         await h.queue.close()
+    }
+
+    func testProtocolHoldReoffersExactBytesOnceThenReblocks() async throws {
+        let h = try await DeliveryHarness.make(); defer { h.remove() }
+        try await h.install(); _ = try await h.append(); _ = try await h.append(request: h.request(chunkId: "later", sequence: 2))
+        try await h.queue.ensureReplayDeliverySchema()
+        let first = try await claim(h.queue, h.deliveryAuthority())
+        _ = try await h.queue.finishReplayClaim(first, completion: .response(.protocolBlocked))
+        let held = try XCTUnwrap(h.deliveryMetadata(first.row.ordinal).blocked); XCTAssertEqual(held.reason, "protocol")
+        h.testClock.advance(3_599); try await h.refresh()
+        guard case .deferred(afterNanoseconds: 1_000_000_000) = try await h.queue.claimNextReplay(h.deliveryAuthority()) else { return XCTFail("hold shortened") }
+        h.testClock.advance(1); try await h.refresh()
+        let again = try await claim(h.queue, h.deliveryAuthority())
+        XCTAssertEqual(again.row, first.row); XCTAssertEqual(again.row.body, first.row.body); XCTAssertEqual(again.attemptCount, 2)
+        XCTAssertNil(try h.deliveryMetadata(first.row.ordinal).blocked)
+        _ = try await h.queue.finishReplayClaim(again, completion: .response(.protocolBlocked))
+        let reheld = try XCTUnwrap(h.deliveryMetadata(first.row.ordinal).blocked)
+        XCTAssertEqual(reheld.reason, "protocol"); XCTAssertNotEqual(reheld.recordedAt, held.recordedAt)
+        guard case .deferred(afterNanoseconds: 3_630_000_000_000) = try await h.queue.claimNextReplay(h.deliveryAuthority()) else { return XCTFail("hold not rescaled") }
+        h.testClock.advance(3_630); try await h.refresh()
+        let third = try await claim(h.queue, h.deliveryAuthority())
+        XCTAssertEqual(third.row, first.row); XCTAssertEqual(third.attemptCount, 3)
+        _ = try await h.queue.finishReplayClaim(third, completion: .response(.accepted))
+        let next = try await claim(h.queue, h.deliveryAuthority()); XCTAssertEqual(next.row.sequence, 2)
+        _ = try await h.queue.finishReplayClaim(next, completion: .response(.accepted))
+        let count = try await h.count(); XCTAssertEqual(count, 0)
+        await h.queue.close()
+    }
+
+    func testProtocolHoldScalesWithRowAgeAndCapsAtOneDay() throws {
+        let started = try EluV1Timestamp("2026-08-05T00:00:00.000Z"), witness = "sha256:" + String(repeating: "a", count: 64)
+        func remaining(_ recordedAt: String, _ now: String) throws -> UInt64 {
+            EluSQLiteRuntimeQueue.protocolHoldRemaining(.init(reason: "protocol", recordedAt: recordedAt, credentialWitness: witness,
+                scopeWitness: witness, protocolGeneration: "replay-v2-1"), startedAt: started, now: try EluV1Timestamp(now))
+        }
+        let second: UInt64 = 1_000_000_000
+        XCTAssertEqual(try remaining("2026-08-06T06:00:00.000Z", "2026-08-06T06:00:00.000Z"), 86_400 * second)
+        XCTAssertEqual(try remaining("2026-08-05T02:00:00.000Z", "2026-08-05T02:00:00.000Z"), 7_200 * second)
+        XCTAssertEqual(try remaining("2026-08-05T00:01:00.000Z", "2026-08-05T00:01:00.000Z"), 3_600 * second)
+        XCTAssertEqual(try remaining("2026-08-05T02:00:00.000Z", "2026-08-05T03:30:00.000Z"), 1_800 * second)
+        XCTAssertEqual(try remaining("2026-08-05T02:00:00.000Z", "2026-08-05T04:00:00.000Z"), 0)
+        // Unusual stored times never throw: the hold stays within one hour to one day.
+        XCTAssertEqual(try remaining("1970-01-01T00:00:00.000Z", "2026-08-05T00:00:00.000Z"), 0)
+        XCTAssertEqual(try remaining("2100-01-01T00:00:00.000Z", "2026-08-05T00:00:00.000Z"), 86_400 * second)
+        XCTAssertTrue((3_600 * second ... 86_400 * second).contains(try remaining("9999-12-31T23:59:59.999Z", "2026-08-05T00:00:00.000Z")))
+    }
+
+    func testProtocolHoldNeverThrows() async throws {
+        for (recordedAt, offered) in [("1970-01-01T00:00:00.000Z", true), ("2100-01-01T00:00:00.000Z", false)] {
+            let h = try await DeliveryHarness.make(); defer { h.remove() }
+            try await h.install(); _ = try await h.append(); try await h.queue.ensureReplayDeliverySchema()
+            await h.queue.close()
+            try h.writeDeliveryMetadata(0, h.heldMetadata("protocol", recordedAt: recordedAt))
+            h.queue = try await h.reopen()
+            let result = try await h.queue.claimNextReplay(h.deliveryAuthority())
+            if offered {
+                guard case let .claimed(claim) = result else { return XCTFail("past hold not offered") }
+                XCTAssertEqual(claim.attemptCount, 2)
+                _ = try await h.queue.finishReplayClaim(claim, completion: .released)
+            } else {
+                guard case .deferred(afterNanoseconds: 86_400_000_000_000) = result else { return XCTFail("future hold not bounded") }
+            }
+            await h.queue.close()
+        }
+    }
+
+    func testUpgradedProtocolBlockDeliversInsideRetentionOnly() async throws {
+        let h = try await DeliveryHarness.make(); defer { h.remove() }
+        try await h.install()
+        let inside = try h.request(replayId: "inside", chunkId: "inside", startedAt: "2026-08-04T22:00:00.000Z", endedAt: "2026-08-04T22:00:05.000Z")
+        let expiring = try h.request(replayId: "expiring", chunkId: "expiring", startedAt: "2026-07-29T00:01:35.000Z", endedAt: "2026-07-29T00:01:40.000Z")
+        let refused = try h.request(replayId: "refused", chunkId: "refused")
+        for request in [inside, expiring, refused] { _ = try await h.append(request: request) }
+        try await h.queue.ensureReplayDeliverySchema(); await h.queue.close()
+        // Metadata exactly as an earlier release persisted it, with no new key or reason.
+        try h.writeDeliveryMetadata(0, h.heldMetadata("protocol", recordedAt: "2026-08-04T22:30:00.000Z"))
+        try h.writeDeliveryMetadata(1, h.heldMetadata("protocol", recordedAt: "2026-07-29T00:02:00.000Z"))
+        try h.writeDeliveryMetadata(2, h.heldMetadata("credential-401", recordedAt: "2026-08-05T00:01:20.000Z"))
+        h.queue = try await h.reopen(); h.testClock.advance(5)
+        let authority = try await h.deliveryAuthority()
+        let delivered = try await claim(h.queue, authority)
+        XCTAssertEqual(delivered.row.body, inside.body); XCTAssertEqual(delivered.row.requestId, inside.requestId)
+        XCTAssertEqual(delivered.attemptCount, 2)
+        _ = try await h.queue.finishReplayClaim(delivered, completion: .response(.accepted))
+        guard case .idle = try await h.queue.claimNextReplay(authority) else { return XCTFail("credential refusal revived") }
+        let rows = try await h.queue.storedReplayChunks(); XCTAssertEqual(rows.map(\.prepared.requestId), [refused.requestId])
+        await h.queue.close()
+    }
+
+    func testWireframeAppendRefusedBehindBlockedHeadButNotBehindPendingRetry() async throws {
+        for completion in [EluV2ReplayResponseOutcome.credentialBlocked(status: 401), .protocolBlocked, .retry(afterSeconds: 5)] {
+            let h = try await DeliveryHarness.make(); defer { h.remove() }
+            try await h.install(); let original = try h.request(); _ = try await h.append(request: original)
+            try await h.queue.ensureReplayDeliverySchema()
+            let first = try await claim(h.queue, h.deliveryAuthority())
+            _ = try await h.queue.finishReplayClaim(first, completion: .response(completion))
+            let before = try await h.queue.storedReplayChunks(), suffix = try h.request(chunkId: "suffix", sequence: 2)
+            if case .retry = completion {
+                guard case .inserted = try await h.append(request: suffix) else { return XCTFail("pending retry stopped the recording") }
+            } else {
+                let reason = completion == .protocolBlocked ? "protocol" : "credential-401"
+                do { _ = try await h.append(request: suffix); XCTFail("suffix stored behind a blocked head") }
+                catch { XCTAssertEqual(error as? EluRuntimeQueueError, .replayStreamBlocked(replayId: original.replayId, reason: reason)) }
+                let after = try await h.queue.storedReplayChunks(); XCTAssertEqual(after, before)
+                let inventory = try await h.queue.replayInventory(); XCTAssertEqual(inventory.replayCount, 1)
+                guard case .duplicate = try await h.append(request: original) else { return XCTFail("exact head retry") }
+            }
+            guard case .inserted = try await h.append(request: h.request(replayId: "other", chunkId: "other")) else { return XCTFail("other recording stopped") }
+            await h.queue.close()
+        }
+    }
+
+    func testCoordinatorRetriesPlainText503AndDeliversSameRequest() async throws {
+        let h = try await DeliveryHarness.make(); defer { h.remove() }
+        try await h.install(); _ = try await h.append(); try await h.queue.ensureReplayDeliverySchema()
+        let counter = DeliveryAttemptCounter()
+        let transport = DeliveryMockTransport { request in
+            if counter.next() == 1 {
+                return EluV1BatchHTTPResponse(status: 503, headers: ["Retry-After": "1"], body: Data("503 Service Unavailable".utf8))
+            }
+            return Self.ack(try EluV2ReplayPreparedRequest(request.body, captureProtocolGeneration: h.generation))
+        }
+        let driver = EluV2ReplayDeliveryCoordinator(queue: h.queue, transport: transport, wallNow: { h.now },
+            sleep: { _ in throw CancellationError() }, randomUnit: { 0 })
+        let first = await driver.trigger(try await h.deliveryAuthority())
+        XCTAssertEqual(first.attempted, 1); XCTAssertEqual(first.retried, 1); XCTAssertEqual(first.blocked, 0)
+        XCTAssertEqual(first.stopped, .deferred)
+        let metadata = try h.deliveryMetadata(0); XCTAssertNil(metadata.blocked); XCTAssertNotNil(metadata.retry)
+        h.testClock.advance(1)
+        let second = await driver.trigger(try await h.deliveryAuthority())
+        XCTAssertEqual(second.accepted, 1); XCTAssertEqual(second.blocked, 0)
+        let sent = await transport.bodies; XCTAssertEqual(sent.count, 2); XCTAssertEqual(sent.first, sent.last)
+        let count = try await h.count(); XCTAssertEqual(count, 0)
+        await driver.close(); await h.queue.close()
+    }
+
+    func testTransientFailureEndsPassAndGatesExternalTriggers() async throws {
+        let h = try await DeliveryHarness.make(); defer { h.remove() }
+        try await h.install(); _ = try await h.append(); _ = try await h.append(request: h.request(replayId: "other", chunkId: "other"))
+        try await h.queue.ensureReplayDeliverySchema()
+        let delays = DeliveryDelayRecorder()
+        let transport = DeliveryMockTransport { _ in EluV1BatchHTTPResponse(status: 503, headers: [:], body: Data("503 Service Unavailable".utf8)) }
+        let driver = EluV2ReplayDeliveryCoordinator(queue: h.queue, transport: transport, wallNow: { h.now },
+            sleep: { delay in delays.record(delay); throw CancellationError() }, randomUnit: { 0 })
+        let authority = try await h.deliveryAuthority()
+        let first = await driver.trigger(authority)
+        XCTAssertEqual(first.attempted, 1); XCTAssertEqual(first.retried, 1); XCTAssertEqual(first.stopped, .deferred)
+        let folded = await driver.trigger(authority)
+        XCTAssertEqual(folded.attempted, 0); XCTAssertEqual(folded.stopped, .deferred)
+        h.testClock.advance(0.5)
+        let second = await driver.trigger(authority)
+        XCTAssertEqual(second.attempted, 1); XCTAssertEqual(second.stopped, .deferred)
+        let rows = try await h.queue.storedReplayChunks(), sent = await transport.bodies
+        XCTAssertEqual(sent, [rows[0].prepared.body, rows[1].prepared.body], "queued recordings take turns")
+        for row in rows { XCTAssertNil(try h.deliveryMetadata(row.ordinal).blocked) }
+        let recorded = try await delays.wait(count: 3)
+        XCTAssertTrue(recorded.contains(500_000_000)); XCTAssertTrue(recorded.contains(1_000_000_000))
+        XCTAssertTrue(recorded.allSatisfy { $0 <= 1_000_000_000 })
+        await driver.close(); await h.queue.close()
+    }
+
+    func testAcceptResetsTransientStreak() async throws {
+        let h = try await DeliveryHarness.make(); defer { h.remove() }
+        try await h.install(); _ = try await h.append(); try await h.queue.ensureReplayDeliverySchema()
+        let counter = DeliveryAttemptCounter()
+        let transport = DeliveryMockTransport { request in
+            if counter.next() < 3 { throw URLError(.networkConnectionLost) }
+            return Self.ack(try EluV2ReplayPreparedRequest(request.body, captureProtocolGeneration: h.generation))
+        }
+        let driver = EluV2ReplayDeliveryCoordinator(queue: h.queue, transport: transport, wallNow: { h.now },
+            sleep: { _ in throw CancellationError() }, randomUnit: { 0 })
+        let authority = try await h.deliveryAuthority()
+        _ = await driver.trigger(authority); var streak = await driver.transientStreakForTesting(); XCTAssertEqual(streak, 1)
+        h.testClock.advance(1)
+        _ = await driver.trigger(authority); streak = await driver.transientStreakForTesting(); XCTAssertEqual(streak, 2)
+        h.testClock.advance(2)
+        let accepted = await driver.trigger(authority); XCTAssertEqual(accepted.accepted, 1)
+        streak = await driver.transientStreakForTesting(); XCTAssertEqual(streak, 0)
+        await driver.close(); await h.queue.close()
     }
 
     func testRefusalPersistsAfterRenewalEndpointChangeAndReopen() async throws {
@@ -76,6 +256,8 @@ final class EluV2ReplayDeliveryTests: XCTestCase {
             _ = try await h.queue.finishReplayClaim(first, completion: .response(.credentialBlocked(status: status)))
             await h.queue.close(); h.queue = try await h.reopen()
             try await h.renew(generation: h.generation, issued: "2026-08-05T00:00:01.000Z", support: h.generation)
+            // Unlike a protocol hold, a credential refusal is never offered again.
+            h.testClock.advance(90_000); try await h.refresh()
             let next = try await h.deliveryAuthority()
             guard case .idle = try await h.queue.claimNextReplay(next) else { return XCTFail("refused row revived") }
             let rows = try await h.queue.storedReplayChunks(); XCTAssertEqual(rows.map(EluStoredReplayRecord.wireframe), [first.row])
@@ -433,7 +615,7 @@ final class EluV2ReplayDeliveryTests: XCTestCase {
             if counter.next() < 3{throw URLError(.networkConnectionLost)}
             sent.fulfill();return Self.ack(try EluV2ReplayPreparedRequest(request.body,captureProtocolGeneration:h.generation))
         }
-        let driver=EluV2ReplayDeliveryCoordinator(queue:h.queue,transport:transport,wallNow:{h.now},sleep:{delay in await sleeper.sleep(delay)})
+        let driver=EluV2ReplayDeliveryCoordinator(queue:h.queue,transport:transport,wallNow:{h.now},sleep:{delay in await sleeper.sleep(delay)},randomUnit:{0})
         let authority=try await h.deliveryAuthority()
         _ = await driver.trigger(authority);await sleeper.waitForCount(1)
         h.testClock.advance(1)
@@ -750,6 +932,31 @@ final class DeliveryHarness: @unchecked Sendable {
         let bytes = try XCTUnwrap(sqlite3_column_blob(statement,0)); let data = Data(bytes:bytes,count:size)
         XCTAssertEqual(sqlite3_step(statement),SQLITE_DONE); return data
     }
+    func deliveryMetadata(_ ordinal: Int64) throws -> EluV2ReplayDeliveryState {
+        let namespace = try EluV1SiteNamespace.directoryComponent(exactConstructorSiteKey: "elu_pk_test_aaaaaaaaaaaaaaaaaaaaaa")
+        let path = endpointPolicy.storageRoot(under: root).appendingPathComponent(namespace).appendingPathComponent("runtime-state-v1.sqlite3").path
+        var db: OpaquePointer?; XCTAssertEqual(sqlite3_open(path, &db), SQLITE_OK); defer { sqlite3_close(db) }
+        var statement: OpaquePointer?; XCTAssertEqual(sqlite3_prepare_v2(db, "SELECT metadata FROM replay_delivery WHERE ordinal=?", -1, &statement, nil), SQLITE_OK)
+        defer { sqlite3_finalize(statement) }; XCTAssertEqual(sqlite3_bind_int64(statement, 1, ordinal), SQLITE_OK)
+        XCTAssertEqual(sqlite3_step(statement), SQLITE_ROW)
+        let bytes = try XCTUnwrap(sqlite3_column_blob(statement, 0))
+        return try EluV2ReplayDeliveryState.decode(Data(bytes: bytes, count: Int(sqlite3_column_bytes(statement, 0))))
+    }
+    func writeDeliveryMetadata(_ ordinal: Int64, _ value: EluV2ReplayDeliveryState) throws {
+        try sql("UPDATE replay_delivery SET metadata=X'\(try value.encoded().map { String(format: "%02x", $0) }.joined())' WHERE ordinal=\(ordinal)")
+    }
+    func heldMetadata(_ reason: String, recordedAt: String) -> EluV2ReplayDeliveryState {
+        let witness = "sha256:" + String(repeating: "a", count: 64)
+        return EluV2ReplayDeliveryState(schemaVersion: 1, attemptCount: 1, blocked: .init(reason: reason, recordedAt: recordedAt,
+            credentialWitness: witness, scopeWitness: witness, protocolGeneration: generation))
+    }
+    /// Publishes the same config again, issued at the current test time.
+    func refresh() async throws {
+        var root = try JSONSerialization.jsonObject(with: config) as! [String: Any]
+        root["issuedAt"] = EluRFC3339.string(from: now); root["expiresAt"] = EluRFC3339.string(from: now.addingTimeInterval(300))
+        config = try JSONSerialization.data(withJSONObject: root)
+        try await activate(support: generation)
+    }
     func schemaVersion() throws -> Int64 {
         let namespace = try EluV1SiteNamespace.directoryComponent(exactConstructorSiteKey: "elu_pk_test_aaaaaaaaaaaaaaaaaaaaaa")
         let path = endpointPolicy.storageRoot(under: root).appendingPathComponent(namespace).appendingPathComponent("runtime-state-v1.sqlite3").path
@@ -827,6 +1034,18 @@ private actor BacklogHeldReplayTransport: EluV2ReplayHTTPTransport {
 private final class DeliveryAttemptCounter:@unchecked Sendable {
     private let lock=NSLock();private var count=0
     func next()->Int{lock.lock();defer{lock.unlock()};count += 1;return count}
+}
+private final class DeliveryDelayRecorder: @unchecked Sendable {
+    private let lock = NSLock(); private var delays: [UInt64] = []
+    func record(_ delay: UInt64) { lock.lock(); delays.append(delay); lock.unlock() }
+    func wait(count: Int) async throws -> [UInt64] {
+        for _ in 0..<300 {
+            lock.lock(); let current = delays; lock.unlock()
+            if current.count >= count { return current }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        lock.lock(); defer { lock.unlock() }; return delays
+    }
 }
 private actor HeldRetrySleeper {
     private var sleepers:[CheckedContinuation<Void,Never>?]=[]

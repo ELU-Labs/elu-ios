@@ -135,6 +135,16 @@ struct EluNativeReplayPreparedAuthority: Sendable {
     func isCurrent() -> Bool {
         EluNativeViewPrivacy.shared.isCurrent(viewPrivacyRevision) && projection.isCurrent()
     }
+    /// A recording stopped behind its held or refused head stays stopped for the
+    /// same original source, identity and session. Only a different context can
+    /// start a new recording; this comparison grants no permission.
+    func sameCaptureContext(as other: Self) -> Bool {
+        projection.source == other.projection.source
+            && projection.identity.streamId == other.projection.identity.streamId
+            && projection.identity.identity.revision == other.projection.identity.identity.revision
+            && projection.identity.identity.contextRevision == other.projection.identity.identity.contextRevision
+            && projection.accounting.key == other.projection.accounting.key
+    }
 }
 
 /// An internal permit, not physical capture enrollment. The capture owner must

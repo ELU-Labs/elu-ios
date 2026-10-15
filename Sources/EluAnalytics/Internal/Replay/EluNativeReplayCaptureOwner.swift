@@ -173,6 +173,7 @@ struct EluNativeReplayFrameBuffer: Sendable {
 enum EluNativeReplayCaptureOutcome: Sendable {
     case settled
     case quarantined
+    /// Settled, but the recording ended behind its held or refused head.
     case epochBlocked(replayId: String, reason: String)
 }
 
@@ -610,6 +611,7 @@ private final class EluNativeReplayCaptureRun: @unchecked Sendable {
         var enrollment: EluNativeReplayCaptureEnrollment?
         var physicalUse: EluNativeReplayCapturePhysicalUse?
         var pendingRequest: EluV2ReplayPreparedRequest?
+        var outcome: EluNativeReplayCaptureOutcome = .settled
         var buffer: EluNativeReplayFrameBuffer?
         var interactionAttachment: EluNativeReplayInteractionAttachment?
         var interactionCollector: EluUIKitReplayCollector?
@@ -792,6 +794,11 @@ private final class EluNativeReplayCaptureRun: @unchecked Sendable {
                 fence.requestRootRecovery()
             }
             fence.withdraw(); buffer?.withdraw()
+        } catch let EluRuntimeQueueError.replayStreamBlocked(replayId, reason) {
+            // The recording's head is held or refused. Report it so the same
+            // capture context does not start a new recording in its place.
+            outcome = .epochBlocked(replayId: replayId, reason: reason)
+            fence.withdraw(); buffer?.withdraw()
         } catch {
             // Withdrawal/failure discards every unsealed value. It never flushes
             // under expired permission or encodes a suffix after unknown commit.
@@ -803,7 +810,7 @@ private final class EluNativeReplayCaptureRun: @unchecked Sendable {
         // physical completion. Cancellation never abandons this join.
         if let interactionAttachment { await interactionAttachment.close() }
         if let interactionCollector { interactionCollector.withdraw() }
-        guard let enrollment else { return .settled }
+        guard let enrollment else { return outcome }
         if let physicalUse {
             physicalUse.settle()
         } else {
@@ -821,7 +828,7 @@ private final class EluNativeReplayCaptureRun: @unchecked Sendable {
             // Even an unused enrollment needs the queue's exact no-start read
             // before resources can be released; cancellation alone is no proof.
             switch try await queue.finishNativeReplayCapture(enrollment) {
-            case .settled: return .settled
+            case .settled: return outcome
             case .physicalWorkPending, .accountingPending, .stale:
                 enrollment.quarantine(retaining: pendingRequest)
                 return .quarantined
