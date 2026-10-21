@@ -305,6 +305,44 @@ final class EluStandaloneFacadeRuntimeTests: XCTestCase {
         }
     }
 
+    /// A call can reach the runtime with no record of the opt-out at call
+    /// time, as a call held before a saved opt-out was read at launch does.
+    /// It is still discarded, and a later opt-in does not surface it.
+    func testCallsRunningUnderASavedOptOutAreDiscardedWhateverTheirCallTimeChoice() async throws {
+        try await withTemporaryDirectory { root in
+            let first = try await makeHarness(root: root)
+            first.backend.execute(.consent(EluConsentOperation(optedOut: true)))
+            await first.backend.settled()
+            await first.close()
+            let harness = try await makeHarness(root: root)
+            XCTAssertTrue(harness.backend.isOptedOut())
+            let before = try await harness.runtime.queueSnapshot()
+            let origin = EluCallOrigin(calledAt: Date(), optedOut: false)
+            for call: EluBufferedOp in [
+                .identify(distinctId: "before-open", userProperties: ["plan": "pro"]),
+                .register(["plan": "pro"]),
+                .group(type: "company", key: "before-open", properties: nil),
+                .setPersonPropertiesForFlags(["plan": "pro"]),
+            ] { harness.backend.execute(call, origin: origin) }
+            await harness.backend.settled()
+            let discarded = try await harness.runtime.queueSnapshot()
+            XCTAssertEqual(discarded.identity, before.identity)
+            XCTAssertEqual(discarded.flagContext, before.flagContext)
+            XCTAssertEqual(harness.backend.dropCounts[.unauthorized, default: 0], 4)
+            harness.backend.execute(.consent(EluConsentOperation(optedOut: false)))
+            harness.backend.execute(.capture(event: "after-opt-in", properties: nil))
+            await harness.backend.settled()
+            _ = await harness.runtime.flush()
+            let records = try await harness.transport.recordedRecords()
+            XCTAssertEqual(records.compactMap { $0["kind"] as? String }, ["event"])
+            let event = records.last?["event"] as? [String: Any] ?? [:]
+            XCTAssertNil((event["identity"] as? [String: Any])?["userId"] as? String)
+            XCTAssertNil((event["properties"] as? [String: Any])?["plan"])
+            XCTAssertEqual(event["groups"] as? [String: String] ?? [:], [:])
+            await harness.close()
+        }
+    }
+
     func testResetStillAppliesWhileOptedOutAndKeepsTheChoice() async throws {
         try await withTemporaryDirectory { root in
             let harness = try await makeHarness(root: root)

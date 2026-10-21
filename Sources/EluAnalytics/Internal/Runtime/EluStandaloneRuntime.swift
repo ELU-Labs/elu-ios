@@ -105,6 +105,8 @@ private final class EluStandaloneDeliveryFence: @unchecked Sendable {
         guard consentIntent == id else { return }
         consentDenied = optedOut; value = UUID()
     }
+    /// An opt-out was accepted and no later opt-in has been saved since.
+    var deniesConsent: Bool { lock.lock(); defer { lock.unlock() }; return consentDenied }
     func advance() -> UUID { lock.lock(); defer { lock.unlock() }; value = UUID(); return value }
     func token() -> UUID { lock.lock(); defer { lock.unlock() }; return value }
     func isCurrent(_ token: UUID) -> Bool { lock.lock(); defer { lock.unlock() }; return !closed && !consentDenied && token == value }
@@ -901,7 +903,7 @@ actor EluStandaloneRuntime {
         defaultValue: EluJSONValue? = nil,
         calledAt: Date? = nil
     ) async -> EluRuntimeQueueSnapshot? {
-        guard phase != .closed, !properties.isEmpty else { return nil }
+        guard !properties.isEmpty, await identityChangeBase() != nil else { return nil }
         guard let snapshot = try? await queue.registerStandaloneSuperProperties(properties, onlyIfAbsent: onlyIfAbsent,
             defaultValue: defaultValue, calledAt: calledAt) else {
             return nil
@@ -911,7 +913,7 @@ actor EluStandaloneRuntime {
 
     @discardableResult
     func unregisterSuperProperty(_ key: String, calledAt: Date? = nil) async -> EluRuntimeQueueSnapshot? {
-        guard phase != .closed else { return nil }
+        guard await identityChangeBase() != nil else { return nil }
         guard let snapshot = try? await queue.unregisterStandaloneSuperProperty(key, calledAt: calledAt) else {
             return nil
         }
@@ -931,7 +933,8 @@ actor EluStandaloneRuntime {
     @discardableResult
     func updateFlagContext(_ change: EluStandaloneFlagContextChange, calledAt: Date? = nil) async -> EluRuntimeQueueSnapshot? {
         performanceMonitor.invalidate()
-        guard phase != .closed, let snapshot = try? await queue.updateStandaloneFlagContext(change, calledAt: calledAt) else { return nil }
+        guard await identityChangeBase() != nil,
+              let snapshot = try? await queue.updateStandaloneFlagContext(change, calledAt: calledAt) else { return nil }
         return await commit(snapshot)
     }
 
@@ -950,20 +953,31 @@ actor EluStandaloneRuntime {
         return await commit(snapshot)
     }
 
-    /// Local identity/context remains available when capture is off. The owner
-    /// creates wire drafts only under current capture authority; there is no backfill.
+    /// The stored state an identity, super-property, group or flag-context
+    /// change applies to, or nil when the change is refused: from the moment
+    /// an opt-out is accepted until a later opt-in is saved, and under a saved
+    /// opt-out. A refused change stores nothing, so a later opt-in cannot
+    /// surface it. Reset is not such a change.
+    private func identityChangeBase() async -> EluRuntimeQueueSnapshot? {
+        guard phase != .closed, !deliveryFence.deniesConsent,
+              let snapshot = try? await queue.snapshot(), !snapshot.identity.optedOut else { return nil }
+        return snapshot
+    }
+
+    /// Local identity/context remains available when capture is off but
+    /// consent is not withdrawn. The owner creates wire drafts only under
+    /// current capture authority; there is no backfill.
     private func mutate(
         _ transition: EluRuntimeMutationTransition,
         calledAt: Date? = nil
     ) async -> EluRuntimeQueueSnapshot? {
-        guard phase != .closed else { return nil }
         let fence = deliveryFence
         let decision = fence.token()
-        guard let generation = try? await queue.snapshot().generation,
+        guard let base = await identityChangeBase(),
               let snapshot = try? await queue.applyOwnedMutation(
                   transition,
                   versions: versions,
-                  expectedGeneration: generation,
+                  expectedGeneration: base.generation,
                   allowWire: phase == .capturing,
                   wireGuard: { fence.isCurrent(decision) },
                   admissionGuard: { fence.token() == decision }, filterMutation: true,
