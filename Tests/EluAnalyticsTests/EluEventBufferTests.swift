@@ -24,12 +24,16 @@ final class EluEventBufferTests: XCTestCase {
         XCTAssertEqual(drained.last, "capture:event-100")
     }
 
-    func testDropAllDoesNotReturnOperations() {
+    func testOptOutDropKeepsOnlyResetsInCallOrder() {
         var buffer = EluEventBuffer()
         buffer.push(.alias("alias"))
-        buffer.dropAll()
+        buffer.push(.reset)
+        buffer.push(.capture(event: "held", properties: nil))
+        buffer.push(.resetGroups)
+        buffer.push(.resetDeviceIdentity)
+        buffer.dropAllExceptResets()
 
-        XCTAssertTrue(buffer.drain().isEmpty)
+        XCTAssertEqual(labels(buffer.drain()), ["reset", "resetDeviceIdentity"])
     }
 
     func testExplicitCaptureTimestampSurvivesPendingBuffer() {

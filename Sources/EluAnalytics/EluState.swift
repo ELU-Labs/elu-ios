@@ -201,7 +201,7 @@ final class EluCore {
             // Preserve the ordered privacy window even when a later consent
             // choice already superseded this operation's durable write.
             pendingConsent = operation
-            if optedOut { buffer.dropAll() }
+            if optedOut { buffer.dropAllExceptResets() }
             backendIntentLock.lock()
             let isLatest = acceptedConsent?.id == operation.id
             backendIntentLock.unlock()

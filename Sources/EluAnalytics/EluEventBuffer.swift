@@ -50,8 +50,19 @@ struct EluEventBuffer {
         return drained
     }
 
-    mutating func dropAll() {
-        ops = []
+    /// An opt-out discards held calls made before it, except resets: a reset
+    /// collects nothing and keeps the consent choice, so it still applies.
+    mutating func dropAllExceptResets() {
+        ops.removeAll { !$0.isReset }
+    }
+}
+
+extension EluBufferedOp {
+    var isReset: Bool {
+        switch self {
+        case .reset, .resetDeviceIdentity: return true
+        default: return false
+        }
     }
 }
 
