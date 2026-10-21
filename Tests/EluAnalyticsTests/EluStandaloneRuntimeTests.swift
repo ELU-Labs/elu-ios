@@ -800,19 +800,48 @@ final class EluStandaloneRuntimeTests: XCTestCase {
         }
     }
 
-    func testMutationHooksKeepExistingLocalOptOutBehaviorWithoutWireAdmission() async throws {
-        try await withTemporaryDirectory { root in
-            let runtime = try await makeRuntime(root: root, transport: RecordingBatchTransport(), clock: TestRuntimeClock(wall: baseDate),
-                eventFilter: .init(beforeSend: { event in var event = event; event.set = ["local": true]; return event }))
-            _ = await runtime.applyConfiguration(fixture("config-enabled.json"))
-            let intent = UUID(); runtime.acceptConsentIntent(intent, optedOut: true)
-            _ = await runtime.setOptedOut(true, intent: intent)
-            let local = await runtime.identify("local-only")
-            XCTAssertEqual(local?.identity.userId, "local-only")
-            XCTAssertTrue(local?.identity.optedOut == true)
-            XCTAssertEqual(local?.flagContext.personProperties["local"], .bool(true))
-            XCTAssertEqual(local?.queuedCount, 0)
-            await runtime.close()
+    /// Android parity: from the moment an opt-out is accepted, and under a
+    /// saved opt-out, identity, super-property, group and flag-context changes
+    /// are refused without running the mutation hook or storing anything.
+    func testIdentityChangesAreRefusedOnceAnOptOutIsAcceptedOrSaved() async throws {
+        for saved in [false, true] {
+            try await withTemporaryDirectory { root in
+                let hooks = EventFilterCounter()
+                let runtime = try await makeRuntime(root: root, transport: RecordingBatchTransport(), clock: TestRuntimeClock(wall: baseDate),
+                    eventFilter: .init(beforeSend: { event in hooks.hit(); var event = event; event.set = ["local": true]; return event }))
+                _ = await runtime.applyConfiguration(fixture("config-enabled.json"))
+                _ = await runtime.identify("member")
+                _ = await runtime.registerSuperProperties(["plan": .string("free")])
+                _ = await runtime.group(type: "company", key: "acme", properties: ["tier": .string("free")])
+                _ = await runtime.setFlagPersonProperties(["beta": .bool(true)])
+                let intent = UUID(); runtime.acceptConsentIntent(intent, optedOut: true)
+                if saved { _ = await runtime.setOptedOut(true, intent: intent) }
+                let before = try await runtime.queueSnapshot()
+                let hooksBefore = hooks.count
+                let changes: [(String, () async -> EluRuntimeQueueSnapshot?)] = [
+                    ("identify", { await runtime.identify("while-opted-out", properties: ["plan": .string("pro")]) }),
+                    ("alias", { await runtime.alias("while-opted-out") }),
+                    ("setPersonProperties", { await runtime.setPersonProperties(["plan": .string("pro")]) }),
+                    ("group", { await runtime.group(type: "company", key: "while-opted-out") }),
+                    ("group properties", { await runtime.group(type: "company", key: "acme", properties: ["tier": .string("gold")]) }),
+                    ("registerSuperProperties", { await runtime.registerSuperProperties(["plan": .string("pro")]) }),
+                    ("registerOnce", { await runtime.registerSuperProperties(["other": .string("pro")], onlyIfAbsent: true) }),
+                    ("unregisterSuperProperty", { await runtime.unregisterSuperProperty("plan") }),
+                    ("setFlagPersonProperties", { await runtime.setFlagPersonProperties(["beta": .bool(false)]) }),
+                    ("setFlagGroupProperties", { await runtime.setFlagGroupProperties(type: "company", properties: ["tier": .string("gold")]) }),
+                    ("resetGroups", { await runtime.updateFlagContext(.resetGroups) }),
+                    ("resetPerson", { await runtime.updateFlagContext(.resetPerson) }),
+                    ("resetGroup", { await runtime.updateFlagContext(.resetGroup("company")) }),
+                ]
+                for (name, change) in changes {
+                    let result = await change()
+                    XCTAssertNil(result, "saved: \(saved), \(name)")
+                }
+                let after = try await runtime.queueSnapshot()
+                XCTAssertEqual(after, before, "saved: \(saved)")
+                XCTAssertEqual(hooks.count, hooksBefore, "saved: \(saved)")
+                await runtime.close()
+            }
         }
     }
 

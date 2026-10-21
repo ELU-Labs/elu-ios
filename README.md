@@ -323,13 +323,13 @@ The latest valid choice made before setup is retained in memory, then saved
 before configuration or lifecycle work can authorize collection. It becomes
 durable when the runtime opens; a process ending before setup cannot persist it.
 The opt-in event is one normal capture attempt and is discarded if configuration
-is not eligible then; it is not backfilled later. Event calls made while opted
-out are discarded, and queued replay is removed. While configuration is still
-loading, or is fetched again after the app returns to the foreground, other calls
-made while opted out are discarded too, and opting in later does not bring them
-back. Opting out also discards calls still waiting for configuration. In both
-cases `reset()` is kept: a reset made before or while opted out still applies
-once configuration arrives, and it keeps the consent choice.
+is not eligible then; it is not backfilled later. While opted out, every call
+except `reset()` is discarded, including `identify`, `alias`, `register`,
+`group`, person-property and flag-context calls. The SDK keeps nothing from
+them, so opting in later does not bring them back. Opting out takes effect at
+once: calls made before it that have not run yet, including calls waiting for
+configuration, are discarded too. Queued replay is removed. A `reset()` made
+before or while opted out still applies, and it keeps the consent choice.
 
 `flush()` requests a delivery attempt; it does not wait for acknowledgment or
 guarantee a send before termination. Unacknowledged durable events remain for a

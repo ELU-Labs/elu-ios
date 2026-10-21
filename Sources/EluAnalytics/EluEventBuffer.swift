@@ -77,6 +77,15 @@ extension EluBufferedOp {
         default: return false
         }
     }
+
+    /// Runs even when made while opted out: a reset collects nothing and keeps
+    /// the consent choice, and a consent choice is how collection resumes.
+    var runsWhileOptedOut: Bool {
+        switch self {
+        case .reset, .resetDeviceIdentity, .consent: return true
+        default: return false
+        }
+    }
 }
 
 /// One consent intent is accepted synchronously, then committed in call order.

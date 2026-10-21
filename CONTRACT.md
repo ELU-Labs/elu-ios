@@ -116,15 +116,18 @@ becomes eligible; pass `captureEventName: nil` to suppress it.
 The latest valid consent choice made before setup is retained in memory and
 saved before configuration or lifecycle work can authorize collection. It is
 durable only once the runtime opens; ending the process before setup cannot
-persist it. Event, screen, and exception calls made during denial are discarded
-even if consent is later granted. While configuration is pending, including the
-fetch after a return to the foreground, every other call made during denial is
-discarded as well, except `reset()` and `reset(resetDeviceId:)`; a later grant
-does not release it. Opt-out also discards calls made before it that are still
-waiting for configuration, with the same exception. A reset made before or
-during an opt-out still applies once configuration arrives: it collects nothing
-and preserves the consent choice. Opt-out removes queued replay; previously
-admitted analytics events remain paused subject to later eligible delivery.
+persist it. Every call made during denial is discarded, except `reset()` and
+`reset(resetDeviceId:)`, whether configuration is current or pending, including
+the fetch after a return to the foreground. This covers event, screen, and
+exception calls, and also identify, alias, super-property, group,
+person-property, and flag-context calls: nothing they carry is stored, and a
+later grant does not release them. Opt-out takes effect at once: calls made
+before it that have not run yet, including calls waiting for configuration, are
+discarded with the same exception. A saved opt-out applies the same way to calls
+made while the SDK starts. A reset made before or during an opt-out still
+applies: it collects nothing and preserves the consent choice. Opt-out removes
+queued replay; previously admitted analytics events remain paused subject to
+later eligible delivery.
 
 With the default `.persistent` option, admitted records use a site-scoped
 SQLite store and survive ordinary process termination. `.memory` uses the same

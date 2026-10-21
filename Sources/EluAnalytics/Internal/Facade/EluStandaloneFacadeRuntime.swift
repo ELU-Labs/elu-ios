@@ -459,12 +459,19 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
     }
 
     func execute(_ op: EluBufferedOp, origin: EluCallOrigin) {
+        // A call made while opted out is discarded, whether configuration is
+        // current or still loading. Nothing it carries is stored, so a later
+        // opt-in cannot surface it. Only a reset and a consent choice run.
+        guard !origin.optedOut || op.runsWhileOptedOut else {
+            count(.unauthorized)
+            return
+        }
         // Every call keeps the time the app made it, including one held for
         // configuration; an explicit event timestamp still wins.
         let calledAt = origin.calledAt
         // Consent is never held, exactly as at launch.
         let hold: EluStandaloneHoldRule
-        if case .consent = op { hold = .never } else { hold = .call(isReset: op.isReset, optedOutAtCall: origin.optedOut) }
+        if case .consent = op { hold = .never } else { hold = .call(isReset: op.isReset) }
         switch op {
         case let .capture(event, properties, timestamp, set, setOnce):
             // Detach event and person maps separately before the actor handoff.
@@ -1146,18 +1153,13 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
         } else { pending = nil }
         let entry = EluStandaloneTailEntry(settlesProjection: settlesProjection, pending: pending,
             whileShutDown: whileShutDown, always: always, operation: operation)
-        if case let .call(isReset, optedOutAtCall) = hold, resumeHold != nil, !isShutDown {
-            if optedOutAtCall && !isReset {
-                // Made while opted out: never held, so a later opt-in cannot release it.
-                appendLocked(entry, discardedAs: .unauthorized)
+        if case let .call(isReset) = hold, resumeHold != nil, !isShutDown {
+            // The same cap as the pre-config buffer: the newest call is
+            // dropped, never an older one.
+            if let held = resumeHold?.count, held >= EluEventBuffer.capacity {
+                appendLocked(entry, discardedAs: .bufferFull)
             } else {
-                // The same cap as the pre-config buffer: the newest call is
-                // dropped, never an older one.
-                if let held = resumeHold?.count, held >= EluEventBuffer.capacity {
-                    appendLocked(entry, discardedAs: .bufferFull)
-                } else {
-                    resumeHold?.append(EluStandaloneHeldCall(entry: entry, isReset: isReset))
-                }
+                resumeHold?.append(EluStandaloneHeldCall(entry: entry, isReset: isReset))
             }
         } else {
             appendLocked(entry)
@@ -1327,8 +1329,9 @@ private extension EluV1FlagJSONValue {
 private enum EluStandaloneHoldRule {
     /// Consent, flush, flag reloads and shutdown run in place.
     case never
-    /// Held, unless the call was made while opted out and is not a reset.
-    case call(isReset: Bool, optedOutAtCall: Bool = false)
+    /// Held until the re-fetched configuration is ready. A call made while
+    /// opted out is discarded before it gets here, unless it is a reset.
+    case call(isReset: Bool)
 }
 
 /// One ordered runtime call with the settlement it owes even when discarded.

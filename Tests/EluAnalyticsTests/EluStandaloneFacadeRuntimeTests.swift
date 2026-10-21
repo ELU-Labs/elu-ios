@@ -237,6 +237,132 @@ final class EluStandaloneFacadeRuntimeTests: XCTestCase {
         }
     }
 
+    /// Android parity: with configuration current and nothing held, a call
+    /// made while opted out is discarded, except a reset. Nothing it carries
+    /// is stored, so a later opt-in cannot surface it in an event, a mutation,
+    /// or the flag context.
+    func testCallsMadeWhileOptedOutAreDiscardedAndNeverSurfaceAfterOptIn() async throws {
+        let member: EluBufferedOp = .identify(distinctId: "member", userProperties: nil)
+        let cases: [(name: String, setup: [EluBufferedOp], call: EluBufferedOp)] = [
+            ("identify", [], .identify(distinctId: "while-opted-out", userProperties: ["plan": "pro"],
+                userPropertiesOnce: ["first": "pro"])),
+            ("alias", [member], .alias("while-opted-out")),
+            ("register", [], .register(["plan": "pro"])),
+            ("registerOnce", [], .registerOnce(["plan": "pro"], defaultValue: nil)),
+            ("unregister", [.register(["plan": "free"])], .unregister("plan")),
+            ("group", [], .group(type: "company", key: "while-opted-out", properties: ["tier": "gold"])),
+            ("setPersonProperties", [member], .setPersonProperties(["plan": "pro"], propertiesOnce: ["first": "pro"])),
+            ("setPersonPropertiesForFlags", [], .setPersonPropertiesForFlags(["plan": "pro"])),
+            ("setGroupPropertiesForFlags", [], .setGroupPropertiesForFlags(type: "company", properties: ["tier": "gold"])),
+            ("resetGroups", [.group(type: "company", key: "acme", properties: ["tier": "free"])], .resetGroups),
+            ("resetPersonPropertiesForFlags", [.setPersonPropertiesForFlags(["plan": "free"])], .resetPersonPropertiesForFlags),
+            ("resetGroupPropertiesForFlags", [.setGroupPropertiesForFlags(type: "company", properties: ["tier": "free"])],
+                .resetGroupPropertiesForFlags("company")),
+        ]
+        for (name, setup, call) in cases {
+            try await withTemporaryDirectory { root in
+                let harness = try await makeHarness(root: root)
+                setup.forEach { harness.backend.execute($0) }
+                await harness.backend.settled()
+                _ = await harness.runtime.flush()
+                let sentBefore = try await harness.transport.recordedRecords().count
+                harness.backend.execute(.consent(EluConsentOperation(optedOut: true)))
+                await harness.backend.settled()
+                let before = try await harness.runtime.queueSnapshot()
+                let distinctId = harness.backend.distinctId()
+                let dropped = harness.backend.dropCounts[.unauthorized, default: 0]
+
+                harness.backend.execute(call)
+                XCTAssertEqual(harness.backend.distinctId(), distinctId, "\(name): no optimistic identity")
+                await harness.backend.settled()
+                let discarded = try await harness.runtime.queueSnapshot()
+                XCTAssertEqual(discarded.identity, before.identity, name)
+                XCTAssertEqual(discarded.flagContext, before.flagContext, name)
+                XCTAssertEqual(harness.backend.dropCounts[.unauthorized, default: 0], dropped + 1, name)
+
+                harness.backend.execute(.consent(EluConsentOperation(optedOut: false)))
+                harness.backend.execute(.capture(event: "after-opt-in", properties: nil))
+                await harness.backend.settled()
+                let granted = try await harness.runtime.queueSnapshot()
+                XCTAssertFalse(granted.identity.optedOut, name)
+                XCTAssertEqual(granted.identity.userId, before.identity.userId, name)
+                XCTAssertEqual(granted.identity.superProperties, before.identity.superProperties, name)
+                XCTAssertEqual(granted.identity.groups, before.identity.groups, name)
+                XCTAssertEqual(granted.flagContext, before.flagContext, name)
+                _ = await harness.runtime.flush()
+                let sent = Array(try await harness.transport.recordedRecords().dropFirst(sentBefore))
+                // No $identify, $create_alias, $groupidentify or $set reaches the server.
+                XCTAssertEqual(sent.compactMap { $0["kind"] as? String }, ["event"], name)
+                let event = sent.last?["event"] as? [String: Any] ?? [:]
+                XCTAssertEqual(event["name"] as? String, "after-opt-in", name)
+                XCTAssertEqual((event["identity"] as? [String: Any])?["userId"] as? String, before.identity.userId, name)
+                XCTAssertEqual(event["groups"] as? [String: String] ?? [:], before.identity.groups, name)
+                let plan: String?
+                if case let .string(value)? = before.identity.superProperties["plan"] { plan = value } else { plan = nil }
+                XCTAssertEqual((event["properties"] as? [String: Any])?["plan"] as? String, plan, name)
+                await harness.close()
+            }
+        }
+    }
+
+    /// A call can reach the runtime with no record of the opt-out at call
+    /// time, as a call held before a saved opt-out was read at launch does.
+    /// It is still discarded, and a later opt-in does not surface it.
+    func testCallsRunningUnderASavedOptOutAreDiscardedWhateverTheirCallTimeChoice() async throws {
+        try await withTemporaryDirectory { root in
+            let first = try await makeHarness(root: root)
+            first.backend.execute(.consent(EluConsentOperation(optedOut: true)))
+            await first.backend.settled()
+            await first.close()
+            let harness = try await makeHarness(root: root)
+            XCTAssertTrue(harness.backend.isOptedOut())
+            let before = try await harness.runtime.queueSnapshot()
+            let origin = EluCallOrigin(calledAt: Date(), optedOut: false)
+            for call: EluBufferedOp in [
+                .identify(distinctId: "before-open", userProperties: ["plan": "pro"]),
+                .register(["plan": "pro"]),
+                .group(type: "company", key: "before-open", properties: nil),
+                .setPersonPropertiesForFlags(["plan": "pro"]),
+            ] { harness.backend.execute(call, origin: origin) }
+            await harness.backend.settled()
+            let discarded = try await harness.runtime.queueSnapshot()
+            XCTAssertEqual(discarded.identity, before.identity)
+            XCTAssertEqual(discarded.flagContext, before.flagContext)
+            XCTAssertEqual(harness.backend.dropCounts[.unauthorized, default: 0], 4)
+            harness.backend.execute(.consent(EluConsentOperation(optedOut: false)))
+            harness.backend.execute(.capture(event: "after-opt-in", properties: nil))
+            await harness.backend.settled()
+            _ = await harness.runtime.flush()
+            let records = try await harness.transport.recordedRecords()
+            XCTAssertEqual(records.compactMap { $0["kind"] as? String }, ["event"])
+            let event = records.last?["event"] as? [String: Any] ?? [:]
+            XCTAssertNil((event["identity"] as? [String: Any])?["userId"] as? String)
+            XCTAssertNil((event["properties"] as? [String: Any])?["plan"])
+            XCTAssertEqual(event["groups"] as? [String: String] ?? [:], [:])
+            await harness.close()
+        }
+    }
+
+    func testResetStillAppliesWhileOptedOutAndKeepsTheChoice() async throws {
+        try await withTemporaryDirectory { root in
+            let harness = try await makeHarness(root: root)
+            harness.backend.execute(.identify(distinctId: "member", userProperties: nil))
+            harness.backend.execute(.register(["plan": "free"]))
+            harness.backend.execute(.consent(EluConsentOperation(optedOut: true)))
+            await harness.backend.settled()
+            let before = try await harness.runtime.queueSnapshot()
+            for reset in [EluBufferedOp.reset, .resetDeviceIdentity] { harness.backend.execute(reset) }
+            await harness.backend.settled()
+            let after = try await harness.runtime.queueSnapshot()
+            XCTAssertNotEqual(after.identity.anonymousId, before.identity.anonymousId)
+            XCTAssertNil(after.identity.userId)
+            XCTAssertTrue(after.identity.superProperties.isEmpty)
+            XCTAssertTrue(after.identity.optedOut)
+            XCTAssertTrue(harness.backend.isOptedOut())
+            await harness.close()
+        }
+    }
+
     func testSetOnceOverloadsGroupsAndLocalFlagContextResetsPersist() async throws {
         try await withTemporaryDirectory { root in
             let harness = try await makeHarness(root: root)
