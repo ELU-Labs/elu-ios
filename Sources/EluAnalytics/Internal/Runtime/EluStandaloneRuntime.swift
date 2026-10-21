@@ -4,6 +4,15 @@ enum EluStandaloneRuntimeError: Error, Equatable, Sendable {
     case invalidSiteKey
 }
 
+/// What an identity change needs while the configuration blocks capture.
+enum EluStandaloneIdentityChange: Equatable, Sendable {
+    /// identify, alias and super properties: refused.
+    case capture
+    /// Person, group and flag-context changes: applied only while feature
+    /// flags are authorized, so flags are evaluated with them.
+    case flagContext
+}
+
 /// Where the runtime stands with respect to capture authority.
 enum EluStandaloneRuntimePhase: Equatable, Sendable {
     case awaitingConfiguration
@@ -833,14 +842,14 @@ actor EluStandaloneRuntime {
         propertiesOnce: [String: EluJSONValue] = [:],
         calledAt: Date? = nil
     ) async -> EluRuntimeQueueSnapshot? {
-        await mutate(.identify(userId: userId, set: properties, setOnce: propertiesOnce), calledAt: calledAt)
+        await mutate(.identify(userId: userId, set: properties, setOnce: propertiesOnce), change: .capture, calledAt: calledAt)
     }
 
     /// Links a second id to the identified one. The queue rejects an alias
     /// raised before an identity exists, because there is nothing to link to.
     @discardableResult
     func alias(_ aliasId: String, calledAt: Date? = nil) async -> EluRuntimeQueueSnapshot? {
-        await mutate(.linkAlias(aliasId: aliasId), calledAt: calledAt)
+        await mutate(.linkAlias(aliasId: aliasId), change: .capture, calledAt: calledAt)
     }
 
     @discardableResult
@@ -850,7 +859,8 @@ actor EluStandaloneRuntime {
         calledAt: Date? = nil
     ) async -> EluRuntimeQueueSnapshot? {
         guard !properties.isEmpty || !propertiesOnce.isEmpty else { return nil }
-        return await mutate(.setPersonProperties(set: properties, setOnce: propertiesOnce, unset: []), calledAt: calledAt)
+        return await mutate(.setPersonProperties(set: properties, setOnce: propertiesOnce, unset: []),
+            change: .flagContext, calledAt: calledAt)
     }
 
     /// The original capture's identity, context and event-time state must still
@@ -889,10 +899,11 @@ actor EluStandaloneRuntime {
         calledAt: Date? = nil
     ) async -> EluRuntimeQueueSnapshot? {
         if properties.isEmpty {
-            return await mutate(.associateGroup(groupType: type, groupKey: key), calledAt: calledAt)
+            return await mutate(.associateGroup(groupType: type, groupKey: key), change: .flagContext, calledAt: calledAt)
         }
         return await mutate(
-            .group(groupType: type, groupKey: key, set: properties, setOnce: [:], unset: []), calledAt: calledAt
+            .group(groupType: type, groupKey: key, set: properties, setOnce: [:], unset: []),
+            change: .flagContext, calledAt: calledAt
         )
     }
 
@@ -903,7 +914,7 @@ actor EluStandaloneRuntime {
         defaultValue: EluJSONValue? = nil,
         calledAt: Date? = nil
     ) async -> EluRuntimeQueueSnapshot? {
-        guard !properties.isEmpty, await identityChangeBase() != nil else { return nil }
+        guard !properties.isEmpty, await identityChangeBase(.capture) != nil else { return nil }
         guard let snapshot = try? await queue.registerStandaloneSuperProperties(properties, onlyIfAbsent: onlyIfAbsent,
             defaultValue: defaultValue, calledAt: calledAt) else {
             return nil
@@ -913,7 +924,7 @@ actor EluStandaloneRuntime {
 
     @discardableResult
     func unregisterSuperProperty(_ key: String, calledAt: Date? = nil) async -> EluRuntimeQueueSnapshot? {
-        guard await identityChangeBase() != nil else { return nil }
+        guard await identityChangeBase(.capture) != nil else { return nil }
         guard let snapshot = try? await queue.unregisterStandaloneSuperProperty(key, calledAt: calledAt) else {
             return nil
         }
@@ -933,7 +944,7 @@ actor EluStandaloneRuntime {
     @discardableResult
     func updateFlagContext(_ change: EluStandaloneFlagContextChange, calledAt: Date? = nil) async -> EluRuntimeQueueSnapshot? {
         performanceMonitor.invalidate()
-        guard await identityChangeBase() != nil,
+        guard await identityChangeBase(.flagContext) != nil,
               let snapshot = try? await queue.updateStandaloneFlagContext(change, calledAt: calledAt) else { return nil }
         return await commit(snapshot)
     }
@@ -955,25 +966,33 @@ actor EluStandaloneRuntime {
 
     /// The stored state an identity, super-property, group or flag-context
     /// change applies to, or nil when the change is refused: from the moment
-    /// an opt-out is accepted until a later opt-in is saved, and under a saved
-    /// opt-out. A refused change stores nothing, so a later opt-in cannot
-    /// surface it. Reset is not such a change.
-    private func identityChangeBase() async -> EluRuntimeQueueSnapshot? {
+    /// an opt-out is accepted until a later opt-in is saved, under a saved
+    /// opt-out, and while the configuration blocks capture (a disabled,
+    /// revoked, expired or malformed configuration, or a blocked region).
+    /// While capture is blocked, a person, group or flag-context change still
+    /// applies if feature flags are authorized, as they are in a blocked
+    /// region, matching Android. A refused change stores nothing, so a later
+    /// opt-in or configuration cannot surface it. Reset is not such a change.
+    private func identityChangeBase(_ change: EluStandaloneIdentityChange) async -> EluRuntimeQueueSnapshot? {
         guard phase != .closed, !deliveryFence.deniesConsent,
               let snapshot = try? await queue.snapshot(), !snapshot.identity.optedOut else { return nil }
+        if case .blocked = phase {
+            guard change == .flagContext, await queue.flagsAreAuthorized() else { return nil }
+        }
         return snapshot
     }
 
-    /// Local identity/context remains available when capture is off but
-    /// consent is not withdrawn. The owner creates wire drafts only under
-    /// current capture authority; there is no backfill.
+    /// Applies a change the base above allows, also before the configuration
+    /// is decided. The owner creates wire drafts only under current capture
+    /// authority; there is no backfill.
     private func mutate(
         _ transition: EluRuntimeMutationTransition,
+        change: EluStandaloneIdentityChange,
         calledAt: Date? = nil
     ) async -> EluRuntimeQueueSnapshot? {
         let fence = deliveryFence
         let decision = fence.token()
-        guard let base = await identityChangeBase(),
+        guard let base = await identityChangeBase(change),
               let snapshot = try? await queue.applyOwnedMutation(
                   transition,
                   versions: versions,

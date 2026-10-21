@@ -121,18 +121,20 @@ final class EluStandaloneStackTests: XCTestCase {
         }
     }
 
-    func testCaptureOffAllowsLocalIdentityContextAndIndependentFlagsWithoutWireBackfill() async throws {
+    func testCaptureOffDiscardsIdentityButKeepsIndependentFlagContextWithoutWireBackfill() async throws {
         try await withHarness { h in
             try await h.install(try fixture(capture: false))
+            // Android parity: identify is discarded while capture is off; flag context follows flag authorization.
             let identity = await h.stack.runtime.identify("local-person", properties: ["tier": .string("pro")])
-            XCTAssertEqual(identity?.identity.userId, "local-person")
+            XCTAssertNil(identity)
             _ = await h.stack.runtime.group(type: "company", key: "example")
             _ = await h.stack.runtime.setFlagPersonProperties(["beta": .bool(true)])
             let projection = await h.stack.flags.reloadProjection()
             XCTAssertNotNil(projection)
-            XCTAssertEqual(projection?.lookup("variant"), .found(value: .string(Array("local-person".utf16)), payload: nil))
+            XCTAssertEqual(projection?.lookup("variant"), .found(value: .string(Array("anonymous".utf16)), payload: nil))
             let snapshot = try await h.stack.runtime.queueSnapshot()
             XCTAssertEqual(snapshot.queuedCount, 0)
+            XCTAssertNil(snapshot.identity.userId)
             XCTAssertEqual(snapshot.identity.groups["company"], "example")
             XCTAssertEqual(snapshot.flagContext.personProperties["beta"], .bool(true))
             let capture = await h.stack.runtime.capture("blocked")

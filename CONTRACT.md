@@ -35,7 +35,14 @@ through the current authority gates, without a blanket next-launch delay.
 Remote policy, local consent, region restrictions, identity, and lifecycle gates
 all apply. The EU restriction uses the documented timezone heuristic and fails
 closed. Config requests may continue while analytics is blocked so the site can
-recover. Blocking collection does not mean no SDK state is stored locally.
+recover. While configuration disables or blocks collection, including for an
+EU-blocked device, `identify`, `alias`, `register`, `registerOnce` and
+`unregister` are discarded and store nothing, so a later configuration that
+permits collection cannot surface them. Person-property, group and
+flag-context calls are discarded as well unless feature flags remain
+authorized, as they can for a blocked region; they then apply locally for flag
+evaluation and enqueue nothing. Blocking collection does not mean no SDK state
+is stored locally.
 
 Calls while setup or configuration is pending may enter a bounded in-memory
 buffer of 100 calls; once it is full, later calls are discarded and the earlier

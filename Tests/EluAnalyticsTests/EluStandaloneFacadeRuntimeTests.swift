@@ -363,6 +363,116 @@ final class EluStandaloneFacadeRuntimeTests: XCTestCase {
         }
     }
 
+    /// Android parity: while the configuration blocks capture (a disabled
+    /// configuration, or a device in a blocked region), identify, alias,
+    /// register, registerOnce and unregister are discarded. Person, group and
+    /// flag-context calls are discarded too, unless feature flags are still
+    /// authorized, as they are in a blocked region; they then change only the
+    /// state flags are evaluated with. A discarded call stores nothing, so it
+    /// never reaches a later event or flag request once capture resumes.
+    func testIdentityCallsWhileTheConfigurationBlocksCaptureMatchAndroid() async throws {
+        let marker = "while-blocked"
+        let seed: [EluBufferedOp] = [
+            .identify(distinctId: "member", userProperties: nil),
+            .register(["plan": "free"]),
+            .group(type: "company", key: "acme", properties: ["tier": "free"]),
+            .setPersonPropertiesForFlags(["role": "admin"]),
+            .setGroupPropertiesForFlags(type: "company", properties: ["seats": 5]),
+        ]
+        let calls: [(name: String, flagContext: Bool, call: EluBufferedOp)] = [
+            ("identify", false, .identify(distinctId: marker, userProperties: ["marker": marker],
+                userPropertiesOnce: ["firstMarker": marker])),
+            ("alias", false, .alias(marker)),
+            ("register", false, .register(["marker": marker])),
+            ("registerOnce", false, .registerOnce(["onceMarker": marker], defaultValue: nil)),
+            ("unregister", false, .unregister("plan")),
+            ("setPersonProperties", true, .setPersonProperties(["marker": marker], propertiesOnce: ["firstMarker": marker])),
+            ("group", true, .group(type: "team", key: marker, properties: ["marker": marker])),
+            ("resetGroups", true, .resetGroups),
+            ("setPersonPropertiesForFlags", true, .setPersonPropertiesForFlags(["marker": marker])),
+            ("resetPersonPropertiesForFlags", true, .resetPersonPropertiesForFlags),
+            ("setGroupPropertiesForFlags", true, .setGroupPropertiesForFlags(type: "company", properties: ["marker": marker])),
+            ("resetGroupPropertiesForFlags", true, .resetGroupPropertiesForFlags("company")),
+        ]
+        let blockedAt = "2026-08-04T00:00:30.000Z"
+        let scenarios: [(name: String, document: Data, zone: String, phase: EluStandaloneRuntimePhase, flags: Bool)] = [
+            ("disabled", try reissuedConfig("config-disabled.json", revision: "config-disabled-2", issuedAt: blockedAt),
+                "America/New_York", .blocked(.disabled), false),
+            ("region", try reissuedConfig("config-enabled.json", revision: "config-region-2", issuedAt: blockedAt),
+                "Europe/Berlin", .blocked(.privacyBlocked), true),
+            ("region without flags", try reissuedConfig("config-enabled.json", revision: "config-region-3", issuedAt: blockedAt) {
+                var features = $0["features"] as? [String: Any] ?? [:]
+                features["flags"] = false
+                $0["features"] = features
+            }, "Europe/Berlin", .blocked(.privacyBlocked), false),
+        ]
+        let resumed = try reissuedConfig("config-enabled.json", revision: "config-resumed-4", issuedAt: "2026-08-04T00:00:45.000Z")
+        for scenario in scenarios {
+            for (callName, flagContext, call) in calls {
+                let name = "\(scenario.name) \(callName)"
+                let discarded = !(flagContext && scenario.flags)
+                try await withTemporaryDirectory { root in
+                    let seeded = try await makeHarness(root: root, flagTransport: FacadeFlagTransport())
+                    seed.forEach { seeded.backend.execute($0) }
+                    await seeded.backend.settled()
+                    _ = await seeded.runtime.flush()
+                    await seeded.close()
+
+                    let blocked = try await makeHarness(root: root, document: scenario.document,
+                        flagTransport: FacadeFlagTransport(), timeZoneIdentifier: scenario.zone)
+                    let phase = await blocked.runtime.currentPhase
+                    XCTAssertEqual(phase, scenario.phase, name)
+                    let before = try await blocked.runtime.queueSnapshot()
+                    let dropped = blocked.backend.dropCounts[.unauthorized, default: 0]
+                    blocked.backend.execute(call)
+                    await blocked.backend.settled()
+                    let after = try await blocked.runtime.queueSnapshot()
+                    XCTAssertEqual(after.queuedCount, 0, name)
+                    guard discarded else {
+                        // Flags stay authorized, so the call changes the state flags are evaluated with.
+                        XCTAssertNotEqual(after.flagContext, before.flagContext, name)
+                        XCTAssertEqual(blocked.backend.dropCounts[.unauthorized, default: 0], dropped, name)
+                        await blocked.close()
+                        return
+                    }
+                    XCTAssertEqual(after.identity, before.identity, name)
+                    XCTAssertEqual(after.flagContext, before.flagContext, name)
+                    XCTAssertEqual(blocked.backend.dropCounts[.unauthorized, default: 0], dropped + 1, name)
+                    await blocked.close()
+
+                    let flags = FacadeFlagTransport()
+                    let harness = try await makeHarness(root: root, document: resumed, flagTransport: flags)
+                    let resumedPhase = await harness.runtime.currentPhase
+                    XCTAssertEqual(resumedPhase, .capturing, name)
+                    harness.backend.activate()
+                    harness.backend.execute(.capture(event: "after-capture-resumes", properties: nil))
+                    await harness.backend.settled()
+                    let granted = try await harness.runtime.queueSnapshot()
+                    XCTAssertEqual(granted.identity.userId, before.identity.userId, name)
+                    XCTAssertEqual(granted.identity.superProperties, before.identity.superProperties, name)
+                    XCTAssertEqual(granted.identity.groups, before.identity.groups, name)
+                    XCTAssertEqual(granted.flagContext, before.flagContext, name)
+                    _ = await harness.runtime.flush()
+                    let sent = try await harness.transport.recordedRecords()
+                    // No $identify, $create_alias, $groupidentify or $set reaches the server.
+                    XCTAssertEqual(sent.compactMap { $0["kind"] as? String }, ["event"], name)
+                    let event = sent.last?["event"] as? [String: Any] ?? [:]
+                    XCTAssertEqual(event["name"] as? String, "after-capture-resumes", name)
+                    XCTAssertEqual((event["identity"] as? [String: Any])?["userId"] as? String, "member", name)
+                    XCTAssertEqual(event["groups"] as? [String: String] ?? [:], ["company": "acme"], name)
+                    let properties = event["properties"] as? [String: Any] ?? [:]
+                    XCTAssertEqual(properties["plan"] as? String, "free", name)
+                    XCTAssertNil(properties["marker"], name)
+                    XCTAssertNil(properties["onceMarker"], name)
+                    let requests = await flags.requestBodies()
+                    XCTAssertFalse(requests.isEmpty, name)
+                    XCTAssertFalse(requests.contains { String(decoding: $0, as: UTF8.self).contains(marker) }, name)
+                    await harness.close()
+                }
+            }
+        }
+    }
+
     func testSetOnceOverloadsGroupsAndLocalFlagContextResetsPersist() async throws {
         try await withTemporaryDirectory { root in
             let harness = try await makeHarness(root: root)
@@ -904,8 +1014,9 @@ final class EluStandaloneFacadeRuntimeTests: XCTestCase {
 
             let snapshot = try await harness.runtime.queueSnapshot()
             XCTAssertEqual(snapshot.queuedCount, 0)
-            // Local identity survives without capture authority; no mutation is backfilled.
-            XCTAssertEqual(snapshot.identity.userId, "user-1")
+            // Android parity: identity changes are discarded too, so nothing is stored.
+            XCTAssertNil(snapshot.identity.userId)
+            XCTAssertTrue(snapshot.identity.superProperties.isEmpty)
             let flushed = await harness.runtime.flush()
             XCTAssertEqual(flushed, .unavailable)
             let records = try await harness.transport.recordedRecords()
@@ -963,8 +1074,8 @@ final class EluStandaloneFacadeRuntimeTests: XCTestCase {
 
             let snapshot = try await harness.runtime.queueSnapshot()
             XCTAssertEqual(snapshot.queuedCount, 0)
-            // Local identity survives without capture authority; no mutation is backfilled.
-            XCTAssertEqual(snapshot.identity.userId, "user-1")
+            // Android parity: the identity change is discarded too, so nothing is stored.
+            XCTAssertNil(snapshot.identity.userId)
             let records = try await harness.transport.recordedRecords()
             XCTAssertTrue(records.isEmpty)
             await harness.close()
@@ -1610,7 +1721,8 @@ final class EluStandaloneFacadeRuntimeTests: XCTestCase {
         rateLimiting: EluRateLimitingOptions = .init(),
         eventFilter: EluEventFilter = .init(),
         faultInjector: (any EluRuntimeQueueFaultInjecting)? = nil,
-        clock suppliedClock: FacadeClock? = nil
+        clock suppliedClock: FacadeClock? = nil,
+        timeZoneIdentifier: String = "America/New_York"
     ) async throws -> Harness {
         let transport = batchTransport ?? FacadeBatchTransport()
         let clock = suppliedClock ?? FacadeClock(wall: baseDate)
@@ -1631,7 +1743,7 @@ final class EluStandaloneFacadeRuntimeTests: XCTestCase {
             continuousBudgetConverter: { $0 },
             time: clock.source,
             randomUnit: { 0 },
-            timeZoneIdentifier: { "America/New_York" },
+            timeZoneIdentifier: { timeZoneIdentifier },
             replaySampleDraw: { 0.1 },
             anonymousIdGenerator: { "anon_facade_\(identifiers.next())" },
             streamIdGenerator: { "stream_facade" },
@@ -1672,6 +1784,19 @@ final class EluStandaloneFacadeRuntimeTests: XCTestCase {
             .appendingPathComponent("Conformance/V1/Fixtures", isDirectory: true)
             .appendingPathComponent(name)
         return try! Data(contentsOf: url)
+    }
+
+    /// A fixture issued again later under a new revision, so a store that
+    /// already applied an earlier document accepts it as newer.
+    private func reissuedConfig(
+        _ name: String, revision: String, issuedAt: String,
+        _ change: (inout [String: Any]) -> Void = { _ in }
+    ) throws -> Data {
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: fixture(name)) as? [String: Any])
+        object["revision"] = revision
+        object["issuedAt"] = issuedAt
+        change(&object)
+        return try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
     }
 
     private func withTemporaryDirectory(_ body: (URL) async throws -> Void) async throws {
@@ -1762,6 +1887,7 @@ actor FacadeBatchTransport: EluV1BatchHTTPTransport {
 /// Answers every flag request from the identity witness it was sent.
 actor FacadeFlagTransport: EluV1FlagTransport {
     private var calls = 0
+    private var bodies: [Data] = []
     private var failing = false
     private var malformed = false
     private let evaluatedAt: String
@@ -1775,6 +1901,7 @@ actor FacadeFlagTransport: EluV1FlagTransport {
 
     func send(endpoint: URL, requestBody: Data) async throws -> Data {
         calls += 1
+        bodies.append(requestBody)
         if failing { throw URLError(.notConnectedToInternet) }
         if malformed { return Data("not valid JSON".utf8) }
         guard let request = try JSONSerialization.jsonObject(with: requestBody) as? [String: Any],
@@ -1803,6 +1930,7 @@ actor FacadeFlagTransport: EluV1FlagTransport {
     }
 
     func callCount() -> Int { calls }
+    func requestBodies() -> [Data] { bodies }
 }
 
 enum FacadeFlagTransportError: Error {
