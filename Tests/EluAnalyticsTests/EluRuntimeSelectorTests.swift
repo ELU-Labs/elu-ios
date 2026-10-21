@@ -130,6 +130,42 @@ final class EluRuntimeSelectorTests: XCTestCase {
         XCTAssertEqual(heldCalls(), ["reset", "resetDeviceIdentity", "reset", "activate"])
     }
 
+    func testCallsMadeWhileOptedOutAreNeverHeldForConfigurationExceptResets() throws {
+        let factory = SelectorSpy(), core = EluCore(backendFactory: factory.factory)
+        core.setup(siteKey: uniqueSiteKey(), options: EluSetupOptions(configHost: inertConfigHost))
+        let backend = try XCTUnwrap(core.backendForTesting() as? SelectorBackend)
+        core.setConsent(optedOut: true)
+        core.dispatch(.identify(distinctId: "while-opted-out", userProperties: nil))
+        core.dispatch(.alias("while-opted-out"))
+        core.dispatch(.register(["plan": "pro"]))
+        core.dispatch(.unregister("plan"))
+        core.dispatch(.group(type: "company", key: "acme", properties: nil))
+        core.dispatch(.setPersonProperties(["plan": "pro"]))
+        core.dispatch(.setPersonPropertiesForFlags(["plan": "pro"]))
+        core.dispatch(.resetGroups)
+        core.reset()
+        core.setConsent(optedOut: false, event: nil)
+        core.dispatch(.identify(distinctId: "after-opt-in", userProperties: nil))
+        drain(core)
+        backend.announceConfigurationReady(); drain(core)
+        let released = backend.recordedCalls().filter { $0 != "optOut" && $0 != "optIn" }
+        XCTAssertEqual(released, ["reset", "identify(after-opt-in)", "activate"])
+    }
+
+    func testStoredOptOutKeepsCallsFromWaitingForConfigurationExceptResets() throws {
+        let factory = SelectorSpy(), core = EluCore(backendFactory: factory.factory)
+        core.setup(siteKey: uniqueSiteKey(), options: EluSetupOptions(configHost: inertConfigHost))
+        let backend = try XCTUnwrap(core.backendForTesting() as? SelectorBackend)
+        backend.stubbedOptedOut = true // A reopened backend's saved consent.
+        core.dispatch(.identify(distinctId: "while-opted-out", userProperties: nil))
+        core.dispatch(.register(["plan": "pro"]))
+        core.reset(resetDeviceId: true)
+        drain(core)
+        backend.stubbedOptedOut = false
+        backend.announceConfigurationReady(); drain(core)
+        XCTAssertEqual(backend.recordedCalls(), ["resetDeviceIdentity", "activate"])
+    }
+
     func testActivityKeepsItsCallTimeDenialWhenBackendConsentChangesBeforeBuffering() throws {
         let factory = SelectorSpy()
         let core = EluCore(backendFactory: factory.factory)
@@ -245,7 +281,7 @@ final class EluRuntimeSelectorTests: XCTestCase {
         )
     }
 
-    func testPreConfigBufferKeepsTheNewestCallsAtItsCapAndCountsTheRest() throws {
+    func testPreConfigBufferKeepsTheOldestCallsAtItsCapAndCountsTheRest() throws {
         let factory = SelectorSpy()
         let core = EluCore(backendFactory: factory.factory)
         core.setup(
@@ -264,8 +300,8 @@ final class EluRuntimeSelectorTests: XCTestCase {
         let backend = try XCTUnwrap(factory.backend(for: .standalone))
         let replayed = backend.recordedCalls().filter { $0.hasPrefix("capture(") }
         XCTAssertEqual(replayed.count, EluEventBuffer.capacity)
-        XCTAssertEqual(replayed.first, "capture(event-\(overflow))")
-        XCTAssertEqual(replayed.last, "capture(event-\(total - 1))")
+        XCTAssertEqual(replayed.first, "capture(event-0)")
+        XCTAssertEqual(replayed.last, "capture(event-\(EluEventBuffer.capacity - 1))")
     }
 
     func testPendingOwnedRuntimeDoesNotExposeGettersOrFlushBeforeReadiness() throws {

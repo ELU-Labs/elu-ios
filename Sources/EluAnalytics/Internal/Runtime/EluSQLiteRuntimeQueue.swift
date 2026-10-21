@@ -8425,17 +8425,28 @@ actor EluSQLiteRuntimeQueue {
         }
     }
 
+    /// The time to store for a call the app made at `calledAt` that runs now,
+    /// for example after waiting for configuration. The call keeps its own
+    /// time, but stored time never moves backward: a call made before the
+    /// latest stored change takes that change's time. Never later than now.
+    func callTime(_ calledAt: Date) -> Date {
+        let now = clock()
+        guard calledAt.timeIntervalSinceReferenceDate.isFinite else { return now }
+        return min(max(calledAt, durableWallFloor), now)
+    }
+
     @discardableResult
     func registerStandaloneSuperProperties(
         _ properties: [String: EluJSONValue],
         onlyIfAbsent: Bool = false,
-        defaultValue: EluJSONValue? = nil
+        defaultValue: EluJSONValue? = nil,
+        calledAt: Date? = nil
     ) throws -> EluRuntimeQueueSnapshot {
         guard !properties.isEmpty,
               validateCaptureProperties(properties),
               Set(properties.keys).isDisjoint(with: Self.reservedVersionProperties),
               state.identity.contextRevision < Int64.max,
-              let now = canonicalDate(clock()),
+              let now = canonicalDate(calledAt.map { callTime($0) } ?? clock()),
               now >= state.identity.updatedAt
         else {
             throw EluRuntimeQueueError.invalidRecord
@@ -8462,11 +8473,11 @@ actor EluSQLiteRuntimeQueue {
     }
 
     @discardableResult
-    func unregisterStandaloneSuperProperty(_ key: String) throws -> EluRuntimeQueueSnapshot {
+    func unregisterStandaloneSuperProperty(_ key: String, calledAt: Date? = nil) throws -> EluRuntimeQueueSnapshot {
         guard EluIdentityState.valid(key, maximumLength: 256),
               !Self.reservedVersionProperties.contains(key),
               state.identity.contextRevision < Int64.max,
-              let now = canonicalDate(clock()),
+              let now = canonicalDate(calledAt.map { callTime($0) } ?? clock()),
               now >= state.identity.updatedAt
         else {
             throw EluRuntimeQueueError.invalidRecord
@@ -8602,7 +8613,8 @@ actor EluSQLiteRuntimeQueue {
         wireGuard: @escaping @Sendable () -> Bool = { true },
         admissionGuard: (@Sendable () -> Bool)? = nil,
         minimumOccurredAt: Date? = nil,
-        filterMutation: Bool = false
+        filterMutation: Bool = false,
+        calledAt: Date? = nil
     ) throws -> EluRuntimeQueueSnapshot {
         guard admissionGuard?() ?? true else { throw EluRuntimeQueueError.sourceAuthorityUnavailable }
         guard ownerNamespaceHash != nil else {
@@ -8626,7 +8638,7 @@ actor EluSQLiteRuntimeQueue {
             personIdentity: EluPersonIdentityState
         )
         do {
-            let occurredAt = clock()
+            let occurredAt = calledAt.map { callTime($0) } ?? clock()
             // A capture-associated mutation cannot precede its accepted event.
             // Keep the actual wall reading; never adjust it to make admission pass.
             if let minimumOccurredAt {
@@ -8646,7 +8658,7 @@ actor EluSQLiteRuntimeQueue {
             } else { next = transition }
             prepared = try prepareMutationTransition(
                 next,
-                occurredAt: filterMutation && eventFilter.active ? clock() : occurredAt,
+                occurredAt: filterMutation && eventFilter.active ? (calledAt.map { callTime($0) } ?? clock()) : occurredAt,
                 versions: versions
             )
         } catch {
@@ -8696,7 +8708,7 @@ actor EluSQLiteRuntimeQueue {
     }
 
     /// Local overrides and membership resets never produce person/group wire mutations.
-    func updateStandaloneFlagContext(_ change: EluStandaloneFlagContextChange) throws -> EluRuntimeQueueSnapshot {
+    func updateStandaloneFlagContext(_ change: EluStandaloneFlagContextChange, calledAt: Date? = nil) throws -> EluRuntimeQueueSnapshot {
         var identity = state.identity, context = state.flagContext
         switch change {
         case let .person(properties):
@@ -8711,7 +8723,8 @@ actor EluSQLiteRuntimeQueue {
         }
         try context.validate()
         guard context != state.flagContext || identity.groups != state.identity.groups else { return state.snapshot }
-        guard identity.contextRevision < Int64.max, let now = canonicalDate(clock()), now >= identity.updatedAt else {
+        guard identity.contextRevision < Int64.max, let now = canonicalDate(calledAt.map { callTime($0) } ?? clock()),
+              now >= identity.updatedAt else {
             throw EluRuntimeQueueError.invalidState
         }
         identity.contextRevision += 1; identity.updatedAt = now
@@ -8917,7 +8930,7 @@ actor EluSQLiteRuntimeQueue {
     }
 
     @discardableResult
-    func reset(expectedGeneration: Int64, resetDeviceId: Bool = false) throws -> EluRuntimeQueueSnapshot {
+    func reset(expectedGeneration: Int64, resetDeviceId: Bool = false, calledAt: Date? = nil) throws -> EluRuntimeQueueSnapshot {
         guard expectedGeneration == state.generation else {
             throw EluRuntimeQueueError.generationMismatch
         }
@@ -8941,7 +8954,7 @@ actor EluSQLiteRuntimeQueue {
         identity.session = nil
         identity.revision += 1
         identity.contextRevision += 1
-        identity.updatedAt = clock()
+        identity.updatedAt = calledAt.map { callTime($0) } ?? clock()
         return try commitPrepared(
             expectedGeneration: expectedGeneration,
             identity: identity,

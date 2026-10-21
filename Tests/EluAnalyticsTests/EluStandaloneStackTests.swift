@@ -507,6 +507,60 @@ final class EluStandaloneStackTests: XCTestCase {
         }
     }
 
+    func testApplicationBackgroundedIsRecordedWithItsTimeBeforeTheSourceSuspends() async throws {
+        try await withHarness { h in
+            let (core, facade) = try await runningCore(h)
+            await MainActor.run {}
+            await facade.settled()
+            let backgroundedAt = h.clock.now
+            facade.applicationBackgrounded(at: backgroundedAt)
+            await facade.settled(); await h.stack.settled()
+            h.clock.advance(5)
+            facade.applicationForegrounded(at: h.clock.now, fromBackground: true)
+            try await eventually { await h.config.count == 2 }
+            await facade.settled()
+            await h.config.resolve(try fixture())
+            try await eventually { await h.stack.runtime.currentPhase == .capturing }
+            await h.stack.settled(); await facade.settled()
+            core.flush(); _ = core.bufferDropCountForTesting(); await facade.settled()
+            try await eventually { await h.events.opened.filter { $0 } == [true] }
+            let names = await h.events.names, times = await h.events.occurredAt
+            XCTAssertEqual(names.filter { $0 == EluStandaloneRuntime.applicationBackgroundedEvent }.count, 1, "\(names)")
+            XCTAssertEqual(times[EluStandaloneRuntime.applicationBackgroundedEvent], EluRFC3339.string(from: backgroundedAt))
+            let backgrounded = try XCTUnwrap(names.firstIndex(of: EluStandaloneRuntime.applicationBackgroundedEvent))
+            XCTAssertLessThan(backgrounded, try XCTUnwrap(names.lastIndex(of: EluStandaloneRuntime.applicationOpenedEvent)))
+            facade.shutDown(); await facade.settled()
+        }
+    }
+
+    func testReturnToForegroundBeforeTheBackgroundIsRecordedStillRefetchesAndHolds() async throws {
+        try await withHarness { h in
+            let (core, facade) = try await runningCore(h)
+            await MainActor.run {}
+            await facade.settled()
+            await h.events.holdNext()
+            core.dispatch(.capture(event: "slow", properties: nil)); core.flush()
+            _ = core.bufferDropCountForTesting()
+            try await eventually { await h.events.isHeld }
+            facade.applicationBackgrounded(at: h.clock.now)
+            facade.applicationForegrounded(at: h.clock.now, fromBackground: true)
+            core.dispatch(.capture(event: "after-return", properties: nil))
+            _ = core.bufferDropCountForTesting()
+            await h.events.release()
+            try await eventually { await h.config.count == 2 }
+            await facade.settled()
+            await h.config.resolve(try fixture())
+            try await eventually { await h.stack.runtime.currentPhase == .capturing }
+            await h.stack.settled(); await facade.settled()
+            core.flush(); _ = core.bufferDropCountForTesting(); await facade.settled()
+            try await eventually { await h.events.names.contains("after-return") }
+            let names = await h.events.names
+            XCTAssertTrue(names.contains(EluStandaloneRuntime.applicationBackgroundedEvent), "\(names)")
+            XCTAssertEqual(Array(names.suffix(2)), [EluStandaloneRuntime.applicationOpenedEvent, "after-return"])
+            facade.shutDown(); await facade.settled()
+        }
+    }
+
     func testOptOutDuringResumeHoldKeepsOnlyHeldResetsAndNeverReleasesDeniedCalls() async throws {
         try await withHarness { h in
             let (core, facade) = try await runningCore(h)
@@ -545,7 +599,103 @@ final class EluStandaloneStackTests: XCTestCase {
         }
     }
 
-    func testResumeHoldDropsItsOldestCallAtTheBufferCap() async throws {
+    func testCallsMadeWhileOptedOutDuringResumeHoldAreNeverReleased() async throws {
+        try await withHarness { h in
+            let (core, facade) = try await runningCore(h)
+            await MainActor.run {}
+            core.dispatch(.identify(distinctId: "before-resume", userProperties: nil))
+            _ = core.bufferDropCountForTesting(); await facade.settled()
+            facade.applicationBackgrounded(at: h.clock.now)
+            await facade.settled(); await h.stack.settled()
+            facade.applicationForegrounded(at: h.clock.now, fromBackground: true)
+            core.setConsent(optedOut: true)
+            core.dispatch(.identify(distinctId: "while-opted-out", userProperties: nil))
+            core.dispatch(.register(["while-opted-out": true]))
+            core.dispatch(.group(type: "company", key: "while-opted-out", properties: nil))
+            core.setConsent(optedOut: false, event: nil)
+            core.dispatch(.register(["after-opt-in": true]))
+            _ = core.bufferDropCountForTesting()
+            try await eventually { await h.config.count == 2 }
+            await h.config.resolve(try fixture())
+            try await eventually { await h.stack.runtime.currentPhase == .capturing }
+            await h.stack.settled(); await facade.settled()
+            try await eventually {
+                try await h.stack.runtime.queueSnapshot().identity.superProperties["after-opt-in"] != nil
+            }
+            let released = try await h.stack.runtime.queueSnapshot()
+            XCTAssertEqual(released.identity.userId, "before-resume")
+            XCTAssertNil(released.identity.superProperties["while-opted-out"])
+            XCTAssertNil(released.identity.groups["company"])
+            XCTAssertFalse(released.identity.optedOut)
+            facade.shutDown(); await facade.settled()
+        }
+    }
+
+    func testCallsHeldForTheFirstConfigurationKeepTheTimeTheyWereMade() async throws {
+        try await withHarness { h in
+            let core = EluCore(backendFactory: EluRuntimeBackendFactory { _, context in
+                EluStandaloneFacadeRuntime(context: context, openStack: { h.stack },
+                    guardedFlagsDidLoad: context.guardedFlagsDidLoad, clock: { h.clock.now })
+            })
+            var options = EluSetupOptions()
+            options.runtimeSelection = .standalone
+            core.setup(siteKey: StackHarness.siteKey, options: options)
+            let facade = try XCTUnwrap(core.backendForTesting() as? EluStandaloneFacadeRuntime)
+            let calledAt = h.clock.now
+            core.dispatch(.register(["plan": "pro"]))
+            core.dispatch(.identify(distinctId: "held-user", userProperties: nil))
+            core.dispatch(.capture(event: "held-at-launch", properties: nil))
+            core.dispatch(.screen(name: "Held screen", properties: nil))
+            core.dispatch(.captureException(StackFailure(), properties: nil))
+            _ = core.bufferDropCountForTesting()
+            facade.setForeground(true)
+            try await eventually { await h.config.count == 1 }
+            h.clock.advance(30)
+            await h.config.resolve(try fixture())
+            try await eventually { core.distinctId() == "held-user" }
+            await h.stack.settled(); await facade.settled()
+            core.flush(); _ = core.bufferDropCountForTesting(); await facade.settled()
+            try await eventually { await h.events.names.contains(EluExceptionSerializer.eventName) }
+            let times = await h.events.occurredAt, expected = EluRFC3339.string(from: calledAt)
+            XCTAssertEqual(times["held-at-launch"], expected)
+            XCTAssertEqual(times["Held screen"], expected)
+            XCTAssertEqual(times[EluExceptionSerializer.eventName], expected)
+            facade.shutDown(); await facade.settled()
+        }
+    }
+
+    func testCallsHeldDuringForegroundRefetchKeepTheTimeTheyWereMade() async throws {
+        try await withHarness { h in
+            let (core, facade) = try await runningCore(h)
+            await MainActor.run {}
+            await facade.settled()
+            facade.applicationBackgrounded(at: h.clock.now)
+            await facade.settled(); await h.stack.settled()
+            h.clock.advance(5)
+            let calledAt = h.clock.now
+            facade.applicationForegrounded(at: calledAt, fromBackground: true)
+            core.dispatch(.identify(distinctId: "held-user", userProperties: nil))
+            core.dispatch(.register(["plan": "pro"]))
+            core.dispatch(.capture(event: "held-during-refetch", properties: nil))
+            _ = core.bufferDropCountForTesting()
+            try await eventually { await h.config.count == 2 }
+            await facade.settled()
+            h.clock.advance(30)
+            await h.config.resolve(try fixture())
+            try await eventually { await h.stack.runtime.currentPhase == .capturing }
+            await h.stack.settled(); await facade.settled()
+            core.flush(); _ = core.bufferDropCountForTesting(); await facade.settled()
+            try await eventually { await h.events.names.contains("held-during-refetch") }
+            let times = await h.events.occurredAt, expected = EluRFC3339.string(from: calledAt)
+            XCTAssertEqual(times[EluStandaloneRuntime.applicationOpenedEvent], expected)
+            XCTAssertEqual(times["held-during-refetch"], expected, "A held identify must not stamp later calls late")
+            let released = try await h.stack.runtime.queueSnapshot()
+            XCTAssertEqual(released.identity.userId, "held-user")
+            facade.shutDown(); await facade.settled()
+        }
+    }
+
+    func testResumeHoldDropsItsNewestCallAtTheBufferCap() async throws {
         try await withHarness { h in
             let (core, facade) = try await runningCore(h)
             await MainActor.run {}
@@ -556,15 +706,20 @@ final class EluStandaloneStackTests: XCTestCase {
             facade.applicationForegrounded(at: h.clock.now, fromBackground: true)
             for index in 0 ..< EluEventBuffer.capacity { core.dispatch(.register(["held-\(index)": index])) }
             _ = core.bufferDropCountForTesting(); await facade.settled()
-            XCTAssertEqual(facade.dropCounts[.bufferFull], 1, "The held application-opened event was the oldest")
+            XCTAssertEqual(facade.dropCounts[.bufferFull], 1, "Only the last register was over the cap")
             try await eventually { await h.config.count == 2 }
             await h.config.resolve(try fixture())
             try await eventually { await h.stack.runtime.currentPhase == .capturing }
             await h.stack.settled(); await facade.settled()
             try await eventually {
-                try await h.stack.runtime.queueSnapshot().identity.superProperties.count == registered + EluEventBuffer.capacity
+                try await h.stack.runtime.queueSnapshot().identity.superProperties.count == registered + EluEventBuffer.capacity - 1
             }
+            let released = try await h.stack.runtime.queueSnapshot().identity.superProperties
+            XCTAssertNotNil(released["held-0"])
+            XCTAssertNil(released["held-\(EluEventBuffer.capacity - 1)"])
             XCTAssertEqual(facade.dropCounts[.bufferFull], 1)
+            core.flush(); _ = core.bufferDropCountForTesting(); await facade.settled()
+            try await eventually { await h.events.opened.filter { $0 } == [true] }
             facade.shutDown(); await facade.settled()
         }
     }
@@ -603,7 +758,7 @@ final class EluStandaloneStackTests: XCTestCase {
     private func runningCore(_ h: StackHarness) async throws -> (EluCore, EluStandaloneFacadeRuntime) {
         let core = EluCore(backendFactory: EluRuntimeBackendFactory { _, context in
             EluStandaloneFacadeRuntime(context: context, openStack: { h.stack },
-                guardedFlagsDidLoad: context.guardedFlagsDidLoad)
+                guardedFlagsDidLoad: context.guardedFlagsDidLoad, clock: { h.clock.now })
         })
         var options = EluSetupOptions()
         options.runtimeSelection = .standalone
@@ -627,6 +782,8 @@ final class EluStandaloneStackTests: XCTestCase {
         await h.close()
     }
 }
+
+private struct StackFailure: Error {}
 
 private func fixture(capture: Bool = true) throws -> Data {
     let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
@@ -699,6 +856,8 @@ private actor StackEventTransport: EluV1AuthorizedBatchTransport {
     private(set) var names: [String] = []
     /// `from_background` of each delivered application-opened event.
     private(set) var opened: [Bool] = []
+    /// The latest delivered `occurredAt` for each event name.
+    private(set) var occurredAt: [String: String] = [:]
     private let delegate = FacadeBatchTransport()
     private var shouldHold = false
     private var held: CheckedContinuation<Void, Never>?
@@ -722,6 +881,9 @@ private actor StackEventTransport: EluV1AuthorizedBatchTransport {
         names += events.compactMap { $0["name"] as? String }
         opened += events.filter { $0["name"] as? String == EluStandaloneRuntime.applicationOpenedEvent }
             .compactMap { ($0["properties"] as? [String: Any])?[EluStandaloneRuntime.fromBackgroundProperty] as? Bool }
+        for event in events {
+            if let name = event["name"] as? String, let time = event["occurredAt"] as? String { occurredAt[name] = time }
+        }
         return try await delegate.send(request)
     }
 }

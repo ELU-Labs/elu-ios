@@ -111,7 +111,8 @@ the behavior below.
 
 The SDK fetches an eligible configuration before sending analytics. Calls made
 while setup or configuration is pending are subject to the SDK's bounded
-buffering and privacy rules. A missing, disabled, expired, or ineligible
+buffering and privacy rules: up to 100 calls wait, and once that limit is
+reached, newer calls are discarded. A missing, disabled, expired, or ineligible
 configuration does not grant permission to send. The SDK fetches configuration
 again each time the app returns to the foreground. Calls made during that
 fetch, including the automatic `Application Opened` event, are held by the same
@@ -174,7 +175,8 @@ open it and leaves the database, WAL and SHM files untouched.
 
 ## Screen tracking and SwiftUI
 
-The SDK records application lifecycle events automatically. Call
+The SDK records application lifecycle events automatically. `Application
+Backgrounded` is recorded with the time the app left the foreground. Call
 `Elu.screen(...)` when a logical screen appears in both UIKit and SwiftUI;
 the SDK does not intercept view controller methods. For SwiftUI:
 
@@ -227,7 +229,9 @@ To supply an event time, use
 with a Foundation `Date`. The timestamp must not precede persisted identity or
 session activity; invalid or older times discard the entire event. Events keep
 call order, so backdating an event after newer activity does not reorder it.
-The overload without `timestamp` uses the runtime clock when it processes the call.
+The overload without `timestamp` uses the time of the call, even when the call
+waited for configuration. If identity, session, or consent changed later than
+that time, the event takes the time of that change instead.
 
 To update a person after an accepted event, use
 `Elu.capture("Checkout completed", properties: ["amount": 42], options:
@@ -239,7 +243,7 @@ The same ordered call admits the event first, then applies the person change
 under the original identity and current consent. It does not reload feature flags.
 These are separate durable writes: a crash, storage failure, or superseding
 identity/privacy intent can leave the event without its person change. Person
-changes use the runtime wall clock, not the event timestamp; a future event time
+changes use the time of the call, not the event timestamp; a future event time
 can make the following person change inadmissible. No automatic backfill occurs.
 
 Pass `EluFeatureFlagOptions` to control one read:
@@ -320,10 +324,12 @@ before configuration or lifecycle work can authorize collection. It becomes
 durable when the runtime opens; a process ending before setup cannot persist it.
 The opt-in event is one normal capture attempt and is discarded if configuration
 is not eligible then; it is not backfilled later. Event calls made while opted
-out are discarded, and queued replay is removed. Opting out also discards calls
-still waiting for configuration, except `reset()`: a reset made before or while
-opted out still applies once configuration arrives, and it keeps the consent
-choice.
+out are discarded, and queued replay is removed. While configuration is still
+loading, or is fetched again after the app returns to the foreground, other calls
+made while opted out are discarded too, and opting in later does not bring them
+back. Opting out also discards calls still waiting for configuration. In both
+cases `reset()` is kept: a reset made before or while opted out still applies
+once configuration arrives, and it keeps the consent choice.
 
 `flush()` requests a delivery attempt; it does not wait for acknowledgment or
 guarantee a send before termination. Unacknowledged durable events remain for a
@@ -438,7 +444,7 @@ name, timestamp and passive-session constraints still apply to replacements.
 
 Captures use the hook's `set` and `setOnce`, including maps introduced by
 the hook, only after the original event is accepted. These remain separate
-ordered writes and use the person mutator's wall clock. No extra flag reload is
+ordered writes and use the time of the original call. No extra flag reload is
 scheduled. A dropped flag event does not consume its durable exposure marker.
 Filtering covers manual events, screens, exceptions and automatic native event
 producers; replay frames are governed by their separate privacy rules.

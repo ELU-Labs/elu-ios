@@ -23,7 +23,8 @@ enum EluFacadeDropReason: String, Equatable, Sendable {
     case rateLimited
     /// Customer filtering dropped or refused this event. No payload is logged.
     case filtered
-    /// The oldest call held for a foreground configuration re-fetch, at its cap.
+    /// A call made while the calls held for a foreground configuration
+    /// re-fetch were at their cap.
     case bufferFull
 }
 
@@ -60,6 +61,13 @@ protocol EluRuntimeBackend: AnyObject {
     /// pre-config buffer.
     func execute(_ op: EluBufferedOp)
 
+    /// Performs one facade operation with what the facade knew when the app
+    /// made the call.
+    func execute(_ op: EluBufferedOp, origin: EluCallOrigin)
+
+    /// The time of a call the app makes now, on the runtime's wall clock.
+    func callTime() -> Date
+
     /// Called once the pre-config buffer has been replayed. The buffered
     /// calls carry the identity, groups, and flag context the first flag
     /// evaluation must use, so the initial load runs after the last of them.
@@ -85,6 +93,16 @@ protocol EluRuntimeBackend: AnyObject {
 
     /// The ELU kill switch: stop capture and delivery for the rest of the run.
     func shutDown()
+}
+
+/// What the facade knew when the app made a call.
+struct EluCallOrigin: Sendable {
+    /// When the app made the call. A call held for configuration keeps this
+    /// time instead of the time it is released.
+    let calledAt: Date
+    /// The visitor was opted out. Such a call never waits for configuration:
+    /// only a reset is held, so a later opt-in cannot release the others.
+    let optedOut: Bool
 }
 
 /// Everything a backend needs to start. Assembled by `EluCore` at the moment
@@ -186,6 +204,8 @@ extension EluRuntimeBackend {
     func beginPendingOperation(_ op: EluBufferedOp) -> (() -> Void)? { nil }
     func beginNetworkObservation(_ request: URLRequest) -> EluNetworkObservation? { nil }
     func withdrawHeldCalls() {}
+    func execute(_ op: EluBufferedOp, origin: EluCallOrigin) { execute(op) }
+    func callTime() -> Date { Date() }
 }
 
 extension EluBufferedOp {

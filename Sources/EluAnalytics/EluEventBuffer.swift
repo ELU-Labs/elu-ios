@@ -25,35 +25,48 @@ enum EluBufferedOp {
     case consent(EluConsentOperation)
 }
 
-/// In-memory FIFO for pre-config facade calls. Cap 100, drop-oldest.
-/// Never persisted, never sent until the EU/enabled decision is made.
+/// A pre-config facade call and the time the app made it.
+struct EluHeldCall {
+    let op: EluBufferedOp
+    /// Kept when the call runs, so a held call is not stamped late.
+    let calledAt: Date
+}
+
+/// In-memory FIFO for pre-config facade calls. Cap 100: once full, the newest
+/// call is dropped, never an older one, so the held calls stay an unbroken
+/// prefix of the app's identity history. Never persisted, never sent until
+/// the EU/enabled decision is made.
 struct EluEventBuffer {
     static let capacity = 100
 
-    private(set) var ops: [EluBufferedOp] = []
+    private(set) var calls: [EluHeldCall] = []
+    var ops: [EluBufferedOp] { calls.map(\.op) }
     /// Calls the cap discarded, counted rather than reported: the facade never
     /// tells the caller a call was dropped.
     private(set) var droppedCount = 0
 
-    mutating func push(_ op: EluBufferedOp) {
-        if ops.count >= Self.capacity {
-            let overflow = ops.count - Self.capacity + 1
-            ops.removeFirst(overflow)
-            droppedCount += overflow
+    mutating func push(_ op: EluBufferedOp, calledAt: Date = Date()) {
+        guard calls.count < Self.capacity else {
+            droppedCount += 1
+            return
         }
-        ops.append(op)
+        calls.append(EluHeldCall(op: op, calledAt: calledAt))
     }
 
     mutating func drain() -> [EluBufferedOp] {
-        let drained = ops
-        ops = []
+        drainCalls().map(\.op)
+    }
+
+    mutating func drainCalls() -> [EluHeldCall] {
+        let drained = calls
+        calls = []
         return drained
     }
 
     /// An opt-out discards held calls made before it, except resets: a reset
     /// collects nothing and keeps the consent choice, so it still applies.
     mutating func dropAllExceptResets() {
-        ops.removeAll { !$0.isReset }
+        calls.removeAll { !$0.op.isReset }
     }
 }
 
