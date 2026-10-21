@@ -507,6 +507,60 @@ final class EluStandaloneStackTests: XCTestCase {
         }
     }
 
+    func testApplicationBackgroundedIsRecordedWithItsTimeBeforeTheSourceSuspends() async throws {
+        try await withHarness { h in
+            let (core, facade) = try await runningCore(h)
+            await MainActor.run {}
+            await facade.settled()
+            let backgroundedAt = h.clock.now
+            facade.applicationBackgrounded(at: backgroundedAt)
+            await facade.settled(); await h.stack.settled()
+            h.clock.advance(5)
+            facade.applicationForegrounded(at: h.clock.now, fromBackground: true)
+            try await eventually { await h.config.count == 2 }
+            await facade.settled()
+            await h.config.resolve(try fixture())
+            try await eventually { await h.stack.runtime.currentPhase == .capturing }
+            await h.stack.settled(); await facade.settled()
+            core.flush(); _ = core.bufferDropCountForTesting(); await facade.settled()
+            try await eventually { await h.events.opened.filter { $0 } == [true] }
+            let names = await h.events.names, times = await h.events.occurredAt
+            XCTAssertEqual(names.filter { $0 == EluStandaloneRuntime.applicationBackgroundedEvent }.count, 1, "\(names)")
+            XCTAssertEqual(times[EluStandaloneRuntime.applicationBackgroundedEvent], EluRFC3339.string(from: backgroundedAt))
+            let backgrounded = try XCTUnwrap(names.firstIndex(of: EluStandaloneRuntime.applicationBackgroundedEvent))
+            XCTAssertLessThan(backgrounded, try XCTUnwrap(names.lastIndex(of: EluStandaloneRuntime.applicationOpenedEvent)))
+            facade.shutDown(); await facade.settled()
+        }
+    }
+
+    func testReturnToForegroundBeforeTheBackgroundIsRecordedStillRefetchesAndHolds() async throws {
+        try await withHarness { h in
+            let (core, facade) = try await runningCore(h)
+            await MainActor.run {}
+            await facade.settled()
+            await h.events.holdNext()
+            core.dispatch(.capture(event: "slow", properties: nil)); core.flush()
+            _ = core.bufferDropCountForTesting()
+            try await eventually { await h.events.isHeld }
+            facade.applicationBackgrounded(at: h.clock.now)
+            facade.applicationForegrounded(at: h.clock.now, fromBackground: true)
+            core.dispatch(.capture(event: "after-return", properties: nil))
+            _ = core.bufferDropCountForTesting()
+            await h.events.release()
+            try await eventually { await h.config.count == 2 }
+            await facade.settled()
+            await h.config.resolve(try fixture())
+            try await eventually { await h.stack.runtime.currentPhase == .capturing }
+            await h.stack.settled(); await facade.settled()
+            core.flush(); _ = core.bufferDropCountForTesting(); await facade.settled()
+            try await eventually { await h.events.names.contains("after-return") }
+            let names = await h.events.names
+            XCTAssertTrue(names.contains(EluStandaloneRuntime.applicationBackgroundedEvent), "\(names)")
+            XCTAssertEqual(Array(names.suffix(2)), [EluStandaloneRuntime.applicationOpenedEvent, "after-return"])
+            facade.shutDown(); await facade.settled()
+        }
+    }
+
     func testOptOutDuringResumeHoldKeepsOnlyHeldResetsAndNeverReleasesDeniedCalls() async throws {
         try await withHarness { h in
             let (core, facade) = try await runningCore(h)

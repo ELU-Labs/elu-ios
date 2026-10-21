@@ -57,6 +57,11 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
     /// Advances with every foreground change, so a readiness check overtaken
     /// by a later transition cannot release the hold.
     private var resumeHoldEpoch = UUID()
+    /// Backgrounds whose event is still ahead of them on the ordered chain.
+    /// While any is pending, the source keeps its foreground state, so the
+    /// event is recorded under the configuration that was current when the
+    /// app left the foreground; the last one then applies the latest intent.
+    private var deferredBackgrounds = 0
 
     private var identity: EluIdentityState?
     private var projectedDistinctId: String?
@@ -147,27 +152,49 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
             await stack.runtime.installNativeReplayComposition(lifecycle: self.nativeLifecycle, capabilities: EluStandaloneRuntime.readbackProvenReplayCapabilities, deferredUntilActivation: true)
             self.syncIdentity(await stack.runtime.currentSnapshot.identity)
             stack.start()
-            self.applyForegroundIntent()
+            // A pending background applies the latest intent once its event is recorded.
+            if self.withLock({ self.deferredBackgrounds == 0 }) { self.applyForegroundIntent() }
         }
         attachOwnedLifecycle()
     }
 
     func setForeground(_ foreground: Bool) {
-        let opensHold = withLock { () -> Bool in
-            guard !isShutDown else { return false }
-            foregroundIntent = foreground
-            started?.runtime.performanceLifecycleIntent(foreground: foreground)
-            foregroundGeneration = UUID()
-            resumeHoldEpoch = UUID()
-            // The pre-config buffer covers launch. After activation, a return to
-            // the foreground holds calls until the re-fetched configuration is ready.
-            guard foreground, !flagLoadDeferred, resumeHold == nil else { return false }
-            resumeHold = []
-            return true
-        }
+        let (opensHold, deferred) = withLock { (recordForegroundIntentLocked(foreground), deferredBackgrounds > 0) }
+        // A pending background applies this intent once its event is recorded.
+        guard !deferred else { return }
         let refetching = applyForegroundIntent()
         // No re-fetch began, so the current source still decides; nothing waits.
         if opensHold && !refetching { releaseResumeHold() }
+    }
+
+    /// Called only while the facade lock is held. Returns true when this opens
+    /// the re-fetch hold.
+    private func recordForegroundIntentLocked(_ foreground: Bool) -> Bool {
+        guard !isShutDown else { return false }
+        foregroundIntent = foreground
+        started?.runtime.performanceLifecycleIntent(foreground: foreground)
+        foregroundGeneration = UUID()
+        resumeHoldEpoch = UUID()
+        // The pre-config buffer covers launch. After activation, a return to
+        // the foreground holds calls until the re-fetched configuration is ready.
+        guard foreground, !flagLoadDeferred, resumeHold == nil else { return false }
+        resumeHold = []
+        return true
+    }
+
+    /// A background whose event is now recorded reaches the source. The last
+    /// pending one applies the latest intent, so a return to the foreground
+    /// made meanwhile still re-fetches before its held calls run.
+    private func applyDeferredBackground() {
+        let (current, last) = withLock { () -> (EluStandaloneStack?, Bool) in
+            deferredBackgrounds -= 1
+            return (isShutDown ? nil : stack, deferredBackgrounds == 0)
+        }
+        current?.setForeground(false)
+        guard last else { return }
+        let refetching = applyForegroundIntent()
+        // No re-fetch began, so the current source still decides; nothing waits.
+        if !refetching && withLock({ foregroundIntent && resumeHold != nil }) { releaseResumeHold() }
     }
 
     func startReplay() { setReplayEnabled(true) }
@@ -349,12 +376,37 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
     }
 
     func applicationBackgrounded(at occurredAt: Date) {
-        setForeground(false)
         let denied = isOptedOut()
-        enqueue(hold: .call(isReset: false)) { runtime, _ in
+        lock.lock()
+        let appliesNow = enqueueBackgroundLocked(at: occurredAt, denied: denied)
+        lock.unlock()
+        if appliesNow { applyForegroundIntent() }
+    }
+
+    /// Called only while the facade lock is held. Returns true when the source
+    /// leaves the foreground now rather than after the event is recorded.
+    private func enqueueBackgroundLocked(at occurredAt: Date, denied: Bool) -> Bool {
+        _ = recordForegroundIntentLocked(false)
+        // The source suspends its configuration when the app leaves the
+        // foreground, so the event is recorded first, with the time it was
+        // signalled, and the background reaches the source right after it.
+        // Held for a re-fetch, it is released with that time instead.
+        let defers = !isShutDown && resumeHold == nil
+        let reachesSource = EluStandaloneOnce()
+        var always: (@Sendable () -> Void)?
+        if defers {
+            deferredBackgrounds += 1
+            // Settles the background even if the event never runs.
+            always = { [weak self] in
+                if reachesSource.claim() { self?.applyDeferredBackground() }
+            }
+        }
+        enqueueLocked(hold: .call(isReset: false), always: always) { runtime, owner in
             if !denied { _ = await runtime.capture(EluStandaloneRuntime.applicationBackgroundedEvent, occurredAt: occurredAt) }
+            if defers, reachesSource.claim() { owner.applyDeferredBackground() }
             _ = await runtime.markBackgrounded(at: occurredAt)
         }
+        return deferredBackgrounds == 0
     }
 
     fileprivate func lifecycleScreen(_ name: String, at occurredAt: Date) {
@@ -1068,6 +1120,22 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
             async -> Void
     ) {
         lock.lock()
+        enqueueLocked(settlesProjection: settlesProjection, affectsFlags: affectsFlags,
+            restrictsCapture: restrictsCapture, whileShutDown: whileShutDown, hold: hold, always: always, operation)
+        lock.unlock()
+    }
+
+    /// Called only while the facade lock is held.
+    private func enqueueLocked(
+        settlesProjection: Bool = false,
+        affectsFlags: Bool = false,
+        restrictsCapture: Bool = true,
+        whileShutDown: Bool = false,
+        hold: EluStandaloneHoldRule = .never,
+        always: (@Sendable () -> Void)? = nil,
+        _ operation: @escaping @Sendable (EluStandaloneRuntime, EluStandaloneFacadeRuntime)
+            async -> Void
+    ) {
         let pending: EluStandaloneFacadePendingIntent?
         if affectsFlags {
             withdrawFlagsLocked(restrictsCapture: restrictsCapture)
@@ -1094,7 +1162,6 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
         } else {
             appendLocked(entry)
         }
-        lock.unlock()
     }
 
     /// Called only while the facade lock is held. A discarded entry still
@@ -1133,7 +1200,8 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
     /// The stack reports every validated configuration it installs. Only one
     /// that is still current after the latest foreground change releases the hold.
     private func configurationReady(_ isCurrent: @escaping @Sendable () -> Bool) {
-        let held = withLock { () -> UUID? in resumeHold == nil ? nil : resumeHoldEpoch }
+        // A pending background re-fetches first; only that configuration releases.
+        let held = withLock { () -> UUID? in resumeHold == nil || deferredBackgrounds > 0 ? nil : resumeHoldEpoch }
         guard let epoch = held, isCurrent() else { return }
         releaseResumeHold(ifEpoch: epoch)
     }
@@ -1275,6 +1343,18 @@ private struct EluStandaloneTailEntry: Sendable {
 private struct EluStandaloneHeldCall: Sendable {
     let entry: EluStandaloneTailEntry
     let isReset: Bool
+}
+
+/// True for the first claim only.
+private final class EluStandaloneOnce: @unchecked Sendable {
+    private let lock = NSLock()
+    private var claimed = false
+    func claim() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard !claimed else { return false }
+        claimed = true
+        return true
+    }
 }
 
 /// Carries a customer callback across the ordered chain. The facade owns when

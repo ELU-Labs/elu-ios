@@ -172,7 +172,8 @@ open it and leaves the database, WAL and SHM files untouched.
 
 ## Screen tracking and SwiftUI
 
-The SDK records application lifecycle events automatically. Call
+The SDK records application lifecycle events automatically. `Application
+Backgrounded` is recorded with the time the app left the foreground. Call
 `Elu.screen(...)` when a logical screen appears in both UIKit and SwiftUI;
 the SDK does not intercept view controller methods. For SwiftUI:
 

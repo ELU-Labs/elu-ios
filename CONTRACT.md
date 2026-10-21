@@ -99,8 +99,10 @@ response also requests flag evaluation without replacing source authority or
 extending its expiry.
 
 Application lifecycle events are automatic when collection is eligible.
-Logical screens require explicit `Elu.screen(...)` calls in both UIKit and
-SwiftUI. Element-interaction autocapture, surveys, and push auto-capture are not
+`Application Backgrounded` is recorded with the time the app left the
+foreground, under the configuration current at that moment. Logical screens
+require explicit `Elu.screen(...)` calls in both UIKit and SwiftUI.
+Element-interaction autocapture, surveys, and push auto-capture are not
 provided.
 
 ## Consent and durable delivery
