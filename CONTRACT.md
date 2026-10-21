@@ -39,7 +39,11 @@ recover. Blocking collection does not mean no SDK state is stored locally.
 
 Calls while setup or configuration is pending may enter a bounded in-memory
 buffer; these calls are not yet durable records. Disabled or denied collection
-does not authorize sending that buffer.
+does not authorize sending that buffer. Each return to the foreground fetches
+configuration again. Calls made until that configuration is validated,
+including the automatic application-opened event, are held by the same rules
+and run in call order once it is; a failed fetch keeps them held until a later
+fetch succeeds.
 
 ## Identity, properties, flags, and screens
 
