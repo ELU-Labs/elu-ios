@@ -6102,6 +6102,14 @@ actor EluSQLiteRuntimeQueue {
         return deadline.isExpired(at: sample.continuous)
     }
 
+    /// Whether the configuration last applied authorizes feature flags now,
+    /// whatever it decided for capture.
+    func flagsAreAuthorized() -> Bool {
+        guard !isPoisoned, !flagClockPoisoned, let manager = flagConfigManager,
+              case .allowed = manager.currentFlagAuthorization(now: clock()) else { return false }
+        return true
+    }
+
     func submitFlagConfig(_ configData: Data, sourceWitness: EluV2ConfigAuthorityWitness? = nil) -> EluV1FlagAuthorization {
         flagScopeFence.invalidate()
         guard sourceIsCurrent(sourceWitness, data: configData) else { return .restricted(.missing) }
