@@ -374,7 +374,12 @@ restrictive write, the SDK cannot promise that intent survives process death.
 The `Elu` API accepts calls before setup, while config is loading, and when
 analytics is disabled without throwing errors into application code.
 When analytics is disabled or a device is EU-blocked, `Elu.*` event calls are
-no-ops and no analytics events or replay leave the device. ELU config checks
+no-ops and no analytics events or replay leave the device. `identify`, `alias`,
+`register`, `registerOnce` and `unregister` are discarded too, and the SDK
+keeps nothing from them, so they do not reappear once analytics is enabled
+again. Person-property, group and flag-property calls are discarded as well,
+unless feature flags stay on, as they can for an EU-blocked device; they then
+still apply on the device so flags are evaluated with them. ELU config checks
 continue so a re-enabled site can recover.
 
 
