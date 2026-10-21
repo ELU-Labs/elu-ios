@@ -54,7 +54,7 @@ struct EluNativeWireframeV2Encoder: Sendable {
                 }
                 if !profile.allowsOrdinaryText {
                     for node in frame.nodes {
-                        if case let .ordinaryText(text) = node.kind, text != EluNativeWireframeEncoder.mask {
+                        if case let .ordinaryText(text) = node.kind, !EluNativeMaskText.isMaskShaped(text) {
                             throw EluNativeInteractionError.privateTarget
                         }
                     }
@@ -115,8 +115,9 @@ struct EluNativeWireframeV2Encoder: Sendable {
         guard node.clip.width > 0, node.clip.height > 0 else { return false }
         switch node.kind {
         case .rectangle: return true
-        case let .ordinaryText(text): return text != EluNativeWireframeEncoder.mask
-        case .text, .input, .placeholder: return false
+        // Mask-shaped text is indistinguishable from masked text on the wire.
+        case let .ordinaryText(text): return !EluNativeMaskText.isMaskShaped(text)
+        case .maskedText, .input, .placeholder: return false
         }
     }
 

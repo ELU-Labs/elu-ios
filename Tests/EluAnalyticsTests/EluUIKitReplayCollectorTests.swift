@@ -139,6 +139,9 @@ final class EluUIKitReplayCollectorTests: XCTestCase {
         let text = String(decoding: try encoder.encode([snapshot]).data, as: UTF8.self)
         XCTAssertFalse(text.contains("PRIVATE_UNRENDERED_SUFFIX"))
         XCTAssertFalse(text.contains("PRIVATE_BUTTON_LABEL"))
+        // Truncated text shows the shape of the full string, like web; an undrawn title shows none.
+        XCTAssertEqual(snapshot.nodes.dropFirst().map(\.kind),
+                       [.maskedText("******* ****** **** *************************"), .maskedText("")])
     }
 
     func testSensitiveProfileReadsCompleteIntrinsicSizeLabel() throws {
@@ -205,7 +208,11 @@ final class EluUIKitReplayCollectorTests: XCTestCase {
         blocked.setTitle("PRIVATE_BLOCKED_TITLE", for: .normal)
         root.addSubview(masked); root.addSubview(blocked); settle()
         Elu.maskView(try XCTUnwrap(masked.titleLabel)); Elu.blockView(try XCTUnwrap(blocked.titleLabel))
-        XCTAssertFalse(try sensitiveSnapshot().nodes.contains { if case .ordinaryText = $0.kind { return true }; return false })
+        let snapshot = try sensitiveSnapshot()
+        XCTAssertFalse(snapshot.nodes.contains { if case .ordinaryText = $0.kind { return true }; return false })
+        // A masked title keeps its shape; a blocked title has no content and no shape.
+        XCTAssertEqual(snapshot.nodes.dropFirst().map(\.kind),
+                       [.maskedText(String(repeating: "*", count: 20)), .maskedText("")])
     }
 
     func testStandardTableUsesOnlyVisibleCellContentAndInheritedRestrictions() throws {
@@ -299,7 +306,7 @@ final class EluUIKitReplayCollectorTests: XCTestCase {
         for item in cases { XCTAssertEqual(text.contains(item.0), item.3, item.0) }
     }
 
-    func testSensitiveProfilePreservesOrdinaryTextAndRejectsPrivateSubtreesBeforeReading() throws {
+    func testSensitiveProfilePreservesOrdinaryTextAndKeepsOnlyShapesOfPrivateContent() throws {
         let ordinary = UILabel(frame: CGRect(x: 0, y: 0, width: 250, height: 30))
         ordinary.text = "Welcome to ELU"
         let privateContainer = UIView(frame: CGRect(x: 0, y: 40, width: 250, height: 40))
@@ -320,9 +327,10 @@ final class EluUIKitReplayCollectorTests: XCTestCase {
         let collector = try EluUIKitReplayCollector()
         let initial = try collector.collect(root: root, ordinal: 0, timestamp: 1_700_000_000_123,
             hasUnresolvedConfiguredBlockRules: false, profile: .sensitiveMask(), isCurrent: { true })
-        XCTAssertEqual(privateLabel.reads, 0)
-        XCTAssertEqual(input.reads, 0)
+        // Masked text and inputs are read only for their `*` shape; blocked content is never opened.
         XCTAssertEqual(blocked.reads, 0)
+        XCTAssertTrue(initial.nodes.contains { $0.kind == .maskedText(String(repeating: "*", count: 20)) })
+        XCTAssertTrue(initial.nodes.contains { $0.kind == .input(secure: false, maskedValue: String(repeating: "*", count: 19)) })
         var encoder = try EluNativeWireframeEncoder()
         let initialBytes = try encoder.encode([initial]).data
         let initialText = String(decoding: initialBytes, as: UTF8.self)
@@ -377,7 +385,7 @@ final class EluUIKitReplayCollectorTests: XCTestCase {
         try metadata.write(to: directory.appendingPathComponent("\(stream)-manifest.json"), options: .withoutOverwriting)
     }
 
-    func testSecureAndOrdinaryContentGettersAreNeverRead() throws {
+    func testMaskedLabelsAndInputsCarryOnlyTheirStarShape() throws {
         let label = GetterLabel(frame: CGRect(x: 0, y: 0, width: 80, height: 20))
         let field = GetterField(frame: CGRect(x: 0, y: 30, width: 80, height: 20))
         let secure = GetterField(frame: CGRect(x: 0, y: 60, width: 80, height: 20))
@@ -388,14 +396,49 @@ final class EluUIKitReplayCollectorTests: XCTestCase {
         settle()
         label.reads = 0; field.reads = 0; secure.reads = 0; text.reads = 0
         let snapshot = try collect(EluUIKitReplayCollector())
-        XCTAssertEqual([label.reads, field.reads, secure.reads, text.reads], [0, 0, 0, 0])
-        XCTAssertEqual(snapshot.nodes.map(\.kind), [.rectangle, .text, .input(secure: false), .input(secure: true), .input(secure: false)])
+        // A text view is measured through its storage length, not its text getters.
+        XCTAssertEqual(text.reads, 0)
+        func stars(_ count: Int) -> String { String(repeating: "*", count: count) }
+        XCTAssertEqual(snapshot.nodes.map(\.kind), [.rectangle, .maskedText(stars(13)),
+            .input(secure: false, maskedValue: stars(13)), .input(secure: true, maskedValue: stars(14)),
+            .input(secure: false, maskedValue: stars(12))])
         var encoder = try EluNativeWireframeEncoder()
         let chunk = try encoder.encode([snapshot])
         let output = String(decoding: chunk.data, as: UTF8.self)
         try export("secure", [(chunk, [snapshot])])
-        XCTAssertFalse(output.contains("PRIVATE_")); XCTAssertTrue(output.contains("[masked]"))
+        XCTAssertFalse(output.contains("PRIVATE")); XCTAssertFalse(output.contains("SECRET")); XCTAssertFalse(output.contains("[masked]"))
         XCTAssertTrue(output.contains("password"))
+    }
+
+    func testBlanketMaskKeepsWhitespaceAndCountsUTF16Units() throws {
+        let label = UILabel(frame: CGRect(x: 0, y: 0, width: 200, height: 20))
+        label.text = "Hi there\u{00A0}you\u{0085}!"
+        let attributed = UILabel(frame: CGRect(x: 0, y: 30, width: 200, height: 20))
+        attributed.attributedText = NSAttributedString(string: "Total:\t42", attributes: [.foregroundColor: UIColor.clear])
+        let field = UITextField(frame: CGRect(x: 0, y: 60, width: 200, height: 20)); field.text = "a😀 b"
+        let empty = UITextField(frame: CGRect(x: 0, y: 90, width: 200, height: 20))
+        let view = UITextView(frame: CGRect(x: 0, y: 120, width: 200, height: 40)); view.text = "line one\nline two"
+        let long = UILabel(frame: CGRect(x: 0, y: 170, width: 200, height: 20)); long.text = String(repeating: "x", count: 5_000)
+        [label, attributed, field, empty, view, long].forEach { root.addSubview($0) }
+        settle()
+        let snapshot = try collect(EluUIKitReplayCollector())
+        XCTAssertEqual(snapshot.nodes.dropFirst().map(\.kind), [
+            .maskedText("** *****\u{00A0}*****"), .maskedText("******\t**"),
+            .input(secure: false, maskedValue: "*****"), .input(secure: false, maskedValue: ""),
+            .input(secure: false, maskedValue: String(repeating: "*", count: 17)),
+            .maskedText(String(repeating: "*", count: 4_096)),
+        ])
+        var encoder = try EluNativeWireframeEncoder()
+        XCTAssertNoThrow(try encoder.encode([snapshot]))
+    }
+
+    func testOverlongReadableTextBecomesCappedStarsNotAPlaceholder() throws {
+        let label = UILabel(frame: CGRect(x: 0, y: 0, width: 300, height: 120))
+        label.numberOfLines = 0; label.font = .systemFont(ofSize: 2); label.textColor = .black
+        label.text = String(repeating: "\u{65E5}", count: 1_400) // 4,200 UTF-8 bytes
+        root.addSubview(label); settle()
+        let snapshot = try sensitiveSnapshot()
+        XCTAssertEqual(snapshot.nodes.dropFirst().map(\.kind), [.maskedText(String(repeating: "*", count: 1_400))])
     }
 
     func testOpaqueImageAndWebSubtreesAreNotInspected() throws {
@@ -456,8 +499,8 @@ final class EluUIKitReplayCollectorTests: XCTestCase {
         let first = try collect(collector)
         scroll.contentOffset = CGPoint(x: 0, y: 60)
         let second = try collect(collector, ordinal: 1)
-        let firstLabel = try XCTUnwrap(first.nodes.first(where: { $0.kind == .text }))
-        let secondLabel = try XCTUnwrap(second.nodes.first(where: { $0.kind == .text }))
+        let firstLabel = try XCTUnwrap(first.nodes.first(where: { $0.kind == .maskedText("") }))
+        let secondLabel = try XCTUnwrap(second.nodes.first(where: { $0.kind == .maskedText("") }))
         XCTAssertEqual(secondLabel.identity, firstLabel.identity)
         XCTAssertEqual(secondLabel.bounds.y, 10); XCTAssertEqual(secondLabel.clip.y, 20); XCTAssertEqual(secondLabel.clip.height, 20)
         var encoder = try EluNativeWireframeEncoder()

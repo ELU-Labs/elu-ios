@@ -220,10 +220,25 @@ readable when its full layout fits, including multiline and wrapped text.
 Standard table and collection views expose only visible standard cells through
 their public content views, with all actual ancestor restrictions retained.
 Truncated text, unsupported attributed
-content, attachments, links, transparent text, and custom subclasses remain
-masked or opaque. All input values, including `UITextField` and `UITextView`,
-stay hidden. Images, web views, custom drawing, and SwiftUI content use
-content-free placeholders in this automatic wireframe mode.
+content, attachments, links, transparent text, readable text over 4,096 UTF-8
+bytes, and custom subclasses remain masked or opaque. All input values,
+including `UITextField`, secure fields and `UITextView`, stay masked. Images,
+web views, custom drawing, and SwiftUI content use content-free placeholders in
+this automatic wireframe mode.
+
+Masking preserves length, with the same rule as web replay. Masked text keeps
+each whitespace character and replaces every other character with `*`. An input
+value becomes one `*` per character, whitespace included, so a password's
+length is visible. Characters are counted in UTF-16 units, so some emoji become
+two `*`. Truncated or clipped text is masked in full: the hidden part's length
+is visible, its content is not. Masked text stops at 4,096 UTF-8 bytes.
+
+To produce these shapes, the SDK reads masked label and button text and the
+length of input values on the main thread while it records a frame, whatever
+the text policy. It keeps only the `*` version; the original is never stored,
+logged or sent. Blocked views and placeholder content are never read. Replay
+chunks recorded by 0.2.3 or earlier keep their `[masked]` form and are still
+delivered.
 
 The separate [annotated SwiftUI replay](README.md#annotated-swiftui-replay-preview)
 mode is in preview and not available for any project yet. It requires
@@ -235,8 +250,9 @@ so unannotated content may be visible. Server permission, consent and privacy
 checks still apply. Self-hosted instances do not support this mode.
 
 Apply `Elu.maskView` or `Elu.blockView` on the main thread before presenting
-private UIKit content. Masking hides subtree text; blocking excludes content
-and descendants, allowing only a content-free bounds placeholder. These
+private UIKit content. Masking replaces subtree text with `*` of the same
+length; blocking excludes content and descendants, allowing only a content-free
+bounds placeholder. These
 restrictions last for the view's lifetime and cannot weaken remote policy.
 Unresolved native blocking rules disable replay. Ordinary analytics properties
 and manually reported errors are not automatically redacted by replay masking;

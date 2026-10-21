@@ -157,7 +157,7 @@ final class EluReplayWindowTests: XCTestCase {
         let mailbox = EluNativeReplayInteractionMailbox(), value = observer(projection, mailbox), finger = NSObject()
         wall = 1_100; value.observeForTesting(fact(.began, finger, y: 30), originalView: safe) {}
         let old = try XCTUnwrap(value.drainCurrent())
-        safe.text = EluNativeWireframeEncoder.mask; settle(); wall = 1_400
+        safe.text = "**** ***"; settle(); wall = 1_400 // mask-shaped text is never a target
         let (next, nextProjection) = try frame(1)
         wall = 1_401 // A later callback sample must not put cancel after the following geometry.
         let cancelled = try XCTUnwrap(value.handoff(nextProjection, at: .init(timestamp: 1_400, continuous: 1_400_000_000)))

@@ -81,12 +81,17 @@ final class EluUIKitReplayInteractionProjectionTests: XCTestCase {
         XCTAssertNil(try projection(retained: false))
     }
 
-    func testInputAndOpaqueOverlayVetoWithoutPrivateReads() throws {
+    func testInputAndOpaqueOverlayVetoWithoutPrivateReadsAtPointTime() throws {
         _ = view()
         let field = InteractionPrivateField(frame: CGRect(x: 10, y: 10, width: 100, height: 100))
         root.addSubview(field); settle()
-        XCTAssertNil(point(try XCTUnwrap(projection())))
-        XCTAssertEqual(field.valueReads, 0)
+        field.valueReads = 0
+        let original = try XCTUnwrap(projection())
+        // Collection reads the value once, only for its `*` length.
+        XCTAssertEqual(field.valueReads, 1)
+        field.valueReads = 0
+        XCTAssertNil(point(original))
+        XCTAssertEqual(field.valueReads, 0, "Point validation must not read input values")
         field.removeFromSuperview()
         let opaque = InteractionOpaqueView(frame: CGRect(x: 10, y: 10, width: 100, height: 100))
         root.addSubview(opaque); settle()
