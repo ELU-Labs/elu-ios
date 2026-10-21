@@ -23,7 +23,8 @@ enum EluFacadeDropReason: String, Equatable, Sendable {
     case rateLimited
     /// Customer filtering dropped or refused this event. No payload is logged.
     case filtered
-    /// The oldest call held for a foreground configuration re-fetch, at its cap.
+    /// A call made while the calls held for a foreground configuration
+    /// re-fetch were at their cap.
     case bufferFull
 }
 

@@ -38,7 +38,8 @@ closed. Config requests may continue while analytics is blocked so the site can
 recover. Blocking collection does not mean no SDK state is stored locally.
 
 Calls while setup or configuration is pending may enter a bounded in-memory
-buffer; these calls are not yet durable records. Disabled or denied collection
+buffer of 100 calls; once it is full, later calls are discarded and the earlier
+ones kept. These calls are not yet durable records. Disabled or denied collection
 does not authorize sending that buffer. Each return to the foreground fetches
 configuration again. Calls made until that configuration is validated,
 including the automatic application-opened event, are held by the same rules

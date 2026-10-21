@@ -281,7 +281,7 @@ final class EluRuntimeSelectorTests: XCTestCase {
         )
     }
 
-    func testPreConfigBufferKeepsTheNewestCallsAtItsCapAndCountsTheRest() throws {
+    func testPreConfigBufferKeepsTheOldestCallsAtItsCapAndCountsTheRest() throws {
         let factory = SelectorSpy()
         let core = EluCore(backendFactory: factory.factory)
         core.setup(
@@ -300,8 +300,8 @@ final class EluRuntimeSelectorTests: XCTestCase {
         let backend = try XCTUnwrap(factory.backend(for: .standalone))
         let replayed = backend.recordedCalls().filter { $0.hasPrefix("capture(") }
         XCTAssertEqual(replayed.count, EluEventBuffer.capacity)
-        XCTAssertEqual(replayed.first, "capture(event-\(overflow))")
-        XCTAssertEqual(replayed.last, "capture(event-\(total - 1))")
+        XCTAssertEqual(replayed.first, "capture(event-0)")
+        XCTAssertEqual(replayed.last, "capture(event-\(EluEventBuffer.capacity - 1))")
     }
 
     func testPendingOwnedRuntimeDoesNotExposeGettersOrFlushBeforeReadiness() throws {

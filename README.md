@@ -108,7 +108,8 @@ the behavior below.
 
 The SDK fetches an eligible configuration before sending analytics. Calls made
 while setup or configuration is pending are subject to the SDK's bounded
-buffering and privacy rules. A missing, disabled, expired, or ineligible
+buffering and privacy rules: up to 100 calls wait, and once that limit is
+reached, newer calls are discarded. A missing, disabled, expired, or ineligible
 configuration does not grant permission to send. The SDK fetches configuration
 again each time the app returns to the foreground. Calls made during that
 fetch, including the automatic `Application Opened` event, are held by the same

@@ -12,16 +12,19 @@ final class EluEventBufferTests: XCTestCase {
         XCTAssertTrue(buffer.ops.isEmpty)
     }
 
-    func testCapacityDropsOldestOperation() {
+    func testCapacityDropsTheNewestOperation() {
         var buffer = EluEventBuffer()
-        for index in 0 ... EluEventBuffer.capacity {
+        buffer.push(.identify(distinctId: "first", userProperties: nil))
+        for index in 1 ... EluEventBuffer.capacity {
             buffer.push(.capture(event: "event-\(index)", properties: nil))
         }
+        buffer.push(.reset)
 
         let drained = labels(buffer.drain())
         XCTAssertEqual(drained.count, EluEventBuffer.capacity)
-        XCTAssertEqual(drained.first, "capture:event-1")
-        XCTAssertEqual(drained.last, "capture:event-100")
+        XCTAssertEqual(drained.first, "identify")
+        XCTAssertEqual(drained.last, "capture:event-99")
+        XCTAssertEqual(buffer.droppedCount, 2)
     }
 
     func testOptOutDropKeepsOnlyResetsInCallOrder() {

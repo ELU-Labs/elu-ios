@@ -50,7 +50,7 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
     private var started: Started?
     /// Calls accepted while a foreground configuration re-fetch is in flight,
     /// in call order; nil while nothing is held. They follow the pre-config
-    /// buffer's rules: capped with the oldest dropped, discarded by an opt-out
+    /// buffer's rules: capped with the newest dropped, discarded by an opt-out
     /// except resets, never holding a call made while opted out except a
     /// reset, and released once a validated configuration is ready.
     private var resumeHold: [EluStandaloneHeldCall]?
@@ -1083,11 +1083,13 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
                 // Made while opted out: never held, so a later opt-in cannot release it.
                 appendLocked(entry, discardedAs: .unauthorized)
             } else {
-                // The same cap as the pre-config buffer: the oldest held call goes.
-                if let held = resumeHold?.count, held >= EluEventBuffer.capacity, let oldest = resumeHold?.removeFirst() {
-                    appendLocked(oldest.entry, discardedAs: .bufferFull)
+                // The same cap as the pre-config buffer: the newest call is
+                // dropped, never an older one.
+                if let held = resumeHold?.count, held >= EluEventBuffer.capacity {
+                    appendLocked(entry, discardedAs: .bufferFull)
+                } else {
+                    resumeHold?.append(EluStandaloneHeldCall(entry: entry, isReset: isReset))
                 }
-                resumeHold?.append(EluStandaloneHeldCall(entry: entry, isReset: isReset))
             }
         } else {
             appendLocked(entry)

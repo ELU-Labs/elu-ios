@@ -641,7 +641,7 @@ final class EluStandaloneStackTests: XCTestCase {
         }
     }
 
-    func testResumeHoldDropsItsOldestCallAtTheBufferCap() async throws {
+    func testResumeHoldDropsItsNewestCallAtTheBufferCap() async throws {
         try await withHarness { h in
             let (core, facade) = try await runningCore(h)
             await MainActor.run {}
@@ -652,15 +652,20 @@ final class EluStandaloneStackTests: XCTestCase {
             facade.applicationForegrounded(at: h.clock.now, fromBackground: true)
             for index in 0 ..< EluEventBuffer.capacity { core.dispatch(.register(["held-\(index)": index])) }
             _ = core.bufferDropCountForTesting(); await facade.settled()
-            XCTAssertEqual(facade.dropCounts[.bufferFull], 1, "The held application-opened event was the oldest")
+            XCTAssertEqual(facade.dropCounts[.bufferFull], 1, "Only the last register was over the cap")
             try await eventually { await h.config.count == 2 }
             await h.config.resolve(try fixture())
             try await eventually { await h.stack.runtime.currentPhase == .capturing }
             await h.stack.settled(); await facade.settled()
             try await eventually {
-                try await h.stack.runtime.queueSnapshot().identity.superProperties.count == registered + EluEventBuffer.capacity
+                try await h.stack.runtime.queueSnapshot().identity.superProperties.count == registered + EluEventBuffer.capacity - 1
             }
+            let released = try await h.stack.runtime.queueSnapshot().identity.superProperties
+            XCTAssertNotNil(released["held-0"])
+            XCTAssertNil(released["held-\(EluEventBuffer.capacity - 1)"])
             XCTAssertEqual(facade.dropCounts[.bufferFull], 1)
+            core.flush(); _ = core.bufferDropCountForTesting(); await facade.settled()
+            try await eventually { await h.events.opened.filter { $0 } == [true] }
             facade.shutDown(); await facade.settled()
         }
     }

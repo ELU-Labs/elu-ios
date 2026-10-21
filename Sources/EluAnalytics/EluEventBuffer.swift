@@ -32,8 +32,10 @@ struct EluHeldCall {
     let calledAt: Date
 }
 
-/// In-memory FIFO for pre-config facade calls. Cap 100, drop-oldest.
-/// Never persisted, never sent until the EU/enabled decision is made.
+/// In-memory FIFO for pre-config facade calls. Cap 100: once full, the newest
+/// call is dropped, never an older one, so the held calls stay an unbroken
+/// prefix of the app's identity history. Never persisted, never sent until
+/// the EU/enabled decision is made.
 struct EluEventBuffer {
     static let capacity = 100
 
@@ -44,10 +46,9 @@ struct EluEventBuffer {
     private(set) var droppedCount = 0
 
     mutating func push(_ op: EluBufferedOp, calledAt: Date = Date()) {
-        if calls.count >= Self.capacity {
-            let overflow = calls.count - Self.capacity + 1
-            calls.removeFirst(overflow)
-            droppedCount += overflow
+        guard calls.count < Self.capacity else {
+            droppedCount += 1
+            return
         }
         calls.append(EluHeldCall(op: op, calledAt: calledAt))
     }
