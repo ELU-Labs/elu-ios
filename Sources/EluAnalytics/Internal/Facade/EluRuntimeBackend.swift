@@ -100,8 +100,8 @@ struct EluCallOrigin: Sendable {
     /// When the app made the call. A call held for configuration keeps this
     /// time instead of the time it is released.
     let calledAt: Date
-    /// The visitor was opted out. Such a call never waits for configuration:
-    /// only a reset is held, so a later opt-in cannot release the others.
+    /// The visitor was opted out. Such a call is discarded unless it is a
+    /// reset, so a later opt-in cannot bring it back.
     let optedOut: Bool
 }
 
