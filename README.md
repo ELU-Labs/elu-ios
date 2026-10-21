@@ -109,7 +109,10 @@ the behavior below.
 The SDK fetches an eligible configuration before sending analytics. Calls made
 while setup or configuration is pending are subject to the SDK's bounded
 buffering and privacy rules. A missing, disabled, expired, or ineligible
-configuration does not grant permission to send.
+configuration does not grant permission to send. The SDK fetches configuration
+again each time the app returns to the foreground. Calls made during that
+fetch, including the automatic `Application Opened` event, are held by the same
+rules and run in call order once the new configuration is validated.
 
 ## Identity: you own it
 
@@ -314,7 +317,10 @@ before configuration or lifecycle work can authorize collection. It becomes
 durable when the runtime opens; a process ending before setup cannot persist it.
 The opt-in event is one normal capture attempt and is discarded if configuration
 is not eligible then; it is not backfilled later. Event calls made while opted
-out are discarded, and queued replay is removed.
+out are discarded, and queued replay is removed. Opting out also discards calls
+still waiting for configuration, except `reset()`: a reset made before or while
+opted out still applies once configuration arrives, and it keeps the consent
+choice.
 
 `flush()` requests a delivery attempt; it does not wait for acknowledgment or
 guarantee a send before termination. Unacknowledged durable events remain for a

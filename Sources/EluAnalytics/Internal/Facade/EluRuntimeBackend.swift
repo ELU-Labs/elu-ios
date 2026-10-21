@@ -23,6 +23,8 @@ enum EluFacadeDropReason: String, Equatable, Sendable {
     case rateLimited
     /// Customer filtering dropped or refused this event. No payload is logged.
     case filtered
+    /// The oldest call held for a foreground configuration re-fetch, at its cap.
+    case bufferFull
 }
 
 /// Controls the original native collector. Local preference never supplies
@@ -62,6 +64,11 @@ protocol EluRuntimeBackend: AnyObject {
     /// calls carry the identity, groups, and flag context the first flag
     /// evaluation must use, so the initial load runs after the last of them.
     func activate()
+
+    /// An opt-out was accepted, in facade call order. Calls the backend still
+    /// holds for configuration are discarded, except resets, exactly as the
+    /// pre-config buffer is.
+    func withdrawHeldCalls()
 
     func distinctId() -> String?
     func groups() -> [String: String]
@@ -178,6 +185,7 @@ extension EluRuntimeBackend {
     }
     func beginPendingOperation(_ op: EluBufferedOp) -> (() -> Void)? { nil }
     func beginNetworkObservation(_ request: URLRequest) -> EluNetworkObservation? { nil }
+    func withdrawHeldCalls() {}
 }
 
 extension EluBufferedOp {

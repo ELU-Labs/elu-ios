@@ -481,6 +481,109 @@ final class EluStandaloneStackTests: XCTestCase {
         }
     }
 
+    func testResumeCallsDuringForegroundRefetchAreHeldUntilValidatedConfiguration() async throws {
+        try await withHarness { h in
+            let (core, facade) = try await runningCore(h)
+            await MainActor.run {} // The owned emitter's launch observation has been installed.
+            await facade.settled()
+            let unauthorizedBefore = facade.dropCounts[.unauthorized] ?? 0
+            facade.applicationBackgrounded(at: h.clock.now)
+            await facade.settled(); await h.stack.settled()
+            facade.applicationForegrounded(at: h.clock.now, fromBackground: true)
+            core.dispatch(.capture(event: "during-refetch", properties: nil))
+            _ = core.bufferDropCountForTesting()
+            try await eventually { await h.config.count == 2 }
+            await facade.settled()
+            await h.config.resolve(try fixture())
+            try await eventually { await h.stack.runtime.currentPhase == .capturing }
+            await h.stack.settled(); await facade.settled()
+            core.flush(); _ = core.bufferDropCountForTesting(); await facade.settled()
+            try await eventually { await h.events.names.contains("during-refetch") }
+            let names = await h.events.names, opened = await h.events.opened
+            XCTAssertEqual(opened.filter { $0 }, [true], "\(names)")
+            XCTAssertEqual(Array(names.suffix(2)), [EluStandaloneRuntime.applicationOpenedEvent, "during-refetch"])
+            XCTAssertEqual(facade.dropCounts[.unauthorized] ?? 0, unauthorizedBefore)
+            facade.shutDown(); await facade.settled()
+        }
+    }
+
+    func testOptOutDuringResumeHoldKeepsOnlyHeldResetsAndNeverReleasesDeniedCalls() async throws {
+        try await withHarness { h in
+            let (core, facade) = try await runningCore(h)
+            await MainActor.run {}
+            core.dispatch(.identify(distinctId: "before-resume", userProperties: nil))
+            _ = core.bufferDropCountForTesting(); await facade.settled()
+            facade.applicationBackgrounded(at: h.clock.now)
+            await facade.settled(); await h.stack.settled()
+            facade.applicationForegrounded(at: h.clock.now, fromBackground: true)
+            core.dispatch(.capture(event: "before-opt-out", properties: nil))
+            core.reset()
+            core.setConsent(optedOut: true)
+            core.dispatch(.capture(event: "while-opted-out", properties: nil))
+            // Signalled while opted out: released after the opt-in, never recorded.
+            facade.applicationForegrounded(at: h.clock.now, fromBackground: true)
+            core.setConsent(optedOut: false, event: nil)
+            core.dispatch(.capture(event: "after-opt-in", properties: nil))
+            _ = core.bufferDropCountForTesting()
+            try await eventually { await h.config.count == 2 }
+            await facade.settled()
+            let held = try await h.stack.runtime.queueSnapshot()
+            XCTAssertEqual(held.identity.userId, "before-resume", "The held reset has not run yet")
+            await h.config.resolve(try fixture())
+            try await eventually { await h.stack.runtime.currentPhase == .capturing }
+            await h.stack.settled(); await facade.settled()
+            core.flush(); _ = core.bufferDropCountForTesting(); await facade.settled()
+            try await eventually { await h.events.names.contains("after-opt-in") }
+            let names = await h.events.names, opened = await h.events.opened
+            XCTAssertFalse(names.contains("before-opt-out"), "\(names)")
+            XCTAssertFalse(names.contains("while-opted-out"), "\(names)")
+            XCTAssertEqual(opened.filter { $0 }, [], "\(names)")
+            let released = try await h.stack.runtime.queueSnapshot()
+            XCTAssertNil(released.identity.userId, "The held reset applies once configuration is ready")
+            XCTAssertFalse(released.identity.optedOut)
+            facade.shutDown(); await facade.settled()
+        }
+    }
+
+    func testResumeHoldDropsItsOldestCallAtTheBufferCap() async throws {
+        try await withHarness { h in
+            let (core, facade) = try await runningCore(h)
+            await MainActor.run {}
+            await facade.settled()
+            let registered = try await h.stack.runtime.queueSnapshot().identity.superProperties.count
+            facade.applicationBackgrounded(at: h.clock.now)
+            await facade.settled(); await h.stack.settled()
+            facade.applicationForegrounded(at: h.clock.now, fromBackground: true)
+            for index in 0 ..< EluEventBuffer.capacity { core.dispatch(.register(["held-\(index)": index])) }
+            _ = core.bufferDropCountForTesting(); await facade.settled()
+            XCTAssertEqual(facade.dropCounts[.bufferFull], 1, "The held application-opened event was the oldest")
+            try await eventually { await h.config.count == 2 }
+            await h.config.resolve(try fixture())
+            try await eventually { await h.stack.runtime.currentPhase == .capturing }
+            await h.stack.settled(); await facade.settled()
+            try await eventually {
+                try await h.stack.runtime.queueSnapshot().identity.superProperties.count == registered + EluEventBuffer.capacity
+            }
+            XCTAssertEqual(facade.dropCounts[.bufferFull], 1)
+            facade.shutDown(); await facade.settled()
+        }
+    }
+
+    func testForegroundWithoutRefetchHoldsNothing() async throws {
+        try await withHarness { h in
+            let (core, facade) = try await runningCore(h)
+            await MainActor.run {}
+            facade.setForeground(true)
+            core.dispatch(.capture(event: "immediate", properties: nil))
+            _ = core.bufferDropCountForTesting(); await facade.settled()
+            core.flush(); _ = core.bufferDropCountForTesting(); await facade.settled()
+            try await eventually { await h.events.names.contains("immediate") }
+            let fetches = await h.config.count
+            XCTAssertEqual(fetches, 1)
+            facade.shutDown(); await facade.settled()
+        }
+    }
+
     func testLateCallbackRetainsOriginalExpiryRatherThanRereadingNewClockLease() async throws {
         try await withHarness { h in
             let (core, facade) = try await runningCore(h)
@@ -594,6 +697,8 @@ private actor StackEventTransport: EluV1AuthorizedBatchTransport {
     private(set) var endpoints: [URL] = []
     private(set) var count = 0
     private(set) var names: [String] = []
+    /// `from_background` of each delivered application-opened event.
+    private(set) var opened: [Bool] = []
     private let delegate = FacadeBatchTransport()
     private var shouldHold = false
     private var held: CheckedContinuation<Void, Never>?
@@ -613,7 +718,10 @@ private actor StackEventTransport: EluV1AuthorizedBatchTransport {
         count += 1
         endpoints.append(request.url)
         let body = try JSONSerialization.jsonObject(with: request.body) as! [String: Any]
-        names += (body["records"] as! [[String: Any]]).compactMap { ($0["event"] as? [String: Any])?["name"] as? String }
+        let events = (body["records"] as! [[String: Any]]).compactMap { $0["event"] as? [String: Any] }
+        names += events.compactMap { $0["name"] as? String }
+        opened += events.filter { $0["name"] as? String == EluStandaloneRuntime.applicationOpenedEvent }
+            .compactMap { ($0["properties"] as? [String: Any])?[EluStandaloneRuntime.fromBackgroundProperty] as? Bool }
         return try await delegate.send(request)
     }
 }
@@ -650,6 +758,7 @@ private final class StackClock: @unchecked Sendable {
             floorTicks: { $0 }, floorNanoseconds: { $0 })
     }
     func advance(_ seconds: UInt64) { lock.lock(); elapsed += seconds * 1_000_000_000; lock.unlock() }
+    var now: Date { source.wallNow() }
 }
 
 private final class StackNotifications: @unchecked Sendable {
