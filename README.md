@@ -47,6 +47,9 @@ the service configuration; the SDK version alone does not enable it. Recordings
 follow your project's masking policy: by default readable UIKit text (labels,
 buttons) is recorded while text inputs stay masked and images, opaque views and
 web views stay blocked; with "mask all text" every text element is masked.
+Masked text and input values appear as one `*` per character, so a replay shows
+their length but never their content (0.2.3 and earlier show the word
+`[masked]` instead). See [UIKit replay coverage](#uikit-replay-coverage).
 
 ## Install (Swift Package Manager)
 
@@ -531,10 +534,25 @@ readable when its complete layout fits, including multiline and wrapped labels.
 Standard `UITableView` and `UICollectionView` instances project visible standard
 cells through their public `contentView`; offscreen cells are excluded and actual
 ancestor mask, block, visibility and clipping restrictions still apply. Transparent or truncated text, attachments, links, unsupported attributed content,
-and custom subclasses remain masked or opaque. All input values, including `UITextField` and `UITextView`, remain hidden. Images, web
+and custom subclasses remain masked or opaque. All input values, including `UITextField`, secure fields and `UITextView`, are always masked. Images, web
 views, custom drawing, and SwiftUI content are represented by content-free
 placeholders in this automatic wireframe mode. Annotated SwiftUI replay is a
 separate opt-in, described below.
+
+Masking keeps the length of the content, the same way web replay does:
+
+- Masked text shows one `*` per character and keeps its spaces and line
+  breaks. Truncated or clipped text is masked in full, so the length of the
+  hidden part shows, but not its content.
+- An input value shows one `*` per character, spaces included. This shows the
+  length of what was typed, including passwords, as the device screen does.
+- Very long masked text and input values are cut off after about 4,000
+  characters.
+
+To draw these shapes, the SDK reads masked text and the length of input values
+on the device while it records a frame, including in "mask all text" mode. It
+keeps only the `*` version: the original text is never stored, logged or sent.
+Blocked views are never read.
 
 Apply additional restrictions on the main thread before content is presented:
 
@@ -851,8 +869,8 @@ duplicates are dropped.
 The package includes `PrivacyInfo.xcprivacy`. It declares the SDK's linked
 analytics, manual exception, native performance/diagnostic data, and ordinary
 replay text, with tracking disabled. Performance and OS diagnostics remain disabled by default;
-replay still requires eligible privacy authority, and masked inputs and blocked
-content are excluded. Elapsed-time clocks are used for in-app timers and duration
+replay still requires eligible privacy authority, masked text and inputs are sent
+only as `*` characters, and blocked content is excluded. Elapsed-time clocks are used for in-app timers and duration
 measurements; raw system boot time is not sent. File metadata is read only for the
 SDK's own files inside the app container, to check its local stores; it is not
 sent. Review your app's complete data

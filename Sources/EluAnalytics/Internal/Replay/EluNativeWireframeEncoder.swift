@@ -5,7 +5,6 @@ import Foundation
 struct EluNativeWireframeEncoder: Sendable {
     static let minimumNodeID: Int64 = 10_000_000
     static let maximumSafeInteger: Int64 = 9_007_199_254_740_991
-    static let mask = "[masked]"
     static let placeholder = "Content hidden"
 
     struct Limits: Equatable, Sendable {
@@ -135,7 +134,7 @@ struct EluNativeWireframeEncoder: Sendable {
 
     private func generatedNodeCost(_ kind: EluNativeMaskedKind) -> Int {
         switch kind {
-        case .text, .ordinaryText, .placeholder: return 1
+        case .maskedText, .ordinaryText, .placeholder: return 1
         case .rectangle, .input: return 0
         }
     }
@@ -148,8 +147,16 @@ struct EluNativeWireframeEncoder: Sendable {
         guard frame.nodes.count < limits.liveNodes else { throw EluNativeEncodingError.nodeLimit }
         var seen: Set<UUID> = []
         for node in frame.nodes {
-            if case let .ordinaryText(text) = node.kind {
-                guard text.utf8.count <= 4_096 else { throw EluNativeEncodingError.invalidText }
+            if let text = node.kind.carriedText {
+                guard text.utf8.count <= EluNativeMaskText.maximumBytes else { throw EluNativeEncodingError.invalidText }
+            }
+            // A masked kind can only ever carry its `*` shape, never content.
+            switch node.kind {
+            case let .maskedText(text):
+                guard EluNativeMaskText.isMaskShaped(text) else { throw EluNativeEncodingError.invalidText }
+            case let .input(_, value):
+                guard EluNativeMaskText.isInputMask(value) else { throw EluNativeEncodingError.invalidText }
+            case .rectangle, .ordinaryText, .placeholder: break
             }
             guard seen.insert(node.identity).inserted else { throw EluNativeEncodingError.duplicateIdentity }
             let c = node.clip, b = node.bounds
@@ -179,9 +186,8 @@ struct EluNativeWireframeEncoder: Sendable {
                       member("width", number(b.width)), member("height", number(b.height)), member("clip", rectangle(n.clip))]
         switch n.kind {
         case .rectangle: fields.append(member("type", string("rectangle")))
-        case .text: fields += [member("type", string("text")), member("text", string(Self.mask))]
-        case let .ordinaryText(text): fields += [member("type", string("text")), member("text", string(text))]
-        case let .input(secure): fields += [member("type", string("input")), member("inputType", string(secure ? "password" : "text")), member("disabled", .bool(true)), member("value", string(Self.mask))]
+        case let .maskedText(text), let .ordinaryText(text): fields += [member("type", string("text")), member("text", string(text))]
+        case let .input(secure, value): fields += [member("type", string("input")), member("inputType", string(secure ? "password" : "text")), member("disabled", .bool(true)), member("value", string(value))]
         case .placeholder: fields += [member("type", string("placeholder")), member("label", string(Self.placeholder))]
         }
         var style: [EluV1StrictCanonicalJSON.Member] = []

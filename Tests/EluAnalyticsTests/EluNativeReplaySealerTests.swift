@@ -194,6 +194,25 @@ final class EluNativeReplaySealerTests: XCTestCase {
         XCTAssertEqual(try bounded.seal(records: [.geometry(frame(0), continuous: 0)]), expected)
     }
 
+    func testEarlierTokenProfilesCannotDescribeNewStarChunks() throws {
+        let tokens = [
+            #"{"blockTraversal":"stop","configuredBlockRuleHandling":"deny-unresolved","contentAccess":"none","imageRule":"block","inputRule":"all","maskInheritance":"subtree","maskToken":"[masked]","opaqueViewRule":"block","placeholderToken":"Content hidden","profileKind":"elu-native-blanket-mask-v1","schemaVersion":1,"secureInputsMasked":true,"textRule":"all","webViewRule":"block"}"#,
+            #"{"blockTraversal":"stop","configuredBlockRuleHandling":"deny-unresolved","contentAccess":"native-text","imageRule":"block","inputRule":"all","maskInheritance":"subtree","maskToken":"[masked]","opaqueViewRule":"block","placeholderToken":"Content hidden","profileKind":"elu-native-sensitive-mask-v1","schemaVersion":1,"secureInputsMasked":true,"textRule":"sensitive","webViewRule":"block"}"#,
+        ]
+        for token in tokens {
+            let profile = try EluNativeMaskingProfile.parse(Data(token.utf8))
+            XCTAssertEqual(profile.rule, .token)
+            for tuple in [EluNativeReplayProtocol.v1, .v2] {
+                XCTAssertThrowsError(try fixture(tuple: tuple, profile: profile).sealer()) {
+                    XCTAssertEqual($0 as? EluNativeReplaySealingError, .invalidBinding)
+                }
+            }
+        }
+        var sealer = try fixture().sealer()
+        let request = try sealer.seal([frame(0, withNode: true)])
+        XCTAssertEqual(request.maskingProfileHash, "sha256:f6e340ee9a350f07e3645dc5e30bc6383e27d0bb42b94e08d552c26a52418281")
+    }
+
     func testV2BlanketProfileCannotSealCoordinates() throws {
         var sealer = try fixture(tuple: .v2).sealer()
         _ = try sealer.seal(records: [.geometry(touchFrame(), continuous: 0)])
@@ -286,7 +305,7 @@ final class EluNativeReplaySealerTests: XCTestCase {
         for index in 0 ..< max(nodeCount, withNode ? 1 : 0) {
             let id = UUID(uuidString: String(format: "00000000-0000-0000-0000-%012d", index + 1))!
             let rect = try EluNativeRect(x: Double(index % 20) * 11.7, y: Double(index / 20) * 9.3, width: 7.1, height: 5.3)
-            nodes.append(.init(identity: id, kind: .text, bounds: rect, clip: rect, style: try .init()))
+            nodes.append(.init(identity: id, kind: .maskedText("***** ****"), bounds: rect, clip: rect, style: try .init()))
         }
         return .init(ordinal: ordinal, timestamp: timestamp ?? (1_785_888_060_123 + ordinal),
             viewport: try .init(width: 320, height: 640), nodes: nodes)

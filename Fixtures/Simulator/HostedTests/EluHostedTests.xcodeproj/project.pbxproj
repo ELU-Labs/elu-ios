@@ -7,6 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		81EF571D0DFA0DB5A27B1F60 /* EluNativeMaskTextTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E69386C959BC4C16C055187C /* EluNativeMaskTextTests.swift */; };
 		AC0BB7A2807D96D6458D4A3C /* EluIdentityStateStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E17705D73C9CE11DA1B71749 /* EluIdentityStateStoreTests.swift */; };
 		AA9F89F526539977CA1872DF /* EluEventContextTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = ADC851961B0DDB5758AE4776 /* EluEventContextTests.swift */; };
 		09542CD3BA2B0414E6441DF2 /* EluEventFilterTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 91EB52FDCF618FF879943968 /* EluEventFilterTests.swift */; };
@@ -103,6 +104,7 @@
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
+		E69386C959BC4C16C055187C /* EluNativeMaskTextTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluNativeMaskTextTests.swift; sourceTree = "<group>"; };
 		E17705D73C9CE11DA1B71749 /* EluIdentityStateStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluIdentityStateStoreTests.swift; sourceTree = "<group>"; };
 		ADC851961B0DDB5758AE4776 /* EluEventContextTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluEventContextTests.swift; sourceTree = "<group>"; };
 		91EB52FDCF618FF879943968 /* EluEventFilterTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EluEventFilterTests.swift; sourceTree = "<group>"; };
@@ -230,6 +232,7 @@
 		A0928195822C53907FA0C692 /* EluAnalyticsTests */ = {
 			isa = PBXGroup;
 			children = (
+				E69386C959BC4C16C055187C /* EluNativeMaskTextTests.swift */,
 				E17705D73C9CE11DA1B71749 /* EluIdentityStateStoreTests.swift */,
 				ADC851961B0DDB5758AE4776 /* EluEventContextTests.swift */,
 				91EB52FDCF618FF879943968 /* EluEventFilterTests.swift */,
@@ -413,6 +416,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				81EF571D0DFA0DB5A27B1F60 /* EluNativeMaskTextTests.swift in Sources */,
 				AC0BB7A2807D96D6458D4A3C /* EluIdentityStateStoreTests.swift in Sources */,
 				AA9F89F526539977CA1872DF /* EluEventContextTests.swift in Sources */,
 				09542CD3BA2B0414E6441DF2 /* EluEventFilterTests.swift in Sources */,

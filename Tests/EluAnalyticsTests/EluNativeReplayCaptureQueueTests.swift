@@ -199,19 +199,22 @@ final class EluNativeReplayCaptureQueueTests: XCTestCase {
     }
 
     func testExactNativeProfileRetainsBytesAcrossSQLiteReopen() async throws {
-        let h = try await DeliveryHarness.make(); defer { h.remove() }
-        try await h.install()
-        let profile = EluNativeMaskingProfile.blanketMask().canonicalBytes
-        let request = try h.request(maskingProfile: profile)
-        // This storage fixture deliberately keeps the existing opaque browser
-        // payload. UIKit/encoder native payload proof lives in the joined tests.
-        let result = try await h.queue.appendReplay(request, maskingProfile: profile,
-            authorization: h.authorization, sourceWitness: h.witness, isCurrentProfile: { $0 == profile })
-        guard case let .inserted(row) = result else { return XCTFail("native metadata insertion") }
-        XCTAssertEqual(row.maskingProfile, profile); XCTAssertEqual(row.prepared.body, request.body)
-        await h.queue.close(); h.queue = try await h.reopen()
-        let rows = try await h.queue.storedReplayChunks()
-        XCTAssertEqual(rows, [row]); await h.queue.close()
+        // The current star profile, and the profile chunks queued by 0.2.3 and earlier carry.
+        let earlier = Data(#"{"blockTraversal":"stop","configuredBlockRuleHandling":"deny-unresolved","contentAccess":"none","imageRule":"block","inputRule":"all","maskInheritance":"subtree","maskToken":"[masked]","opaqueViewRule":"block","placeholderToken":"Content hidden","profileKind":"elu-native-blanket-mask-v1","schemaVersion":1,"secureInputsMasked":true,"textRule":"all","webViewRule":"block"}"#.utf8)
+        for profile in [EluNativeMaskingProfile.blanketMask().canonicalBytes, earlier] {
+            let h = try await DeliveryHarness.make(); defer { h.remove() }
+            try await h.install()
+            let request = try h.request(maskingProfile: profile)
+            // This storage fixture deliberately keeps the existing opaque browser
+            // payload. UIKit/encoder native payload proof lives in the joined tests.
+            let result = try await h.queue.appendReplay(request, maskingProfile: profile,
+                authorization: h.authorization, sourceWitness: h.witness, isCurrentProfile: { $0 == profile })
+            guard case let .inserted(row) = result else { return XCTFail("native metadata insertion") }
+            XCTAssertEqual(row.maskingProfile, profile); XCTAssertEqual(row.prepared.body, request.body)
+            await h.queue.close(); h.queue = try await h.reopen()
+            let rows = try await h.queue.storedReplayChunks()
+            XCTAssertEqual(rows, [row]); await h.queue.close()
+        }
     }
 
     func testActualNativeEnvelopeCannotUseGenericAppendWithoutPhysicalAdmission() async throws {
