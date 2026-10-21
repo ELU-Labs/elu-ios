@@ -90,7 +90,9 @@ private final class EluUIKitCollectionFence: @unchecked Sendable {
 }
 
 /// A synchronous main-thread collector of policy-filtered geometry and native text.
-/// Input values, images, web views, and opaque drawing never enter snapshots.
+/// Masked text and input values enter snapshots only as their `*` shape; the
+/// original is read transiently and never kept. Images, web views, and opaque
+/// drawing never enter snapshots.
 @MainActor
 final class EluUIKitReplayCollector {
     private struct Projection {
@@ -289,18 +291,27 @@ final class EluUIKitReplayCollector {
             } else if view is UIImageView || view is WKWebView {
                 kind = .placeholder; traversable = false
             } else if let field = view as? UITextField {
-                // Deliberately before any value access; no branch reads a value.
-                kind = .input(secure: field.isSecureTextEntry); traversable = false
+                // Only the value's UTF-16 length is read, to draw one `*` per
+                // unit. A read-only query reuses the original shape instead.
+                let value = query == nil
+                    ? EluNativeMaskText.maskInput(utf16Length: field.text?.utf16.count ?? 0)
+                    : queryInputValue(view, nodes: queryNodes ?? [:])
+                kind = .input(secure: field.isSecureTextEntry, maskedValue: value); traversable = false
             } else if let text = view as? UITextView {
-                kind = .input(secure: text.isSecureTextEntry); traversable = false
+                // Always an input, like a web textarea. Storage length only.
+                let value = query == nil
+                    ? EluNativeMaskText.maskInput(utf16Length: text.textStorage.length)
+                    : queryInputValue(view, nodes: queryNodes ?? [:])
+                kind = .input(secure: text.isSecureTextEntry, maskedValue: value); traversable = false
             } else if let label = view as? UILabel {
                 // Subclasses can expose custom-sensitive state through getters.
-                // Only exact system controls are eligible for ordinary text.
+                // Only exact system controls are eligible for ordinary text;
+                // every other label contributes only its `*` shape.
                 if let query {
-                    kind = !masked && visible == converted ? queryKind(view, original: query, nodes: queryNodes ?? [:]) : .text
+                    kind = queryKind(view, original: query, nodes: queryNodes ?? [:], readable: !masked && visible == converted)
                 } else {
                     kind = !masked && type(of: label) == UILabel.self && visible == converted
-                        && hasVisiblePlainText(label) ? ordinaryText(label.text ?? "") : .text
+                        && hasVisiblePlainText(label) ? ordinaryText(label.text ?? "") : maskedText(label)
                 }
                 traversable = false
             } else if let button = view as? UIButton, type(of: button) == UIButton.self {
@@ -308,7 +319,7 @@ final class EluUIKitReplayCollector {
                 // plain title overridden by an attributed/configured title.
                 let titleLabel = button.titleLabel
                 if let query {
-                    kind = !masked && visible == converted ? queryKind(view, original: query, nodes: queryNodes ?? [:]) : .text
+                    kind = queryKind(view, original: query, nodes: queryNodes ?? [:], readable: !masked && visible == converted)
                 } else {
                 kind = !masked && visible == converted
                     && titleLabel.map({ label in
@@ -317,7 +328,7 @@ final class EluUIKitReplayCollector {
                             && button.bounds.contains(label.convert(label.bounds, to: button))
                             && hasVisiblePlainText(label)
                     }) == true
-                    ? ordinaryText(titleLabel?.text ?? "") : .text
+                    ? ordinaryText(titleLabel?.text ?? "") : maskedTitle(titleLabel, restrictions: restrictions)
                 }
                 traversable = false
             } else if let table = view as? UITableView, type(of: table) == UITableView.self {
@@ -347,15 +358,15 @@ final class EluUIKitReplayCollector {
                 projection = Projection(view: view, identity: value)
             }
             guard nextProjections.updateValue(projection, forKey: key) == nil else { throw EluUIKitReplayCollectionError.invalidRoot }
-            // No attributed strings, accessibility, image/URL/layer contents,
-            // descriptions, screenshots, or pixel access enter the snapshot.
+            // No attributed strings, masked originals, accessibility, image/URL/layer
+            // contents, descriptions, screenshots, or pixel access enter the snapshot.
             let style = try EluNativeStyle(color: kind == .placeholder ? .init(red: 255, green: 255, blue: 255) : nil)
             nodes.append(.init(identity: projection.identity, kind: kind, bounds: bounds, clip: try rect(visible), style: style))
             if retainInteractionProjection, view !== root, !masked, !blocked, view.alpha == 1,
                visible.width > 0, visible.height > 0 {
                 switch kind {
                 case .rectangle: interactionEligible.insert(projection.identity)
-                case let .ordinaryText(value) where value != EluNativeWireframeEncoder.mask:
+                case let .ordinaryText(value) where !EluNativeMaskText.isMaskShaped(value):
                     interactionEligible.insert(projection.identity)
                     if let label = view as? UILabel, type(of: label) == UILabel.self {
                         addInteractionCheck(interactionTextIdentityCheck(label))
@@ -487,12 +498,21 @@ final class EluUIKitReplayCollector {
         } catch { return nil }
     }
 
+    /// Reads no text: an eligible readable leaf keeps its original kind and
+    /// every other leaf keeps its original masked shape.
     private func queryKind(_ view: UIView, original: EluUIKitReplayCollectedProjection,
-                           nodes: [UUID: EluNativeMaskedKind]) -> EluNativeMaskedKind {
+                           nodes: [UUID: EluNativeMaskedKind], readable: Bool) -> EluNativeMaskedKind {
         guard let prior = projections[ObjectIdentifier(view)], prior.view === view,
-              original.eligible.contains(prior.identity),
-              let kind = nodes[prior.identity] else { return .text }
-        return kind
+              let kind = nodes[prior.identity] else { return .maskedText("") }
+        if readable, original.eligible.contains(prior.identity) { return kind }
+        if case .maskedText = kind { return kind }
+        return .maskedText("")
+    }
+
+    private func queryInputValue(_ view: UIView, nodes: [UUID: EluNativeMaskedKind]) -> String {
+        guard let prior = projections[ObjectIdentifier(view)], prior.view === view,
+              case let .input(_, value)? = nodes[prior.identity] else { return "" }
+        return value
     }
 
     /// Only the exact last successful snapshot can recover its original witness.
@@ -674,8 +694,21 @@ final class EluUIKitReplayCollector {
     }
 
     private func ordinaryText(_ text: String) -> EluNativeMaskedKind {
-        // Refuse oversized content as one unit rather than retaining a prefix.
-        text.utf8.count <= 4_096 ? .ordinaryText(text) : .placeholder
+        // Oversized readable text is masked as one unit rather than sending a prefix.
+        text.utf8.count <= EluNativeMaskText.maximumBytes ? .ordinaryText(text) : .maskedText(EluNativeMaskText.maskText(text))
+    }
+
+    /// The displayed string, including truncated or clipped parts, is read only
+    /// to derive its `*` shape. The original is not kept.
+    private func maskedText(_ label: UILabel) -> EluNativeMaskedKind {
+        .maskedText(EluNativeMaskText.maskText(label.attributedText?.string ?? label.text ?? ""))
+    }
+
+    /// A blocked or undrawn title has no shape to show.
+    private func maskedTitle(_ label: UILabel?, restrictions: [EluUIKitReplayRestriction]) -> EluNativeMaskedKind {
+        guard let label, !label.isHidden, label.alpha > 0, label.eluReplayRestriction != .block,
+              !restrictions.contains(where: { $0.view === label && $0.action == .block }) else { return .maskedText("") }
+        return maskedText(label)
     }
 
     private func canProjectThroughListAncestor(_ view: UIView) -> Bool {

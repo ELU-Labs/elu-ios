@@ -107,11 +107,11 @@ struct EluNativeReplayFrameBuffer: Sendable {
                 }
                 nodes += snapshot.nodes.count
             }
-            // Charge geometry/style plus bounded UTF-8 text before retaining it.
+            // Charge geometry/style plus bounded UTF-8 text and masks before retaining them.
             var estimatedBytes = nodes * 512 + candidate.count * 256
             for snapshot in candidate {
                 for node in snapshot.nodes {
-                    if case let .ordinaryText(text) = node.kind {
+                    if let text = node.kind.carriedText {
                         let count = text.utf8.count
                         guard count <= 4_096, count <= Self.maximumEstimatedBytes - estimatedBytes else {
                             throw EluNativeReplayCaptureError.bufferLimit

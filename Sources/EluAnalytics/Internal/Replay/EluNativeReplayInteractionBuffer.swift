@@ -160,7 +160,7 @@ struct EluNativeReplayInteractionBuffer: Sendable {
                 bytes += frame.nodes.count * 512 + 256
                 guard bytes <= maximumBytes else { return false }
                 for node in frame.nodes {
-                    if case let .ordinaryText(text) = node.kind {
+                    if let text = node.kind.carriedText {
                         let count = text.utf8.count
                         guard count <= 4_096,
                               count <= maximumBytes - bytes else { return false }

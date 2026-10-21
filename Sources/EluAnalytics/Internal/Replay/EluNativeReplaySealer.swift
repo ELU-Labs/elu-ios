@@ -61,6 +61,8 @@ struct EluNativeReplaySealer: Sendable {
               original.effectiveMasking.secureInputsMasked,
               original.effectiveMasking.platformFallbackApplied == projected.platformFallbackApplied,
               original.effectiveMasking.text == profile.textMasking,
+              // New chunks carry `*` masks; only a star profile describes them.
+              profile.rule == .star,
               original.effectiveMasking.inputs == .all, original.effectiveMasking.images == .block,
               versions.platform == "ios"
         else { throw EluNativeReplaySealingError.invalidBinding }

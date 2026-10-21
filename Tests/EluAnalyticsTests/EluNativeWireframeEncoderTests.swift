@@ -7,6 +7,7 @@ final class EluNativeWireframeEncoderTests: XCTestCase {
     private let second = UUID(uuidString: "00000000-0000-4000-8000-000000000002")!
     private let third = UUID(uuidString: "00000000-0000-4000-8000-000000000003")!
     private let time: Int64 = 1_788_883_200_000
+    private let masked = EluNativeMaskedKind.maskedText("**** **")
 
     func testEmptyGeometryCanonicalBytesRemainFrozenAcrossExtractedStep() throws {
         var encoder = try EluNativeWireframeEncoder()
@@ -41,17 +42,17 @@ final class EluNativeWireframeEncoderTests: XCTestCase {
         _ = try encoder.encode([frame(0, nodes: [node(first, .ordinaryText(String(repeating: "é", count: 2_048)))])])
     }
 
-    func testInitialCanonicalFixedTokensAndNoLocalIdentityOnWire() throws {
+    func testInitialCanonicalStarMasksAndNoLocalIdentityOnWire() throws {
         var encoder = try EluNativeWireframeEncoder()
-        let nodes = try [node(first, .text), node(second, .input(secure: true)), node(third, .placeholder)]
+        let nodes = try [node(first, masked), node(second, .input(secure: true, maskedValue: "******")), node(third, .placeholder)]
         let chunk = try encoder.encode([frame(0, nodes: nodes)])
         let events = try decode(chunk)
         XCTAssertEqual(chunk.sequence, 0); XCTAssertEqual(chunk.eventCount, 2)
         XCTAssertEqual(chunk.firstTimestamp, time); XCTAssertEqual(chunk.lastTimestamp, time)
         XCTAssertEqual((events[0]["type"] as? NSNumber)?.intValue, 4)
         let leaves = try fullLeaves(events[1])
-        XCTAssertEqual(leaves[0]["text"] as? String, "[masked]")
-        XCTAssertEqual(leaves[1]["value"] as? String, "[masked]")
+        XCTAssertEqual(leaves[0]["text"] as? String, "**** **")
+        XCTAssertEqual(leaves[1]["value"] as? String, "******")
         XCTAssertEqual(leaves[1]["inputType"] as? String, "password")
         XCTAssertEqual(leaves[1]["disabled"] as? Bool, true)
         XCTAssertEqual(leaves[2]["label"] as? String, "Content hidden")
@@ -59,6 +60,17 @@ final class EluNativeWireframeEncoderTests: XCTestCase {
         XCTAssertFalse(String(decoding: chunk.data, as: UTF8.self).contains("ordinal"))
         XCTAssertEqual(try EluV1StrictCanonicalJSON.parse(chunk.data).canonicalData, chunk.data)
         XCTAssertEqual(encoder.state.live.map(\.id), [10_000_001, 10_000_002, 10_000_003])
+    }
+
+    func testChangedMaskShapeIsAFullSnapshotCarryingOnlyStars() throws {
+        var encoder = try EluNativeWireframeEncoder()
+        _ = try encoder.encode([frame(0, nodes: [node(first, .input(secure: false, maskedValue: "**")), node(second, masked)])])
+        let typed = try encoder.encode([frame(1, nodes: [node(first, .input(secure: false, maskedValue: "****")), node(second, masked)])])
+        let event = try decode(typed)[0]
+        XCTAssertEqual((event["type"] as? NSNumber)?.intValue, 2)
+        let leaves = try fullLeaves(event)
+        XCTAssertEqual(leaves[0]["value"] as? String, "****"); XCTAssertEqual(leaves[1]["text"] as? String, "**** **")
+        XCTAssertEqual(encoder.state.live.map(\.id), [10_000_001, 10_000_002])
     }
 
     func testSameMillisecondDistinctFramesAreLegalButDuplicateFrameFailsAtomically() throws {
@@ -95,7 +107,7 @@ final class EluNativeWireframeEncoderTests: XCTestCase {
         let bounds = try EluNativeRect(x: 0, y: 0, width: 20, height: 20)
         for clip in [try EluNativeRect(x: 0, y: 0, width: 21, height: 20), try EluNativeRect(x: -1, y: 0, width: 1, height: 1)] {
             var encoder = try EluNativeWireframeEncoder(); let old = encoder.state
-            let value = EluNativeMaskedNode(identity: first, kind: .text, bounds: bounds, clip: clip, style: try .init())
+            let value = EluNativeMaskedNode(identity: first, kind: masked, bounds: bounds, clip: clip, style: try .init())
             XCTAssertThrowsError(try encoder.encode([frame(0, nodes: [value])]))
             XCTAssertEqual(encoder.state, old)
         }
@@ -103,7 +115,7 @@ final class EluNativeWireframeEncoderTests: XCTestCase {
 
     func testClipPreservesUntrimmedOriginAndEmptyVisibleArea() throws {
         var encoder = try EluNativeWireframeEncoder()
-        let visible = EluNativeMaskedNode(identity: first, kind: .text,
+        let visible = EluNativeMaskedNode(identity: first, kind: masked,
             bounds: try .init(x: -20, y: 20, width: 100, height: 30),
             clip: try .init(x: 0, y: 25, width: 50, height: 20), style: try .init())
         let empty = EluNativeMaskedNode(identity: second, kind: .placeholder,
@@ -121,7 +133,7 @@ final class EluNativeWireframeEncoderTests: XCTestCase {
         let old = encoder.state
         XCTAssertThrowsError(try encoder.encode([frame(1, nodes: [a, a])])) { XCTAssertEqual($0 as? EluNativeEncodingError, .duplicateIdentity) }
         XCTAssertEqual(encoder.state, old)
-        let valid = try encoder.encode([frame(1, nodes: [a, node(second, .text)])])
+        let valid = try encoder.encode([frame(1, nodes: [a, node(second, masked)])])
         let operations = try XCTUnwrap(decode(valid)[0]["data"] as? [String: Any])
         XCTAssertEqual((operations["adds"] as? [Any])?.count, 1)
         XCTAssertEqual((operations["updates"] as? [Any])?.count, 0)
@@ -130,7 +142,7 @@ final class EluNativeWireframeEncoderTests: XCTestCase {
 
     func testRemoveAndSuffixAddPreserveSurvivorPaintOrder() throws {
         var encoder = try EluNativeWireframeEncoder()
-        let a = try node(first, .text), b = try node(second, .rectangle), c = try node(third, .placeholder)
+        let a = try node(first, masked), b = try node(second, .rectangle), c = try node(third, .placeholder)
         _ = try encoder.encode([frame(0, nodes: [a, b])])
         let chunk = try encoder.encode([frame(1, nodes: [b, c])])
         let event = try decode(chunk)[0], data = try XCTUnwrap(event["data"] as? [String: Any])
@@ -142,8 +154,8 @@ final class EluNativeWireframeEncoderTests: XCTestCase {
     }
 
     func testExistingChangeReorderAndMiddleInsertionUseFullSnapshot() throws {
-        let a = try node(first, .text), b = try node(second, .rectangle), c = try node(third, .placeholder)
-        for nodes in [[try node(first, .text, x: 15), b], [b, a], [a, c, b]] {
+        let a = try node(first, masked), b = try node(second, .rectangle), c = try node(third, .placeholder)
+        for nodes in [[try node(first, masked, x: 15), b], [b, a], [a, c, b]] {
             var encoder = try EluNativeWireframeEncoder()
             _ = try encoder.encode([frame(0, nodes: [a, b])])
             let result = try encoder.encode([frame(1, nodes: nodes)])
@@ -156,37 +168,37 @@ final class EluNativeWireframeEncoderTests: XCTestCase {
     func testRetiredIdentityCannotReturnAfterMutationOrFullSnapshot() throws {
         for changed in [false, true] {
             var encoder = try EluNativeWireframeEncoder()
-            let a = try node(first, .text), b = try node(second, .rectangle)
+            let a = try node(first, masked), b = try node(second, .rectangle)
             _ = try encoder.encode([frame(0, nodes: [a, b])])
             _ = try encoder.encode([frame(1, nodes: [changed ? node(second, .rectangle, x: 15) : b])])
             let old = encoder.state
             XCTAssertThrowsError(try encoder.encode([frame(2, nodes: [a, b])])) { XCTAssertEqual($0 as? EluNativeEncodingError, .retiredIdentity) }
             XCTAssertEqual(encoder.state, old)
-            _ = try encoder.encode([frame(2, nodes: [b, node(third, .text)])])
+            _ = try encoder.encode([frame(2, nodes: [b, node(third, masked)])])
             XCTAssertEqual(encoder.state.live.last?.id, 10_000_003)
         }
     }
 
     func testFullSnapshotDoesNotRenewLifetimeIDBudget() throws {
         var encoder = try EluNativeWireframeEncoder(limits: .init(liveNodes: 3, lifetimeIDs: 3))
-        _ = try encoder.encode([frame(0, nodes: [node(first, .text), node(second, .rectangle)])])
-        _ = try encoder.encode([frame(1, nodes: [node(first, .text, x: 15)])])
+        _ = try encoder.encode([frame(0, nodes: [node(first, masked), node(second, .rectangle)])])
+        _ = try encoder.encode([frame(1, nodes: [node(first, masked, x: 15)])])
         let old = encoder.state
-        XCTAssertThrowsError(try encoder.encode([frame(2, nodes: [node(first, .text), node(third, .placeholder)])])) { XCTAssertEqual($0 as? EluNativeEncodingError, .nodeLimit) }
+        XCTAssertThrowsError(try encoder.encode([frame(2, nodes: [node(first, masked), node(third, .placeholder)])])) { XCTAssertEqual($0 as? EluNativeEncodingError, .nodeLimit) }
         XCTAssertEqual(encoder.state, old)
     }
 
     func testSafeIntegerIDBoundaryAllowsLastIDThenFailsWithoutReusingIt() throws {
         var encoder = try EluNativeWireframeEncoder(firstNodeID: EluNativeWireframeEncoder.maximumSafeInteger - 1)
-        _ = try encoder.encode([frame(0, nodes: [node(first, .text)])])
+        _ = try encoder.encode([frame(0, nodes: [node(first, masked)])])
         XCTAssertEqual(encoder.state.live[0].id, EluNativeWireframeEncoder.maximumSafeInteger)
         let old = encoder.state
-        XCTAssertThrowsError(try encoder.encode([frame(1, nodes: [node(first, .text), node(second, .text)])])) { XCTAssertEqual($0 as? EluNativeEncodingError, .counterExhausted) }
+        XCTAssertThrowsError(try encoder.encode([frame(1, nodes: [node(first, masked), node(second, masked)])])) { XCTAssertEqual($0 as? EluNativeEncodingError, .counterExhausted) }
         XCTAssertEqual(encoder.state, old)
     }
 
     func testExactByteLimitAndFailedLaterFrameLeaveOriginalStateIntact() throws {
-        let frames = try [frame(0, nodes: [node(first, .text)]), frame(1, nodes: [node(second, .input(secure: false))])]
+        let frames = try [frame(0, nodes: [node(first, masked)]), frame(1, nodes: [node(second, .input(secure: false, maskedValue: "******"))])]
         var baseline = try EluNativeWireframeEncoder(); let expected = try baseline.encode(frames)
         var exact = try EluNativeWireframeEncoder(limits: .init(decodedBytes: expected.data.count))
         XCTAssertEqual(try exact.encode(frames), expected)
@@ -200,9 +212,9 @@ final class EluNativeWireframeEncoderTests: XCTestCase {
     func testEventAndRepresentationCapsAreAtomic() throws {
         for limits in [try EluNativeWireframeEncoder.Limits(events: 2), try .init(representations: 3)] {
             var encoder = try EluNativeWireframeEncoder(limits: limits); let before = encoder.state
-            XCTAssertThrowsError(try encoder.encode([frame(0, nodes: [node(first, .text)]), frame(1, nodes: [node(first, .text)])]))
+            XCTAssertThrowsError(try encoder.encode([frame(0, nodes: [node(first, masked)]), frame(1, nodes: [node(first, masked)])]))
             XCTAssertEqual(encoder.state, before)
-            _ = try encoder.encode([frame(0, nodes: [node(first, .text)])])
+            _ = try encoder.encode([frame(0, nodes: [node(first, masked)])])
         }
     }
 
@@ -213,7 +225,7 @@ final class EluNativeWireframeEncoderTests: XCTestCase {
         XCTAssertEqual(encoded.nodeRepresentations, 10_000)
         XCTAssertEqual(try fullLeaves(decode(encoded)[1]).count, 9_999)
         let old = encoder.state
-        XCTAssertThrowsError(try encoder.encode([frame(1, nodes: nodes + [node(UUID(), .text)])])) { XCTAssertEqual($0 as? EluNativeEncodingError, .nodeLimit) }
+        XCTAssertThrowsError(try encoder.encode([frame(1, nodes: nodes + [node(UUID(), masked)])])) { XCTAssertEqual($0 as? EluNativeEncodingError, .nodeLimit) }
         XCTAssertEqual(encoder.state, old)
     }
 
@@ -234,7 +246,7 @@ final class EluNativeWireframeEncoderTests: XCTestCase {
         let style = try EluNativeStyle(color: .init(red: 255, green: 0, blue: 16),
             backgroundColor: .init(red: 0, green: 20, blue: 30, alpha: 128), fontSize: 12.5, fontFamily: .system)
         let bounds = try EluNativeRect(x: 0, y: 0, width: 20, height: 20)
-        let value = EluNativeMaskedNode(identity: first, kind: .input(secure: false), bounds: bounds, clip: bounds, style: style)
+        let value = EluNativeMaskedNode(identity: first, kind: .input(secure: false, maskedValue: "******"), bounds: bounds, clip: bounds, style: style)
         var encoder = try EluNativeWireframeEncoder()
         let leaves = try fullLeaves(decode(encoder.encode([frame(0, nodes: [value])]))[1])
         let actual = try XCTUnwrap(leaves[0]["style"] as? [String: Any])
@@ -246,7 +258,7 @@ final class EluNativeWireframeEncoderTests: XCTestCase {
 
     func testExactRendererIDBudgetDoesNotReclaimRemovedNodesAndFullResetsIt() throws {
         var encoder = try EluNativeWireframeEncoder()
-        let a = try node(first, .text), b = try node(second, .input(secure: true)), c = try node(third, .placeholder)
+        let a = try node(first, masked), b = try node(second, .input(secure: true, maskedValue: "******")), c = try node(third, .placeholder)
         _ = try encoder.encode([frame(0, nodes: [a, b])])
         XCTAssertEqual(encoder.state.rendererBudget, 3)
         _ = try encoder.encode([frame(1, nodes: [a, b, c])])
@@ -259,10 +271,10 @@ final class EluNativeWireframeEncoderTests: XCTestCase {
 
     func testSyntheticFixtureExportUsesActualEncoder() throws {
         var encoder = try EluNativeWireframeEncoder()
-        let a = try node(first, .text), b = try node(second, .input(secure: true)), c = try node(third, .placeholder)
+        let a = try node(first, masked), b = try node(second, .input(secure: true, maskedValue: "******")), c = try node(third, .placeholder)
         let chunks = try [encoder.encode([frame(0, nodes: [a, b])]),
                           encoder.encode([frame(1, nodes: [a, b, c])]),
-                          encoder.encode([frame(2, nodes: [node(first, .text, x: 15), b, c])]),
+                          encoder.encode([frame(2, nodes: [node(first, masked, x: 15), b, c])]),
                           encoder.encode([frame(3, nodes: [b, c])])]
         for chunk in chunks { XCTAssertEqual(try EluV1StrictCanonicalJSON.parse(chunk.data).canonicalData, chunk.data) }
         if let directory = ProcessInfo.processInfo.environment["ELU_NATIVE_FIXTURE_DIRECTORY"] {

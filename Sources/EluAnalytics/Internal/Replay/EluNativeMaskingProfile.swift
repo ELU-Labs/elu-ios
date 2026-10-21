@@ -26,32 +26,51 @@ enum EluNativeMaskingRetention: Equatable, Sendable {
 /// Closed, immutable native masking metadata. It contains no remote target
 /// dialect, source token, clock, session, budget or advertised transport claim.
 struct EluNativeMaskingProfile: Equatable, Sendable {
+    /// Exact class equality is the only substitution the service accepts.
+    enum MaskingClass: Equatable, Sendable { case blanket, sensitive }
+    /// `star` describes current capture: length-preserving `*` masks.
+    /// `token` describes chunks sealed by earlier versions; nothing new uses it.
+    enum MaskRule: Equatable, Sendable { case token, star }
+
     static let maximumBytes = 1_024
-    private static let frozenBytes = Data(#"{"blockTraversal":"stop","configuredBlockRuleHandling":"deny-unresolved","contentAccess":"none","imageRule":"block","inputRule":"all","maskInheritance":"subtree","maskToken":"[masked]","opaqueViewRule":"block","placeholderToken":"Content hidden","profileKind":"elu-native-blanket-mask-v1","schemaVersion":1,"secureInputsMasked":true,"textRule":"all","webViewRule":"block"}"#.utf8)
-    private static let sensitiveBytes = Data(#"{"blockTraversal":"stop","configuredBlockRuleHandling":"deny-unresolved","contentAccess":"native-text","imageRule":"block","inputRule":"all","maskInheritance":"subtree","maskToken":"[masked]","opaqueViewRule":"block","placeholderToken":"Content hidden","profileKind":"elu-native-sensitive-mask-v1","schemaVersion":1,"secureInputsMasked":true,"textRule":"sensitive","webViewRule":"block"}"#.utf8)
+    private static let blanketTokenBytes = Data(#"{"blockTraversal":"stop","configuredBlockRuleHandling":"deny-unresolved","contentAccess":"none","imageRule":"block","inputRule":"all","maskInheritance":"subtree","maskToken":"[masked]","opaqueViewRule":"block","placeholderToken":"Content hidden","profileKind":"elu-native-blanket-mask-v1","schemaVersion":1,"secureInputsMasked":true,"textRule":"all","webViewRule":"block"}"#.utf8)
+    private static let sensitiveTokenBytes = Data(#"{"blockTraversal":"stop","configuredBlockRuleHandling":"deny-unresolved","contentAccess":"native-text","imageRule":"block","inputRule":"all","maskInheritance":"subtree","maskToken":"[masked]","opaqueViewRule":"block","placeholderToken":"Content hidden","profileKind":"elu-native-sensitive-mask-v1","schemaVersion":1,"secureInputsMasked":true,"textRule":"sensitive","webViewRule":"block"}"#.utf8)
+    private static let blanketStarBytes = Data(#"{"blockTraversal":"stop","configuredBlockRuleHandling":"deny-unresolved","contentAccess":"masked-shape","imageRule":"block","inputMask":"star-per-utf16-unit","inputRule":"all","maskInheritance":"subtree","maskedTextMaxBytes":4096,"opaqueViewRule":"block","placeholderToken":"Content hidden","profileKind":"elu-native-blanket-star-mask-v1","schemaVersion":2,"secureInputsMasked":true,"textMask":"star-non-whitespace-utf16","textRule":"all","webViewRule":"block"}"#.utf8)
+    private static let sensitiveStarBytes = Data(#"{"blockTraversal":"stop","configuredBlockRuleHandling":"deny-unresolved","contentAccess":"native-text","imageRule":"block","inputMask":"star-per-utf16-unit","inputRule":"all","maskInheritance":"subtree","maskedTextMaxBytes":4096,"opaqueViewRule":"block","placeholderToken":"Content hidden","profileKind":"elu-native-sensitive-star-mask-v1","schemaVersion":2,"secureInputsMasked":true,"textMask":"star-non-whitespace-utf16","textRule":"sensitive","webViewRule":"block"}"#.utf8)
+    private static let known: [(bytes: Data, maskingClass: MaskingClass, rule: MaskRule)] = [
+        (blanketStarBytes, .blanket, .star), (sensitiveStarBytes, .sensitive, .star),
+        (blanketTokenBytes, .blanket, .token), (sensitiveTokenBytes, .sensitive, .token),
+    ]
     let canonicalBytes: Data
-    var allowsOrdinaryText: Bool { canonicalBytes == Self.sensitiveBytes }
+    let maskingClass: MaskingClass
+    let rule: MaskRule
+    var allowsOrdinaryText: Bool { maskingClass == .sensitive }
     var textMasking: EluV1MaskingLevel { allowsOrdinaryText ? .sensitive : .all }
     var hash: String { EluV1StrictCanonicalJSON.hash(canonicalBytes) }
 
-    private init(canonicalBytes: Data) { self.canonicalBytes = canonicalBytes }
+    private init(_ entry: (bytes: Data, maskingClass: MaskingClass, rule: MaskRule)) {
+        canonicalBytes = entry.bytes; maskingClass = entry.maskingClass; rule = entry.rule
+    }
 
     /// A description of the implemented fixed behavior, never permission to run it.
-    static func blanketMask() -> Self { Self(canonicalBytes: frozenBytes) }
-    static func sensitiveMask() -> Self { Self(canonicalBytes: sensitiveBytes) }
+    /// Both describe current capture, which always masks with `*`.
+    static func blanketMask() -> Self { Self(known[0]) }
+    static func sensitiveMask() -> Self { Self(known[1]) }
 
     static func select(for policy: EluV1MaskingPolicy, platform: EluV1Platform) -> Self {
         let hasApplicableRules = policy.platformRules?.contains { $0.platform == platform } ?? false
         return policy.text == .sensitive && !hasApplicableRules ? .sensitiveMask() : .blanketMask()
     }
 
+    /// Accepts all four closed documents, so chunks sealed before an upgrade
+    /// keep their original description and remain deliverable.
     static func parse(_ bytes: Data) throws -> Self {
         guard (1 ... maximumBytes).contains(bytes.count) else { throw EluNativeMaskingProfileError.invalidSize }
         let document = try EluV1StrictCanonicalJSON.parse(bytes)
         guard case .object = document.value, document.canonicalData == bytes,
-              bytes == frozenBytes || bytes == sensitiveBytes else { throw EluNativeMaskingProfileError.unrecognizedProfile }
+              let entry = known.first(where: { $0.bytes == bytes }) else { throw EluNativeMaskingProfileError.unrecognizedProfile }
         // Return private immutable storage, not a potentially externally aliased Data buffer.
-        return Self(canonicalBytes: bytes == frozenBytes ? frozenBytes : sensitiveBytes)
+        return Self(entry)
     }
 
     /// The supplied policy must come from the validated original configuration.

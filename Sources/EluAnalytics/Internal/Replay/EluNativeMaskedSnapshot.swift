@@ -1,7 +1,8 @@
 import Foundation
 
 /// Internal masked values only. This is neither a UIKit collector nor proof of
-/// source/privacy permission. There is deliberately no text, URL or image input.
+/// source/privacy permission. Masked kinds carry only their `*` shape; there is
+/// deliberately no original masked text, input value, URL or image input.
 enum EluNativeEncodingError: Error, Equatable, Sendable {
     case invalidGeometry
     case invalidViewport
@@ -88,10 +89,21 @@ struct EluNativeStyle: Equatable, Sendable {
 
 enum EluNativeMaskedKind: Equatable, Sendable {
     case rectangle
-    case text
+    /// Already masked by `EluNativeMaskText.maskText`; never original text.
+    case maskedText(String)
     case ordinaryText(String)
-    case input(secure: Bool)
+    /// Already masked by `EluNativeMaskText.maskInput`; never the value.
+    case input(secure: Bool, maskedValue: String)
     case placeholder
+
+    /// The exact string this kind puts on the wire, for size accounting.
+    var carriedText: String? {
+        switch self {
+        case let .maskedText(text), let .ordinaryText(text): return text
+        case let .input(_, value): return value
+        case .rectangle, .placeholder: return nil
+        }
+    }
 }
 
 struct EluNativeMaskedNode: Equatable, Sendable {

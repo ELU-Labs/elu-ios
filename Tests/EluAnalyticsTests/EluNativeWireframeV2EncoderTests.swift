@@ -53,7 +53,10 @@ final class EluNativeWireframeV2EncoderTests: XCTestCase {
     }
 
     func testBlanketAndStructurallyPrivateTargetsNeverProduceTouchCoordinates() throws {
-        let kinds: [EluNativeMaskedKind] = [.text, .ordinaryText("[masked]"), .input(secure: false), .input(secure: true), .placeholder]
+        // Text that is entirely `*` and whitespace (including empty) is
+        // indistinguishable from a mask on the wire, so it is never a target.
+        let kinds: [EluNativeMaskedKind] = [.maskedText("******"), .maskedText(""), .ordinaryText("***"), .ordinaryText(""),
+            .ordinaryText(" * \u{3000}"), .input(secure: false, maskedValue: "**"), .input(secure: true, maskedValue: "**"), .placeholder]
         for kind in kinds {
             var encoder = try EluNativeWireframeV2Encoder(profile: .sensitiveMask())
             _ = try encoder.encode([geometry(0, nodes: [node(first, kind: kind)])])
@@ -95,7 +98,7 @@ final class EluNativeWireframeV2EncoderTests: XCTestCase {
             XCTAssertEqual($0 as? EluNativeInteractionError, .staleGeometry)
         }
         _ = try encoder.encode([.interaction(.moves([point(1_100, ordinal: 1)]))])
-        for nodes in [[], [try node(first, kind: .text)], [try node(first, clip: .init(x: 0, y: 0, width: 0, height: 0))]] {
+        for nodes in [[], [try node(first, kind: .maskedText("*******"))], [try node(first, clip: .init(x: 0, y: 0, width: 0, height: 0))]] {
             let before = encoder.state
             XCTAssertThrowsError(try encoder.encode([geometry(2, offset: 1_200, nodes: nodes)])) {
                 XCTAssertEqual($0 as? EluNativeInteractionError, .privateTarget)
@@ -232,7 +235,22 @@ final class EluNativeWireframeV2EncoderTests: XCTestCase {
             XCTAssertEqual($0 as? EluNativeInteractionError, .privateTarget)
         }
         XCTAssertEqual(encoder.state, original)
-        XCTAssertNoThrow(try encoder.encode([geometry(0, nodes: [node(first, kind: .text)])]))
+        XCTAssertNoThrow(try encoder.encode([geometry(0, nodes: [node(first, kind: .maskedText("******* ****"))])]))
+        // Mask-shaped ordinary text is wire-identical to a mask; anything else is refused.
+        XCTAssertNoThrow(try encoder.encode([geometry(1, offset: 200, nodes: [node(first, kind: .ordinaryText("** *"))])]))
+        let before = encoder.state
+        XCTAssertThrowsError(try encoder.encode([geometry(2, offset: 400, nodes: [node(first, kind: .ordinaryText("*a*"))])])) {
+            XCTAssertEqual($0 as? EluNativeInteractionError, .privateTarget)
+        }
+        XCTAssertEqual(encoder.state, before)
+    }
+
+    func testOrdinaryTextWithAnyNonMaskCharacterRemainsATarget() throws {
+        for text in ["Visible native label", "*a*", "** \u{0085}", "\u{200B}"] {
+            var encoder = try EluNativeWireframeV2Encoder(profile: .sensitiveMask())
+            _ = try encoder.encode([geometry(0, nodes: [node(first, kind: .ordinaryText(text))])])
+            XCTAssertNoThrow(try encoder.encode([.interaction(.start(point(100)))]), text)
+        }
     }
 
     private func started() throws -> EluNativeWireframeV2Encoder {
