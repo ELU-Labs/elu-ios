@@ -109,6 +109,27 @@ final class EluRuntimeSelectorTests: XCTestCase {
         XCTAssertFalse(core.isOptedOut())
     }
 
+    func testOptOutKeepsHeldResetsAndOptInReleasesThemWithoutOtherHeldCalls() throws {
+        let factory = SelectorSpy(), core = EluCore(backendFactory: factory.factory)
+        core.setup(siteKey: uniqueSiteKey(), options: EluSetupOptions(configHost: inertConfigHost))
+        let backend = try XCTUnwrap(core.backendForTesting() as? SelectorBackend)
+        core.dispatch(.identify(distinctId: "before-opt-out", userProperties: nil))
+        core.reset()
+        core.dispatch(.capture(event: "before-opt-out", properties: nil))
+        core.reset(resetDeviceId: true)
+        core.setConsent(optedOut: true)
+        core.reset()
+        core.dispatch(.capture(event: "during-opt-out", properties: nil))
+        core.setConsent(optedOut: false, event: nil)
+        drain(core)
+        // A superseded opt-out may or may not reach the backend; it still closes its window.
+        let heldCalls = { backend.recordedCalls().filter { $0 != "optOut" && $0 != "optIn" } }
+        XCTAssertEqual(heldCalls(), [])
+        XCTAssertEqual(backend.recordedCalls().last, "optIn")
+        backend.announceConfigurationReady(); drain(core)
+        XCTAssertEqual(heldCalls(), ["reset", "resetDeviceIdentity", "reset", "activate"])
+    }
+
     func testActivityKeepsItsCallTimeDenialWhenBackendConsentChangesBeforeBuffering() throws {
         let factory = SelectorSpy()
         let core = EluCore(backendFactory: factory.factory)

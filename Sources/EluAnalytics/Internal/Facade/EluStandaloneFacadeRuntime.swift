@@ -46,6 +46,14 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
     private var tail: Task<Void, Never>?
     private var tailVersion = UUID()
     private var started: Started?
+    /// Calls accepted while a foreground configuration re-fetch is in flight,
+    /// in call order; nil while nothing is held. They follow the pre-config
+    /// buffer's rules: capped with the oldest dropped, discarded by an opt-out
+    /// except resets, and released once a validated configuration is ready.
+    private var resumeHold: [EluStandaloneHeldCall]?
+    /// Advances with every foreground change, so a readiness check overtaken
+    /// by a later transition cannot release the hold.
+    private var resumeHoldEpoch = UUID()
 
     private var identity: EluIdentityState?
     private var projectedDistinctId: String?
@@ -122,9 +130,13 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
                 return true
             }
             guard accepted, await self.persistStartupConsent(to: stack.runtime) else { stack.close(); return }
+            let initialConfigurationReady = context.initialConfigurationReady
             stack.observe(onIntent: { [weak self] in self?.configurationIntent() },
                 onSettled: { [weak self] in self?.scheduleFlagReload() },
-                onReady: context.initialConfigurationReady)
+                onReady: { [weak self] isCurrent in
+                    self?.configurationReady(isCurrent)
+                    initialConfigurationReady(isCurrent)
+                })
             await stack.runtime.installNativeReplayComposition(lifecycle: self.nativeLifecycle, capabilities: EluStandaloneRuntime.readbackProvenReplayCapabilities, deferredUntilActivation: true)
             self.syncIdentity(await stack.runtime.currentSnapshot.identity)
             stack.start()
@@ -134,13 +146,21 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
     }
 
     func setForeground(_ foreground: Bool) {
-        withLock {
-            guard !isShutDown else { return }
+        let opensHold = withLock { () -> Bool in
+            guard !isShutDown else { return false }
             foregroundIntent = foreground
             started?.runtime.performanceLifecycleIntent(foreground: foreground)
             foregroundGeneration = UUID()
+            resumeHoldEpoch = UUID()
+            // The pre-config buffer covers launch. After activation, a return to
+            // the foreground holds calls until the re-fetched configuration is ready.
+            guard foreground, !flagLoadDeferred, resumeHold == nil else { return false }
+            resumeHold = []
+            return true
         }
-        applyForegroundIntent()
+        let refetching = applyForegroundIntent()
+        // No re-fetch began, so the current source still decides; nothing waits.
+        if opensHold && !refetching { releaseResumeHold() }
     }
 
     func startReplay() { setReplayEnabled(true) }
@@ -178,11 +198,13 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
         }
     }
 
-    private func applyForegroundIntent() {
+    /// Returns true when the stack changed its foreground state.
+    @discardableResult
+    private func applyForegroundIntent() -> Bool {
         let (current, foreground, generation) = withLock { (stack, foregroundIntent, foregroundGeneration) }
-        current?.setForeground(foreground, ifCurrent: { [weak self] in
+        return current?.setForeground(foreground, ifCurrent: { [weak self] in
             self?.withLock { self?.isShutDown == false && self?.foregroundGeneration == generation } ?? false
-        })
+        }) ?? false
     }
 
     /// Opens the site-scoped runtime under the ELU support directory with the
@@ -304,26 +326,35 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
         #endif
     }
 
-    fileprivate func applicationForegrounded(at occurredAt: Date, fromBackground: Bool) {
+    // Lifecycle signals keep their place among held calls. An event signalled
+    // while opted out is never recorded, even if a later opt-in releases it.
+    func applicationForegrounded(at occurredAt: Date, fromBackground: Bool) {
         setForeground(true)
-        enqueue { runtime, _ in
-            _ = await runtime.capture(EluStandaloneRuntime.applicationOpenedEvent,
-                properties: [EluStandaloneRuntime.fromBackgroundProperty: .bool(fromBackground)],
-                occurredAt: occurredAt)
+        let denied = isOptedOut()
+        enqueue(hold: .call(isReset: false)) { runtime, _ in
+            if !denied {
+                _ = await runtime.capture(EluStandaloneRuntime.applicationOpenedEvent,
+                    properties: [EluStandaloneRuntime.fromBackgroundProperty: .bool(fromBackground)],
+                    occurredAt: occurredAt)
+            }
             await runtime.markForegrounded()
         }
     }
 
-    fileprivate func applicationBackgrounded(at occurredAt: Date) {
+    func applicationBackgrounded(at occurredAt: Date) {
         setForeground(false)
-        enqueue { runtime, _ in
-            _ = await runtime.capture(EluStandaloneRuntime.applicationBackgroundedEvent, occurredAt: occurredAt)
+        let denied = isOptedOut()
+        enqueue(hold: .call(isReset: false)) { runtime, _ in
+            if !denied { _ = await runtime.capture(EluStandaloneRuntime.applicationBackgroundedEvent, occurredAt: occurredAt) }
             _ = await runtime.markBackgrounded(at: occurredAt)
         }
     }
 
     fileprivate func lifecycleScreen(_ name: String, at occurredAt: Date) {
-        enqueue { runtime, _ in _ = await runtime.screen(name, occurredAt: occurredAt) }
+        let denied = isOptedOut()
+        enqueue(hold: .call(isReset: false)) { runtime, _ in
+            if !denied { _ = await runtime.screen(name, occurredAt: occurredAt) }
+        }
     }
 
     func beginPendingOperation(_ op: EluBufferedOp) -> (() -> Void)? {
@@ -363,6 +394,9 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
     // MARK: - Facade operations
 
     func execute(_ op: EluBufferedOp) {
+        // Consent is never held, exactly as at launch.
+        let hold: EluStandaloneHoldRule
+        if case .consent = op { hold = .never } else { hold = .call(isReset: op.isReset) }
         switch op {
         case let .capture(event, properties, timestamp, set, setOnce):
             // Detach event and person maps separately before the actor handoff.
@@ -372,7 +406,7 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
             let person = project(set), personOnce = project(setOnce)
             let hasPersonIntent = set != nil || setOnce != nil || captureHookCanChangePerson
             let permitsPerson = personProfiles != .never
-            enqueue(affectsFlags: hasPersonIntent, restrictsCapture: false) { runtime, owner in
+            enqueue(affectsFlags: hasPersonIntent, restrictsCapture: false, hold: hold) { runtime, owner in
                 let current = hasPersonIntent ? owner.capturePersonAdmission() : nil
                 let submitted = await runtime.captureWithPersonChanges(name, properties: projected, occurredAt: timestamp,
                     person: .init(set: set == nil ? nil : person, setOnce: setOnce == nil ? nil : personOnce),
@@ -387,7 +421,7 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
         case let .screen(name, properties):
             let screen = name
             let projected = project(properties)
-            enqueue { runtime, owner in
+            enqueue(hold: hold) { runtime, owner in
                 owner.record(await runtime.screen(screen, properties: projected))
             }
 
@@ -397,7 +431,7 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
             // over the derived ones.
             let exception = EluExceptionSerializer.properties(for: error)
                 .merging(project(properties)) { _, explicit in explicit }
-            enqueue { runtime, owner in
+            enqueue(hold: hold) { runtime, owner in
                 owner.record(await runtime.captureException(properties: exception))
             }
 
@@ -412,7 +446,7 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
             // reported from the moment `identify` is accepted, and the
             // projection is withdrawn once the call settles.
             projectIdentity { $0.projectedDistinctId = userId }
-            enqueue(settlesProjection: true, affectsFlags: true) { runtime, owner in
+            enqueue(settlesProjection: true, affectsFlags: true, hold: hold) { runtime, owner in
                 owner.apply(await runtime.identify(userId, properties: projected, propertiesOnce: projectedOnce))
                 owner.scheduleFlagReload()
             }
@@ -423,14 +457,14 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
                 count(.invalidInput)
                 return
             }
-            enqueue(affectsFlags: true) { runtime, owner in
+            enqueue(affectsFlags: true, hold: hold) { runtime, owner in
                 owner.apply(await runtime.alias(aliasId))
             }
 
         case let .register(properties):
             let projected = project(properties)
             guard !projected.isEmpty else { return }
-            enqueue(affectsFlags: true) { runtime, owner in
+            enqueue(affectsFlags: true, hold: hold) { runtime, owner in
                 owner.apply(await runtime.registerSuperProperties(projected))
             }
 
@@ -442,7 +476,7 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
                 count(.invalidInput)
                 return
             }
-            enqueue(affectsFlags: true) { runtime, owner in
+            enqueue(affectsFlags: true, hold: hold) { runtime, owner in
                 owner.apply(await runtime.registerSuperProperties(projected,
                     onlyIfAbsent: true, defaultValue: projectedDefault))
             }
@@ -453,7 +487,7 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
                 return
             }
             guard !EluFacadeJSON.isReservedKey(key) else { return }
-            enqueue(affectsFlags: true) { runtime, owner in
+            enqueue(affectsFlags: true, hold: hold) { runtime, owner in
                 owner.apply(await runtime.unregisterSuperProperty(key))
             }
 
@@ -465,7 +499,7 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
                 return
             }
             let projected = project(properties)
-            enqueue(affectsFlags: true) { runtime, owner in
+            enqueue(affectsFlags: true, hold: hold) { runtime, owner in
                 owner.apply(
                     await runtime.group(type: groupType, key: groupKey, properties: projected)
                 )
@@ -479,7 +513,7 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
             guard personProfiles != .never else { return }
             let projected = project(properties), projectedOnce = project(propertiesOnce)
             guard !projected.isEmpty || !projectedOnce.isEmpty else { return }
-            enqueue(affectsFlags: true) { runtime, owner in
+            enqueue(affectsFlags: true, hold: hold) { runtime, owner in
                 owner.apply(await runtime.setPersonProperties(projected, propertiesOnce: projectedOnce))
                 owner.scheduleFlagReload()
             }
@@ -487,7 +521,7 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
         case let .setPersonPropertiesForFlags(properties):
             let projected = project(properties)
             guard !projected.isEmpty else { return }
-            enqueue(affectsFlags: true) { runtime, owner in
+            enqueue(affectsFlags: true, hold: hold) { runtime, owner in
                 owner.apply(await runtime.setFlagPersonProperties(projected))
                 owner.scheduleFlagReload()
             }
@@ -499,7 +533,7 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
             }
             let projected = project(properties)
             guard !projected.isEmpty else { return }
-            enqueue(affectsFlags: true) { runtime, owner in
+            enqueue(affectsFlags: true, hold: hold) { runtime, owner in
                 owner.apply(
                     await runtime.setFlagGroupProperties(type: groupType, properties: projected)
                 )
@@ -509,7 +543,7 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
         case let .consent(operation):
             acceptConsent(operation)
             let properties = project(operation.properties)
-            enqueue(affectsFlags: true) { runtime, owner in
+            enqueue(affectsFlags: true, hold: .never) { runtime, owner in
                 let snapshot = await runtime.setOptedOut(operation.optedOut, intent: operation.id)
                 owner.apply(snapshot)
                 guard snapshot != nil, !operation.optedOut else { return }
@@ -520,16 +554,16 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
             }
 
         case .resetGroups:
-            enqueue(affectsFlags: true) { runtime, owner in
+            enqueue(affectsFlags: true, hold: hold) { runtime, owner in
                 owner.apply(await runtime.updateFlagContext(.resetGroups)); owner.scheduleFlagReload()
             }
         case .resetPersonPropertiesForFlags:
-            enqueue(affectsFlags: true) { runtime, owner in
+            enqueue(affectsFlags: true, hold: hold) { runtime, owner in
                 owner.apply(await runtime.updateFlagContext(.resetPerson)); owner.scheduleFlagReload()
             }
         case let .resetGroupPropertiesForFlags(type):
             if let type, EluFacadeJSON.identifier(type, maximumLength: 256) == nil { count(.invalidInput); return }
-            enqueue(affectsFlags: true) { runtime, owner in
+            enqueue(affectsFlags: true, hold: hold) { runtime, owner in
                 owner.apply(await runtime.updateFlagContext(.resetGroup(type))); owner.scheduleFlagReload()
             }
         case .reset, .resetDeviceIdentity:
@@ -539,7 +573,7 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
             // read before the queued call runs must not report them or
             // attribute an exposure to the identity replacing it.
             projectIdentity { $0.clearFlagsLocked() }
-            enqueue(settlesProjection: true, affectsFlags: true) { runtime, owner in
+            enqueue(settlesProjection: true, affectsFlags: true, hold: hold) { runtime, owner in
                 owner.apply(await runtime.resetIdentity(resetDeviceId: resetDeviceId))
                 owner.clearFlags()
                 owner.scheduleFlagReload()
@@ -568,6 +602,9 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
     func shutDown() {
         lock.lock()
         isShutDown = true
+        // Held calls settle on the tail, where a stopped facade discards them.
+        for call in resumeHold ?? [] { appendLocked(call.entry) }
+        resumeHold = nil
         flagGeneration = UUID()
         clearFlagsLocked()
         let currentStack = stack
@@ -1007,6 +1044,7 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
         affectsFlags: Bool = false,
         restrictsCapture: Bool = true,
         whileShutDown: Bool = false,
+        hold: EluStandaloneHoldRule = .never,
         always: (@Sendable () -> Void)? = nil,
         _ operation: @escaping @Sendable (EluStandaloneRuntime, EluStandaloneFacadeRuntime)
             async -> Void
@@ -1020,20 +1058,41 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
             pendingFlagIntents[value.id] = value
             pending = value
         } else { pending = nil }
+        let entry = EluStandaloneTailEntry(settlesProjection: settlesProjection, pending: pending,
+            whileShutDown: whileShutDown, always: always, operation: operation)
+        if case let .call(isReset) = hold, resumeHold != nil, !isShutDown {
+            // The same cap as the pre-config buffer: the oldest held call goes.
+            if let held = resumeHold?.count, held >= EluEventBuffer.capacity, let oldest = resumeHold?.removeFirst() {
+                appendLocked(oldest.entry, discardedAs: .bufferFull)
+            }
+            resumeHold?.append(EluStandaloneHeldCall(entry: entry, isReset: isReset))
+        } else {
+            appendLocked(entry)
+        }
+        lock.unlock()
+    }
+
+    /// Called only while the facade lock is held. A discarded entry still
+    /// settles its projection and pending intent in call order.
+    private func appendLocked(_ entry: EluStandaloneTailEntry, discardedAs reason: EluFacadeDropReason? = nil) {
         let previous = tail
         tailVersion = UUID()
         tail = Task { [weak self] in
             await previous?.value
             guard let self else {
-                always?()
+                entry.always?()
                 return
             }
             defer {
-                if settlesProjection { self.settleIdentityProjection() }
-                if let pending { self.finishPendingIntent(pending) }
-                always?()
+                if entry.settlesProjection { self.settleIdentityProjection() }
+                if let pending = entry.pending { self.finishPendingIntent(pending) }
+                entry.always?()
             }
-            guard whileShutDown || !self.isStopped else {
+            if let reason {
+                self.count(reason)
+                return
+            }
+            guard entry.whileShutDown || !self.isStopped else {
                 self.count(.unauthorized)
                 return
             }
@@ -1041,10 +1100,34 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
                 self.count(.storage)
                 return
             }
-            await operation(runtime, self)
+            await entry.operation(runtime, self)
             runtime.reevaluateNativeReplay()
         }
-        lock.unlock()
+    }
+
+    /// The stack reports every validated configuration it installs. Only one
+    /// that is still current after the latest foreground change releases the hold.
+    private func configurationReady(_ isCurrent: @escaping @Sendable () -> Bool) {
+        let held = withLock { () -> UUID? in resumeHold == nil ? nil : resumeHoldEpoch }
+        guard let epoch = held, isCurrent() else { return }
+        releaseResumeHold(ifEpoch: epoch)
+    }
+
+    /// Hands every held call to the tail in call order.
+    private func releaseResumeHold(ifEpoch epoch: UUID? = nil) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let held = resumeHold, epoch.map({ $0 == resumeHoldEpoch }) ?? true else { return }
+        resumeHold = nil
+        for call in held { appendLocked(call.entry) }
+    }
+
+    func withdrawHeldCalls() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let held = resumeHold else { return }
+        resumeHold = held.filter(\.isReset)
+        for call in held where !call.isReset { appendLocked(call.entry, discardedAs: .unauthorized) }
     }
 
     /// Called only while the facade lock is held; no database work occurs.
@@ -1145,6 +1228,27 @@ private extension EluV1FlagJSONValue {
             return .object(object)
         }
     }
+}
+
+/// Which calls a foreground configuration re-fetch holds.
+private enum EluStandaloneHoldRule {
+    /// Consent, flush, flag reloads and shutdown run in place.
+    case never
+    case call(isReset: Bool)
+}
+
+/// One ordered runtime call with the settlement it owes even when discarded.
+private struct EluStandaloneTailEntry: Sendable {
+    let settlesProjection: Bool
+    let pending: EluStandaloneFacadePendingIntent?
+    let whileShutDown: Bool
+    let always: (@Sendable () -> Void)?
+    let operation: @Sendable (EluStandaloneRuntime, EluStandaloneFacadeRuntime) async -> Void
+}
+
+private struct EluStandaloneHeldCall: Sendable {
+    let entry: EluStandaloneTailEntry
+    let isReset: Bool
 }
 
 /// Carries a customer callback across the ordered chain. The facade owns when

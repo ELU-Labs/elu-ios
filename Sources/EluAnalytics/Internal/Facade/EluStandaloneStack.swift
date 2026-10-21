@@ -93,9 +93,12 @@ final class EluStandaloneStack: @unchecked Sendable {
         lock.unlock()
     }
 
-    func setForeground(_ foreground: Bool, ifCurrent: () -> Bool = { true }) {
+    /// Returns true when this call changed the source's foreground state. A
+    /// change to foreground withdraws source authority until a new fetch settles.
+    @discardableResult
+    func setForeground(_ foreground: Bool, ifCurrent: () -> Bool = { true }) -> Bool {
         lock.lock()
-        guard started, !closed, ifCurrent(), self.foreground != foreground else { lock.unlock(); return }
+        guard started, !closed, ifCurrent(), self.foreground != foreground else { lock.unlock(); return false }
         self.foreground = foreground
         latestDecision = UUID()
         let transition = lifecycle.authorityGate.suspend()
@@ -111,6 +114,7 @@ final class EluStandaloneStack: @unchecked Sendable {
         }
         lock.unlock()
         notify?()
+        return true
     }
 
     fileprivate func accept(_ token: EluV2ConfigLifecycleToken) {
