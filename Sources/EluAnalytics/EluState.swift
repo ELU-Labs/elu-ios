@@ -137,7 +137,8 @@ final class EluCore {
                           let backend = self.backend, predicate() else { return }
                     self.state = .running
                     self.disabledReason = nil
-                    for op in self.buffer.drain() { backend.execute(op) }
+                    // Only calls made while the visitor was not opted out were held.
+                    for op in self.buffer.drain() { backend.execute(op, origin: EluCallOrigin(optedOut: false)) }
                     backend.activate()
                 }
             })
@@ -165,7 +166,8 @@ final class EluCore {
         let intent = beginPendingOperation(op)
         queue.async { [self] in
             defer { intent.finish?() }
-            if intent.deniedAtCall || pendingConsent?.optedOut == true {
+            let optedOut = intent.deniedAtCall || pendingConsent?.optedOut == true
+            if optedOut {
                 switch op {
                 case .capture, .screen, .captureException: return
                 default: break
@@ -173,17 +175,16 @@ final class EluCore {
             }
             switch state {
             case .running:
-                execute(op)
+                backend?.execute(op, origin: EluCallOrigin(optedOut: optedOut))
             case .pending:
+                // A call made while opted out never waits for configuration,
+                // so a later opt-in cannot release it. Only a reset is held.
+                guard !optedOut || op.isReset else { return }
                 buffer.push(op)
             case .idle, .disabled:
                 break
             }
         }
-    }
-
-    private func execute(_ op: EluBufferedOp) {
-        backend?.execute(op)
     }
 
     // MARK: - Non-buffered facade paths

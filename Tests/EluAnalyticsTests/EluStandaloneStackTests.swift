@@ -545,6 +545,38 @@ final class EluStandaloneStackTests: XCTestCase {
         }
     }
 
+    func testCallsMadeWhileOptedOutDuringResumeHoldAreNeverReleased() async throws {
+        try await withHarness { h in
+            let (core, facade) = try await runningCore(h)
+            await MainActor.run {}
+            core.dispatch(.identify(distinctId: "before-resume", userProperties: nil))
+            _ = core.bufferDropCountForTesting(); await facade.settled()
+            facade.applicationBackgrounded(at: h.clock.now)
+            await facade.settled(); await h.stack.settled()
+            facade.applicationForegrounded(at: h.clock.now, fromBackground: true)
+            core.setConsent(optedOut: true)
+            core.dispatch(.identify(distinctId: "while-opted-out", userProperties: nil))
+            core.dispatch(.register(["while-opted-out": true]))
+            core.dispatch(.group(type: "company", key: "while-opted-out", properties: nil))
+            core.setConsent(optedOut: false, event: nil)
+            core.dispatch(.register(["after-opt-in": true]))
+            _ = core.bufferDropCountForTesting()
+            try await eventually { await h.config.count == 2 }
+            await h.config.resolve(try fixture())
+            try await eventually { await h.stack.runtime.currentPhase == .capturing }
+            await h.stack.settled(); await facade.settled()
+            try await eventually {
+                try await h.stack.runtime.queueSnapshot().identity.superProperties["after-opt-in"] != nil
+            }
+            let released = try await h.stack.runtime.queueSnapshot()
+            XCTAssertEqual(released.identity.userId, "before-resume")
+            XCTAssertNil(released.identity.superProperties["while-opted-out"])
+            XCTAssertNil(released.identity.groups["company"])
+            XCTAssertFalse(released.identity.optedOut)
+            facade.shutDown(); await facade.settled()
+        }
+    }
+
     func testResumeHoldDropsItsOldestCallAtTheBufferCap() async throws {
         try await withHarness { h in
             let (core, facade) = try await runningCore(h)
