@@ -41,6 +41,8 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
     private var capturePersonGeneration = UUID()
     private var pendingFlagIntents: [UUID: EluStandaloneFacadePendingIntent] = [:]
     private let flagTransport: (any EluV1FlagTransport)?
+    /// The wall clock that stamps the time of each call the app makes.
+    private let clock: @Sendable () -> Date
     private let lock = NSLock()
 
     private var tail: Task<Void, Never>?
@@ -91,8 +93,10 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
         context: EluRuntimeBackendContext,
         open: @escaping @Sendable () async throws -> EluStandaloneRuntime,
         flagTransport: (any EluV1FlagTransport)? = nil,
-        observeApplicationLifecycle: Bool = false
+        observeApplicationLifecycle: Bool = false,
+        clock: @escaping @Sendable () -> Date = { Date() }
     ) {
+        self.clock = clock
         flagsDidLoad = context.flagsDidLoad
         flagSnapshotDidLoad = context.flagSnapshotDidLoad
         personProfiles = context.personProfiles
@@ -111,8 +115,10 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
     init(
         context: EluRuntimeBackendContext,
         openStack: @escaping @Sendable () async throws -> EluStandaloneStack,
-        guardedFlagsDidLoad: @escaping @Sendable (@escaping @Sendable () -> Bool) -> Void
+        guardedFlagsDidLoad: @escaping @Sendable (@escaping @Sendable () -> Bool) -> Void,
+        clock: @escaping @Sendable () -> Date = { Date() }
     ) {
+        self.clock = clock
         flagsDidLoad = context.flagsDidLoad
         flagSnapshotDidLoad = context.flagSnapshotDidLoad
         personProfiles = context.personProfiles
@@ -394,11 +400,16 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
 
     // MARK: - Facade operations
 
+    func callTime() -> Date { clock() }
+
     func execute(_ op: EluBufferedOp) {
-        execute(op, origin: EluCallOrigin(optedOut: isOptedOut()))
+        execute(op, origin: EluCallOrigin(calledAt: callTime(), optedOut: isOptedOut()))
     }
 
     func execute(_ op: EluBufferedOp, origin: EluCallOrigin) {
+        // Every call keeps the time the app made it, including one held for
+        // configuration; an explicit event timestamp still wins.
+        let calledAt = origin.calledAt
         // Consent is never held, exactly as at launch.
         let hold: EluStandaloneHoldRule
         if case .consent = op { hold = .never } else { hold = .call(isReset: op.isReset, optedOutAtCall: origin.optedOut) }
@@ -414,12 +425,13 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
             enqueue(affectsFlags: hasPersonIntent, restrictsCapture: false, hold: hold) { runtime, owner in
                 let current = hasPersonIntent ? owner.capturePersonAdmission() : nil
                 let submitted = await runtime.captureWithPersonChanges(name, properties: projected, occurredAt: timestamp,
+                    calledAt: calledAt,
                     person: .init(set: set == nil ? nil : person, setOnce: setOnce == nil ? nil : personOnce),
                     admissionGuard: current)
                 owner.record(submitted.result)
                 guard permitsPerson, submitted.person.hasIntent, let current, current(), case let .accepted(_, accepted) = submitted.result else { return }
                 owner.apply(await runtime.setPersonProperties(submitted.person.set ?? [:], propertiesOnce: submitted.person.setOnce ?? [:],
-                    afterAcceptedCapture: accepted, admissionGuard: current))
+                    afterAcceptedCapture: accepted, admissionGuard: current, calledAt: calledAt))
                 // Match capture-associated mutation semantics: no extra flag reload.
             }
 
@@ -427,7 +439,7 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
             let screen = name
             let projected = project(properties)
             enqueue(hold: hold) { runtime, owner in
-                owner.record(await runtime.screen(screen, properties: projected))
+                owner.record(await runtime.screen(screen, properties: projected, calledAt: calledAt))
             }
 
         case let .captureException(error, properties):
@@ -437,7 +449,7 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
             let exception = EluExceptionSerializer.properties(for: error)
                 .merging(project(properties)) { _, explicit in explicit }
             enqueue(hold: hold) { runtime, owner in
-                owner.record(await runtime.captureException(properties: exception))
+                owner.record(await runtime.captureException(properties: exception, calledAt: calledAt))
             }
 
         case let .identify(distinctId, userProperties, userPropertiesOnce):
@@ -452,7 +464,8 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
             // projection is withdrawn once the call settles.
             projectIdentity { $0.projectedDistinctId = userId }
             enqueue(settlesProjection: true, affectsFlags: true, hold: hold) { runtime, owner in
-                owner.apply(await runtime.identify(userId, properties: projected, propertiesOnce: projectedOnce))
+                owner.apply(await runtime.identify(userId, properties: projected, propertiesOnce: projectedOnce,
+                    calledAt: calledAt))
                 owner.scheduleFlagReload()
             }
 
@@ -463,14 +476,14 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
                 return
             }
             enqueue(affectsFlags: true, hold: hold) { runtime, owner in
-                owner.apply(await runtime.alias(aliasId))
+                owner.apply(await runtime.alias(aliasId, calledAt: calledAt))
             }
 
         case let .register(properties):
             let projected = project(properties)
             guard !projected.isEmpty else { return }
             enqueue(affectsFlags: true, hold: hold) { runtime, owner in
-                owner.apply(await runtime.registerSuperProperties(projected))
+                owner.apply(await runtime.registerSuperProperties(projected, calledAt: calledAt))
             }
 
         case let .registerOnce(properties, defaultValue):
@@ -483,7 +496,7 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
             }
             enqueue(affectsFlags: true, hold: hold) { runtime, owner in
                 owner.apply(await runtime.registerSuperProperties(projected,
-                    onlyIfAbsent: true, defaultValue: projectedDefault))
+                    onlyIfAbsent: true, defaultValue: projectedDefault, calledAt: calledAt))
             }
 
         case let .unregister(key):
@@ -493,7 +506,7 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
             }
             guard !EluFacadeJSON.isReservedKey(key) else { return }
             enqueue(affectsFlags: true, hold: hold) { runtime, owner in
-                owner.apply(await runtime.unregisterSuperProperty(key))
+                owner.apply(await runtime.unregisterSuperProperty(key, calledAt: calledAt))
             }
 
         case let .group(type, key, properties):
@@ -506,7 +519,7 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
             let projected = project(properties)
             enqueue(affectsFlags: true, hold: hold) { runtime, owner in
                 owner.apply(
-                    await runtime.group(type: groupType, key: groupKey, properties: projected)
+                    await runtime.group(type: groupType, key: groupKey, properties: projected, calledAt: calledAt)
                 )
                 // The association and its properties are part of the flag
                 // evaluation context, so the next evaluation sees the group
@@ -519,7 +532,7 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
             let projected = project(properties), projectedOnce = project(propertiesOnce)
             guard !projected.isEmpty || !projectedOnce.isEmpty else { return }
             enqueue(affectsFlags: true, hold: hold) { runtime, owner in
-                owner.apply(await runtime.setPersonProperties(projected, propertiesOnce: projectedOnce))
+                owner.apply(await runtime.setPersonProperties(projected, propertiesOnce: projectedOnce, calledAt: calledAt))
                 owner.scheduleFlagReload()
             }
 
@@ -527,7 +540,7 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
             let projected = project(properties)
             guard !projected.isEmpty else { return }
             enqueue(affectsFlags: true, hold: hold) { runtime, owner in
-                owner.apply(await runtime.setFlagPersonProperties(projected))
+                owner.apply(await runtime.setFlagPersonProperties(projected, calledAt: calledAt))
                 owner.scheduleFlagReload()
             }
 
@@ -540,7 +553,7 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
             guard !projected.isEmpty else { return }
             enqueue(affectsFlags: true, hold: hold) { runtime, owner in
                 owner.apply(
-                    await runtime.setFlagGroupProperties(type: groupType, properties: projected)
+                    await runtime.setFlagGroupProperties(type: groupType, properties: projected, calledAt: calledAt)
                 )
                 owner.scheduleFlagReload()
             }
@@ -560,16 +573,16 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
 
         case .resetGroups:
             enqueue(affectsFlags: true, hold: hold) { runtime, owner in
-                owner.apply(await runtime.updateFlagContext(.resetGroups)); owner.scheduleFlagReload()
+                owner.apply(await runtime.updateFlagContext(.resetGroups, calledAt: calledAt)); owner.scheduleFlagReload()
             }
         case .resetPersonPropertiesForFlags:
             enqueue(affectsFlags: true, hold: hold) { runtime, owner in
-                owner.apply(await runtime.updateFlagContext(.resetPerson)); owner.scheduleFlagReload()
+                owner.apply(await runtime.updateFlagContext(.resetPerson, calledAt: calledAt)); owner.scheduleFlagReload()
             }
         case let .resetGroupPropertiesForFlags(type):
             if let type, EluFacadeJSON.identifier(type, maximumLength: 256) == nil { count(.invalidInput); return }
             enqueue(affectsFlags: true, hold: hold) { runtime, owner in
-                owner.apply(await runtime.updateFlagContext(.resetGroup(type))); owner.scheduleFlagReload()
+                owner.apply(await runtime.updateFlagContext(.resetGroup(type), calledAt: calledAt)); owner.scheduleFlagReload()
             }
         case .reset, .resetDeviceIdentity:
             let resetDeviceId: Bool
@@ -579,7 +592,7 @@ final class EluStandaloneFacadeRuntime: EluRuntimeBackend, EluReplayControl, @un
             // attribute an exposure to the identity replacing it.
             projectIdentity { $0.clearFlagsLocked() }
             enqueue(settlesProjection: true, affectsFlags: true, hold: hold) { runtime, owner in
-                owner.apply(await runtime.resetIdentity(resetDeviceId: resetDeviceId))
+                owner.apply(await runtime.resetIdentity(resetDeviceId: resetDeviceId, calledAt: calledAt))
                 owner.clearFlags()
                 owner.scheduleFlagReload()
             }

@@ -717,13 +717,15 @@ actor EluStandaloneRuntime {
         _ name: String,
         properties: [String: EluJSONValue] = [:],
         occurredAt: Date? = nil,
+        calledAt: Date? = nil,
         admissionGuard: (@Sendable () -> Bool)? = nil
     ) async -> EluV1CaptureResult {
-        await submit(
+        let time = await eventTime(occurredAt, calledAt: calledAt)
+        return await submit(
             EluV1CaptureCommand(
                 kind: .capture,
                 name: name,
-                occurredAt: occurredAt ?? clock(),
+                occurredAt: time,
                 properties: properties,
                 versions: versions
             ),
@@ -731,16 +733,27 @@ actor EluStandaloneRuntime {
         )
     }
 
+    /// An explicit event time is kept as given. Otherwise the event takes the
+    /// time the app made the call, so a call held for configuration is not
+    /// stamped late; without one, the event takes the current time.
+    private func eventTime(_ occurredAt: Date?, calledAt: Date?) async -> Date {
+        if let occurredAt { return occurredAt }
+        guard let calledAt else { return clock() }
+        return await queue.callTime(calledAt)
+    }
+
     /// The detached person result belongs only to this accepted original call.
     /// It is consumed by the existing ordered facade continuation, never queued
     /// automatically by the event filter or persisted as another permission.
     func captureWithPersonChanges(_ name: String, properties: [String: EluJSONValue], occurredAt: Date?,
+                                  calledAt: Date? = nil,
                                   person: EluEventPersonChanges, admissionGuard: (@Sendable () -> Bool)?)
         async -> (result: EluV1CaptureResult, person: EluEventPersonChanges) {
+        let time = await eventTime(occurredAt, calledAt: calledAt)
         let fence = deliveryFence, decision = fence.token()
         let attempt = EluEventFilterAttempt(person: person, allowsPersonChanges: true,
             continuationAdmission: { fence.isCurrent(decision) && (admissionGuard?() ?? true) })
-        let result = await submit(.init(kind: .capture, name: name, occurredAt: occurredAt ?? clock(),
+        let result = await submit(.init(kind: .capture, name: name, occurredAt: time,
             properties: properties, versions: versions), admissionGuard: admissionGuard, filterAttempt: attempt)
         return (result, attempt.acceptedPersonChanges())
     }
@@ -754,15 +767,17 @@ actor EluStandaloneRuntime {
     func screen(
         _ name: String,
         properties: [String: EluJSONValue] = [:],
-        occurredAt: Date? = nil
+        occurredAt: Date? = nil,
+        calledAt: Date? = nil
     ) async -> EluV1CaptureResult {
         var merged = properties
         merged[Self.screenNameProperty] = .string(name)
+        let time = await eventTime(occurredAt, calledAt: calledAt)
         return await submit(
             EluV1CaptureCommand(
                 kind: .screen,
                 name: name,
-                occurredAt: occurredAt ?? clock(),
+                occurredAt: time,
                 properties: merged,
                 versions: versions
             )
@@ -774,13 +789,15 @@ actor EluStandaloneRuntime {
     /// the runtime.
     func captureException(
         properties: [String: EluJSONValue],
-        occurredAt: Date? = nil
+        occurredAt: Date? = nil,
+        calledAt: Date? = nil
     ) async -> EluV1CaptureResult {
-        await submit(
+        let time = await eventTime(occurredAt, calledAt: calledAt)
+        return await submit(
             EluV1CaptureCommand(
                 kind: .exception,
                 name: EluExceptionSerializer.eventName,
-                occurredAt: occurredAt ?? clock(),
+                occurredAt: time,
                 properties: properties,
                 versions: versions
             )
@@ -811,25 +828,27 @@ actor EluStandaloneRuntime {
     func identify(
         _ userId: String,
         properties: [String: EluJSONValue] = [:],
-        propertiesOnce: [String: EluJSONValue] = [:]
+        propertiesOnce: [String: EluJSONValue] = [:],
+        calledAt: Date? = nil
     ) async -> EluRuntimeQueueSnapshot? {
-        await mutate(.identify(userId: userId, set: properties, setOnce: propertiesOnce))
+        await mutate(.identify(userId: userId, set: properties, setOnce: propertiesOnce), calledAt: calledAt)
     }
 
     /// Links a second id to the identified one. The queue rejects an alias
     /// raised before an identity exists, because there is nothing to link to.
     @discardableResult
-    func alias(_ aliasId: String) async -> EluRuntimeQueueSnapshot? {
-        await mutate(.linkAlias(aliasId: aliasId))
+    func alias(_ aliasId: String, calledAt: Date? = nil) async -> EluRuntimeQueueSnapshot? {
+        await mutate(.linkAlias(aliasId: aliasId), calledAt: calledAt)
     }
 
     @discardableResult
     func setPersonProperties(
         _ properties: [String: EluJSONValue],
-        propertiesOnce: [String: EluJSONValue] = [:]
+        propertiesOnce: [String: EluJSONValue] = [:],
+        calledAt: Date? = nil
     ) async -> EluRuntimeQueueSnapshot? {
         guard !properties.isEmpty || !propertiesOnce.isEmpty else { return nil }
-        return await mutate(.setPersonProperties(set: properties, setOnce: propertiesOnce, unset: []))
+        return await mutate(.setPersonProperties(set: properties, setOnce: propertiesOnce, unset: []), calledAt: calledAt)
     }
 
     /// The original capture's identity, context and event-time state must still
@@ -840,7 +859,8 @@ actor EluStandaloneRuntime {
     func setPersonProperties(
         _ properties: [String: EluJSONValue], propertiesOnce: [String: EluJSONValue],
         afterAcceptedCapture accepted: EluRuntimeQueueSnapshot,
-        admissionGuard: @escaping @Sendable () -> Bool
+        admissionGuard: @escaping @Sendable () -> Bool,
+        calledAt: Date? = nil
     ) async -> EluRuntimeQueueSnapshot? {
         guard phase != .closed, admissionGuard() else { return nil }
         let fence = deliveryFence, decision = fence.token()
@@ -852,7 +872,7 @@ actor EluStandaloneRuntime {
                 .setPersonProperties(set: properties, setOnce: propertiesOnce, unset: []),
                 versions: versions, expectedGeneration: snapshot.generation,
                 allowWire: phase == .capturing, wireGuard: current, admissionGuard: current,
-                minimumOccurredAt: accepted.identity.updatedAt)
+                minimumOccurredAt: accepted.identity.updatedAt, calledAt: calledAt)
         else { return nil }
         return await commit(next)
     }
@@ -863,13 +883,14 @@ actor EluStandaloneRuntime {
     func group(
         type: String,
         key: String,
-        properties: [String: EluJSONValue] = [:]
+        properties: [String: EluJSONValue] = [:],
+        calledAt: Date? = nil
     ) async -> EluRuntimeQueueSnapshot? {
         if properties.isEmpty {
-            return await mutate(.associateGroup(groupType: type, groupKey: key))
+            return await mutate(.associateGroup(groupType: type, groupKey: key), calledAt: calledAt)
         }
         return await mutate(
-            .group(groupType: type, groupKey: key, set: properties, setOnce: [:], unset: [])
+            .group(groupType: type, groupKey: key, set: properties, setOnce: [:], unset: []), calledAt: calledAt
         )
     }
 
@@ -877,38 +898,40 @@ actor EluStandaloneRuntime {
     func registerSuperProperties(
         _ properties: [String: EluJSONValue],
         onlyIfAbsent: Bool = false,
-        defaultValue: EluJSONValue? = nil
+        defaultValue: EluJSONValue? = nil,
+        calledAt: Date? = nil
     ) async -> EluRuntimeQueueSnapshot? {
         guard phase != .closed, !properties.isEmpty else { return nil }
-        guard let snapshot = try? await queue.registerStandaloneSuperProperties(properties, onlyIfAbsent: onlyIfAbsent, defaultValue: defaultValue) else {
+        guard let snapshot = try? await queue.registerStandaloneSuperProperties(properties, onlyIfAbsent: onlyIfAbsent,
+            defaultValue: defaultValue, calledAt: calledAt) else {
             return nil
         }
         return await commit(snapshot)
     }
 
     @discardableResult
-    func unregisterSuperProperty(_ key: String) async -> EluRuntimeQueueSnapshot? {
+    func unregisterSuperProperty(_ key: String, calledAt: Date? = nil) async -> EluRuntimeQueueSnapshot? {
         guard phase != .closed else { return nil }
-        guard let snapshot = try? await queue.unregisterStandaloneSuperProperty(key) else {
+        guard let snapshot = try? await queue.unregisterStandaloneSuperProperty(key, calledAt: calledAt) else {
             return nil
         }
         return await commit(snapshot)
     }
 
     @discardableResult
-    func setFlagPersonProperties(_ properties: [String: EluJSONValue]) async -> EluRuntimeQueueSnapshot? {
-        await updateFlagContext(.person(properties))
+    func setFlagPersonProperties(_ properties: [String: EluJSONValue], calledAt: Date? = nil) async -> EluRuntimeQueueSnapshot? {
+        await updateFlagContext(.person(properties), calledAt: calledAt)
     }
 
     @discardableResult
-    func setFlagGroupProperties(type: String, properties: [String: EluJSONValue]) async -> EluRuntimeQueueSnapshot? {
-        await updateFlagContext(.group(type: type, properties: properties))
+    func setFlagGroupProperties(type: String, properties: [String: EluJSONValue], calledAt: Date? = nil) async -> EluRuntimeQueueSnapshot? {
+        await updateFlagContext(.group(type: type, properties: properties), calledAt: calledAt)
     }
 
     @discardableResult
-    func updateFlagContext(_ change: EluStandaloneFlagContextChange) async -> EluRuntimeQueueSnapshot? {
+    func updateFlagContext(_ change: EluStandaloneFlagContextChange, calledAt: Date? = nil) async -> EluRuntimeQueueSnapshot? {
         performanceMonitor.invalidate()
-        guard phase != .closed, let snapshot = try? await queue.updateStandaloneFlagContext(change) else { return nil }
+        guard phase != .closed, let snapshot = try? await queue.updateStandaloneFlagContext(change, calledAt: calledAt) else { return nil }
         return await commit(snapshot)
     }
 
@@ -916,10 +939,11 @@ actor EluStandaloneRuntime {
     /// super properties, session, and flag context are cleared. This local
     /// operation is available without capture authority and enqueues no wire record.
     @discardableResult
-    func resetIdentity(resetDeviceId: Bool = false) async -> EluRuntimeQueueSnapshot? {
+    func resetIdentity(resetDeviceId: Bool = false, calledAt: Date? = nil) async -> EluRuntimeQueueSnapshot? {
         guard phase != .closed else { return nil }
         guard let generation = try? await queue.snapshot().generation,
-              let snapshot = try? await queue.reset(expectedGeneration: generation, resetDeviceId: resetDeviceId)
+              let snapshot = try? await queue.reset(expectedGeneration: generation, resetDeviceId: resetDeviceId,
+                  calledAt: calledAt)
         else {
             return nil
         }
@@ -929,7 +953,8 @@ actor EluStandaloneRuntime {
     /// Local identity/context remains available when capture is off. The owner
     /// creates wire drafts only under current capture authority; there is no backfill.
     private func mutate(
-        _ transition: EluRuntimeMutationTransition
+        _ transition: EluRuntimeMutationTransition,
+        calledAt: Date? = nil
     ) async -> EluRuntimeQueueSnapshot? {
         guard phase != .closed else { return nil }
         let fence = deliveryFence
@@ -941,7 +966,8 @@ actor EluStandaloneRuntime {
                   expectedGeneration: generation,
                   allowWire: phase == .capturing,
                   wireGuard: { fence.isCurrent(decision) },
-                  admissionGuard: { fence.token() == decision }, filterMutation: true
+                  admissionGuard: { fence.token() == decision }, filterMutation: true,
+                  calledAt: calledAt
               )
         else {
             return nil

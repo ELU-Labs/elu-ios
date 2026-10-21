@@ -224,7 +224,9 @@ To supply an event time, use
 with a Foundation `Date`. The timestamp must not precede persisted identity or
 session activity; invalid or older times discard the entire event. Events keep
 call order, so backdating an event after newer activity does not reorder it.
-The overload without `timestamp` uses the runtime clock when it processes the call.
+The overload without `timestamp` uses the time of the call, even when the call
+waited for configuration. If identity, session, or consent changed later than
+that time, the event takes the time of that change instead.
 
 To update a person after an accepted event, use
 `Elu.capture("Checkout completed", properties: ["amount": 42], options:
@@ -236,7 +238,7 @@ The same ordered call admits the event first, then applies the person change
 under the original identity and current consent. It does not reload feature flags.
 These are separate durable writes: a crash, storage failure, or superseding
 identity/privacy intent can leave the event without its person change. Person
-changes use the runtime wall clock, not the event timestamp; a future event time
+changes use the time of the call, not the event timestamp; a future event time
 can make the following person change inadmissible. No automatic backfill occurs.
 
 Pass `EluFeatureFlagOptions` to control one read:
@@ -437,7 +439,7 @@ name, timestamp and passive-session constraints still apply to replacements.
 
 Captures use the hook's `set` and `setOnce`, including maps introduced by
 the hook, only after the original event is accepted. These remain separate
-ordered writes and use the person mutator's wall clock. No extra flag reload is
+ordered writes and use the time of the original call. No extra flag reload is
 scheduled. A dropped flag event does not consume its durable exposure marker.
 Filtering covers manual events, screens, exceptions and automatic native event
 producers; replay frames are governed by their separate privacy rules.

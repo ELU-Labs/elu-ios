@@ -138,7 +138,9 @@ final class EluCore {
                     self.state = .running
                     self.disabledReason = nil
                     // Only calls made while the visitor was not opted out were held.
-                    for op in self.buffer.drain() { backend.execute(op, origin: EluCallOrigin(optedOut: false)) }
+                    for call in self.buffer.drainCalls() {
+                        backend.execute(call.op, origin: EluCallOrigin(calledAt: call.calledAt, optedOut: false))
+                    }
                     backend.activate()
                 }
             })
@@ -151,12 +153,12 @@ final class EluCore {
         }
     }
 
-    private func beginPendingOperation(_ op: EluBufferedOp) -> (finish: (() -> Void)?, deniedAtCall: Bool) {
+    private func beginPendingOperation(_ op: EluBufferedOp) -> (finish: (() -> Void)?, deniedAtCall: Bool, calledAt: Date) {
         backendIntentLock.lock()
         defer { backendIntentLock.unlock() }
         let current = intentBackend
         let denied = acceptedConsent?.optedOut == true || current?.isOptedOut() == true
-        return (current?.beginPendingOperation(op), denied)
+        return (current?.beginPendingOperation(op), denied, current?.callTime() ?? Date())
     }
 
     // MARK: - Facade dispatch
@@ -175,12 +177,12 @@ final class EluCore {
             }
             switch state {
             case .running:
-                backend?.execute(op, origin: EluCallOrigin(optedOut: optedOut))
+                backend?.execute(op, origin: EluCallOrigin(calledAt: intent.calledAt, optedOut: optedOut))
             case .pending:
                 // A call made while opted out never waits for configuration,
                 // so a later opt-in cannot release it. Only a reset is held.
                 guard !optedOut || op.isReset else { return }
-                buffer.push(op)
+                buffer.push(op, calledAt: intent.calledAt)
             case .idle, .disabled:
                 break
             }

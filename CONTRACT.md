@@ -43,7 +43,9 @@ does not authorize sending that buffer. Each return to the foreground fetches
 configuration again. Calls made until that configuration is validated,
 including the automatic application-opened event, are held by the same rules
 and run in call order once it is; a failed fetch keeps them held until a later
-fetch succeeds.
+fetch succeeds. A held call keeps the time it was made. An event without an
+explicit time is recorded at that time, or at the latest recorded identity,
+session, or consent change when that change is later.
 
 ## Identity, properties, flags, and screens
 
