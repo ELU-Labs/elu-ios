@@ -98,6 +98,38 @@ final class EluNativeRasterDeliveryTests: XCTestCase {
         await h.close()
     }
 
+    func testAndroidOnlyListKeepsTheBaseButNeverCapturesOrSendsRaster() async throws {
+        let h = try await Rig.make(); defer { h.remove() }
+        _ = try await h.append(h.request()); await h.stop()
+        let rows = try await h.queue.storedReplayRecords()
+        // The base configuration still activates capture under this receipt.
+        try await h.publish(branch: true, advance: true, platforms: ["android"])
+        let witness = try XCTUnwrap(h.native.base.witness)
+        XCTAssertNotNil(witness.nativeV3); XCTAssertNil(witness.nativeV3?.raster)
+        let transport = RasterDeliveryTransport { _, _ in .init(status: 500, headers: [:], body: Data()) }
+        let clock = h.native.base.testClock
+        let coordinator = EluV2ReplayDeliveryCoordinator(queue: h.queue, transport: transport, wallNow: { clock.read() })
+        if let permission = try await h.permission() {
+            guard case .idle = try await h.queue.claimNextReplay(permission) else {
+                return XCTFail("another platform's list granted raster delivery")
+            }
+            _ = await coordinator.trigger(permission)
+        }
+        let sent = await transport.bodies; XCTAssertTrue(sent.isEmpty)
+        _ = await coordinator.closeAndWait()
+        do {
+            _ = try await h.owner.prepareRaster(source: witness,
+                sourceIdentity: h.registry.sourceIdentity(), timeZoneIdentifier: "America/Los_Angeles")
+            XCTFail("another platform's list authorized raster capture")
+        } catch {}
+        let retained = try await h.queue.storedReplayRecords(); XCTAssertEqual(retained, rows)
+        // A later list that names iOS delivers the retained original bytes.
+        try await h.publish(branch: true, advance: true, platforms: ["ios"])
+        let restored = try await h.claim(); XCTAssertEqual(restored.row, rows[0])
+        _ = try await h.queue.finishReplayClaim(restored, completion: .released)
+        await h.close()
+    }
+
     func testExactConflictAndSizeRefusalPermanentlyBlockOriginalEpochIncludingAppendAndReopen() async throws {
         for reason in ["request", "chunk", "sequence", "too-large"] {
             let h = try await Rig.make(); defer { h.remove() }
@@ -457,11 +489,12 @@ final class EluNativeRasterDeliveryTests: XCTestCase {
             guard case let .claimed(value) = try await queue.claimNextReplay(authority) else { throw EluRuntimeQueueError.invalidState }
             return value
         }
-        func publish(branch: Bool, advance: Bool, installCapture: Bool = true) async throws {
+        func publish(branch: Bool, advance: Bool, installCapture: Bool = true,
+                     platforms: [String] = ["android", "ios"]) async throws {
             var base = try JSONSerialization.jsonObject(with: native.base.config) as! [String: Any]
             if advance { native.base.testClock.advance(0.001); base["issuedAt"] = EluRFC3339.string(from: native.base.now); base["expiresAt"] = EluRFC3339.string(from: native.base.now.addingTimeInterval(300)) }
             let bytes = try JSONSerialization.data(withJSONObject: base)
-            let parsed = try EluNativeV3ConfigParser.parse(branch ? nativeV3SourceRasterFixture(base: bytes) : nativeV3SourceEnvelope(bytes))
+            let parsed = try EluNativeV3ConfigParser.parse(branch ? nativeV3SourceRasterFixture(base: bytes, platforms: platforms) : nativeV3SourceEnvelope(bytes))
             try publishReceipt(parsed)
             guard installCapture else { return }
             guard case .activated = try await applyCapture(parsed.configV2Data) else { throw EluRuntimeQueueError.invalidState }
