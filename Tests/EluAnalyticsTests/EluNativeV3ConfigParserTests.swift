@@ -59,11 +59,119 @@ final class EluNativeV3ConfigParserTests: XCTestCase {
         XCTAssertThrowsError(try parse(value))
     }
 
-    func testRasterPlatformSelectionRequiresCanonicalIosMembership() throws {
+    func testEachIssuedPlatformListTurnsRasterOnOnlyWhenItNamesIos() throws {
+        var absent = try envelope(); absent.removeValue(forKey: "raster")
+        let baseOnly = try parse(absent)
+        for (platforms, rasterOn) in [(["ios"], true), (["android", "ios"], true), (["android"], false)] {
+            var value = try envelope()
+            set(&value, ["raster", "platforms"], platforms)
+            let bytes = try encode(value)
+            let result = try EluNativeV3ConfigParser.parse(bytes)
+            let name = platforms.joined(separator: ",")
+            XCTAssertEqual(result.raster != nil, rasterOn, name)
+            if rasterOn {
+                XCTAssertEqual(result.raster?.effectivePolicyHash, expectedHash, name)
+                XCTAssertEqual(result.raster?.endpoint.absoluteString, "https://ingest.elu.dev/v3/replay", name)
+                XCTAssertEqual(result.raster?.maximumRequestBytes, 5_242_880, name)
+            }
+            XCTAssertEqual(result.data, bytes, name)
+            XCTAssertEqual(result.configV2Data, baseOnly.configV2Data, name)
+            XCTAssertEqual(result.baseCanonicalData, baseOnly.baseCanonicalData, name)
+            XCTAssertEqual(result.baseSemanticHash, baseOnly.baseSemanticHash, name)
+            XCTAssertEqual(result.basePrivacyHash, baseOnly.basePrivacyHash, name)
+            // The complete branch, including its list, stays bound to the receipt.
+            XCTAssertNotEqual(result.semanticHash, baseOnly.semanticHash, name)
+        }
+    }
+
+    func testAndroidOnlyListKeepsTheBaseConfigurationExactlyAsWithoutTheBranch() throws {
+        var absent = try envelope(); absent.removeValue(forKey: "raster")
+        var value = try envelope(); set(&value, ["raster", "platforms"], ["android"])
+        let baseOnly = try parse(absent), result = try parse(value)
+        XCTAssertNil(result.raster)
+        XCTAssertEqual(result.base.status, .enabled)
+        XCTAssertEqual(result.base.features?.capture, true)
+        XCTAssertEqual(result.base.features?.replay, true)
+        XCTAssertEqual(result.base.features?.flags, true)
+        XCTAssertEqual(result.base.privacy?.replay.sampleRate, 0.25)
+        XCTAssertEqual(result.base.privacy?.replay.minimumDurationSeconds, 5)
+        XCTAssertEqual(result.base.capabilities?.replay.replayProtocolGeneration, "protocol-generation-v2")
+        XCTAssertEqual(result.base.issuedAt.source, baseOnly.base.issuedAt.source)
+        XCTAssertEqual(result.base.expiresAt.source, baseOnly.base.expiresAt.source)
+        XCTAssertEqual(result.baseCanonicalData, baseOnly.baseCanonicalData)
+        XCTAssertEqual(result.baseSemanticHash, baseOnly.baseSemanticHash)
+        XCTAssertEqual(try EluV1ConfigManager.prepareConfig(result.configV2Data, endpointPolicy: .cloud).semanticHash,
+                       baseOnly.baseSemanticHash)
+        var both = try envelope(); set(&both, ["raster", "platforms"], ["android", "ios"])
+        XCTAssertNotEqual(result.semanticHash, try parse(both).semanticHash)
+    }
+
+    func testAndroidOnlyBranchIsCheckedAsStrictlyAsAnIosBranch() throws {
+        func android() throws -> [String: Any] {
+            var value = try envelope(); set(&value, ["raster", "platforms"], ["android"]); return value
+        }
+        XCTAssertNil(try parse(android()).raster)
+        func assertMismatched(_ value: [String: Any], _ name: String) {
+            XCTAssertThrowsError(try parse(value), name) { error in
+                XCTAssertEqual(error as? EluNativeV3ConfigParser.Failure, .mismatchedRaster, name)
+            }
+        }
+        let changes: [([String], Any)] = [
+            (["schemaVersion"], 2), (["endpoint"], "https://other.example/v3/replay"),
+            (["replayContractVersion"], "2.0.0"), (["replaySchemaVersion"], 2), (["ackSchemaVersion"], 2),
+            (["replayProtocolGeneration"], "protocol-generation-v2"), (["codec"], "elu-native-wireframe-v2"),
+            (["compression"], "none"), (["privacy", "schemaVersion"], 2), (["privacy", "revision"], "other"),
+            (["privacy", "effectivePolicyHash"], "sha256:" + String(repeating: "0", count: 64)),
+            (["privacy", "maskingProfileHash"], "sha256:" + String(repeating: "0", count: 64)),
+            (["privacy", "declaredRegionsAllowed"], false), (["privacy", "inputCoverage"], "all"),
+            (["privacy", "automaticInputDiscovery"], true), (["privacy", "unknownContentClassification"], true),
+            (["privacy", "redactionBoundary"], "after-upload"), (["privacy", "requiredBindingBehavior"], "allow"),
+            (["unknown"], true), (["privacy", "unknown"], true), (["limits", "unknown"], true),
+        ]
+        for (path, change) in changes {
+            var changed = try android(); set(&changed, ["raster"] + path, change)
+            assertMismatched(changed, path.joined(separator: "."))
+        }
+        for key in Self.limits.keys {
+            var changed = try android(); set(&changed, ["raster", "limits", key], Self.limits[key]! + 1)
+            assertMismatched(changed, key)
+        }
+        let original = try android()["raster"] as! [String: Any]
+        for key in original.keys {
+            var raster = original; raster.removeValue(forKey: key)
+            var changed = try android(); changed["raster"] = raster
+            assertMismatched(changed, "missing " + key)
+        }
+        // A base privacy change needs a new whole-policy hash for this list too.
+        var audience = try android(); set(&audience, ["configV2", "replayAudience"], "new-devices")
+        assertMismatched(audience, "stale policy hash")
+        try refreshPolicyHash(&audience)
+        XCTAssertEqual(try parse(audience).base.replayAudience, "new-devices")
+        XCTAssertNil(try parse(audience).raster)
+        // A base that could never carry raster replay is still refused as a whole.
+        let bases: [([String], Any)] = [
+            (["features", "replay"], false), (["privacy", "masking", "images"], "block"),
+            (["privacy", "masking", "platformRules"], [["platform": "android", "action": "mask",
+                "targetDialect": "elu-native-class-v1", "target": "private"]]),
+        ]
+        for (path, change) in bases {
+            var changed = try android(); set(&changed, ["configV2"] + path, change)
+            try refreshPolicyHash(&changed)
+            XCTAssertThrowsError(try parse(changed), path.joined(separator: "."))
+        }
+    }
+
+    func testOnlyTheThreeIssuedPlatformListsAreAccepted() throws {
+        for platforms in [["android"], ["ios"], ["android", "ios"]] {
+            var value = try envelope()
+            set(&value, ["raster", "platforms"], platforms)
+            XCTAssertNoThrow(try parse(value), platforms.joined(separator: ","))
+        }
         let invalid: [Any] = [
-            [String](), ["android"], ["ios", "android"], ["ios", "ios"],
-            ["android", "android", "ios"], ["browser", "ios"], ["IOS"],
-            "ios", NSNull(), [1], [["ios"]],
+            [String](), ["ios", "android"], ["web"], ["android", "android"], ["ios", "ios"],
+            ["android", "android", "ios"], ["android", "ios", "ios"], ["android", "ios", "web"],
+            ["browser"], ["browser", "ios"], ["android", "browser"], ["IOS"], ["Android"], ["android "],
+            "ios", "android", NSNull(), [1], [["ios"]], [["android"]], ["platform": "android"],
         ]
         for platforms in invalid {
             var value = try envelope()

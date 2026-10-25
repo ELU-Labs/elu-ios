@@ -416,6 +416,27 @@ final class EluV2ConfigSourceTests: XCTestCase {
         await source.close(); XCTAssertTrue(source.denials.pending() === second)
     }
 
+    func testNativeV3RasterListForAnotherPlatformKeepsTheBaseLeaseWithRasterOff() async throws {
+        for (platforms, rasterOn) in [(["android"], false), (["ios"], true), (["android", "ios"], true)] {
+            let name = platforms.joined(separator: ",")
+            let (source, transport, _) = try makeSource(format: .nativeV3)
+            let bytes = try nativeV3SourceRasterFixture(base: fixture(), platforms: platforms)
+            let parsed = try EluNativeV3ConfigParser.parse(bytes)
+            let baseOnly = try EluNativeV3ConfigParser.parse(nativeV3SourceEnvelope(parsed.configV2Data))
+            let result = await refresh(source, transport, data: bytes)
+            XCTAssertEqual(result, .document(parsed.configV2Data), name)
+            let retained = await source.currentLease()
+            let lease = try XCTUnwrap(retained, name)
+            XCTAssertEqual(lease.data, parsed.configV2Data, name)
+            XCTAssertEqual(lease.receiptData, bytes, name)
+            XCTAssertEqual(lease.nativeV3?.raster != nil, rasterOn, name)
+            XCTAssertEqual(lease.nativeV3?.baseSemanticHash, baseOnly.baseSemanticHash, name)
+            let current = await source.currentDocument()
+            XCTAssertEqual(current, parsed.configV2Data, name)
+            await source.close()
+        }
+    }
+
     func testNativeV3MalformedExtensionWithdrawsWithoutDroppingIntoBaseOnly() async throws {
         let (source, transport, _) = try makeSource(format: .nativeV3)
         let base = try fixture(), valid = nativeV3SourceEnvelope(base)
@@ -502,7 +523,7 @@ func nativeV3SourceEnvelope(_ base: Data) -> Data {
     Data("{\"schemaVersion\":3,\"configV2\":".utf8) + base + Data("}".utf8)
 }
 
-func nativeV3SourceRasterFixture(base original: Data) throws -> Data {
+func nativeV3SourceRasterFixture(base original: Data, platforms: [String] = ["android", "ios"]) throws -> Data {
     var base = try JSONSerialization.jsonObject(with: original) as! [String: Any]
     var privacy = base["privacy"] as! [String: Any]
     var masking = privacy["masking"] as! [String: Any]; masking["images"] = "allow"
@@ -531,7 +552,7 @@ func nativeV3SourceRasterFixture(base original: Data) throws -> Data {
     let raster: [String: Any] = ["schemaVersion": 1, "endpoint": "https://ingest.elu.dev/v3/replay",
         "replayContractVersion": "3.0.0", "replaySchemaVersion": 3, "ackSchemaVersion": 3,
         "replayProtocolGeneration": "native-raster-generation-v1", "codec": "elu-native-raster-v1",
-        "compression": "gzip", "platforms": ["android", "ios"], "privacy": declared, "limits": limits]
+        "compression": "gzip", "platforms": platforms, "privacy": declared, "limits": limits]
     return try JSONSerialization.data(withJSONObject: ["schemaVersion": 3, "configV2": base, "raster": raster], options: [.sortedKeys])
 }
 

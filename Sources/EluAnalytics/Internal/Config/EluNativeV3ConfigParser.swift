@@ -60,7 +60,9 @@ enum EluNativeV3ConfigParser {
               let baseData = extracted.propertyData else { throw Failure.malformed }
         let prepared = try EluV1ConfigManager.prepareConfig(baseData, endpointPolicy: endpointPolicy)
         guard prepared.document.schemaVersion == 2 else { throw Failure.incompatibleBase }
-        let raster = try envelope.objectProperty("raster").map {
+        // A valid branch whose platform list does not name iOS leaves `raster`
+        // nil: the base configuration applies exactly as without the branch.
+        let raster = try envelope.objectProperty("raster").flatMap {
             try validateRaster($0, base: prepared.document, baseData: baseData,
                                events: prepared.trustedEndpoints?[.events])
         }
@@ -71,8 +73,9 @@ enum EluNativeV3ConfigParser {
                       basePrivacyHash: prepared.policySourceHash, raster: raster)
     }
 
+    /// Returns nil only for a complete, valid branch granted to another platform.
     private static func validateRaster(_ candidate: JSON, base: EluV1ConfigDocument,
-                                       baseData: Data, events: URL?) throws -> RasterPolicy {
+                                       baseData: Data, events: URL?) throws -> RasterPolicy? {
         guard base.status == .enabled,
               base.features?.capture == true, base.features?.replay == true,
               let privacy = base.privacy, privacy.capture.enabled, privacy.replay.enabled,
@@ -114,12 +117,11 @@ enum EluNativeV3ConfigParser {
               let platforms = rasterMembers.first(where: { $0.name == Array("platforms".utf16) })?.value else {
             throw Failure.mismatchedRaster
         }
+        // The issuer grants raster to exactly one of these sorted lists; any
+        // other list is malformed. A list without iOS is still checked in full
+        // below and stays hash-bound, but never enables this recorder.
         let platformBytes = try EluV1StrictCanonicalJSON.canonicalData(for: platforms)
-        // Only canonical iOS-containing platform sets are valid here; a grant
-        // that excludes iOS never enables this recorder. The complete envelope
-        // remains hash-bound.
-        guard platformBytes == Data(#"["ios"]"#.utf8)
-            || platformBytes == Data(#"["android","ios"]"#.utf8) else { throw Failure.mismatchedRaster }
+        guard let grantsIOS = issuedPlatformLists[platformBytes] else { throw Failure.mismatchedRaster }
         let expected = object([
             ("schemaVersion", integer(1)), ("endpoint", string(endpoint.absoluteString)),
             ("replayContractVersion", string("3.0.0")), ("replaySchemaVersion", integer(3)),
@@ -141,10 +143,17 @@ enum EluNativeV3ConfigParser {
         // extra, null, crossed-profile and mismatched-policy member recursively.
         guard try EluV1StrictCanonicalJSON.canonicalData(for: candidate)
             == EluV1StrictCanonicalJSON.canonicalData(for: expected) else { throw Failure.mismatchedRaster }
+        guard grantsIOS else { return nil }
         return RasterPolicy(endpoint: endpoint, revision: privacy.revision, effectivePolicyHash: hash,
                             maximumRequestBytes: min(limits.replayChunkBytes, 5_242_880))
     }
 
+    /// Canonical bytes of each platform list the issuer grants, and whether it names iOS.
+    private static let issuedPlatformLists: [Data: Bool] = [
+        Data(#"["android"]"#.utf8): false,
+        Data(#"["ios"]"#.utf8): true,
+        Data(#"["android","ios"]"#.utf8): true,
+    ]
     private static var rasterLimits: JSON {
         object([("requestBytes", integer(5_242_880)), ("decodedPayloadBytes", integer(2_800_000)),
                 ("pngBytes", integer(2_097_152)), ("imageEdgePixels", integer(2_048)),
