@@ -633,6 +633,91 @@ final class EluStandaloneStackTests: XCTestCase {
         }
     }
 
+    /// Pins current behaviour. Backgrounding withdraws the configuration
+    /// (phase awaitingConfiguration, not blocked), and an identify-type call
+    /// made then still changes the stored identity, super properties, groups
+    /// or flag context: nothing is queued and nothing is counted as dropped.
+    /// After the return to the foreground the next event carries the change,
+    /// but no mutation for it is ever sent. Android currently discards these
+    /// calls instead (V2ConfigCompositionTest).
+    func testIdentityCallsMadeInTheBackgroundAreKeptAndReachTheNextEvent() async throws {
+        let marker = "while-withheld"
+        let seed: [EluBufferedOp] = [
+            .identify(distinctId: "member", userProperties: nil),
+            .register(["plan": "free"]),
+            .group(type: "company", key: "acme", properties: ["tier": "free"]),
+            .setPersonPropertiesForFlags(["role": "admin"]),
+            .setGroupPropertiesForFlags(type: "company", properties: ["seats": 5]),
+        ]
+        typealias EventCheck = (_ userId: String?, _ properties: [String: Any], _ groups: [String: String]) -> Bool
+        let calls: [(name: String, call: EluBufferedOp, event: EventCheck)] = [
+            ("identify", .identify(distinctId: marker, userProperties: ["marker": marker],
+                userPropertiesOnce: ["firstMarker": marker]), { userId, _, _ in userId == marker }),
+            ("alias", .alias(marker), { userId, _, _ in userId == "member" }),
+            ("register", .register(["marker": marker]), { _, properties, _ in properties["marker"] as? String == marker }),
+            ("registerOnce", .registerOnce(["onceMarker": marker], defaultValue: nil),
+                { _, properties, _ in properties["onceMarker"] as? String == marker }),
+            ("unregister", .unregister("plan"), { _, properties, _ in properties["plan"] == nil }),
+            ("setPersonProperties", .setPersonProperties(["marker": marker], propertiesOnce: ["firstMarker": marker]),
+                { _, _, _ in true }),
+            ("group", .group(type: "team", key: marker, properties: ["marker": marker]), { _, _, groups in groups["team"] == marker }),
+            ("resetGroups", .resetGroups, { _, _, groups in groups.isEmpty }),
+            ("setPersonPropertiesForFlags", .setPersonPropertiesForFlags(["marker": marker]), { _, _, _ in true }),
+            ("resetPersonPropertiesForFlags", .resetPersonPropertiesForFlags, { _, _, _ in true }),
+            ("setGroupPropertiesForFlags", .setGroupPropertiesForFlags(type: "company", properties: ["marker": marker]),
+                { _, _, _ in true }),
+            ("resetGroupPropertiesForFlags", .resetGroupPropertiesForFlags("company"), { _, _, _ in true }),
+        ]
+        for (name, call, eventCheck) in calls {
+            try await withHarness { h in
+                let (core, facade) = try await runningCore(h)
+                await MainActor.run {}
+                seed.forEach { core.dispatch($0) }
+                _ = core.bufferDropCountForTesting(); await facade.settled()
+                facade.applicationBackgrounded(at: h.clock.now)
+                await facade.settled(); await h.stack.settled()
+                let phase = await h.stack.runtime.currentPhase
+                XCTAssertEqual(phase, .awaitingConfiguration, name)
+                let before = try await h.stack.runtime.queueSnapshot()
+                let dropped = facade.dropCounts[.unauthorized] ?? 0
+
+                core.dispatch(call)
+                _ = core.bufferDropCountForTesting(); await facade.settled()
+                let after = try await h.stack.runtime.queueSnapshot()
+                XCTAssertLessThanOrEqual(after.queuedCount, before.queuedCount, name)
+                XCTAssertTrue(after.identity != before.identity || after.flagContext != before.flagContext, name)
+                XCTAssertEqual(facade.dropCounts[.unauthorized] ?? 0, dropped, name)
+
+                facade.applicationForegrounded(at: h.clock.now, fromBackground: true)
+                try await eventually { await h.config.count == 2 }
+                await facade.settled()
+                await h.config.resolve(try fixture())
+                try await eventually { await h.stack.runtime.currentPhase == .capturing }
+                await h.stack.settled(); await facade.settled()
+                core.dispatch(.capture(event: "after-resume", properties: nil))
+                core.flush(); _ = core.bufferDropCountForTesting(); await facade.settled()
+                try await eventually { await h.events.names.contains("after-resume") }
+
+                // The background change survives the return to the foreground.
+                let resumed = try await h.stack.runtime.queueSnapshot()
+                XCTAssertEqual(resumed.identity.userId, after.identity.userId, name)
+                XCTAssertEqual(resumed.identity.superProperties, after.identity.superProperties, name)
+                XCTAssertEqual(resumed.identity.groups, after.identity.groups, name)
+                XCTAssertEqual(resumed.flagContext, after.flagContext, name)
+                let delivered = await h.events.records
+                let records = try delivered.map { try XCTUnwrap(JSONSerialization.jsonObject(with: $0) as? [String: Any]) }
+                let event = try XCTUnwrap(records.compactMap { $0["event"] as? [String: Any] }
+                    .last(where: { $0["name"] as? String == "after-resume" }), name)
+                XCTAssertTrue(eventCheck((event["identity"] as? [String: Any])?["userId"] as? String,
+                    event["properties"] as? [String: Any] ?? [:], event["groups"] as? [String: String] ?? [:]), "\(name): \(event)")
+                // No identify, alias, person or group mutation for it is ever sent.
+                let mutations = zip(delivered, records).filter { $0.1["kind"] as? String == "mutation" }.map(\.0)
+                XCTAssertFalse(mutations.contains { String(decoding: $0, as: UTF8.self).contains(marker) }, name)
+                facade.shutDown(); await facade.settled()
+            }
+        }
+    }
+
     func testCallsHeldForTheFirstConfigurationKeepTheTimeTheyWereMade() async throws {
         try await withHarness { h in
             let core = EluCore(backendFactory: EluRuntimeBackendFactory { _, context in
@@ -860,6 +945,8 @@ private actor StackEventTransport: EluV1AuthorizedBatchTransport {
     private(set) var opened: [Bool] = []
     /// The latest delivered `occurredAt` for each event name.
     private(set) var occurredAt: [String: String] = [:]
+    /// Every delivered record, serialized, in delivery order.
+    private(set) var records: [Data] = []
     private let delegate = FacadeBatchTransport()
     private var shouldHold = false
     private var held: CheckedContinuation<Void, Never>?
@@ -879,6 +966,9 @@ private actor StackEventTransport: EluV1AuthorizedBatchTransport {
         count += 1
         endpoints.append(request.url)
         let body = try JSONSerialization.jsonObject(with: request.body) as! [String: Any]
+        records += try (body["records"] as! [[String: Any]]).map {
+            try JSONSerialization.data(withJSONObject: $0, options: [.sortedKeys])
+        }
         let events = (body["records"] as! [[String: Any]]).compactMap { $0["event"] as? [String: Any] }
         names += events.compactMap { $0["name"] as? String }
         opened += events.filter { $0["name"] as? String == EluStandaloneRuntime.applicationOpenedEvent }
