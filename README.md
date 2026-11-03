@@ -15,19 +15,34 @@ each release has its notes. Application code uses `Elu.*` with an ELU site key.
 - Bounded UIKit session replay, controlled by remote configuration and on-device
   privacy rules
 
-## Current release: 0.2.3
+## Current release: 0.2.4
 
-`0.2.3` is the current release. It fixes two native session replay issues:
+`0.2.4` is the current release. It changes how native session replay masks text
+and how the SDK handles calls around opt-out, configuration and the app's return
+to the foreground:
 
-- A recording no longer stops uploading when the service, or a proxy in front of
-  it, briefly answers with an error page that is not ELU's error format, for
-  example during maintenance. Those uploads now retry with backoff, and
-  recordings that earlier versions held back on the device upload again within
-  a day of the app updating, as long as they are less than seven days old.
-- Replay now resumes when the app is relaunched or updated during a session. The
-  new launch starts a new recording in the same session, under the same sampling
-  decision and the same recording-length limit. A local `stopSessionRecording()`
-  still lasts only until the app is relaunched.
+- Masked text and input values in a replay appear as one `*` per character
+  instead of the word `[masked]`, so a replay shows their length but never their
+  content.
+- Calls made while the user is opted out are discarded, except `reset()`, so
+  opting in later does not bring them back. In 0.2.3, `identify` and other
+  identity, property and group calls made while opted out were kept on the
+  device and applied after a later opt-in.
+- While analytics is disabled or the device is EU-blocked, `identify`, `alias`
+  and super-property calls are discarded too. Person, group and flag-property
+  calls are discarded unless feature flags stay on.
+- A `reset()` that is still waiting for configuration when the user opts out is
+  kept and applies once configuration arrives. In 0.2.3 the opt-out discarded it,
+  so the logout was lost.
+- Calls made while the SDK fetches configuration after the app returns to the
+  foreground, including the automatic `Application Opened` event, wait and run
+  in call order once the new configuration is validated. In 0.2.3 they were
+  lost.
+- Calls that wait for configuration, at launch or on return to the foreground,
+  keep the time they were made. Once 100 calls are waiting, newer calls are
+  discarded, so an early `identify` is kept.
+- `Application Backgrounded` is delivered, with the time the app left the
+  foreground. In 0.2.3 it was not sent.
 
 It includes analytics, identity, sessions, durable delivery, feature flags, and
 automatic device and app context on every event (see
@@ -54,12 +69,12 @@ their length but never their content (0.2.3 and earlier show the word
 ## Install (Swift Package Manager)
 
 In Xcode, use **File → Add Package Dependencies…**, enter
-`https://github.com/ELU-Labs/elu-ios`, choose 0.2.3 or later, and add the
+`https://github.com/ELU-Labs/elu-ios`, choose 0.2.4 or later, and add the
 `EluAnalytics` library to your app target. Or add to your `Package.swift`:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/ELU-Labs/elu-ios.git", from: "0.2.3"),
+    .package(url: "https://github.com/ELU-Labs/elu-ios.git", from: "0.2.4"),
 ],
 targets: [
     .target(
