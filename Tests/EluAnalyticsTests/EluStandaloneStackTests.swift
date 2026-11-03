@@ -633,13 +633,12 @@ final class EluStandaloneStackTests: XCTestCase {
         }
     }
 
-    /// Pins current behaviour. Backgrounding withdraws the configuration
-    /// (phase awaitingConfiguration, not blocked), and an identify-type call
-    /// made then still changes the stored identity, super properties, groups
-    /// or flag context: nothing is queued and nothing is counted as dropped.
-    /// After the return to the foreground the next event carries the change,
-    /// but no mutation for it is ever sent. Android currently discards these
-    /// calls instead (V2ConfigCompositionTest).
+    /// Backgrounding withdraws the configuration (phase awaitingConfiguration,
+    /// not blocked), and an identify-type call made then still changes the
+    /// stored identity, super properties, groups or flag context: nothing is
+    /// queued and nothing is counted as dropped. After the return to the
+    /// foreground the next event carries the change, but no mutation for it
+    /// is ever sent. Android does the same (V2ConfigCompositionTest).
     func testIdentityCallsMadeInTheBackgroundAreKeptAndReachTheNextEvent() async throws {
         let marker = "while-withheld"
         let seed: [EluBufferedOp] = [

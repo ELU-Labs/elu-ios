@@ -473,12 +473,11 @@ final class EluStandaloneFacadeRuntimeTests: XCTestCase {
         }
     }
 
-    /// Pins current behaviour. With capture on and feature flags off, the
-    /// four flag-context calls still change the stored flag context, with
-    /// nothing counted as dropped, and the first flag request once flags are
-    /// turned on again carries that change. Person and group calls follow
-    /// capture and apply. Android currently discards the four flag-context
-    /// calls instead (V2ConfigCompositionTest).
+    /// With capture on and feature flags off, the four flag-context calls
+    /// still change the stored flag context, with nothing counted as dropped,
+    /// and the first flag request once flags are turned on again carries that
+    /// change. Person and group calls follow capture and apply. Android does
+    /// the same (V2ConfigCompositionTest).
     func testWithFlagsOffFlagContextCallsStillApplyAndReachTheNextFlagRequest() async throws {
         let marker = "while-withheld"
         let seed: [EluBufferedOp] = [
