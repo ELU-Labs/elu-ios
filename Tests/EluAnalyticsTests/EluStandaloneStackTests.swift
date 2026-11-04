@@ -633,12 +633,13 @@ final class EluStandaloneStackTests: XCTestCase {
         }
     }
 
-    /// Backgrounding withdraws the configuration (phase awaitingConfiguration,
-    /// not blocked), and an identify-type call made then still changes the
-    /// stored identity, super properties, groups or flag context: nothing is
-    /// queued and nothing is counted as dropped. After the return to the
-    /// foreground the next event carries the change, but no mutation for it
-    /// is ever sent. Android does the same (V2ConfigCompositionTest).
+    /// Backgrounding a capturing site withdraws the configuration (phase
+    /// awaitingConfiguration), and an identify-type call made then still
+    /// changes the stored identity, super properties, groups or flag context:
+    /// nothing is queued and nothing is counted as dropped. After the return
+    /// to the foreground the next event carries the change, but no mutation
+    /// for it is ever sent. A site that was not capturing refuses them (below).
+    /// Android does the same (V2ConfigCompositionTest).
     func testIdentityCallsMadeInTheBackgroundAreKeptAndReachTheNextEvent() async throws {
         let marker = "while-withheld"
         let seed: [EluBufferedOp] = [
@@ -712,6 +713,104 @@ final class EluStandaloneStackTests: XCTestCase {
                 // No identify, alias, person or group mutation for it is ever sent.
                 let mutations = zip(delivered, records).filter { $0.1["kind"] as? String == "mutation" }.map(\.0)
                 XCTAssertFalse(mutations.contains { String(decoding: $0, as: UTF8.self).contains(marker) }, name)
+                facade.shutDown(); await facade.settled()
+            }
+        }
+    }
+
+    /// A site that was not capturing when the app went to the background
+    /// (capture off, a disabled configuration or a blocked region) keeps
+    /// refusing identify-type calls there: nothing is stored or queued, and
+    /// after the return to a capturing configuration the next event carries
+    /// the identity from before the block. Only a site that was capturing
+    /// keeps them (above). Android does the same (V2ConfigCompositionTest).
+    func testIdentityCallsMadeInTheBackgroundOnABlockedSiteAreDiscarded() async throws {
+        let marker = "while-blocked"
+        let seed: [EluBufferedOp] = [
+            .identify(distinctId: "member", userProperties: nil),
+            .register(["plan": "free"]),
+            .group(type: "company", key: "acme", properties: ["tier": "free"]),
+            .setPersonPropertiesForFlags(["role": "admin"]),
+        ]
+        let calls: [EluBufferedOp] = [
+            .identify(distinctId: marker, userProperties: ["marker": marker], userPropertiesOnce: ["firstMarker": marker]),
+            .alias(marker),
+            .register(["marker": marker]),
+            .registerOnce(["onceMarker": marker], defaultValue: nil),
+            .unregister("plan"),
+            .setPersonProperties(["marker": marker], propertiesOnce: ["firstMarker": marker]),
+            .group(type: "team", key: marker, properties: ["marker": marker]),
+            .resetGroups,
+            .setPersonPropertiesForFlags(["marker": marker]),
+            .resetPersonPropertiesForFlags,
+            .setGroupPropertiesForFlags(type: "company", properties: ["marker": marker]),
+            .resetGroupPropertiesForFlags("company"),
+        ]
+        let scenarios: [(name: String, blocking: (StackHarness) throws -> Data)] = [
+            ("capture off", { _ in try reissued(fixture(capture: false), step: 1) }),
+            ("disabled", { _ in try reissued(fixtureFile("config-disabled.json"), step: 1) }),
+            ("region", { h in h.timeZone.set("Europe/Paris"); return try reissued(fixture(), step: 1) }),
+        ]
+        for (name, blocking) in scenarios {
+            try await withHarness { h in
+                let (core, facade) = try await runningCore(h)
+                await MainActor.run {}
+                seed.forEach { core.dispatch($0) }
+                _ = core.bufferDropCountForTesting(); await facade.settled()
+
+                // The next foreground fetch blocks the site.
+                facade.applicationBackgrounded(at: h.clock.now)
+                await facade.settled(); await h.stack.settled()
+                facade.applicationForegrounded(at: h.clock.now, fromBackground: true)
+                try await eventually { await h.config.count == 2 }
+                await facade.settled()
+                await h.config.resolve(try blocking(h))
+                try await eventually {
+                    let phase = await h.stack.runtime.currentPhase
+                    if case .blocked = phase { return true }
+                    return false
+                }
+                await h.stack.settled(); await facade.settled()
+                let blockedPhase = await h.stack.runtime.currentPhase
+                XCTAssertTrue({ if case .blocked = blockedPhase { return true }; return false }(), "\(name): \(blockedPhase)")
+
+                facade.applicationBackgrounded(at: h.clock.now)
+                await facade.settled(); await h.stack.settled()
+                let phase = await h.stack.runtime.currentPhase
+                XCTAssertEqual(phase, .awaitingConfiguration, name)
+                let before = try await h.stack.runtime.queueSnapshot()
+                XCTAssertEqual(before.identity.userId, "member", name)
+                calls.forEach { core.dispatch($0) }
+                _ = core.bufferDropCountForTesting(); await facade.settled()
+                let after = try await h.stack.runtime.queueSnapshot()
+                XCTAssertEqual(after.identity, before.identity, name)
+                XCTAssertEqual(after.flagContext, before.flagContext, name)
+                XCTAssertEqual(after.queuedCount, before.queuedCount, name)
+
+                h.timeZone.set("America/New_York")
+                facade.applicationForegrounded(at: h.clock.now, fromBackground: true)
+                try await eventually { await h.config.count == 3 }
+                await facade.settled()
+                await h.config.resolve(try reissued(fixture(), step: 2))
+                try await eventually { await h.stack.runtime.currentPhase == .capturing }
+                await h.stack.settled(); await facade.settled()
+                core.dispatch(.capture(event: "after-block", properties: nil))
+                core.flush(); _ = core.bufferDropCountForTesting(); await facade.settled()
+                try await eventually { await h.events.names.contains("after-block") }
+
+                let resumed = try await h.stack.runtime.queueSnapshot()
+                XCTAssertEqual(resumed.identity.userId, "member", name)
+                XCTAssertEqual(resumed.identity.superProperties, before.identity.superProperties, name)
+                XCTAssertEqual(resumed.identity.groups, before.identity.groups, name)
+                XCTAssertEqual(resumed.flagContext, before.flagContext, name)
+                let delivered = await h.events.records
+                let records = try delivered.map { try XCTUnwrap(JSONSerialization.jsonObject(with: $0) as? [String: Any]) }
+                let event = try XCTUnwrap(records.compactMap { $0["event"] as? [String: Any] }
+                    .last(where: { $0["name"] as? String == "after-block" }), name)
+                XCTAssertEqual((event["identity"] as? [String: Any])?["userId"] as? String, "member", "\(name): \(event)")
+                XCTAssertEqual((event["properties"] as? [String: Any])?["plan"] as? String, "free", "\(name): \(event)")
+                XCTAssertEqual((event["groups"] as? [String: String])?["company"], "acme", "\(name): \(event)")
+                XCTAssertFalse(delivered.contains { String(decoding: $0, as: UTF8.self).contains(marker) }, name)
                 facade.shutDown(); await facade.settled()
             }
         }
@@ -871,9 +970,27 @@ final class EluStandaloneStackTests: XCTestCase {
 
 private struct StackFailure: Error {}
 
-private func fixture(capture: Bool = true) throws -> Data {
+private func fixtureFile(_ name: String) throws -> Data {
     let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-    var value = try JSONSerialization.jsonObject(with: Data(contentsOf: root.appendingPathComponent("Conformance/V2/fixtures/config-enabled.json"))) as! [String: Any]
+    return try Data(contentsOf: root.appendingPathComponent("Conformance/V2/fixtures/\(name)"))
+}
+
+/// The same document issued `step` × 30 s later under a new revision, so the
+/// source accepts it as a newer decision rather than a conflicting copy.
+private func reissued(_ data: Data, step: Int) throws -> Data {
+    var value = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+    let formatter = ISO8601DateFormatter()
+    formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    for key in ["issuedAt", "expiresAt"] {
+        let original = try XCTUnwrap((value[key] as? String).flatMap(formatter.date(from:)))
+        value[key] = formatter.string(from: original.addingTimeInterval(Double(30 * step)))
+    }
+    value["revision"] = "\(try XCTUnwrap(value["revision"] as? String))-reissued-\(step)"
+    return try JSONSerialization.data(withJSONObject: value, options: [.sortedKeys])
+}
+
+private func fixture(capture: Bool = true) throws -> Data {
+    var value = try JSONSerialization.jsonObject(with: fixtureFile("config-enabled.json")) as! [String: Any]
     var features = value["features"] as! [String: Any]
     features["capture"] = capture
     value["features"] = features
@@ -895,12 +1012,14 @@ private struct StackHarness: Sendable {
     let config = StackConfigTransport()
     let events = StackEventTransport()
     let clock = StackClock()
+    let timeZone = StackTimeZone()
     init(root: URL, endpointPolicy: EluEndpointPolicy = .cloud) async throws {
         self.root = root
+        let zone = timeZone
         stack = try await EluStandaloneStack.make(rootDirectoryURL: root, siteKey: Self.siteKey,
             configHost: endpointPolicy.declaredAPIOrigin ?? URL(string: "https://elu.dev")!, endpointPolicy: endpointPolicy, configTransport: config,
             eventTransport: events, flagTransport: StackFlagTransport(expectedHost: endpointPolicy.declaredAPIOrigin?.host), clock: clock.source,
-            scheduler: StackScheduler(), timeZoneIdentifier: { "America/New_York" })
+            scheduler: StackScheduler(), timeZoneIdentifier: { zone.value })
     }
     func install(_ data: Data) async throws {
         stack.start()
@@ -915,6 +1034,14 @@ private struct StackHarness: Sendable {
         await config.failAll()
         await stack.settled()
     }
+}
+
+/// The device time zone the harness reports; a blocked region is a European one.
+private final class StackTimeZone: @unchecked Sendable {
+    private let lock = NSLock()
+    private var identifier = "America/New_York"
+    var value: String { lock.lock(); defer { lock.unlock() }; return identifier }
+    func set(_ value: String) { lock.lock(); identifier = value; lock.unlock() }
 }
 
 private extension EluV1FlagCacheReadResult {

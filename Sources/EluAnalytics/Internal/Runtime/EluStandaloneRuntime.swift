@@ -189,6 +189,10 @@ actor EluStandaloneRuntime {
     private let flushDelayNanoseconds: UInt64
 
     private var phase: EluStandaloneRuntimePhase = .awaitingConfiguration
+    /// Set when a withdrawal (backgrounding, or a lost source) replaces a
+    /// blocked phase. Identity changes stay refused until a configuration is
+    /// decided again, so a blocked site never stores them in the background.
+    private var blockedAcrossWithdrawal = false
     private var coordinator: EluV1BatchDeliveryCoordinator?
     private var flushTimer: Task<Void, Never>?
     private var lastSnapshot: EluRuntimeQueueSnapshot
@@ -619,6 +623,7 @@ actor EluStandaloneRuntime {
             invalidateAuthority()
             configurationDocument = nil
             configurationWitness = nil
+            if case .blocked = phase { blockedAcrossWithdrawal = true }
             if phase != .closed { phase = .awaitingConfiguration }
             await retireDelivery()
             throw error
@@ -664,6 +669,7 @@ actor EluStandaloneRuntime {
         invalidateAuthority()
         configurationDocument = nil
         configurationWitness = nil
+        if case .blocked = phase { blockedAcrossWithdrawal = true }
         phase = .awaitingConfiguration
         await retireDelivery()
     }
@@ -699,6 +705,7 @@ actor EluStandaloneRuntime {
             case .activated: self.phase = .capturing
             case let .terminated(terminal): self.phase = .blocked(terminal.reason)
             }
+            self.blockedAcrossWithdrawal = false
         }
         if let configurationGate {
             guard configurationGate.consume(sourceWitness, data: configData, apply: publish) else {
@@ -973,9 +980,14 @@ actor EluStandaloneRuntime {
     /// applies if feature flags are authorized, as they are in a blocked
     /// region, matching Android. A refused change stores nothing, so a later
     /// opt-in or configuration cannot surface it. Reset is not such a change.
+    /// A site that was blocked when the configuration was withdrawn (in the
+    /// background) refuses every such change, flag context included, until a
+    /// configuration is decided again; only a site that was capturing keeps
+    /// them, as on Android.
     private func identityChangeBase(_ change: EluStandaloneIdentityChange) async -> EluRuntimeQueueSnapshot? {
         guard phase != .closed, !deliveryFence.deniesConsent,
-              let snapshot = try? await queue.snapshot(), !snapshot.identity.optedOut else { return nil }
+              let snapshot = try? await queue.snapshot(), !snapshot.identity.optedOut,
+              !blockedAcrossWithdrawal else { return nil }
         if case .blocked = phase {
             guard change == .flagContext, await queue.flagsAreAuthorized() else { return nil }
         }
@@ -1248,6 +1260,7 @@ actor EluStandaloneRuntime {
         nativeAuthority.withdraw()
         replayRelay.withdraw()
         phase = .closed
+        blockedAcrossWithdrawal = false
         #if canImport(SwiftUI) && canImport(UIKit)
         if let declaredRegionObserver {
             EluSwiftUIReplayRegistration.shared.remove(declaredRegionObserver)
