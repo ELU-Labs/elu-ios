@@ -31,6 +31,10 @@ to the foreground:
 - While analytics is disabled or the device is EU-blocked, `identify`, `alias`
   and super-property calls are discarded too. Person, group and flag-property
   calls are discarded unless feature flags stay on.
+- If analytics was off or disabled, or the device was EU-blocked, when the app
+  went to the background, identity, property, group and flag-property calls made
+  in the background are discarded, even when feature flags stay on, until the
+  SDK fetches configuration again. If analytics was on, they are kept, as before.
 - A `reset()` that is still waiting for configuration when the user opts out is
   kept and applies once configuration arrives. In 0.2.3 the opt-out discarded it,
   so the logout was lost.
@@ -394,8 +398,11 @@ no-ops and no analytics events or replay leave the device. `identify`, `alias`,
 keeps nothing from them, so they do not reappear once analytics is enabled
 again. Person-property, group and flag-property calls are discarded as well,
 unless feature flags stay on, as they can for an EU-blocked device; they then
-still apply on the device so flags are evaluated with them. ELU config checks
-continue so a re-enabled site can recover.
+still apply on the device so flags are evaluated with them. If the app goes to
+the background while analytics is disabled or the device is EU-blocked, all of
+these calls made in the background are discarded, even when feature flags stay
+on, until the SDK fetches configuration again. ELU config checks continue so a
+re-enabled site can recover.
 
 
 ### Capture rate limiting
