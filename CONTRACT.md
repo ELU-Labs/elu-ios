@@ -41,8 +41,11 @@ EU-blocked device, `identify`, `alias`, `register`, `registerOnce` and
 permits collection cannot surface them. Person-property, group and
 flag-context calls are discarded as well unless feature flags remain
 authorized, as they can for a blocked region; they then apply locally for flag
-evaluation and enqueue nothing. Blocking collection does not mean no SDK state
-is stored locally.
+evaluation and enqueue nothing. If the app goes to the background while
+configuration blocks collection, every such call made in the background,
+flag context included, is discarded and stores nothing until a configuration is
+decided again; if collection was permitted, they are kept. Blocking collection
+does not mean no SDK state is stored locally.
 
 Calls while setup or configuration is pending may enter a bounded in-memory
 buffer of 100 calls; once it is full, later calls are discarded and the earlier
