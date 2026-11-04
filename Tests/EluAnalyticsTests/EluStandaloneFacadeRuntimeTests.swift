@@ -473,6 +473,73 @@ final class EluStandaloneFacadeRuntimeTests: XCTestCase {
         }
     }
 
+    /// With capture on and feature flags off, the four flag-context calls
+    /// still change the stored flag context, with nothing counted as dropped,
+    /// and the first flag request once flags are turned on again carries that
+    /// change. Person and group calls follow capture and apply. Android does
+    /// the same (V2ConfigCompositionTest).
+    func testWithFlagsOffFlagContextCallsStillApplyAndReachTheNextFlagRequest() async throws {
+        let marker = "while-withheld"
+        let seed: [EluBufferedOp] = [
+            .identify(distinctId: "member", userProperties: nil),
+            .register(["plan": "free"]),
+            .group(type: "company", key: "acme", properties: ["tier": "free"]),
+            .setPersonPropertiesForFlags(["role": "admin"]),
+            .setGroupPropertiesForFlags(type: "company", properties: ["seats": 5]),
+        ]
+        // `request` is what the first flag request after flags return must show, or nil when not checked.
+        let calls: [(name: String, call: EluBufferedOp, request: ((String) -> Bool)?)] = [
+            ("setPersonProperties", .setPersonProperties(["marker": marker], propertiesOnce: ["firstMarker": marker]), nil),
+            ("group", .group(type: "team", key: marker, properties: ["marker": marker]), nil),
+            ("resetGroups", .resetGroups, nil),
+            ("setPersonPropertiesForFlags", .setPersonPropertiesForFlags(["marker": marker]), { $0.contains(marker) }),
+            ("resetPersonPropertiesForFlags", .resetPersonPropertiesForFlags, { !$0.contains("admin") }),
+            ("setGroupPropertiesForFlags", .setGroupPropertiesForFlags(type: "company", properties: ["marker": marker]),
+                { $0.contains(marker) }),
+            ("resetGroupPropertiesForFlags", .resetGroupPropertiesForFlags("company"), { !$0.contains("seats") }),
+        ]
+        let flagsOff = try reissuedConfig("config-enabled.json", revision: "config-flags-off-2",
+            issuedAt: "2026-08-04T00:00:30.000Z") {
+            var features = $0["features"] as? [String: Any] ?? [:]
+            features["flags"] = false
+            $0["features"] = features
+        }
+        let flagsOn = try reissuedConfig("config-enabled.json", revision: "config-flags-on-3",
+            issuedAt: "2026-08-04T00:00:45.000Z")
+        for (name, call, request) in calls {
+            try await withTemporaryDirectory { root in
+                let seeded = try await makeHarness(root: root, flagTransport: FacadeFlagTransport())
+                seed.forEach { seeded.backend.execute($0) }
+                await seeded.backend.settled()
+                _ = await seeded.runtime.flush()
+                await seeded.close()
+
+                let off = try await makeHarness(root: root, document: flagsOff, flagTransport: FacadeFlagTransport())
+                let phase = await off.runtime.currentPhase
+                XCTAssertEqual(phase, .capturing, name)
+                let before = try await off.runtime.queueSnapshot()
+                let dropped = off.backend.dropCounts[.unauthorized, default: 0]
+                off.backend.execute(call)
+                await off.backend.settled()
+                let after = try await off.runtime.queueSnapshot()
+                XCTAssertTrue(after.identity != before.identity || after.flagContext != before.flagContext, name)
+                XCTAssertEqual(off.backend.dropCounts[.unauthorized, default: 0], dropped, name)
+                await off.close()
+                guard let request else { return }
+                XCTAssertNotEqual(after.flagContext, before.flagContext, name)
+
+                let flags = FacadeFlagTransport()
+                let on = try await makeHarness(root: root, document: flagsOn, flagTransport: flags)
+                on.backend.activate()
+                await on.backend.settled()
+                let requests = await flags.requestBodies()
+                let first = try XCTUnwrap(requests.first, name)
+                XCTAssertTrue(request(String(decoding: first, as: UTF8.self)), "\(name): \(String(decoding: first, as: UTF8.self))")
+                await on.close()
+            }
+        }
+    }
+
     func testSetOnceOverloadsGroupsAndLocalFlagContextResetsPersist() async throws {
         try await withTemporaryDirectory { root in
             let harness = try await makeHarness(root: root)
