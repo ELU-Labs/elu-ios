@@ -601,7 +601,7 @@ final class EluV1BatchDeliveryTests: XCTestCase {
     func testRetryAfterTheHeadOutlivedTheServerOutcomeRemovesOnlyTheHead() async throws {
         let directory = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
-        let clock = TestBatchClock(wall: capturedAt, monotonic: 10)
+        let clock = TestBatchClock(wall: capturedAt, monotonic: 10, holdsTimers: true)
         let queue = try await makeQueue(directory: directory, clock: clock.source.wallNow)
         _ = try await appendRecords(queue, count: 1)
         clock.setWall(capturedAt.addingTimeInterval(100))
@@ -621,15 +621,14 @@ final class EluV1BatchDeliveryTests: XCTestCase {
             randomUnit: 0
         )
 
-        guard case let .deferred(deadline) = await coordinator.trigger() else {
-            return XCTFail("Expected network retry")
+        guard try await deferAndMakeDue(coordinator, clock, "Expected network retry") else {
+            return
         }
         clock.setWall(
             capturedAt.addingTimeInterval(
                 EluV1BatchDeliveryCoordinator.serverOutcomeRetentionSeconds + 1
             )
         )
-        clock.setMonotonic(deadline)
         let result = await coordinator.trigger()
         XCTAssertEqual(result, .resolved(delivered: 0, terminallyDiscarded: 3))
         let sequences = await transport.recordSequences()
@@ -1225,10 +1224,11 @@ final class EluV1BatchDeliveryTests: XCTestCase {
         // The time bound is passed before the answer count is reached.
         for index in 0 ..< answers - 1 {
             clock.setWall(capturedAt.addingTimeInterval(Double(index) * 600))
-            guard case let .deferred(deadline) = await coordinator.trigger() else {
-                return XCTFail("Expected a stream-gap retry before the answer bound")
-            }
-            clock.setMonotonic(deadline)
+            guard try await deferAndMakeDue(
+                coordinator,
+                clock,
+                "Expected a stream-gap retry before the answer bound"
+            ) else { return }
         }
         let beforeMove = try await queue.eventDeliveryStream()
         XCTAssertEqual(beforeMove.streamId, "stream_delivery_test")
@@ -1275,10 +1275,11 @@ final class EluV1BatchDeliveryTests: XCTestCase {
         // The answer count is reached within one minute: no move yet.
         for index in 0 ..< answers {
             clock.setWall(capturedAt.addingTimeInterval(Double(index) * 10))
-            guard case let .deferred(deadline) = await coordinator.trigger() else {
-                return XCTFail("Expected a stream-gap retry before the time bound")
-            }
-            clock.setMonotonic(deadline)
+            guard try await deferAndMakeDue(
+                coordinator,
+                clock,
+                "Expected a stream-gap retry before the time bound"
+            ) else { return }
         }
         // One millisecond short of the bound: still no move.
         clock.setWall(
@@ -1286,10 +1287,11 @@ final class EluV1BatchDeliveryTests: XCTestCase {
                 EluV1BatchDeliveryCoordinator.streamGapRotationSeconds - 0.001
             )
         )
-        guard case let .deferred(deadline) = await coordinator.trigger() else {
-            return XCTFail("Expected a stream-gap retry just before the time bound")
-        }
-        clock.setMonotonic(deadline)
+        guard try await deferAndMakeDue(
+            coordinator,
+            clock,
+            "Expected a stream-gap retry just before the time bound"
+        ) else { return }
         let beforeMove = try await queue.eventDeliveryStream()
         XCTAssertEqual(beforeMove.streamId, "stream_delivery_test")
         XCTAssertEqual(beforeMove.gap?.answers, Int64(answers + 1))
@@ -1326,18 +1328,20 @@ final class EluV1BatchDeliveryTests: XCTestCase {
 
         for index in 0 ..< answers - 1 {
             clock.setWall(capturedAt.addingTimeInterval(Double(index) * 600))
-            guard case let .deferred(deadline) = await coordinator.trigger() else {
-                return XCTFail("Expected a stream-gap retry")
-            }
-            clock.setMonotonic(deadline)
+            guard try await deferAndMakeDue(
+                coordinator,
+                clock,
+                "Expected a stream-gap retry"
+            ) else { return }
         }
         // Sequence 0 is resolved and sequence 1 is answered stream-gap. The
         // count for sequence 0 does not carry over to the new head.
         clock.setWall(capturedAt.addingTimeInterval(Double(answers) * 600))
-        guard case let .deferred(nextHead) = await coordinator.trigger() else {
-            return XCTFail("Expected a stream-gap retry for the new head")
-        }
-        clock.setMonotonic(nextHead)
+        guard try await deferAndMakeDue(
+            coordinator,
+            clock,
+            "Expected a stream-gap retry for the new head"
+        ) else { return }
         let newHead = try await queue.eventDeliveryStream()
         XCTAssertEqual(newHead.streamId, "stream_delivery_test")
         XCTAssertEqual(newHead.gap?.sequence, 1)
@@ -1346,10 +1350,11 @@ final class EluV1BatchDeliveryTests: XCTestCase {
         // A clock set back a day restarts the window at the new reading.
         let setBack = capturedAt.addingTimeInterval(-86_400)
         clock.setWall(setBack)
-        guard case let .deferred(afterSetBack) = await coordinator.trigger() else {
-            return XCTFail("Expected a stream-gap retry after the clock went back")
-        }
-        clock.setMonotonic(afterSetBack)
+        guard try await deferAndMakeDue(
+            coordinator,
+            clock,
+            "Expected a stream-gap retry after the clock went back"
+        ) else { return }
         let restarted = try await queue.eventDeliveryStream()
         XCTAssertEqual(restarted.gap?.answers, 2)
         XCTAssertEqual(
@@ -1384,10 +1389,11 @@ final class EluV1BatchDeliveryTests: XCTestCase {
         )
         for index in 0 ..< firstSession {
             clock.setWall(capturedAt.addingTimeInterval(Double(index) * 60))
-            guard case let .deferred(deadline) = await first.trigger() else {
-                return XCTFail("Expected a stream-gap retry")
-            }
-            clock.setMonotonic(deadline)
+            guard try await deferAndMakeDue(
+                first,
+                clock,
+                "Expected a stream-gap retry"
+            ) else { return }
         }
         await first.cancel()
         await queue.close()
@@ -1416,10 +1422,11 @@ final class EluV1BatchDeliveryTests: XCTestCase {
             randomUnit: 0
         )
         for _ in 0 ..< answers - firstSession - 1 {
-            guard case let .deferred(deadline) = await second.trigger() else {
-                return XCTFail("Expected a stream-gap retry after the restart")
-            }
-            secondClock.setMonotonic(deadline)
+            guard try await deferAndMakeDue(
+                second,
+                secondClock,
+                "Expected a stream-gap retry after the restart"
+            ) else { return }
         }
         let moved = await second.trigger()
         XCTAssertEqual(moved, .resolved(delivered: 2, terminallyDiscarded: 0))
@@ -1569,6 +1576,32 @@ final class EluV1BatchDeliveryTests: XCTestCase {
                 EluV1EventDeliveryStream(installationStreamId: "", streamId: "stream_wire", gap: nil)
             )
         )
+    }
+
+    /// Runs one trigger that must defer a retry, waits until the retry timer
+    /// is asleep (for an hour, on a clock that holds timers), then makes the
+    /// retry due. The timer cannot fire on its own, so the next trigger runs
+    /// the retry and nothing races it.
+    private func deferAndMakeDue(
+        _ coordinator: EluV1BatchDeliveryCoordinator,
+        _ clock: TestBatchClock,
+        _ message: String,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async throws -> Bool {
+        let sleeps = clock.sleepsStarted()
+        guard case let .deferred(deadline) = await coordinator.trigger() else {
+            XCTFail(message, file: file, line: line)
+            return false
+        }
+        var waits = 0
+        while clock.sleepsStarted() == sleeps, waits < 2_000 {
+            try await Task.sleep(nanoseconds: 5_000_000)
+            waits += 1
+        }
+        XCTAssertGreaterThan(clock.sleepsStarted(), sleeps, file: file, line: line)
+        clock.setMonotonic(deadline)
+        return true
     }
 
     private func coordinator(
@@ -2172,6 +2205,7 @@ private final class TestBatchClock: @unchecked Sendable {
     /// Retry timers sleep for an hour instead of the backoff, so a slow run
     /// cannot fire a retry the test means to drive itself.
     private let holdsTimers: Bool
+    private var sleeps = 0
 
     init(wall: Date, monotonic: UInt64, holdsTimers: Bool = false) {
         self.wall = wall
@@ -2192,10 +2226,23 @@ private final class TestBatchClock: @unchecked Sendable {
                 return monotonic
             },
             sleep: { [self] nanoseconds in
+                self.noteSleep()
                 let held: UInt64 = 3_600_000_000_000
                 try await Task.sleep(nanoseconds: self.holdsTimers ? held : nanoseconds)
             }
         )
+    }
+
+    func sleepsStarted() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return sleeps
+    }
+
+    private func noteSleep() {
+        lock.lock()
+        defer { lock.unlock() }
+        sleeps += 1
     }
 
     func setWall(_ value: Date) {
