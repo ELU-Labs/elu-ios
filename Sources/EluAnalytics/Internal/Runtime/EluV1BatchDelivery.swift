@@ -192,8 +192,10 @@ actor EluV1BatchDeliveryCoordinator {
     /// stored nothing for it before that send, so it still holds whatever it
     /// stored since. Any other record this old is removed without sending it,
     /// and, as for any record that leaves unanswered, the rest of the queue
-    /// moves to a new wire stream first. Twelve hours inside the server's
-    /// retention, as in the other ELU SDKs, to allow for clock changes.
+    /// moves to a new wire stream first, unless later records have already
+    /// gone out with it on this one (`discardUnsendable`). Twelve hours
+    /// inside the server's retention, as in the other ELU SDKs, to allow for
+    /// clock changes.
     static let resendBoundarySeconds: TimeInterval = 648_000
     private static let resendBoundaryMilliseconds = Int64(resendBoundarySeconds * 1_000)
     static let maximumResponseBytes = 1_048_576
@@ -216,9 +218,8 @@ actor EluV1BatchDeliveryCoordinator {
     static let streamGapRotationAnswers: Int64 = 5
     static let streamGapRotationSeconds: TimeInterval = 2_700
     /// The server closes a gap once it has been presented this many times
-    /// (the closing request included) over this long since the first:
-    /// `STREAM_GAP_CLOSE_PRESENTATIONS` and `STREAM_GAP_CLOSE_AFTER_SECONDS`
-    /// in the server. A change there must keep both rotation bounds above
+    /// (the closing request included) over this long since the first. If
+    /// the server's bounds change, both rotation bounds must stay above
     /// them.
     static let serverGapClosePresentations: Int64 = 3
     static let serverGapCloseGraceSeconds: TimeInterval = 1_800
@@ -390,7 +391,8 @@ actor EluV1BatchDeliveryCoordinator {
                 }
                 try await discardUnsendable(
                     references(for: expired, streamId: target.installationStreamId),
-                    target: target
+                    target: target,
+                    serverStoredNone: false
                 )
                 localResolutionsInPass += 1
                 return .resolved(delivered: 0, terminallyDiscarded: expired.count)
@@ -480,13 +482,17 @@ actor EluV1BatchDeliveryCoordinator {
                 target: target,
                 sentAt: sentAt
             ) else {
-                // The head alone is larger than a request may be.
+                // The head alone is larger than a request may be. It can
+                // have gone out with later records only under an earlier,
+                // larger limit, whose answer then never arrived or stored
+                // nothing.
                 guard localResolutionsInPass < Self.maximumLocalResolutionsPerPass else {
                     return .bounded(delivered: 0, terminallyDiscarded: 0)
                 }
                 try await discardUnsendable(
                     references(for: [head], streamId: target.installationStreamId),
-                    target: target
+                    target: target,
+                    serverStoredNone: false
                 )
                 localResolutionsInPass += 1
                 return .resolved(delivered: 0, terminallyDiscarded: 1)
@@ -500,26 +506,45 @@ actor EluV1BatchDeliveryCoordinator {
     /// Removes records that cannot be sent: larger than any request may be,
     /// refused 413 on their own, or past the resend boundary. If the server
     /// never answered them, it would hold every later record of the wire
-    /// stream as `stream-gap`. The rest of the queue moves to a new wire
-    /// stream first, and the records stay queued if that fails: if the
-    /// process ends between the two steps, the record is removed again on
-    /// the new stream instead of leaving a gap.
+    /// stream as `stream-gap`, so the rest of the queue moves to a new wire
+    /// stream first, unless the stream may stay
+    /// (`EluV1EventDeliveryStream.keepsStream`). `serverStoredNone` is true
+    /// when the server's own answer shows it stored no request that carried
+    /// these records. The records stay queued when the queue cannot take
+    /// that step (it is closed or has failed, or now belongs to another
+    /// installation stream). Writing the moved stream to its file is best
+    /// effort, and a failed write does not keep them. If the process ends
+    /// between the two steps, the record is removed again on the new stream
+    /// instead of leaving a gap.
     private func discardUnsendable(
         _ references: [EluQueueAcknowledgementReference],
-        target: EluV1DeliveryTarget
+        target: EluV1DeliveryTarget,
+        serverStoredNone: Bool
     ) async throws {
-        try await moveDeliveryStream(from: target)
+        guard let last = references.last?.sequence else { return }
+        try await moveDeliveryStream(
+            from: target,
+            removingThrough: last,
+            serverStoredNone: serverStoredNone
+        )
         try await queue.acknowledge(references)
     }
 
-    /// Moves the wire stream away from `target`, unless another coordinator
-    /// already has. Throws when the stream could not be read or written, or
+    /// Moves the wire stream away from `target` before the queue head through
+    /// `last` is removed unanswered, unless another coordinator already has,
+    /// or the stream may stay. The decision and the move are one step on the
+    /// queue's actor. Throws when the stream could not be read or changed, or
     /// when the queue now belongs to another installation stream.
-    private func moveDeliveryStream(from target: EluV1DeliveryTarget) async throws {
+    private func moveDeliveryStream(
+        from target: EluV1DeliveryTarget,
+        removingThrough last: Int64,
+        serverStoredNone: Bool
+    ) async throws {
         let generator = deliveryStreamIdGenerator
         let after = try await queue.updateEventDeliveryStream { current in
             guard current.installationStreamId == target.installationStreamId,
-                  current.streamId == target.streamId
+                  current.streamId == target.streamId,
+                  !current.keepsStream(removingThrough: last, serverStoredNone: serverStoredNone)
             else {
                 return nil
             }
@@ -527,9 +552,7 @@ actor EluV1BatchDeliveryCoordinator {
                 to: EluV1BatchDeliveryCoordinator.newDeliveryStreamId(generator, avoiding: current)
             )
         }
-        guard after.installationStreamId == target.installationStreamId,
-              after.streamId != target.streamId
-        else {
+        guard after.installationStreamId == target.installationStreamId else {
             throw EluRuntimeQueueError.generationMismatch
         }
     }
@@ -858,8 +881,16 @@ actor EluV1BatchDeliveryCoordinator {
                 return blockRequest(prepared.requestId, reason: .protocolFailure)
             }
             if prepared.records.count == 1 {
+                // Every request that carried this record was larger than
+                // this one, so under the same limit the server refused them
+                // all, and the records after it may go on a new stream at
+                // once.
                 do {
-                    try await discardUnsendable(prepared.references, target: prepared.target)
+                    try await discardUnsendable(
+                        prepared.references,
+                        target: prepared.target,
+                        serverStoredNone: true
+                    )
                     return .resolved(delivered: 0, terminallyDiscarded: 1)
                 } catch {
                     return .preserved(.queueFailure)

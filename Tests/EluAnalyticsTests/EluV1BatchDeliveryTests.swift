@@ -206,11 +206,17 @@ final class EluV1BatchDeliveryTests: XCTestCase {
         let afterFirst = try await queue.snapshot()
         XCTAssertEqual(afterFirst.headSequence, 64)
         XCTAssertEqual(afterFirst.queuedCount, 1)
+        // The first removal moves off the installation stream. Nothing goes
+        // out on the moved stream, so the others leave it where it is.
+        let streamAfterFirst = try await queue.eventDeliveryStream()
+        XCTAssertEqual(streamAfterFirst.streamId, "stream_moved_1")
 
         let second = await coordinator.trigger()
         XCTAssertEqual(second, .resolved(delivered: 0, terminallyDiscarded: 1))
         let afterSecond = try await queue.snapshot()
         XCTAssertEqual(afterSecond.queuedCount, 0)
+        let streamAfterSecond = try await queue.eventDeliveryStream()
+        XCTAssertEqual(streamAfterSecond.streamId, "stream_moved_1")
         await queue.close()
     }
 
@@ -319,6 +325,9 @@ final class EluV1BatchDeliveryTests: XCTestCase {
         let streams = await transport.streamIds()
         XCTAssertTrue(streams.prefix(11).allSatisfy { $0 == "stream_delivery_test" })
         XCTAssertTrue(streams.suffix(11).allSatisfy { $0 == "stream_moved_1" })
+        // Requests went out on the moved stream, so it moves again.
+        let stream = try await queue.eventDeliveryStream()
+        XCTAssertEqual(stream.streamId, "stream_moved_2")
         await queue.close()
     }
 
@@ -698,6 +707,123 @@ final class EluV1BatchDeliveryTests: XCTestCase {
         let snapshot = try await queue.snapshot()
         XCTAssertEqual(snapshot.queuedCount, 0)
         await coordinator.cancel()
+        await queue.close()
+    }
+
+    func testRemovedHeadKeepsTheStreamWhenALaterRecordAlreadyWentOutWithIt() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let boundary = EluV1BatchDeliveryCoordinator.resendBoundarySeconds
+        let clock = TestBatchClock(wall: capturedAt, monotonic: 10, holdsTimers: true)
+        var queue = try await makeQueue(directory: directory, clock: clock.source.wallNow)
+        _ = try await appendRecords(queue, count: 1)
+        // Sequence 0 is sent, and its answer never arrives.
+        clock.setWall(capturedAt.addingTimeInterval(100))
+        let firstTransport = TestBatchTransport(replies: [.network])
+        let first = try coordinator(
+            queue: queue,
+            transport: firstTransport,
+            clock: clock,
+            randomUnit: 0
+        )
+        guard case .deferred = await first.trigger() else {
+            return XCTFail("Expected a retry after the first lost answer")
+        }
+        await first.cancel()
+        await queue.close()
+
+        // An hour short of the boundary, sequence 1 is captured and goes out
+        // with sequence 0 on the same stream; that answer is lost too.
+        clock.setWall(capturedAt.addingTimeInterval(boundary - 3_600))
+        queue = try await makeQueue(directory: directory, clock: clock.source.wallNow)
+        _ = try await appendRecords(queue, count: 1)
+        let secondTransport = TestBatchTransport(replies: [.network])
+        let second = try coordinator(
+            queue: queue,
+            transport: secondTransport,
+            clock: clock,
+            randomUnit: 0
+        )
+        guard case .deferred = await second.trigger() else {
+            return XCTFail("Expected a retry after the second lost answer")
+        }
+        let secondSequences = await secondTransport.recordSequences()
+        XCTAssertEqual(secondSequences, [[0, 1]])
+        await second.cancel()
+        await queue.close()
+
+        // A boundary after the first send, sequence 0 is removed unsent. The
+        // server either stored both records or neither, so sequence 1 goes
+        // again on the same stream: it gets its stored outcome back instead
+        // of being accepted a second time on a new stream.
+        clock.setWall(capturedAt.addingTimeInterval(100 + boundary + 60))
+        queue = try await makeQueue(directory: directory, clock: clock.source.wallNow)
+        let thirdTransport = TestBatchTransport(replies: [.accept])
+        let third = try coordinator(queue: queue, transport: thirdTransport, clock: clock)
+        let result = await third.trigger()
+        XCTAssertEqual(result, .resolved(delivered: 1, terminallyDiscarded: 1))
+        let sequences = await thirdTransport.recordSequences()
+        XCTAssertEqual(sequences, [[1]])
+        let streams = await thirdTransport.streamIds()
+        XCTAssertEqual(streams, ["stream_delivery_test"])
+        let stream = try await queue.eventDeliveryStream()
+        XCTAssertEqual(stream.streamId, "stream_delivery_test")
+        let snapshot = try await queue.snapshot()
+        XCTAssertEqual(snapshot.queuedCount, 0)
+        await third.cancel()
+        await queue.close()
+    }
+
+    func testOversizedHeadKeepsTheStreamAndAStoredNothingAnswerIsCountedAsAGap() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let queue = try await makeQueue(directory: directory)
+        _ = try await appendRecords(queue, count: 1, valueBytes: 2_000)
+        _ = try await appendRecords(queue, count: 1)
+        // Under a larger limit, both records go out and the answer is lost.
+        let clock = TestBatchClock(wall: capturedAt, monotonic: 0, holdsTimers: true)
+        let firstTransport = TestBatchTransport(replies: [.network])
+        let first = try coordinator(
+            queue: queue,
+            transport: firstTransport,
+            clock: clock,
+            randomUnit: 0
+        )
+        guard case .deferred = await first.trigger() else {
+            return XCTFail("Expected a retry after the lost answer")
+        }
+        await first.cancel()
+        let firstSequences = await firstTransport.recordSequences()
+        XCTAssertEqual(firstSequences, [[0, 1]])
+
+        // Under a smaller limit the head can no longer be sent and is
+        // removed. Sequence 1 already went out with it, so it goes again on
+        // the same stream. Here the server had stored neither and answers
+        // that it is waiting for sequence 0: the answer counts toward the
+        // server's close of the gap and the SDK's own move.
+        let transport = TestBatchTransport(replies: [.streamGap])
+        let second = try coordinator(
+            queue: queue,
+            byteLimit: EluV1BatchAuthorizationSnapshot.minimumBatchBytes,
+            transport: transport,
+            clock: clock,
+            randomUnit: 0
+        )
+        guard case .deferred = await second.trigger() else {
+            return XCTFail("Expected a stream-gap retry")
+        }
+        let sequences = await transport.recordSequences()
+        XCTAssertEqual(sequences, [[1]])
+        let streams = await transport.streamIds()
+        XCTAssertEqual(streams, ["stream_delivery_test"])
+        let stream = try await queue.eventDeliveryStream()
+        XCTAssertEqual(stream.streamId, "stream_delivery_test")
+        XCTAssertEqual(stream.gap?.sequence, 1)
+        XCTAssertEqual(stream.gap?.answers, 1)
+        let snapshot = try await queue.snapshot()
+        XCTAssertEqual(snapshot.headSequence, 1)
+        XCTAssertEqual(snapshot.queuedCount, 1)
+        await second.cancel()
         await queue.close()
     }
 
@@ -1303,12 +1429,12 @@ final class EluV1BatchDeliveryTests: XCTestCase {
         let calls = await transport.callCount()
         XCTAssertEqual(calls, 0)
 
-        // The next pass removes it, moving on from the stream nothing was
-        // sent on, and the record after it goes on the newest stream.
+        // The next pass removes it. Nothing has gone out on the moved stream,
+        // so the server has not seen it and the record after it starts it.
         let result = await coordinator.trigger()
         XCTAssertEqual(result, .resolved(delivered: 1, terminallyDiscarded: 1))
         let streams = await transport.streamIds()
-        XCTAssertEqual(streams, ["stream_moved_2"])
+        XCTAssertEqual(streams, ["stream_moved_1"])
         let snapshot = try await queue.snapshot()
         XCTAssertEqual(snapshot.queuedCount, 0)
         await queue.close()
@@ -1332,9 +1458,11 @@ final class EluV1BatchDeliveryTests: XCTestCase {
             randomUnit: 0
         )
 
-        // The time bound is passed before the answer count is reached.
+        // The time bound is reached by the answer before the last one the
+        // count needs: that answer and the ones before it do not move it.
+        let step = EluV1BatchDeliveryCoordinator.streamGapRotationSeconds / Double(answers - 2)
         for index in 0 ..< answers - 1 {
-            clock.setWall(capturedAt.addingTimeInterval(Double(index) * 600))
+            clock.setWall(capturedAt.addingTimeInterval(Double(index) * step))
             guard try await deferAndMakeDue(
                 coordinator,
                 clock,
@@ -1345,8 +1473,16 @@ final class EluV1BatchDeliveryTests: XCTestCase {
         XCTAssertEqual(beforeMove.streamId, "stream_delivery_test")
         XCTAssertEqual(beforeMove.gap?.sequence, 0)
         XCTAssertEqual(beforeMove.gap?.answers, Int64(answers - 1))
+        XCTAssertEqual(
+            beforeMove.gap?.firstAnsweredAtMilliseconds,
+            Int64(capturedAt.timeIntervalSince1970 * 1_000)
+        )
+        XCTAssertEqual(
+            Double(answers - 2) * step,
+            EluV1BatchDeliveryCoordinator.streamGapRotationSeconds
+        )
 
-        clock.setWall(capturedAt.addingTimeInterval(Double(answers) * 600))
+        clock.setWall(capturedAt.addingTimeInterval(Double(answers - 1) * step))
         let moved = await coordinator.trigger()
         XCTAssertEqual(moved, .resolved(delivered: 2, terminallyDiscarded: 0))
         let streams = await transport.streamIds()
@@ -1366,10 +1502,9 @@ final class EluV1BatchDeliveryTests: XCTestCase {
     }
 
     func testStreamGapRotationWaitsLongerThanTheServerGapCloseGrace() {
-        // The server closes a gap presented 3 times over 30 minutes (its
-        // STREAM_GAP_CLOSE_PRESENTATIONS and STREAM_GAP_CLOSE_AFTER_SECONDS);
-        // the SDK must wait for more answers over longer, so the server's
-        // close is the normal path.
+        // The server closes a gap presented 3 times over 30 minutes; the SDK
+        // must wait for more answers over longer, so the server's close is
+        // the normal path.
         XCTAssertEqual(EluV1BatchDeliveryCoordinator.serverGapClosePresentations, 3)
         XCTAssertEqual(EluV1BatchDeliveryCoordinator.serverGapCloseGraceSeconds, 1_800)
         XCTAssertGreaterThan(
@@ -1809,6 +1944,85 @@ final class EluV1BatchDeliveryTests: XCTestCase {
                 )
             )
         )
+    }
+
+    func testDeliveryStreamFileWriteTruncatesAStaleTemporaryFileAndRefusesALinkedOne() throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = EluV1EventDeliveryStreamStore(directoryURL: directory)
+        let value = EluV1EventDeliveryStream(
+            installationStreamId: "stream_install",
+            streamId: "stream_wire",
+            gap: nil,
+            sent: .init(throughSequence: 9, firstSentAtMilliseconds: 1_786_147_200_000)
+        )
+        let temporary = directory.appendingPathComponent(".event-delivery-stream-v1.tmp")
+
+        // A temporary file left from an earlier write, longer than the new
+        // bytes, is cut to them.
+        try Data(repeating: 0x7b, count: 1_500).write(to: temporary)
+        try store.save(value)
+        XCTAssertEqual(try store.load(), value)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: temporary.path))
+
+        // A temporary file that is a second link to another file is refused
+        // before any byte of that file changes.
+        let other = directory.appendingPathComponent("other-file")
+        let otherBytes = Data("bytes another file keeps".utf8)
+        try otherBytes.write(to: other)
+        try FileManager.default.linkItem(at: other, to: temporary)
+        XCTAssertThrowsError(try store.save(.initial(installationStreamId: "stream_install")))
+        XCTAssertEqual(try Data(contentsOf: other), otherBytes)
+        XCTAssertEqual(try store.load(), value)
+    }
+
+    func testOnlyAStreamTheServerMayHoldBackMovesWhenItsHeadIsRemoved() {
+        let unknownMoved = EluV1EventDeliveryStream(
+            installationStreamId: "stream_install",
+            streamId: "stream_wire",
+            gap: nil
+        )
+        let sentThrough3 = EluV1EventDeliveryStream.Sent(
+            throughSequence: 3,
+            firstSentAtMilliseconds: 1_786_147_200_000
+        )
+        var answeredMoved = unknownMoved
+        answeredMoved.gap = .init(
+            sequence: 0,
+            firstAnsweredAtMilliseconds: 1_786_147_200_000,
+            answers: 1
+        )
+        var sentMoved = unknownMoved
+        sentMoved.sent = .init(throughSequence: 0, firstSentAtMilliseconds: 1_786_147_200_000)
+        let installation = EluV1EventDeliveryStream.initial(installationStreamId: "stream_install")
+        var installationSentLater = installation
+        installationSentLater.sent = sentThrough3
+
+        // (stream, removed through, server stored none, keeps it, label)
+        let cases: [(EluV1EventDeliveryStream, Int64, Bool, Bool, String)] = [
+            // A moved stream nothing went out on is unknown to the server.
+            (unknownMoved, 0, false, true, "unknown moved stream"),
+            (unknownMoved, 0, true, true, "unknown moved stream, refused"),
+            // A moved stream that was answered or sent on is known to it.
+            (answeredMoved, 0, false, false, "answered moved stream"),
+            (sentMoved, 0, false, false, "sent moved stream"),
+            // The installation stream may be known to it from an earlier
+            // version that noted nothing.
+            (installation, 0, false, false, "installation stream"),
+            // A later record went out with the removed ones.
+            (installationSentLater, 2, false, true, "later record sent"),
+            (installationSentLater, 3, false, false, "nothing later sent"),
+            (installationSentLater, 4, false, false, "removed past the sends"),
+            // Unless the server's own answer shows it stored none of them.
+            (installationSentLater, 2, true, false, "later record sent, refused"),
+        ]
+        for (stream, sequence, serverStoredNone, keeps, label) in cases {
+            XCTAssertEqual(
+                stream.keepsStream(removingThrough: sequence, serverStoredNone: serverStoredNone),
+                keeps,
+                label
+            )
+        }
     }
 
     /// Runs one trigger that must defer a retry, waits until the retry timer

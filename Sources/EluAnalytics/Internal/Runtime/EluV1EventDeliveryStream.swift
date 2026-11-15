@@ -70,6 +70,30 @@ struct EluV1EventDeliveryStream: Equatable, Sendable {
         return next
     }
 
+    /// Whether the queue head through `sequence` can be removed without an
+    /// answer from the server while later records stay on this wire stream.
+    ///
+    /// - A moved stream nothing has been sent or answered on yet is unknown
+    ///   to the server, which starts a stream at the first sequence it
+    ///   receives. The installation stream never counts as unknown: an
+    ///   earlier version may have sent on it without noting it.
+    /// - A stream that has already sent a record after `sequence` stays,
+    ///   unless `serverStoredNone`. Every request that carried that record
+    ///   carried the removed ones ahead of it, so the server either stored
+    ///   them in order and has no gap, or stored none of them and answers
+    ///   the later records `stream-gap` until it closes the gap or the head
+    ///   moves. A new stream would carry later records the server may
+    ///   already hold, and they would be counted twice.
+    func keepsStream(removingThrough sequence: Int64, serverStoredNone: Bool) -> Bool {
+        if streamId != installationStreamId, sent == nil, gap == nil {
+            return true
+        }
+        if !serverStoredNone, let sent, sent.throughSequence > sequence {
+            return true
+        }
+        return false
+    }
+
     var isValid: Bool {
         EluV1EventDeliveryStreamStore.validStreamId(installationStreamId)
             && EluV1EventDeliveryStreamStore.validStreamId(streamId)
@@ -105,10 +129,12 @@ struct EluV1EventDeliveryStreamStore: Sendable {
         let bytes = try Self.encode(value)
         guard bytes.count <= Self.maximumBytes else { throw EluRuntimeQueueError.invalidState }
         try withDirectory { directory in
+            // Opened without truncating: a temporary file left as a link to
+            // another file is refused below before any of its bytes change.
             let output = openat(
                 directory,
                 Self.temporaryFilename,
-                O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_NONBLOCK,
+                O_WRONLY | O_CREAT | O_NOFOLLOW | O_NONBLOCK,
                 mode_t(0o600)
             )
             guard output >= 0 else { throw EluRuntimeQueueError.databaseUnavailable }
@@ -116,7 +142,8 @@ struct EluV1EventDeliveryStreamStore: Sendable {
             defer { if !closed { _ = Darwin.close(output) } }
             var metadata = stat()
             guard fstat(output, &metadata) == 0, metadata.st_mode & S_IFMT == S_IFREG,
-                  metadata.st_uid == geteuid(), metadata.st_nlink == 1
+                  metadata.st_uid == geteuid(), metadata.st_nlink == 1,
+                  ftruncate(output, 0) == 0
             else {
                 throw EluRuntimeQueueError.databaseUnavailable
             }
