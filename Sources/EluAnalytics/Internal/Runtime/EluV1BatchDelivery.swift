@@ -182,13 +182,20 @@ actor EluV1BatchDeliveryCoordinator {
     /// with `stream-gap`.
     static let maximumRecordAgeSeconds: TimeInterval = 604_800
     /// How long the server keeps the outcome it stored for a record, counted
-    /// from when it first answered it. A record younger than this is sent: if
-    /// the server stored it already, it answers again with the stored
-    /// outcome. An older record is removed without sending it, because the
-    /// server may have deleted that outcome and would refuse the record as a
-    /// conflict. As for any record that leaves unanswered, the rest of the
-    /// queue moves to a new wire stream first.
+    /// from when it first answered it. A record resent within that time gets
+    /// the stored outcome again. A record resent later may find it deleted
+    /// and be refused as a conflict, so records stop going out before then
+    /// (`resendBoundarySeconds`).
     static let serverOutcomeRetentionSeconds: TimeInterval = 691_200
+    /// A record younger than this is sent. An older one is sent only on a
+    /// wire stream that first sent it less than this long ago: the server
+    /// stored nothing for it before that send, so it still holds whatever it
+    /// stored since. Any other record this old is removed without sending it,
+    /// and, as for any record that leaves unanswered, the rest of the queue
+    /// moves to a new wire stream first. Twelve hours inside the server's
+    /// retention, as in the other ELU SDKs, to allow for clock changes.
+    static let resendBoundarySeconds: TimeInterval = 648_000
+    private static let resendBoundaryMilliseconds = Int64(resendBoundarySeconds * 1_000)
     static let maximumResponseBytes = 1_048_576
     static let maximumErrorResponseBytes = 65_536
     static let requestTimeoutSeconds: TimeInterval = 30
@@ -200,15 +207,20 @@ actor EluV1BatchDeliveryCoordinator {
     /// for an earlier sequence.
     static let streamGapCode = "stream-gap"
     /// A head answered `stream-gap` at least this many times, over at least
-    /// this long, moves to a new wire stream. The bound is well past a
-    /// transient gap (two senders racing) and past the time the server is
-    /// given to close a gap itself (the server closes a gap after 30 minutes),
-    /// so the server's close is the normal path and rotation is only the
-    /// fallback for a stream the server will never advance. Both counts
-    /// persist across restarts.
+    /// this long by the device clock, moves to a new wire stream. The bound
+    /// is well past a transient gap (two senders racing) and past both
+    /// bounds after which the server closes a gap itself, so the server's
+    /// close is the normal path and rotation is only the fallback for a
+    /// stream the server will never advance. Both counts persist across
+    /// restarts.
     static let streamGapRotationAnswers: Int64 = 5
     static let streamGapRotationSeconds: TimeInterval = 2_700
-    /// The server's own grace before it closes a gap, in seconds.
+    /// The server closes a gap once it has been presented this many times
+    /// (the closing request included) over this long since the first:
+    /// `STREAM_GAP_CLOSE_PRESENTATIONS` and `STREAM_GAP_CLOSE_AFTER_SECONDS`
+    /// in the server. A change there must keep both rotation bounds above
+    /// them.
+    static let serverGapClosePresentations: Int64 = 3
     static let serverGapCloseGraceSeconds: TimeInterval = 1_800
 
     private let queue: EluSQLiteRuntimeQueue
@@ -234,7 +246,7 @@ actor EluV1BatchDeliveryCoordinator {
         time: EluV1BatchTimeSource = .system,
         randomUnit: @escaping @Sendable () -> Double = { Double.random(in: 0 ... 1) },
         deliveryStreamIdGenerator: @escaping @Sendable () -> String = {
-            "stream_" + UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+            "stream_" + EluRuntimeIdentifier.compactUUID()
         }
     ) {
         self.queue = queue
@@ -359,7 +371,7 @@ actor EluV1BatchDeliveryCoordinator {
 
     private func performFreshSegment() async -> EluV1SegmentResult {
         do {
-            let target = try await currentTarget()
+            let (target, stream) = try await currentTarget()
             let records = try await queue.peek(
                 maximumCount: authorization.eventBatchCount,
                 maximumBytes: EluV1BatchAuthorizationSnapshot.maximumBatchBytes
@@ -368,10 +380,10 @@ actor EluV1BatchDeliveryCoordinator {
 
             // Records past the server's age bound are still sent: the server
             // judges age and stores a terminal outcome for a record that is
-            // too old, which keeps the stream contiguous. Only records past
-            // the server's outcome retention are removed here.
+            // too old, which keeps the stream contiguous. Only records the
+            // server may no longer hold an earlier outcome for are removed.
             let now = try currentWallTime()
-            let expired = Array(records.prefix { outlivesServerOutcome($0, at: now) })
+            let expired = Array(records.prefix { outlivesServerOutcome($0, at: now, on: stream) })
             if !expired.isEmpty {
                 guard localResolutionsInPass < Self.maximumLocalResolutionsPerPass else {
                     return .bounded(delivered: 0, terminallyDiscarded: 0)
@@ -383,7 +395,7 @@ actor EluV1BatchDeliveryCoordinator {
                 localResolutionsInPass += 1
                 return .resolved(delivered: 0, terminallyDiscarded: expired.count)
             }
-            let sendable = Array(records.prefix { !outlivesServerOutcome($0, at: now) })
+            let sendable = Array(records.prefix { !outlivesServerOutcome($0, at: now, on: stream) })
             return await sendLargestHomogeneousPrefix(
                 sendable,
                 target: target,
@@ -394,16 +406,17 @@ actor EluV1BatchDeliveryCoordinator {
         }
     }
 
-    private func currentTarget() async throws -> EluV1DeliveryTarget {
+    private func currentTarget() async throws -> (EluV1DeliveryTarget, EluV1EventDeliveryStream) {
         let snapshot = try await queue.snapshot()
         let stream = try await queue.eventDeliveryStream()
         guard stream.installationStreamId == snapshot.streamId else {
             throw EluRuntimeQueueError.generationMismatch
         }
-        return EluV1DeliveryTarget(
+        let target = EluV1DeliveryTarget(
             installationStreamId: snapshot.streamId,
             streamId: stream.streamId
         )
+        return (target, stream)
     }
 
     private func performRetry(_ retry: EluV1PendingBatchRetry) async -> EluV1SegmentResult {
@@ -434,7 +447,7 @@ actor EluV1BatchDeliveryCoordinator {
             return .preserved(.authorizationExpired)
         }
         do {
-            let target = try await currentTarget()
+            let (target, _) = try await currentTarget()
             guard try await recordsStillMatchHead(
                 retry.records,
                 streamId: target.installationStreamId
@@ -485,103 +498,107 @@ actor EluV1BatchDeliveryCoordinator {
     }
 
     /// Removes records that cannot be sent: larger than any request may be,
-    /// refused 413 on their own, or past the server's outcome retention. If
-    /// the server never answered them, it would hold every later record of
-    /// the wire stream as `stream-gap`. The rest of the queue moves to a new
-    /// wire stream first: if the process ends between the two steps, the
-    /// record is removed again on the new stream instead of leaving a gap.
+    /// refused 413 on their own, or past the resend boundary. If the server
+    /// never answered them, it would hold every later record of the wire
+    /// stream as `stream-gap`. The rest of the queue moves to a new wire
+    /// stream first, and the records stay queued if that fails: if the
+    /// process ends between the two steps, the record is removed again on
+    /// the new stream instead of leaving a gap.
     private func discardUnsendable(
         _ references: [EluQueueAcknowledgementReference],
         target: EluV1DeliveryTarget
     ) async throws {
-        await moveDeliveryStream(from: target)
+        try await moveDeliveryStream(from: target)
         try await queue.acknowledge(references)
     }
 
-    /// Moves the wire stream from `target` to a new id. Another coordinator
-    /// may already have moved it; a failed write leaves this owner on the new
-    /// stream anyway, and a later open answers the gap again.
-    @discardableResult
-    private func moveDeliveryStream(
-        from target: EluV1DeliveryTarget,
-        current known: EluV1EventDeliveryStream? = nil
-    ) async -> Bool {
-        do {
-            let current: EluV1EventDeliveryStream
-            if let known {
-                current = known
-            } else {
-                current = try await queue.eventDeliveryStream()
-            }
+    /// Moves the wire stream away from `target`, unless another coordinator
+    /// already has. Throws when the stream could not be read or written, or
+    /// when the queue now belongs to another installation stream.
+    private func moveDeliveryStream(from target: EluV1DeliveryTarget) async throws {
+        let generator = deliveryStreamIdGenerator
+        let after = try await queue.updateEventDeliveryStream { current in
             guard current.installationStreamId == target.installationStreamId,
                   current.streamId == target.streamId
             else {
-                return current.streamId != target.streamId
+                return nil
             }
-            let next = EluV1EventDeliveryStream(
-                installationStreamId: current.installationStreamId,
-                streamId: newDeliveryStreamId(avoiding: current),
-                gap: nil
+            return current.moved(
+                to: EluV1BatchDeliveryCoordinator.newDeliveryStreamId(generator, avoiding: current)
             )
-            if try await queue.replaceEventDeliveryStream(expected: current, with: next) {
-                return true
-            }
-            return try await queue.eventDeliveryStream().streamId != target.streamId
-        } catch {
-            return false
+        }
+        guard after.installationStreamId == target.installationStreamId,
+              after.streamId != target.streamId
+        else {
+            throw EluRuntimeQueueError.generationMismatch
         }
     }
 
-    private func newDeliveryStreamId(avoiding current: EluV1EventDeliveryStream) -> String {
-        let candidate = deliveryStreamIdGenerator()
+    private static func newDeliveryStreamId(
+        _ generator: @Sendable () -> String,
+        avoiding current: EluV1EventDeliveryStream
+    ) -> String {
+        let candidate = generator()
         if EluV1EventDeliveryStreamStore.validStreamId(candidate),
            candidate != current.streamId,
            candidate != current.installationStreamId
         {
             return candidate
         }
-        return "stream_" + UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+        return "stream_" + EluRuntimeIdentifier.compactUUID()
     }
 
     /// Counts a `stream-gap` answer for the head at `sequence`, persisted with
     /// the wire stream. Returns true when the head now has a different wire
     /// stream to go on: either this answer reached the bound and moved it, or
-    /// another coordinator moved it already.
+    /// another coordinator moved it already. An answer from a stream that has
+    /// moved on is not counted against the new one.
     private func noteStreamGap(
         sequence: Int64,
         target: EluV1DeliveryTarget
     ) async -> Bool {
+        guard let now = Self.milliseconds(time.wallNow()) else { return false }
+        let generator = deliveryStreamIdGenerator
         do {
-            let current = try await queue.eventDeliveryStream()
-            guard current.installationStreamId == target.installationStreamId else {
-                return false
+            let after = try await queue.updateEventDeliveryStream { current in
+                guard current.installationStreamId == target.installationStreamId,
+                      current.streamId == target.streamId
+                else {
+                    return nil
+                }
+                var gap = current.gap.flatMap { $0.sequence == sequence ? $0 : nil }
+                    ?? EluV1EventDeliveryStream.Gap(
+                        sequence: sequence,
+                        firstAnsweredAtMilliseconds: now,
+                        answers: 0
+                    )
+                // A clock set back starts the window again rather than
+                // stretching it. A clock set forward shortens it, which is
+                // harmless: the server stores nothing for a `stream-gap`
+                // answer, and the head goes again on the new stream.
+                if now < gap.firstAnsweredAtMilliseconds {
+                    gap.firstAnsweredAtMilliseconds = now
+                }
+                gap.answers = gap.answers < Int64.max ? gap.answers + 1 : Int64.max
+                let elapsed = now.subtractingReportingOverflow(gap.firstAnsweredAtMilliseconds)
+                let bound = Int64(EluV1BatchDeliveryCoordinator.streamGapRotationSeconds * 1_000)
+                if gap.answers >= EluV1BatchDeliveryCoordinator.streamGapRotationAnswers,
+                   !elapsed.overflow,
+                   elapsed.partialValue >= bound
+                {
+                    return current.moved(
+                        to: EluV1BatchDeliveryCoordinator.newDeliveryStreamId(
+                            generator,
+                            avoiding: current
+                        )
+                    )
+                }
+                var next = current
+                next.gap = gap
+                return next
             }
-            guard current.streamId == target.streamId else { return true }
-            guard let now = Self.milliseconds(time.wallNow()) else { return false }
-            var gap = current.gap.flatMap { $0.sequence == sequence ? $0 : nil }
-                ?? EluV1EventDeliveryStream.Gap(
-                    sequence: sequence,
-                    firstAnsweredAtMilliseconds: now,
-                    answers: 0
-                )
-            // A clock set back starts the window again rather than
-            // shortening or stretching it.
-            if now < gap.firstAnsweredAtMilliseconds {
-                gap.firstAnsweredAtMilliseconds = now
-            }
-            gap.answers = gap.answers < Int64.max ? gap.answers + 1 : Int64.max
-            let elapsed = now.subtractingReportingOverflow(gap.firstAnsweredAtMilliseconds)
-            let bound = Int64(Self.streamGapRotationSeconds * 1_000)
-            if gap.answers >= Self.streamGapRotationAnswers,
-               !elapsed.overflow,
-               elapsed.partialValue >= bound
-            {
-                return await moveDeliveryStream(from: target, current: current)
-            }
-            var next = current
-            next.gap = gap
-            try await queue.replaceEventDeliveryStream(expected: current, with: next)
-            return false
+            return after.installationStreamId == target.installationStreamId
+                && after.streamId != target.streamId
         } catch {
             return false
         }
@@ -598,6 +615,25 @@ actor EluV1BatchDeliveryCoordinator {
         return Int64(value)
     }
 
+    /// Records, before the request starts, that the prepared records go out
+    /// on their wire stream at `now`, so a resend after an answer that never
+    /// arrived knows the server stored nothing for them before then. Returns
+    /// false when the wire stream moved meanwhile.
+    private func recordSend(_ prepared: EluV1PreparedBatch, at now: Date) async throws -> Bool {
+        guard let first = prepared.records.first?.sequence,
+              let last = prepared.records.last?.sequence,
+              let sentAt = Self.milliseconds(now)
+        else {
+            return true
+        }
+        let streamId = prepared.streamId
+        let after = try await queue.updateEventDeliveryStream { current in
+            guard current.streamId == streamId else { return nil }
+            return current.recordingSend(first: first, last: last, atMilliseconds: sentAt)
+        }
+        return after.streamId == streamId
+    }
+
     private func send(
         _ prepared: EluV1PreparedBatch,
         attempt: Int
@@ -608,6 +644,7 @@ actor EluV1BatchDeliveryCoordinator {
         guard !Task.isCancelled else {
             return .preserved(.cancelled)
         }
+        let stream: EluV1EventDeliveryStream
         do {
             guard try await recordsStillMatchHead(
                 prepared.records,
@@ -615,8 +652,11 @@ actor EluV1BatchDeliveryCoordinator {
             ) else {
                 return .preserved(.queueFailure)
             }
-            // Another coordinator may have moved the wire stream meanwhile.
-            guard try await queue.eventDeliveryStream().streamId == prepared.streamId else {
+            stream = try await queue.eventDeliveryStream()
+            // The wire stream may have moved since this batch was prepared:
+            // by another coordinator, or by a one-record 413 in the first
+            // half of a split. The pass then packs again from the queue head.
+            guard stream.streamId == prepared.streamId else {
                 return .restart(delivered: 0, terminallyDiscarded: 0)
             }
         } catch {
@@ -634,7 +674,9 @@ actor EluV1BatchDeliveryCoordinator {
         guard authorizationIsCurrent(at: preflightNow) else {
             return .preserved(.authorizationExpired)
         }
-        if prepared.records.contains(where: { outlivesServerOutcome($0, at: preflightNow) }) {
+        if prepared.records.contains(where: {
+            outlivesServerOutcome($0, at: preflightNow, on: stream)
+        }) {
             // The next segment removes it. Counted as a local resolution so a
             // clock that moves back and forth cannot loop without bound.
             guard localResolutionsInPass < Self.maximumLocalResolutionsPerPass else {
@@ -651,6 +693,13 @@ actor EluV1BatchDeliveryCoordinator {
         }
         guard networkRequestsInPass < Self.maximumNetworkRequestsPerPass else {
             return .bounded(delivered: 0, terminallyDiscarded: 0)
+        }
+        do {
+            guard try await recordSend(prepared, at: preflightNow) else {
+                return .restart(delivered: 0, terminallyDiscarded: 0)
+            }
+        } catch {
+            return .preserved(.queueFailure)
         }
         networkRequestsInPass += 1
 
@@ -823,11 +872,9 @@ actor EluV1BatchDeliveryCoordinator {
             guard case let .resolved(firstDelivered, firstDiscarded) = first else {
                 return first
             }
-            // A one-record 413 in the first half moved the wire stream; the
-            // second half is packed again from the queue head on the new one.
-            guard await deliveryStreamIsCurrent(prepared.target) else {
-                return .restart(delivered: firstDelivered, terminallyDiscarded: firstDiscarded)
-            }
+            // If a one-record 413 in the first half moved the wire stream,
+            // `send` does not send the second half on the old one: the pass
+            // packs it again from the queue head on the new stream.
             let second = await sendExactRecords(secondRecords, target: prepared.target)
             return second.adding(delivered: firstDelivered, terminallyDiscarded: firstDiscarded)
 
@@ -918,11 +965,6 @@ actor EluV1BatchDeliveryCoordinator {
         } catch {
             return .preserved(.queueFailure)
         }
-    }
-
-    private func deliveryStreamIsCurrent(_ target: EluV1DeliveryTarget) async -> Bool {
-        guard let current = try? await queue.eventDeliveryStream() else { return false }
-        return current.streamId == target.streamId
     }
 
     private func largestFittingPrefix(
@@ -1024,8 +1066,31 @@ actor EluV1BatchDeliveryCoordinator {
         }
     }
 
-    private func outlivesServerOutcome(_ record: EluQueuedRecord, at now: Date) -> Bool {
-        now.timeIntervalSince(record.occurredAt) >= Self.serverOutcomeRetentionSeconds
+    /// Whether `record` may no longer be sent on `stream`: it is at least
+    /// `resendBoundarySeconds` old, and was not first sent on this wire
+    /// stream less than that long ago. Retention counts from the server's
+    /// first answer, which comes after the first send, so a record sent on
+    /// this stream since then gets its stored outcome again, or, if the
+    /// server never stored it, the answer for a new record.
+    private func outlivesServerOutcome(
+        _ record: EluQueuedRecord,
+        at now: Date,
+        on stream: EluV1EventDeliveryStream
+    ) -> Bool {
+        guard now.timeIntervalSince(record.occurredAt) >= Self.resendBoundarySeconds else {
+            return false
+        }
+        guard let sent = stream.sent,
+              record.sequence <= sent.throughSequence,
+              let nowMilliseconds = Self.milliseconds(now)
+        else {
+            return true
+        }
+        let sinceFirstSend = nowMilliseconds.subtractingReportingOverflow(
+            sent.firstSentAtMilliseconds
+        )
+        return sinceFirstSend.overflow
+            || sinceFirstSend.partialValue >= Self.resendBoundaryMilliseconds
     }
 
     private func authorizationIsCurrent() -> Bool {

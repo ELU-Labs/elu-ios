@@ -383,7 +383,7 @@ private enum EluSQLiteRuntimeSchema {
     ]
 }
 
-private enum EluRuntimeIdentifier {
+enum EluRuntimeIdentifier {
     static func compactUUID() -> String {
         UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
     }
@@ -9416,10 +9416,10 @@ actor EluSQLiteRuntimeQueue {
     }
 
     /// The stream id event batches carry on the wire, with the stream-gap
-    /// evidence for its head. Persistent storage keeps it in a small file
-    /// beside the database, read once per open; memory storage keeps it only
-    /// here. Anything unreadable, or written for another installation stream,
-    /// means the installation stream itself.
+    /// evidence for its head and what has been sent on it. Persistent storage
+    /// keeps it in a small file beside the database, read once per open;
+    /// memory storage keeps it only here. Anything unreadable, or written for
+    /// another installation stream, means the installation stream itself.
     func eventDeliveryStream() throws -> EluV1EventDeliveryStream {
         let resources = try requireResources()
         if let current = eventDeliveryStreamState,
@@ -9441,29 +9441,32 @@ actor EluSQLiteRuntimeQueue {
         return value
     }
 
-    /// Replaces the wire stream state only while it still equals `expected`,
-    /// so two delivery coordinators never both move the stream. This owner
-    /// uses the new state at once. Writing the file is best effort: if it
-    /// fails, a later open finds the previous stream, its gap is answered
-    /// again, and delivery moves it again.
+    /// Changes the wire stream state in one step: `change` gets the current
+    /// state and returns the next one, or nil to keep it, and the state it
+    /// leaves is returned. The read and the write it decides happen in this
+    /// one call on the queue's actor, so another delivery coordinator cannot
+    /// change the state between them. This owner uses the new state at once.
+    /// Writing the file is best effort: if it fails, a later open finds the
+    /// previous state, a moved stream's gap is answered again and delivery
+    /// moves it again, and records whose send was not written down count
+    /// from their next send that is.
     @discardableResult
-    func replaceEventDeliveryStream(
-        expected: EluV1EventDeliveryStream,
-        with next: EluV1EventDeliveryStream
-    ) throws -> Bool {
+    func updateEventDeliveryStream(
+        _ change: @Sendable (EluV1EventDeliveryStream) -> EluV1EventDeliveryStream?
+    ) throws -> EluV1EventDeliveryStream {
         let resources = try requireResources()
         let current = try eventDeliveryStream()
-        guard current == expected,
-              next.installationStreamId == current.installationStreamId,
-              next.isValid
-        else {
-            return false
+        guard let next = change(current), next != current else {
+            return current
+        }
+        guard next.installationStreamId == current.installationStreamId, next.isValid else {
+            throw EluRuntimeQueueError.invalidState
         }
         eventDeliveryStreamState = next
         if resources.persistence == .persistent {
             try? eventDeliveryStreamStore(resources).save(next)
         }
-        return true
+        return next
     }
 
     private func eventDeliveryStreamStore(

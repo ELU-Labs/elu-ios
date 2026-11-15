@@ -17,9 +17,19 @@ struct EluV1EventDeliveryStream: Equatable, Sendable {
         var answers: Int64
     }
 
+    /// Records already sent on this wire stream: every queued record up to
+    /// `throughSequence`. The earliest of those sends began at
+    /// `firstSentAtMilliseconds` by the device clock, so whatever the server
+    /// stored for them, it stored no earlier than that.
+    struct Sent: Equatable, Sendable {
+        var throughSequence: Int64
+        var firstSentAtMilliseconds: Int64
+    }
+
     let installationStreamId: String
     let streamId: String
     var gap: Gap?
+    var sent: Sent? = nil
 
     static func initial(installationStreamId: String) -> EluV1EventDeliveryStream {
         EluV1EventDeliveryStream(
@@ -29,10 +39,42 @@ struct EluV1EventDeliveryStream: Equatable, Sendable {
         )
     }
 
+    /// The same installation on a new wire stream, where nothing has been
+    /// sent or answered yet.
+    func moved(to streamId: String) -> EluV1EventDeliveryStream {
+        EluV1EventDeliveryStream(
+            installationStreamId: installationStreamId,
+            streamId: streamId,
+            gap: nil
+        )
+    }
+
+    /// The state once the queue head `first` through `last` is sent at `now`.
+    func recordingSend(
+        first: Int64,
+        last: Int64,
+        atMilliseconds now: Int64
+    ) -> EluV1EventDeliveryStream {
+        var next = self
+        if let sent, sent.throughSequence >= first {
+            // Some of these records went out before, and the server may hold
+            // what it stored for them since then: keep the earliest send.
+            next.sent = Sent(
+                throughSequence: max(sent.throughSequence, last),
+                firstSentAtMilliseconds: min(sent.firstSentAtMilliseconds, now)
+            )
+        } else {
+            // Every record sent before has left the queue.
+            next.sent = Sent(throughSequence: last, firstSentAtMilliseconds: now)
+        }
+        return next
+    }
+
     var isValid: Bool {
         EluV1EventDeliveryStreamStore.validStreamId(installationStreamId)
             && EluV1EventDeliveryStreamStore.validStreamId(streamId)
             && (gap.map { $0.sequence >= 0 && $0.answers >= 1 } ?? true)
+            && (sent.map { $0.throughSequence >= 0 } ?? true)
     }
 }
 
@@ -110,23 +152,37 @@ struct EluV1EventDeliveryStreamStore: Sendable {
             var answers: Int64
         }
 
+        struct Sent: Codable, Equatable {
+            var throughSequence: Int64
+            var firstSentAtMilliseconds: Int64
+        }
+
         var schemaVersion: Int
         var installationStreamId: String
         var streamId: String
         var gap: Gap?
+        var sent: Sent?
 
         private enum CodingKeys: String, CodingKey {
             case schemaVersion
             case installationStreamId
             case streamId
             case gap
+            case sent
         }
 
-        init(schemaVersion: Int, installationStreamId: String, streamId: String, gap: Gap?) {
+        init(
+            schemaVersion: Int,
+            installationStreamId: String,
+            streamId: String,
+            gap: Gap?,
+            sent: Sent?
+        ) {
             self.schemaVersion = schemaVersion
             self.installationStreamId = installationStreamId
             self.streamId = streamId
             self.gap = gap
+            self.sent = sent
         }
 
         init(from decoder: Decoder) throws {
@@ -135,6 +191,7 @@ struct EluV1EventDeliveryStreamStore: Sendable {
             installationStreamId = try container.decode(String.self, forKey: .installationStreamId)
             streamId = try container.decode(String.self, forKey: .streamId)
             gap = try container.decode(Gap?.self, forKey: .gap)
+            sent = try container.decode(Sent?.self, forKey: .sent)
         }
 
         func encode(to encoder: Encoder) throws {
@@ -144,6 +201,7 @@ struct EluV1EventDeliveryStreamStore: Sendable {
             try container.encode(streamId, forKey: .streamId)
             // Written as null so the canonical bytes always carry every key.
             try container.encode(gap, forKey: .gap)
+            try container.encode(sent, forKey: .sent)
         }
     }
 
@@ -158,6 +216,12 @@ struct EluV1EventDeliveryStreamStore: Sendable {
                     sequence: $0.sequence,
                     firstAnsweredAtMilliseconds: $0.firstAnsweredAtMilliseconds,
                     answers: $0.answers
+                )
+            },
+            sent: value.sent.map {
+                Document.Sent(
+                    throughSequence: $0.throughSequence,
+                    firstSentAtMilliseconds: $0.firstSentAtMilliseconds
                 )
             }
         )
@@ -182,6 +246,12 @@ struct EluV1EventDeliveryStreamStore: Sendable {
                     sequence: $0.sequence,
                     firstAnsweredAtMilliseconds: $0.firstAnsweredAtMilliseconds,
                     answers: $0.answers
+                )
+            },
+            sent: document.sent.map {
+                EluV1EventDeliveryStream.Sent(
+                    throughSequence: $0.throughSequence,
+                    firstSentAtMilliseconds: $0.firstSentAtMilliseconds
                 )
             }
         )
