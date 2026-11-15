@@ -3814,6 +3814,8 @@ actor EluSQLiteRuntimeQueue {
         }
     }
     private var isPoisoned = false
+    /// Loaded once per open; see `eventDeliveryStream()`.
+    private var eventDeliveryStreamState: EluV1EventDeliveryStream?
     private var rateLimiter: EluCaptureRateLimiter?
     private let rateLimitOwner = UUID()
     private let eventFilter: EluEventFilter
@@ -9411,6 +9413,65 @@ actor EluSQLiteRuntimeQueue {
             }
             throw mapOperationError(error)
         }
+    }
+
+    /// The stream id event batches carry on the wire, with the stream-gap
+    /// evidence for its head. Persistent storage keeps it in a small file
+    /// beside the database, read once per open; memory storage keeps it only
+    /// here. Anything unreadable, or written for another installation stream,
+    /// means the installation stream itself.
+    func eventDeliveryStream() throws -> EluV1EventDeliveryStream {
+        let resources = try requireResources()
+        if let current = eventDeliveryStreamState,
+           current.installationStreamId == state.streamId
+        {
+            return current
+        }
+        var loaded: EluV1EventDeliveryStream?
+        if resources.persistence == .persistent {
+            loaded = try? eventDeliveryStreamStore(resources).load()
+        }
+        let value: EluV1EventDeliveryStream
+        if let loaded, loaded.installationStreamId == state.streamId {
+            value = loaded
+        } else {
+            value = .initial(installationStreamId: state.streamId)
+        }
+        eventDeliveryStreamState = value
+        return value
+    }
+
+    /// Replaces the wire stream state only while it still equals `expected`,
+    /// so two delivery coordinators never both move the stream. This owner
+    /// uses the new state at once. Writing the file is best effort: if it
+    /// fails, a later open finds the previous stream, its gap is answered
+    /// again, and delivery moves it again.
+    @discardableResult
+    func replaceEventDeliveryStream(
+        expected: EluV1EventDeliveryStream,
+        with next: EluV1EventDeliveryStream
+    ) throws -> Bool {
+        let resources = try requireResources()
+        let current = try eventDeliveryStream()
+        guard current == expected,
+              next.installationStreamId == current.installationStreamId,
+              next.isValid
+        else {
+            return false
+        }
+        eventDeliveryStreamState = next
+        if resources.persistence == .persistent {
+            try? eventDeliveryStreamStore(resources).save(next)
+        }
+        return true
+    }
+
+    private func eventDeliveryStreamStore(
+        _ resources: EluRuntimeResources
+    ) -> EluV1EventDeliveryStreamStore {
+        EluV1EventDeliveryStreamStore(
+            directoryURL: URL(fileURLWithPath: resources.canonicalDirectory, isDirectory: true)
+        )
     }
 
     func close() {

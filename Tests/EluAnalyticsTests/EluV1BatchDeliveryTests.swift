@@ -125,6 +125,13 @@ final class EluV1BatchDeliveryTests: XCTestCase {
         XCTAssertEqual(oversizeResult, .resolved(delivered: 1, terminallyDiscarded: 1))
         let oversizeSequences = await oversizeTransport.recordSequences()
         XCTAssertEqual(oversizeSequences, [[1]])
+        // Sequence 0 never reaches the server, so the rest of the queue goes
+        // on a new wire stream that the server starts at sequence 1.
+        let oversizeStreams = await oversizeTransport.streamIds()
+        XCTAssertEqual(oversizeStreams, ["stream_moved_1"])
+        let movedStream = try await oversizeQueue.eventDeliveryStream()
+        XCTAssertEqual(movedStream.streamId, "stream_moved_1")
+        XCTAssertEqual(movedStream.installationStreamId, "stream_delivery_test")
         let afterOversize = try await oversizeQueue.snapshot()
         XCTAssertEqual(afterOversize.queuedCount, 0)
         await oversizeQueue.close()
@@ -183,18 +190,13 @@ final class EluV1BatchDeliveryTests: XCTestCase {
         let directory = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
         let queue = try await makeQueue(directory: directory)
-        _ = try await appendRecords(queue, count: 65)
+        // Every record is larger than one request may be.
+        _ = try await appendRecords(queue, count: 65, valueBytes: 2_000)
         let transport = TestBatchTransport(replies: [])
-        let clock = TestBatchClock(
-            wall: capturedAt.addingTimeInterval(
-                EluV1BatchDeliveryCoordinator.maximumRecordAgeSeconds
-            ),
-            monotonic: 0
-        )
         let coordinator = try self.coordinator(
             queue: queue,
-            transport: transport,
-            clock: clock
+            byteLimit: EluV1BatchAuthorizationSnapshot.minimumBatchBytes,
+            transport: transport
         )
 
         let first = await coordinator.trigger()
@@ -314,10 +316,13 @@ final class EluV1BatchDeliveryTests: XCTestCase {
         XCTAssertEqual(sequences[21], [1])
         XCTAssertTrue(sequences.prefix(11).allSatisfy { $0.first == 0 })
         XCTAssertTrue(sequences.suffix(11).allSatisfy { $0.first == 1 })
+        let streams = await transport.streamIds()
+        XCTAssertTrue(streams.prefix(11).allSatisfy { $0 == "stream_delivery_test" })
+        XCTAssertTrue(streams.suffix(11).allSatisfy { $0 == "stream_moved_1" })
         await queue.close()
     }
 
-    func test413AgeTransitionDeletesOnlyAgedPrefixThenContinuesSubsegment() async throws {
+    func test413SplitKeepsARecordThatAgedAndTheServerResolvesIt() async throws {
         let directory = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
         let clock = TestBatchClock(wall: capturedAt, monotonic: 0)
@@ -333,7 +338,7 @@ final class EluV1BatchDeliveryTests: XCTestCase {
         let transport = TestBatchTransport(
             replies: [
                 .httpAndSetWall(413, nil, clock, initialWall.addingTimeInterval(2)),
-                .accept,
+                .rejectSequences([0], "record-too-old"),
                 .accept,
             ]
         )
@@ -346,7 +351,9 @@ final class EluV1BatchDeliveryTests: XCTestCase {
         let result = await coordinator.trigger()
         XCTAssertEqual(result, .resolved(delivered: 2, terminallyDiscarded: 1))
         let sequences = await transport.recordSequences()
-        XCTAssertEqual(sequences, [[0, 1, 2], [1], [2]])
+        XCTAssertEqual(sequences, [[0, 1, 2], [0, 1], [2]])
+        let streams = await transport.streamIds()
+        XCTAssertEqual(streams, Array(repeating: "stream_delivery_test", count: 3))
         let snapshot = try await queue.snapshot()
         XCTAssertEqual(snapshot.queuedCount, 0)
         await queue.close()
@@ -547,7 +554,7 @@ final class EluV1BatchDeliveryTests: XCTestCase {
         await queue.close()
     }
 
-    func testRetryAgeTransitionDeletesOnlyAgedPrefixThenContinuesSuffix() async throws {
+    func testRetryAfterTheHeadAgedResendsTheSameRequest() async throws {
         let directory = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
         let clock = TestBatchClock(wall: capturedAt, monotonic: 10)
@@ -560,7 +567,9 @@ final class EluV1BatchDeliveryTests: XCTestCase {
                 EluV1BatchDeliveryCoordinator.maximumRecordAgeSeconds - 1
             )
         )
-        let transport = TestBatchTransport(replies: [.network, .accept])
+        let transport = TestBatchTransport(
+            replies: [.network, .rejectSequences([0], "record-too-old")]
+        )
         let coordinator = try self.coordinator(
             queue: queue,
             transport: transport,
@@ -580,7 +589,53 @@ final class EluV1BatchDeliveryTests: XCTestCase {
         let result = await coordinator.trigger()
         XCTAssertEqual(result, .resolved(delivered: 2, terminallyDiscarded: 1))
         let sequences = await transport.recordSequences()
+        XCTAssertEqual(sequences, [[0, 1, 2], [0, 1, 2]])
+        let ids = await transport.requestIds()
+        XCTAssertEqual(Set(ids).count, 1)
+        let snapshot = try await queue.snapshot()
+        XCTAssertEqual(snapshot.queuedCount, 0)
+        await coordinator.cancel()
+        await queue.close()
+    }
+
+    func testRetryAfterTheHeadOutlivedTheServerOutcomeRemovesOnlyTheHead() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let clock = TestBatchClock(wall: capturedAt, monotonic: 10)
+        let queue = try await makeQueue(directory: directory, clock: clock.source.wallNow)
+        _ = try await appendRecords(queue, count: 1)
+        clock.setWall(capturedAt.addingTimeInterval(100))
+        _ = try await appendRecords(queue, count: 2)
+        clock.setWall(
+            capturedAt.addingTimeInterval(
+                EluV1BatchDeliveryCoordinator.serverOutcomeRetentionSeconds - 1
+            )
+        )
+        let transport = TestBatchTransport(
+            replies: [.network, .rejectSequences([1, 2], "record-too-old")]
+        )
+        let coordinator = try self.coordinator(
+            queue: queue,
+            transport: transport,
+            clock: clock,
+            randomUnit: 0
+        )
+
+        guard case let .deferred(deadline) = await coordinator.trigger() else {
+            return XCTFail("Expected network retry")
+        }
+        clock.setWall(
+            capturedAt.addingTimeInterval(
+                EluV1BatchDeliveryCoordinator.serverOutcomeRetentionSeconds + 1
+            )
+        )
+        clock.setMonotonic(deadline)
+        let result = await coordinator.trigger()
+        XCTAssertEqual(result, .resolved(delivered: 0, terminallyDiscarded: 3))
+        let sequences = await transport.recordSequences()
         XCTAssertEqual(sequences, [[0, 1, 2], [1, 2]])
+        let streams = await transport.streamIds()
+        XCTAssertEqual(streams, ["stream_delivery_test", "stream_moved_1"])
         let snapshot = try await queue.snapshot()
         XCTAssertEqual(snapshot.queuedCount, 0)
         await coordinator.cancel()
@@ -771,18 +826,27 @@ final class EluV1BatchDeliveryTests: XCTestCase {
         }
     }
 
-    func testSevenDayBoundaryAndFutureTimestampHandling() async throws {
-        for (offset, shouldDiscard) in [
-            (EluV1BatchDeliveryCoordinator.maximumRecordAgeSeconds - 0.001, false),
-            (EluV1BatchDeliveryCoordinator.maximumRecordAgeSeconds, true),
-            (EluV1BatchDeliveryCoordinator.maximumRecordAgeSeconds + 0.001, true),
-            (-60.0, false),
-        ] {
+    func testRecordsAreSentUntilTheServerMayHaveDroppedTheirOutcome() async throws {
+        let maximumAge = EluV1BatchDeliveryCoordinator.maximumRecordAgeSeconds
+        let retention = EluV1BatchDeliveryCoordinator.serverOutcomeRetentionSeconds
+        XCTAssertGreaterThan(retention, maximumAge)
+        // The server's answer to the record, or nil when it is not sent.
+        let tooOld = TestBatchReply.rejectSequences([0], "record-too-old")
+        let cases: [(TimeInterval, TestBatchReply?)] = [
+            (-60, .accept),
+            (maximumAge - 0.001, .accept),
+            (maximumAge, tooOld),
+            (maximumAge + 0.001, tooOld),
+            (retention - 0.001, tooOld),
+            (retention, nil),
+            (retention + 0.001, nil),
+        ]
+        for (offset, reply) in cases {
             let directory = try temporaryDirectory()
             defer { try? FileManager.default.removeItem(at: directory) }
             let queue = try await makeQueue(directory: directory)
             _ = try await appendRecords(queue, count: 1)
-            let transport = TestBatchTransport(replies: [.accept])
+            let transport = TestBatchTransport(replies: reply.map { [$0] } ?? [])
             let clock = TestBatchClock(
                 wall: capturedAt.addingTimeInterval(offset),
                 monotonic: 0
@@ -794,20 +858,30 @@ final class EluV1BatchDeliveryTests: XCTestCase {
                 authorizationExpiry: capturedAt.addingTimeInterval(900_000)
             )
             let result = await coordinator.trigger()
-            if shouldDiscard {
+            let calls = await transport.callCount()
+            let stream = try await queue.eventDeliveryStream()
+            switch reply {
+            case .none:
+                // Removed unsent; whatever follows goes on a new stream.
+                XCTAssertEqual(calls, 0, "age \(offset)")
                 XCTAssertEqual(result, .resolved(delivered: 0, terminallyDiscarded: 1))
-                let calls = await transport.callCount()
-                XCTAssertEqual(calls, 0)
-            } else {
+                XCTAssertEqual(stream.streamId, "stream_moved_1", "age \(offset)")
+            case .some(.accept):
+                XCTAssertEqual(calls, 1, "age \(offset)")
                 XCTAssertEqual(result, .resolved(delivered: 1, terminallyDiscarded: 0))
-                let calls = await transport.callCount()
-                XCTAssertEqual(calls, 1)
+                XCTAssertEqual(stream.streamId, "stream_delivery_test", "age \(offset)")
+            case .some:
+                XCTAssertEqual(calls, 1, "age \(offset)")
+                XCTAssertEqual(result, .resolved(delivered: 0, terminallyDiscarded: 1))
+                XCTAssertEqual(stream.streamId, "stream_delivery_test", "age \(offset)")
             }
+            let snapshot = try await queue.snapshot()
+            XCTAssertEqual(snapshot.queuedCount, 0)
             await queue.close()
         }
     }
 
-    func testNonMonotonicRecordAgesStopPrefixBeforeAgedRow() async throws {
+    func testAgedRecordBetweenFreshOnesIsSentInTheSameRequest() async throws {
         let directory = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
         let clock = TestBatchClock(
@@ -825,7 +899,7 @@ final class EluV1BatchDeliveryTests: XCTestCase {
                 EluV1BatchDeliveryCoordinator.maximumRecordAgeSeconds + 50
             )
         )
-        let transport = TestBatchTransport(replies: [.accept, .accept])
+        let transport = TestBatchTransport(replies: [.rejectSequences([1], "record-too-old")])
         let coordinator = try self.coordinator(
             queue: queue,
             transport: transport,
@@ -835,7 +909,48 @@ final class EluV1BatchDeliveryTests: XCTestCase {
         let result = await coordinator.trigger()
         XCTAssertEqual(result, .resolved(delivered: 2, terminallyDiscarded: 1))
         let sequences = await transport.recordSequences()
+        XCTAssertEqual(sequences, [[0, 1, 2]])
+        let snapshot = try await queue.snapshot()
+        XCTAssertEqual(snapshot.queuedCount, 0)
+        await queue.close()
+    }
+
+    func testRecordPastTheServerOutcomeEndsThePrefixAndIsRemovedOnItsOwn() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let clock = TestBatchClock(
+            wall: capturedAt.addingTimeInterval(100),
+            monotonic: 0
+        )
+        let queue = try await makeQueue(directory: directory, clock: clock.source.wallNow)
+        _ = try await appendRecords(queue, count: 1)
+        clock.setWall(capturedAt)
+        _ = try await appendRecords(queue, count: 1)
+        clock.setWall(capturedAt.addingTimeInterval(200))
+        _ = try await appendRecords(queue, count: 1)
+        clock.setWall(
+            capturedAt.addingTimeInterval(
+                EluV1BatchDeliveryCoordinator.serverOutcomeRetentionSeconds + 50
+            )
+        )
+        let transport = TestBatchTransport(
+            replies: [
+                .rejectSequences([0], "record-too-old"),
+                .rejectSequences([2], "record-too-old"),
+            ]
+        )
+        let coordinator = try self.coordinator(
+            queue: queue,
+            transport: transport,
+            clock: clock
+        )
+
+        let result = await coordinator.trigger()
+        XCTAssertEqual(result, .resolved(delivered: 0, terminallyDiscarded: 3))
+        let sequences = await transport.recordSequences()
         XCTAssertEqual(sequences, [[0], [2]])
+        let streams = await transport.streamIds()
+        XCTAssertEqual(streams, ["stream_delivery_test", "stream_moved_1"])
         let snapshot = try await queue.snapshot()
         XCTAssertEqual(snapshot.queuedCount, 0)
         await queue.close()
@@ -896,12 +1011,12 @@ final class EluV1BatchDeliveryTests: XCTestCase {
         await queue.close()
     }
 
-    func testAgeIsRecheckedAfterQueueValidationImmediatelyBeforeTransport() async throws {
+    func testRecordThatAgesAtTheNetworkBoundaryIsStillSent() async throws {
         let directory = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
         let queue = try await makeQueue(directory: directory)
         _ = try await appendRecords(queue, count: 1)
-        let transport = TestBatchTransport(replies: [.accept])
+        let transport = TestBatchTransport(replies: [.rejectSequences([0], "record-too-old")])
         let beforeBoundary = capturedAt.addingTimeInterval(
             EluV1BatchDeliveryCoordinator.maximumRecordAgeSeconds - 1
         )
@@ -936,7 +1051,56 @@ final class EluV1BatchDeliveryTests: XCTestCase {
         let result = await coordinator.trigger()
         XCTAssertEqual(result, .resolved(delivered: 0, terminallyDiscarded: 1))
         let calls = await transport.callCount()
+        XCTAssertEqual(calls, 1)
+        let snapshot = try await queue.snapshot()
+        XCTAssertEqual(snapshot.queuedCount, 0)
+        await queue.close()
+    }
+
+    func testRecordThatOutlivesTheServerOutcomeAtTheNetworkBoundaryIsRemovedUnsent() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let queue = try await makeQueue(directory: directory)
+        _ = try await appendRecords(queue, count: 1)
+        let transport = TestBatchTransport(replies: [])
+        let beforeBoundary = capturedAt.addingTimeInterval(
+            EluV1BatchDeliveryCoordinator.serverOutcomeRetentionSeconds - 1
+        )
+        let atBoundary = capturedAt.addingTimeInterval(
+            EluV1BatchDeliveryCoordinator.serverOutcomeRetentionSeconds
+        )
+        let clock = TestScriptedWallClock(
+            values: [
+                beforeBoundary,
+                beforeBoundary,
+                beforeBoundary,
+                beforeBoundary,
+                atBoundary,
+            ]
+        )
+        let coordinator = EluV1BatchDeliveryCoordinator(
+            queue: queue,
+            authorization: try EluV1BatchAuthorizationSnapshot(
+                siteKey: "elu_pk_live_test",
+                eventsEndpoint: try XCTUnwrap(
+                    URL(string: "https://ingest.elu.dev/v1/events")
+                ),
+                expiresAt: capturedAt.addingTimeInterval(900_000),
+                eventBatchCount: 1_000,
+                eventBatchBytes: 1_000_000
+            ),
+            transport: transport,
+            time: clock.source,
+            randomUnit: { 0 },
+            deliveryStreamIdGenerator: { "stream_moved_1" }
+        )
+
+        let result = await coordinator.trigger()
+        XCTAssertEqual(result, .resolved(delivered: 0, terminallyDiscarded: 1))
+        let calls = await transport.callCount()
         XCTAssertEqual(calls, 0)
+        let stream = try await queue.eventDeliveryStream()
+        XCTAssertEqual(stream.streamId, "stream_moved_1")
         let snapshot = try await queue.snapshot()
         XCTAssertEqual(snapshot.queuedCount, 0)
         await queue.close()
@@ -1019,6 +1183,394 @@ final class EluV1BatchDeliveryTests: XCTestCase {
         }
     }
 
+    func testOneRecord413DiscardMovesTheRestToANewStream() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let queue = try await makeQueue(directory: directory)
+        _ = try await appendRecords(queue, count: 2)
+        let transport = TestBatchTransport(replies: [.http(413, nil), .http(413, nil), .accept])
+        let coordinator = try self.coordinator(queue: queue, transport: transport)
+
+        let result = await coordinator.trigger()
+        XCTAssertEqual(result, .resolved(delivered: 1, terminallyDiscarded: 1))
+        let sequences = await transport.recordSequences()
+        XCTAssertEqual(sequences, [[0, 1], [0], [1]])
+        // The split's second half is not sent on the stream that now misses
+        // sequence 0; it is packed again on the new stream.
+        let streams = await transport.streamIds()
+        XCTAssertEqual(streams, ["stream_delivery_test", "stream_delivery_test", "stream_moved_1"])
+        let snapshot = try await queue.snapshot()
+        XCTAssertEqual(snapshot.queuedCount, 0)
+        await queue.close()
+    }
+
+    func testStreamGapMovesTheHeadOnlyAfterEnoughAnswersAndResendsItAtOnce() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let queue = try await makeQueue(directory: directory)
+        _ = try await appendRecords(queue, count: 2)
+        let answers = Int(EluV1BatchDeliveryCoordinator.streamGapRotationAnswers)
+        let transport = TestBatchTransport(
+            replies: Array(repeating: TestBatchReply.streamGap, count: answers)
+                + [TestBatchReply.accept]
+        )
+        let clock = TestBatchClock(wall: capturedAt, monotonic: 0, holdsTimers: true)
+        let coordinator = try self.coordinator(
+            queue: queue,
+            transport: transport,
+            clock: clock,
+            randomUnit: 0
+        )
+
+        // The time bound is passed before the answer count is reached.
+        for index in 0 ..< answers - 1 {
+            clock.setWall(capturedAt.addingTimeInterval(Double(index) * 600))
+            guard case let .deferred(deadline) = await coordinator.trigger() else {
+                return XCTFail("Expected a stream-gap retry before the answer bound")
+            }
+            clock.setMonotonic(deadline)
+        }
+        let beforeMove = try await queue.eventDeliveryStream()
+        XCTAssertEqual(beforeMove.streamId, "stream_delivery_test")
+        XCTAssertEqual(beforeMove.gap?.sequence, 0)
+        XCTAssertEqual(beforeMove.gap?.answers, Int64(answers - 1))
+
+        clock.setWall(capturedAt.addingTimeInterval(Double(answers) * 600))
+        let moved = await coordinator.trigger()
+        XCTAssertEqual(moved, .resolved(delivered: 2, terminallyDiscarded: 0))
+        let streams = await transport.streamIds()
+        XCTAssertEqual(
+            streams,
+            Array(repeating: "stream_delivery_test", count: answers) + ["stream_moved_1"]
+        )
+        let sequences = await transport.recordSequences()
+        XCTAssertEqual(sequences, Array(repeating: [Int64(0), 1], count: answers + 1))
+        let afterMove = try await queue.eventDeliveryStream()
+        XCTAssertEqual(afterMove.streamId, "stream_moved_1")
+        XCTAssertNil(afterMove.gap)
+        let snapshot = try await queue.snapshot()
+        XCTAssertEqual(snapshot.queuedCount, 0)
+        await coordinator.cancel()
+        await queue.close()
+    }
+
+    func testStreamGapMovesTheHeadOnlyAfterTheTimeBound() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let queue = try await makeQueue(directory: directory)
+        _ = try await appendRecords(queue, count: 1)
+        let answers = Int(EluV1BatchDeliveryCoordinator.streamGapRotationAnswers)
+        let transport = TestBatchTransport(
+            replies: Array(repeating: TestBatchReply.streamGap, count: answers + 2)
+                + [TestBatchReply.accept]
+        )
+        let clock = TestBatchClock(wall: capturedAt, monotonic: 0, holdsTimers: true)
+        let coordinator = try self.coordinator(
+            queue: queue,
+            transport: transport,
+            clock: clock,
+            randomUnit: 0
+        )
+
+        // The answer count is reached within one minute: no move yet.
+        for index in 0 ..< answers {
+            clock.setWall(capturedAt.addingTimeInterval(Double(index) * 10))
+            guard case let .deferred(deadline) = await coordinator.trigger() else {
+                return XCTFail("Expected a stream-gap retry before the time bound")
+            }
+            clock.setMonotonic(deadline)
+        }
+        // One millisecond short of the bound: still no move.
+        clock.setWall(
+            capturedAt.addingTimeInterval(
+                EluV1BatchDeliveryCoordinator.streamGapRotationSeconds - 0.001
+            )
+        )
+        guard case let .deferred(deadline) = await coordinator.trigger() else {
+            return XCTFail("Expected a stream-gap retry just before the time bound")
+        }
+        clock.setMonotonic(deadline)
+        let beforeMove = try await queue.eventDeliveryStream()
+        XCTAssertEqual(beforeMove.streamId, "stream_delivery_test")
+        XCTAssertEqual(beforeMove.gap?.answers, Int64(answers + 1))
+
+        clock.setWall(
+            capturedAt.addingTimeInterval(EluV1BatchDeliveryCoordinator.streamGapRotationSeconds)
+        )
+        let moved = await coordinator.trigger()
+        XCTAssertEqual(moved, .resolved(delivered: 1, terminallyDiscarded: 0))
+        let streams = await transport.streamIds()
+        XCTAssertEqual(streams.filter { $0 == "stream_delivery_test" }.count, answers + 2)
+        XCTAssertEqual(streams.last, "stream_moved_1")
+        await coordinator.cancel()
+        await queue.close()
+    }
+
+    func testStreamGapEvidenceBelongsToOneHeadAndRestartsWhenTheClockGoesBack() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let queue = try await makeQueue(directory: directory)
+        _ = try await appendRecords(queue, count: 3)
+        let answers = Int(EluV1BatchDeliveryCoordinator.streamGapRotationAnswers)
+        let transport = TestBatchTransport(
+            replies: Array(repeating: TestBatchReply.streamGap, count: answers - 1)
+                + [TestBatchReply.acceptHeadThenStreamGap, .streamGap, .streamGap, .accept]
+        )
+        let clock = TestBatchClock(wall: capturedAt, monotonic: 0, holdsTimers: true)
+        let coordinator = try self.coordinator(
+            queue: queue,
+            transport: transport,
+            clock: clock,
+            randomUnit: 0
+        )
+
+        for index in 0 ..< answers - 1 {
+            clock.setWall(capturedAt.addingTimeInterval(Double(index) * 600))
+            guard case let .deferred(deadline) = await coordinator.trigger() else {
+                return XCTFail("Expected a stream-gap retry")
+            }
+            clock.setMonotonic(deadline)
+        }
+        // Sequence 0 is resolved and sequence 1 is answered stream-gap. The
+        // count for sequence 0 does not carry over to the new head.
+        clock.setWall(capturedAt.addingTimeInterval(Double(answers) * 600))
+        guard case let .deferred(nextHead) = await coordinator.trigger() else {
+            return XCTFail("Expected a stream-gap retry for the new head")
+        }
+        clock.setMonotonic(nextHead)
+        let newHead = try await queue.eventDeliveryStream()
+        XCTAssertEqual(newHead.streamId, "stream_delivery_test")
+        XCTAssertEqual(newHead.gap?.sequence, 1)
+        XCTAssertEqual(newHead.gap?.answers, 1)
+
+        // A clock set back a day restarts the window at the new reading.
+        let setBack = capturedAt.addingTimeInterval(-86_400)
+        clock.setWall(setBack)
+        guard case let .deferred(afterSetBack) = await coordinator.trigger() else {
+            return XCTFail("Expected a stream-gap retry after the clock went back")
+        }
+        clock.setMonotonic(afterSetBack)
+        let restarted = try await queue.eventDeliveryStream()
+        XCTAssertEqual(restarted.gap?.answers, 2)
+        XCTAssertEqual(
+            restarted.gap?.firstAnsweredAtMilliseconds,
+            Int64(setBack.timeIntervalSince1970 * 1_000)
+        )
+
+        let streams = await transport.streamIds()
+        XCTAssertTrue(streams.allSatisfy { $0 == "stream_delivery_test" })
+        let snapshot = try await queue.snapshot()
+        XCTAssertEqual(snapshot.headSequence, 1)
+        await coordinator.cancel()
+        await queue.close()
+    }
+
+    func testStreamGapEvidenceAndTheMovedStreamSurviveQueueRestarts() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let answers = Int(EluV1BatchDeliveryCoordinator.streamGapRotationAnswers)
+        let firstSession = 3
+        var queue = try await makeQueue(directory: directory)
+        _ = try await appendRecords(queue, count: 2)
+        let clock = TestBatchClock(wall: capturedAt, monotonic: 0, holdsTimers: true)
+        let firstTransport = TestBatchTransport(
+            replies: Array(repeating: TestBatchReply.streamGap, count: firstSession)
+        )
+        let first = try coordinator(
+            queue: queue,
+            transport: firstTransport,
+            clock: clock,
+            randomUnit: 0
+        )
+        for index in 0 ..< firstSession {
+            clock.setWall(capturedAt.addingTimeInterval(Double(index) * 60))
+            guard case let .deferred(deadline) = await first.trigger() else {
+                return XCTFail("Expected a stream-gap retry")
+            }
+            clock.setMonotonic(deadline)
+        }
+        await first.cancel()
+        await queue.close()
+        let file = directory.appendingPathComponent(EluV1EventDeliveryStreamStore.filename)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: file.path))
+
+        // A new process: the answers already counted still count.
+        queue = try await makeQueue(directory: directory)
+        let reopened = try await queue.eventDeliveryStream()
+        XCTAssertEqual(reopened.gap?.answers, Int64(firstSession))
+        let secondTransport = TestBatchTransport(
+            replies: Array(repeating: TestBatchReply.streamGap, count: answers - firstSession)
+                + [TestBatchReply.accept]
+        )
+        let secondClock = TestBatchClock(
+            wall: capturedAt.addingTimeInterval(
+                EluV1BatchDeliveryCoordinator.streamGapRotationSeconds
+            ),
+            monotonic: 0,
+            holdsTimers: true
+        )
+        let second = try coordinator(
+            queue: queue,
+            transport: secondTransport,
+            clock: secondClock,
+            randomUnit: 0
+        )
+        for _ in 0 ..< answers - firstSession - 1 {
+            guard case let .deferred(deadline) = await second.trigger() else {
+                return XCTFail("Expected a stream-gap retry after the restart")
+            }
+            secondClock.setMonotonic(deadline)
+        }
+        let moved = await second.trigger()
+        XCTAssertEqual(moved, .resolved(delivered: 2, terminallyDiscarded: 0))
+        let secondStreams = await secondTransport.streamIds()
+        XCTAssertEqual(
+            secondStreams,
+            Array(repeating: "stream_delivery_test", count: answers - firstSession)
+                + ["stream_moved_1"]
+        )
+        await second.cancel()
+        await queue.close()
+
+        // Later records keep going on the moved stream after another restart.
+        queue = try await makeQueue(directory: directory)
+        let records = try await appendRecords(queue, count: 1)
+        XCTAssertEqual(records.map(\.sequence), [2])
+        let thirdTransport = TestBatchTransport(replies: [.accept])
+        let third = try coordinator(queue: queue, transport: thirdTransport)
+        let delivered = await third.trigger()
+        XCTAssertEqual(delivered, .resolved(delivered: 1, terminallyDiscarded: 0))
+        let thirdStreams = await thirdTransport.streamIds()
+        XCTAssertEqual(thirdStreams, ["stream_moved_1"])
+        await queue.close()
+    }
+
+    func testMovedStreamReaddressesEventsAndKeepsRecordIds() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let queue = try await makeQueue(directory: directory)
+        _ = try await appendRecords(queue, count: 1, valueBytes: 12_000)
+        let event = try await appendEvent(queue)
+        let snapshot = try await queue.snapshot()
+        let eventBody = try EluQueueBatchCodec.encodeBatch(
+            requestId: "request_\(String(repeating: "a", count: 64))",
+            streamId: snapshot.streamId,
+            sentAt: capturedAt,
+            versions: event.versions,
+            records: [event]
+        )
+        let transport = TestBatchTransport(replies: [.accept])
+        let coordinator = try self.coordinator(
+            queue: queue,
+            byteLimit: max(EluV1BatchAuthorizationSnapshot.minimumBatchBytes, eventBody.count),
+            transport: transport
+        )
+
+        let result = await coordinator.trigger()
+        XCTAssertEqual(result, .resolved(delivered: 1, terminallyDiscarded: 1))
+        let streams = await transport.streamIds()
+        XCTAssertEqual(streams, ["stream_moved_1"])
+        let eventStreams = await transport.eventStreamIds()
+        XCTAssertEqual(eventStreams, [["stream_moved_1"]])
+        let recordIds = await transport.recordIds()
+        XCTAssertEqual(recordIds, [[event.recordId]])
+        let sequences = await transport.recordSequences()
+        XCTAssertEqual(sequences, [[1]])
+        let after = try await queue.snapshot()
+        XCTAssertEqual(after.queuedCount, 0)
+        XCTAssertEqual(after.streamId, "stream_delivery_test")
+        await queue.close()
+    }
+
+    func testMemoryStorageKeepsTheMovedStreamOutOfFiles() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let queue = try await makeQueue(directory: directory, persistence: .memory)
+        _ = try await appendRecords(queue, count: 1, valueBytes: 2_000)
+        _ = try await appendRecords(queue, count: 1)
+        let transport = TestBatchTransport(replies: [.accept])
+        let coordinator = try self.coordinator(
+            queue: queue,
+            byteLimit: EluV1BatchAuthorizationSnapshot.minimumBatchBytes,
+            transport: transport
+        )
+
+        let result = await coordinator.trigger()
+        XCTAssertEqual(result, .resolved(delivered: 1, terminallyDiscarded: 1))
+        let streams = await transport.streamIds()
+        XCTAssertEqual(streams, ["stream_moved_1"])
+        let file = directory.appendingPathComponent(EluV1EventDeliveryStreamStore.filename)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: file.path))
+        await queue.close()
+    }
+
+    func testDeliveryStreamFileForAnotherStreamOrMalformedIsIgnored() async throws {
+        let foreign = try EluV1EventDeliveryStreamStore.encode(
+            EluV1EventDeliveryStream(
+                installationStreamId: "stream_other_install",
+                streamId: "stream_other_wire",
+                gap: nil
+            )
+        )
+        for contents in [foreign, Data("not a stream document".utf8)] {
+            let directory = try temporaryDirectory()
+            defer { try? FileManager.default.removeItem(at: directory) }
+            try contents.write(
+                to: directory.appendingPathComponent(EluV1EventDeliveryStreamStore.filename)
+            )
+            let queue = try await makeQueue(directory: directory)
+            _ = try await appendRecords(queue, count: 1)
+            let transport = TestBatchTransport(replies: [.accept])
+            let coordinator = try self.coordinator(queue: queue, transport: transport)
+
+            let result = await coordinator.trigger()
+            XCTAssertEqual(result, .resolved(delivered: 1, terminallyDiscarded: 0))
+            let streams = await transport.streamIds()
+            XCTAssertEqual(streams, ["stream_delivery_test"])
+            await queue.close()
+        }
+    }
+
+    func testDeliveryStreamFileRoundTripsAndAcceptsOnlyItsOwnBytes() throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = EluV1EventDeliveryStreamStore(directoryURL: directory)
+        XCTAssertNil(try store.load())
+        for value in [
+            EluV1EventDeliveryStream.initial(installationStreamId: "stream_install"),
+            EluV1EventDeliveryStream(
+                installationStreamId: "stream_install",
+                streamId: "stream_wire",
+                gap: .init(sequence: 7, firstAnsweredAtMilliseconds: 1_786_147_200_000, answers: 3)
+            ),
+        ] {
+            try store.save(value)
+            XCTAssertEqual(try store.load(), value)
+        }
+
+        let bytes = try EluV1EventDeliveryStreamStore.encode(
+            .initial(installationStreamId: "stream_install")
+        )
+        let text = try XCTUnwrap(String(data: bytes, encoding: .utf8))
+        for altered in [
+            text + "\n",
+            " " + text,
+            String(text.dropLast()) + ",\"extra\":1}",
+            text.replacingOccurrences(of: "\"schemaVersion\":1", with: "\"schemaVersion\":2"),
+            text.replacingOccurrences(of: "\"gap\":null,", with: ""),
+        ] {
+            XCTAssertThrowsError(
+                try EluV1EventDeliveryStreamStore.decode(Data(altered.utf8)),
+                altered
+            )
+        }
+        XCTAssertThrowsError(
+            try EluV1EventDeliveryStreamStore.encode(
+                EluV1EventDeliveryStream(installationStreamId: "", streamId: "stream_wire", gap: nil)
+            )
+        )
+    }
+
     private func coordinator(
         queue: EluSQLiteRuntimeQueue,
         byteLimit: Int = 1_000_000,
@@ -1028,6 +1580,7 @@ final class EluV1BatchDeliveryTests: XCTestCase {
         authorizationExpiry: Date? = nil
     ) throws -> EluV1BatchDeliveryCoordinator {
         let clock = clock ?? TestBatchClock(wall: capturedAt, monotonic: 0)
+        let streamIds = TestStreamIdSequence()
         return EluV1BatchDeliveryCoordinator(
             queue: queue,
             authorization: try EluV1BatchAuthorizationSnapshot(
@@ -1039,13 +1592,48 @@ final class EluV1BatchDeliveryTests: XCTestCase {
             ),
             transport: transport,
             time: clock.source,
-            randomUnit: { randomUnit }
+            randomUnit: { randomUnit },
+            deliveryStreamIdGenerator: { streamIds.next() }
         )
     }
 
     private func makeQueue(directory: URL) async throws -> EluSQLiteRuntimeQueue {
         let fixedClock = capturedAt
         return try await makeQueue(directory: directory, clock: { fixedClock })
+    }
+
+    private func makeQueue(
+        directory: URL,
+        persistence: EluPersistenceMode
+    ) async throws -> EluSQLiteRuntimeQueue {
+        let fixedClock = capturedAt
+        return try await EluSQLiteRuntimeQueue.open(
+            directoryURL: directory,
+            persistence: persistence,
+            clock: { fixedClock },
+            anonymousIdGenerator: { "anon_delivery_test" },
+            streamIdGenerator: { "stream_delivery_test" },
+            sessionIdGenerator: { "session_delivery_test" }
+        )
+    }
+
+    @discardableResult
+    private func appendEvent(_ queue: EluSQLiteRuntimeQueue) async throws -> EluQueuedRecord {
+        let snapshot = try await queue.snapshot()
+        if snapshot.identity.session == nil {
+            _ = try await queue.recordEligibleActivity(expectedGeneration: snapshot.generation)
+        }
+        return try await queue.appendEvent(
+            EluEventDraft(
+                kind: .capture,
+                name: "delivery_event",
+                occurredAt: capturedAt,
+                expectedSessionId: "session_delivery_test",
+                properties: [:],
+                versions: try versions()
+            ),
+            sessionUpdate: .preserve
+        )
     }
 
     private func makeQueue(
@@ -1165,6 +1753,12 @@ private enum TestBatchReply: Sendable {
     case duplicateAcknowledgementKey
     case oversizedResponse
     case delayedAccept(UInt64)
+    /// The head record is retryable `stream-gap`; nothing is resolved.
+    case streamGap
+    /// The head is accepted and the next record is retryable `stream-gap`.
+    case acceptHeadThenStreamGap
+    /// Listed sequences are terminally rejected with the code; the rest are accepted.
+    case rejectSequences(Set<Int64>, String)
 }
 
 private enum TestBatchTransportError: Error {
@@ -1279,10 +1873,39 @@ private actor TestBatchTransport: EluV1BatchHTTPTransport {
         case let .delayedAccept(nanoseconds):
             try await Task.sleep(nanoseconds: nanoseconds)
             return try acceptedResponse(for: request)
+        case .streamGap:
+            return try streamGapResponse(for: request, acceptingHead: false)
+        case .acceptHeadThenStreamGap:
+            return try streamGapResponse(for: request, acceptingHead: true)
+        case let .rejectSequences(sequences, code):
+            return try selectiveRejectionResponse(for: request, sequences: sequences, code: code)
         }
     }
 
     func callCount() -> Int { requests.count }
+
+    func streamIds() -> [String] {
+        requests.compactMap { try? requestFacts($0).streamId }
+    }
+
+    func recordIds() -> [[String]] {
+        requests.compactMap { try? requestFacts($0).records.map(\.recordId) }
+    }
+
+    /// The `streamId` each event in each request names.
+    func eventStreamIds() -> [[String]] {
+        requests.compactMap { request in
+            guard let object = try? JSONSerialization.jsonObject(with: request.body),
+                  let root = object as? [String: Any],
+                  let records = root["records"] as? [[String: Any]]
+            else {
+                return nil
+            }
+            return records.compactMap { record in
+                (record["event"] as? [String: Any])?["streamId"] as? String
+            }
+        }
+    }
     func maximumConcurrentCalls() -> Int { maximumActiveCalls }
 
     func requestIds() -> [String] {
@@ -1335,6 +1958,77 @@ private actor TestBatchTransport: EluV1BatchHTTPTransport {
                     "code": "temporarily-unavailable",
                 ],
             ],
+        ]
+        return EluV1BatchHTTPResponse(
+            status: 200,
+            headers: [:],
+            body: try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
+        )
+    }
+
+    private func streamGapResponse(
+        for request: EluV1BatchHTTPRequest,
+        acceptingHead: Bool
+    ) throws -> EluV1BatchHTTPResponse {
+        let facts = try requestFacts(request)
+        let resolved = acceptingHead ? Array(facts.records.prefix(1)) : []
+        guard facts.records.count > resolved.count else { throw TestBatchTransportError.network }
+        let gap = facts.records[resolved.count]
+        var outcomes: [[String: Any]] = resolved.map { record -> [String: Any] in
+            [
+                "sequence": record.sequence,
+                "recordId": record.recordId,
+                "kind": record.kind,
+                "result": "accepted",
+            ]
+        }
+        outcomes.append([
+            "sequence": gap.sequence,
+            "recordId": gap.recordId,
+            "kind": gap.kind,
+            "result": "retryable",
+            "code": "stream-gap",
+        ])
+        let body: [String: Any] = [
+            "schemaVersion": 1,
+            "requestId": facts.requestId,
+            "streamId": facts.streamId,
+            "resolvedThroughSequence": resolved.last.map { $0.sequence as Any } ?? NSNull(),
+            "retryFromSequence": gap.sequence,
+            "outcomes": outcomes,
+        ]
+        return EluV1BatchHTTPResponse(
+            status: 200,
+            headers: [:],
+            body: try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
+        )
+    }
+
+    private func selectiveRejectionResponse(
+        for request: EluV1BatchHTTPRequest,
+        sequences: Set<Int64>,
+        code: String
+    ) throws -> EluV1BatchHTTPResponse {
+        let facts = try requestFacts(request)
+        let outcomes = facts.records.map { record -> [String: Any] in
+            var outcome: [String: Any] = [
+                "sequence": record.sequence,
+                "recordId": record.recordId,
+                "kind": record.kind,
+                "result": sequences.contains(record.sequence) ? "terminally-rejected" : "accepted",
+            ]
+            if sequences.contains(record.sequence) {
+                outcome["code"] = code
+            }
+            return outcome
+        }
+        let body: [String: Any] = [
+            "schemaVersion": 1,
+            "requestId": facts.requestId,
+            "streamId": facts.streamId,
+            "resolvedThroughSequence": try XCTUnwrap(facts.records.last).sequence,
+            "retryFromSequence": NSNull(),
+            "outcomes": outcomes,
         ]
         return EluV1BatchHTTPResponse(
             status: 200,
@@ -1459,14 +2153,30 @@ private actor TestBatchTransport: EluV1BatchHTTPTransport {
     }
 }
 
+private final class TestStreamIdSequence: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+
+    func next() -> String {
+        lock.lock()
+        defer { lock.unlock() }
+        count += 1
+        return "stream_moved_\(count)"
+    }
+}
+
 private final class TestBatchClock: @unchecked Sendable {
     private let lock = NSLock()
     private var wall: Date
     private var monotonic: UInt64
+    /// Retry timers sleep for an hour instead of the backoff, so a slow run
+    /// cannot fire a retry the test means to drive itself.
+    private let holdsTimers: Bool
 
-    init(wall: Date, monotonic: UInt64) {
+    init(wall: Date, monotonic: UInt64, holdsTimers: Bool = false) {
         self.wall = wall
         self.monotonic = monotonic
+        self.holdsTimers = holdsTimers
     }
 
     var source: EluV1BatchTimeSource {
@@ -1481,7 +2191,10 @@ private final class TestBatchClock: @unchecked Sendable {
                 defer { lock.unlock() }
                 return monotonic
             },
-            sleep: { nanoseconds in try await Task.sleep(nanoseconds: nanoseconds) }
+            sleep: { [self] nanoseconds in
+                let held: UInt64 = 3_600_000_000_000
+                try await Task.sleep(nanoseconds: self.holdsTimers ? held : nanoseconds)
+            }
         )
     }
 

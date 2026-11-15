@@ -157,6 +157,17 @@ on a later eligible launch; lost acknowledgments do not justify treating a
 request as delivered. Offline storage does not bypass current configuration,
 consent, or privacy authority.
 
+Events are sent in order, and ELU answers each one, including events older than
+seven days, which it refuses as too old. An event the SDK cannot send is removed
+from the device, and the events after it are sent under a new event stream id
+so later events are not held back: that covers an event too large for any
+request, one refused `413` on its own, and one older than the eight days ELU
+keeps its earlier answers. If ELU keeps answering that it is waiting for an
+earlier event (at least six times over at least 30 minutes for the same event),
+the waiting events also move to a new event stream id. The current event stream
+id is kept in a small file beside the `.persistent` store, and in memory only
+for `.memory`.
+
 For a `429` or `5xx` response, the SDK retries the unchanged request with
 backoff, whatever the response body. When the body is ELU's error object, its
 `Retry-After` is honoured (up to one day for replay), and a `429` pauses that
