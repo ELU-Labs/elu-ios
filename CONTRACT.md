@@ -163,7 +163,7 @@ from the device, and the events after it are sent under a new event stream id
 so later events are not held back: that covers an event too large for any
 request, one refused `413` on its own, and one older than the eight days ELU
 keeps its earlier answers. If ELU keeps answering that it is waiting for an
-earlier event (at least six times over at least 30 minutes for the same event),
+earlier event (at least five times over at least 45 minutes for the same event),
 the waiting events also move to a new event stream id. The current event stream
 id is kept in a small file beside the `.persistent` store, and in memory only
 for `.memory`.

@@ -1254,6 +1254,18 @@ final class EluV1BatchDeliveryTests: XCTestCase {
         await queue.close()
     }
 
+    func testStreamGapRotationWaitsLongerThanTheServerGapCloseGrace() {
+        // The server closes a gap after 30 minutes; the SDK must wait longer
+        // so the server's close is the normal path.
+        XCTAssertEqual(EluV1BatchDeliveryCoordinator.serverGapCloseGraceSeconds, 1_800)
+        XCTAssertGreaterThan(
+            EluV1BatchDeliveryCoordinator.streamGapRotationSeconds,
+            EluV1BatchDeliveryCoordinator.serverGapCloseGraceSeconds
+        )
+        XCTAssertEqual(EluV1BatchDeliveryCoordinator.streamGapRotationSeconds, 2_700)
+        XCTAssertEqual(EluV1BatchDeliveryCoordinator.streamGapRotationAnswers, 5)
+    }
+
     func testStreamGapMovesTheHeadOnlyAfterTheTimeBound() async throws {
         let directory = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }

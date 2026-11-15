@@ -202,10 +202,14 @@ actor EluV1BatchDeliveryCoordinator {
     /// A head answered `stream-gap` at least this many times, over at least
     /// this long, moves to a new wire stream. The bound is well past a
     /// transient gap (two senders racing) and past the time the server is
-    /// given to close a gap itself, so only a stream the server will never
-    /// advance is left. Both counts persist across restarts.
-    static let streamGapRotationAnswers: Int64 = 6
-    static let streamGapRotationSeconds: TimeInterval = 1_800
+    /// given to close a gap itself (the server closes a gap after 30 minutes),
+    /// so the server's close is the normal path and rotation is only the
+    /// fallback for a stream the server will never advance. Both counts
+    /// persist across restarts.
+    static let streamGapRotationAnswers: Int64 = 5
+    static let streamGapRotationSeconds: TimeInterval = 2_700
+    /// The server's own grace before it closes a gap, in seconds.
+    static let serverGapCloseGraceSeconds: TimeInterval = 1_800
 
     private let queue: EluSQLiteRuntimeQueue
     private let authorization: EluV1BatchAuthorizationSnapshot
