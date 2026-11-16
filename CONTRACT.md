@@ -157,6 +157,30 @@ on a later eligible launch; lost acknowledgments do not justify treating a
 request as delivered. Offline storage does not bypass current configuration,
 consent, or privacy authority.
 
+Events are sent in order, and ELU answers each one, including events older than
+seven days, which it refuses as too old. ELU keeps each answer for eight days
+from when it first gave it, and the SDK sends an event again only while ELU
+still holds any answer it may have given (the shared transport policy names this
+`clientRetryBoundary` `before-idempotency-retention`). An event is sent until it
+is seven and a half days old, twelve hours inside those eight days to allow for
+clock changes. An older event that was already sent under the current event
+stream id goes again there until seven and a half days after it was first sent,
+so the events of a request whose answer was lost get ELU's stored answers
+instead of being counted again. An event the SDK cannot send is removed from the
+device, and the events after it are sent under a new event stream id so later
+events are not held back: that covers an event too large for any request, one
+refused `413` on its own, and one past those bounds. A new event stream id that
+nothing has been sent under yet is kept, since ELU has not seen it. The current
+id is also kept when later events were already sent under it together with the
+removed one, unless ELU refused the removed event `413` on its own: ELU may
+already hold those later events, and sending them under a new id would count
+them twice. If ELU keeps answering that it is waiting for an earlier event (at
+least five times over at least 45 minutes by the device clock for the same
+event), the waiting events also move to a new event stream id. The current event
+stream id, and when the events still on the device were first sent under it, are
+kept in a small file beside the `.persistent` store, and in memory only for
+`.memory`.
+
 For a `429` or `5xx` response, the SDK retries the unchanged request with
 backoff, whatever the response body. When the body is ELU's error object, its
 `Retry-After` is honoured (up to one day for replay), and a `429` pauses that
